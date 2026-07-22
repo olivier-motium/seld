@@ -89,6 +89,7 @@ touches only expected content recorded as GSV-owned.
 ## Portability
 
 The runtime uses the Python standard library before freezing, plus bundled
-static Bridge assets and fonts. PyInstaller produces one executable per OS and
-architecture. Vault records and backups are platform-neutral UTF-8/ZIP data and
-never contain executable installation state.
+static Bridge assets. The UI uses the host system font stack and ships no font
+runtime. PyInstaller produces one executable per OS and architecture. Vault
+records and backups are platform-neutral UTF-8/ZIP data and never contain
+executable installation state.

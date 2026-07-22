@@ -85,7 +85,11 @@ def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
     with sync_playwright() as playwright:
         browser = _launch(playwright.chromium)
         try:
-            page = browser.new_page(viewport={"width": 1440, "height": 920}, device_scale_factor=1)
+            page = browser.new_page(
+                viewport={"width": 1440, "height": 920},
+                device_scale_factor=1,
+                reduced_motion="reduce",
+            )
             page.on(
                 "console",
                 lambda message: (
@@ -109,6 +113,10 @@ def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
             _assert_visibility(page, "#rail-backdrop", visible=False)
             _assert_visibility(page, "#inspector-backdrop", visible=False)
             _assert_visibility(page, "#inspector-foot", visible=False)
+            _assert_visibility(page, "#connection-orb", visible=False)
+            _assert_visibility(page, "#local-status .status-dot", visible=True)
+            _assert_orb_canvas(page, ".continuity-orb")
+            _assert_reduced_orb_static(page, ".continuity-orb")
             _assert_no_browser_errors(console_errors, page_errors)
             _assert_viewport(page)
 
@@ -141,13 +149,19 @@ def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
             expected_error_index = len(console_errors)
             page.route("**/api/v1/snapshot", lambda route: route.abort())
             page.locator(".connection-notice.is-stale").wait_for(timeout=15_000)
+            _assert_visibility(page, "#connection-orb", visible=True)
+            _assert_visibility(page, "#local-status .status-dot", visible=False)
+            _assert_orb_canvas(page, "#connection-orb")
+            _assert_reduced_orb_static(page, "#connection-orb")
             page.screenshot(path=str(output / "bridge-stale.png"), animations="disabled")
             _consume_expected_network_errors(console_errors, expected_error_index)
             _assert_no_browser_errors(console_errors, page_errors)
             page.unroute("**/api/v1/snapshot")
 
             unavailable = browser.new_page(
-                viewport={"width": 1024, "height": 760}, device_scale_factor=1
+                viewport={"width": 1024, "height": 760},
+                device_scale_factor=1,
+                reduced_motion="reduce",
             )
             unavailable_console_errors: list[str] = []
             unavailable_page_errors: list[str] = []
@@ -163,6 +177,8 @@ def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
             unavailable.route("**/api/v1/snapshot", lambda route: route.abort())
             unavailable.goto(url, wait_until="domcontentloaded")
             unavailable.locator(".unavailable-state").wait_for(timeout=5_000)
+            _assert_visibility(unavailable, "#connection-orb", visible=False)
+            _assert_visibility(unavailable, "#local-status .status-dot", visible=True)
             unavailable.screenshot(
                 path=str(output / "bridge-unavailable.png"), animations="disabled"
             )
@@ -240,6 +256,31 @@ def _assert_visibility(page: Any, selector: str, *, visible: bool) -> None:
     if actual is not visible:
         expectation = "visible" if visible else "hidden"
         raise RuntimeError(f"expected {selector} to be {expectation}")
+
+
+def _assert_orb_canvas(page: Any, selector: str) -> None:
+    inked = page.locator(selector).first.evaluate(
+        """canvas => {
+          const context = canvas.getContext('2d');
+          const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+          let count = 0;
+          for (let index = 3; index < pixels.length; index += 4) {
+            if (pixels[index] > 0) count += 1;
+          }
+          return count;
+        }"""
+    )
+    if inked < 6:
+        raise RuntimeError(f"thinking orb did not render enough canvas pixels: {inked}")
+
+
+def _assert_reduced_orb_static(page: Any, selector: str) -> None:
+    locator = page.locator(selector).first
+    before = locator.evaluate("canvas => canvas.toDataURL()")
+    page.wait_for_timeout(160)
+    after = locator.evaluate("canvas => canvas.toDataURL()")
+    if before != after:
+        raise RuntimeError("reduced-motion thinking orb continued animating")
 
 
 def _consume_expected_network_errors(errors: list[str], start: int) -> None:

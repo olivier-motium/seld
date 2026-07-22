@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import threading
 from collections.abc import Iterator
@@ -117,23 +118,63 @@ def test_codex_deep_link_round_trips_encoded_prompt_path_and_origin(tmp_path: Pa
     }
 
 
-def test_packaged_bridge_bundle_contains_ui_fonts_and_licenses() -> None:
+def test_packaged_bridge_bundle_contains_ui_assets_and_licenses() -> None:
     resource = files("continuity_kernel") / "resources/bridge"
     expected = {
         "bridge.css",
         "bridge.js",
-        "fonts/ibm-plex-sans-regular.woff2",
-        "fonts/newsreader-variable.woff2",
         "gsv-mark.svg",
         "index.html",
-        "licenses/IBM-Plex-OFL.txt",
-        "licenses/Newsreader-OFL.txt",
+        "licenses/Lucide-ISC.txt",
+        "licenses/Thinking-Orbs-MIT.txt",
     }
 
     with as_file(resource) as root:
         present = {str(path.relative_to(root)) for path in Path(root).rglob("*") if path.is_file()}
 
     assert expected <= present
+
+
+def test_bridge_ui_tokens_and_dependency_free_orb_contract() -> None:
+    resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(resource) as root:
+        css = (Path(root) / "bridge.css").read_text(encoding="utf-8")
+        html = (Path(root) / "index.html").read_text(encoding="utf-8")
+        javascript = (Path(root) / "bridge.js").read_text(encoding="utf-8")
+
+    for token in (
+        "--text-xs: 12px",
+        "--text-sm: 13px",
+        "--text-md: 14px",
+        "--text-title: 24px",
+        "--ink: #292929",
+        "--muted: #5d5d5d",
+        "--quiet: #9e9e9e",
+        "--radius-nav: 8px",
+        "--radius-card: 16px",
+        "--radius-pill: 999px",
+    ):
+        assert token in css
+    assert '"SF Pro Text"' in css
+    assert '"SF Pro Display"' in css
+    assert "@font-face" not in css
+    assert "letter-spacing: -0.15px" in css
+    assert "letter-spacing: 0" not in css
+    assert {match.group(1) for match in re.finditer(r"font-weight:\s*(\d+)", css)} == {
+        "400",
+        "500",
+    }
+    assert re.search(r"\.nav-icon,[^{]+\{[^}]*width:\s*14px", css, re.DOTALL)
+    assert re.search(r"\.thinking-orb\s*\{[^}]*width:\s*20px[^}]*height:\s*20px", css, re.DOTALL)
+    assert "thinking-orbs 0.1.1" in javascript
+    assert "382be79c472cd600277f01e14f98f8c0ee18dcb0" in javascript
+    assert "prefers-reduced-motion: reduce" in javascript
+    assert "IntersectionObserver" in javascript
+    assert "Math.min(2, window.devicePixelRatio || 1)" in javascript
+    assert "snapshotSignature" in javascript
+    assert 'from "react"' not in javascript
+    assert 'aria-live="polite"' not in html
+    assert ".woff2" not in bridge._MIME_TYPES
 
 
 def test_http_surface_requires_per_launch_bearer_for_private_data(

@@ -57,7 +57,6 @@ _MIME_TYPES: Final = {
     ".json": "application/json; charset=utf-8",
     ".png": "image/png",
     ".svg": "image/svg+xml",
-    ".woff2": "font/woff2",
 }
 
 

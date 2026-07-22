@@ -22,5 +22,6 @@ The script drives the real bearer-gated loopback Bridge in a headless browser.
 It verifies the synthetic task by role and exact rendered title, exercises the
 mobile rail and inspector, checks hidden-state controls, forces stale and
 unavailable transport states, rejects uncaught JavaScript or unexpected console
-errors, checks sticky-header geometry and viewport overflow, rejects blank
-captures, and never reads the configured user vault.
+errors, verifies deterministic reduced-motion orb pixels, checks sticky-header
+geometry and viewport overflow, rejects blank captures, and never reads the
+configured user vault.
