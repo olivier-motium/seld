@@ -130,7 +130,15 @@ transaction and require the documented stop-plus-setup activation step.
 The vault and backups are user data. GSV never deletes them during Codex
 uninstall. The generated marketplace, plugin registration, managed instruction
 block, Bridge receipt, and installation receipt are integration state. Removal
-touches only expected content recorded as GSV-owned.
+touches only expected content recorded as GSV-owned. Uninstall snapshots the
+exact managed instruction bytes and verifies the marketplace digest before
+provider mutation, keeps the marketplace manifest present while Codex removes
+and verifies its registrations, then rechecks and deletes the local state. Any
+incomplete stage retains the ownership receipt and executable for the exact
+recovery path. A receipt-bound legacy state whose generated marketplace is
+already absent gets a deterministic packaged removal scaffold so a
+manifest-dependent Codex provider can finish cleanup. A recursive-delete error
+is manual-review state because deletion may have been partial.
 
 ## Portability
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -20,11 +21,32 @@ class FakeCodex:
     marketplaces: dict[str, str] = field(default_factory=dict)
     plugins: set[str] = field(default_factory=set)
     calls: list[tuple[str, ...]] = field(default_factory=list)
+    required_manifest: Path | None = None
 
     def run(self, executable: str, arguments: list[str], home: Path) -> dict[str, Any]:
         del executable, home
         command = tuple(arguments)
         self.calls.append(command)
+        checks_or_removes = (
+            command
+            in {
+                ("plugin", "list", "--json"),
+                ("plugin", "marketplace", "list", "--json"),
+            }
+            or command[:2] == ("plugin", "remove")
+            or command[:3]
+            == (
+                "plugin",
+                "marketplace",
+                "remove",
+            )
+        )
+        if (
+            self.required_manifest is not None
+            and checks_or_removes
+            and not self.required_manifest.is_file()
+        ):
+            raise SetupError("provider refused operation because marketplace manifest is absent")
         if command == ("plugin", "marketplace", "list", "--json"):
             return {
                 "marketplaces": [
@@ -212,7 +234,7 @@ def test_uninstall_rejects_multiple_or_nested_managed_blocks(
     assert agents.read_text(encoding="utf-8") == ambiguous
 
 
-def test_instruction_post_verification_failure_prevents_all_provider_calls(
+def test_instruction_preflight_failure_prevents_all_provider_calls(
     tmp_path: Path,
     fake_codex: FakeCodex,
     monkeypatch: pytest.MonkeyPatch,
@@ -223,21 +245,24 @@ def test_instruction_post_verification_failure_prevents_all_provider_calls(
     receipt = integration._receipt_path(home)
     calls_before = list(fake_codex.calls)
 
-    def fail_verification(_: Path) -> bool:
-        raise SetupError("injected instruction post-verification failure")
+    agents_before = (home / "AGENTS.md").read_bytes()
 
-    monkeypatch.setattr(integration, "_instructions_installed", fail_verification)
+    def fail_verification(_: Path) -> integration._InstructionCleanupPlan:
+        raise SetupError("injected instruction preflight failure")
+
+    monkeypatch.setattr(integration, "_plan_instruction_removal", fail_verification)
     removed = integration.uninstall_codex(codex_home=home)
 
     assert removed["cleanup_complete"] is False
     assert removed["local_cleanup_verified"] is False
     assert removed["provider_cleanup_skipped"] is True
     assert removed["provider_cleanup_verified"] is False
-    assert "post-verification failure" in removed["local_cleanup_error"]
+    assert "preflight failure" in removed["local_cleanup_error"]
     assert fake_codex.calls == calls_before
     assert fake_codex.plugins == {integration.PLUGIN_ID}
     assert integration.MARKETPLACE_NAME in fake_codex.marketplaces
-    assert not Path(installed.marketplace_root).exists()
+    assert Path(installed.marketplace_root).exists()
+    assert (home / "AGENTS.md").read_bytes() == agents_before
     assert receipt.exists()
 
 
@@ -547,6 +572,7 @@ def test_provider_failure_at_any_stage_keeps_receipt_and_retries_cleanly(
     home.mkdir()
     installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
     receipt = integration._receipt_path(home)
+    agents_before = (home / "AGENTS.md").read_bytes()
     calls = 0
 
     def fail_provider_stage(
@@ -572,23 +598,24 @@ def test_provider_failure_at_any_stage_keeps_receipt_and_retries_cleanly(
     )
     assert removed["plugin_removed"] is None
     assert removed["marketplace_removed"] is None
+    assert removed["marketplace_files_state"] == "verified_present"
     assert removed["deferred_registrations"] == ["plugin", "marketplace"]
     assert "Re-run `gsv codex uninstall`" in removed["next"]
     assert receipt.exists()
-    assert not Path(installed.marketplace_root).exists()
-    assert not (home / "AGENTS.md").exists()
+    assert Path(installed.marketplace_root).exists()
+    assert (home / "AGENTS.md").read_bytes() == agents_before
 
     monkeypatch.setattr(integration, "_run_json", fake_codex.run)
     retried = integration.uninstall_codex(codex_home=home)
 
     assert retried["cleanup_complete"] is True
-    assert retried["marketplace_files_state"] == "already_missing"
+    assert retried["marketplace_files_state"] == "removed"
     assert fake_codex.plugins == set()
     assert fake_codex.marketplaces == {}
     assert not receipt.exists()
 
 
-def test_uninstall_without_codex_removes_owned_files_and_preserves_retry_receipt(
+def test_uninstall_without_codex_preserves_provider_files_and_retry_receipt(
     tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "codex"
@@ -599,6 +626,7 @@ def test_uninstall_without_codex_removes_owned_files_and_preserves_retry_receipt
     installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
     marketplace = Path(installed.marketplace_root)
     receipt = integration._receipt_path(home)
+    installed_agents = agents.read_bytes()
 
     def unavailable() -> str:
         raise SetupError("Codex executable is unavailable")
@@ -610,10 +638,10 @@ def test_uninstall_without_codex_removes_owned_files_and_preserves_retry_receipt
     assert removed["codex_available"] is False
     assert removed["codex_home"] == str(home.resolve())
     assert removed["deferred_registrations"] == ["plugin", "marketplace"]
-    assert removed["instructions_removed"] is True
-    assert removed["local_cleanup_verified"] is True
-    assert removed["marketplace_files_removed"] is True
-    assert removed["marketplace_files_state"] == "removed"
+    assert removed["instructions_removed"] is False
+    assert removed["local_cleanup_verified"] is False
+    assert removed["marketplace_files_removed"] is False
+    assert removed["marketplace_files_state"] == "verified_present"
     assert removed["marketplace_removed"] is None
     assert removed["plugin_removed"] is None
     assert "Re-run `gsv codex uninstall`" in removed["next"]
@@ -622,8 +650,8 @@ def test_uninstall_without_codex_removes_owned_files_and_preserves_retry_receipt
     assert removed["receipt_preserved_for_retry"] is True
     assert removed["registration_cleanup_deferred"] is True
     assert removed["user_data_preserved"] is True
-    assert agents.read_bytes() == original
-    assert not marketplace.exists()
+    assert agents.read_bytes() == installed_agents
+    assert marketplace.exists()
     assert receipt.exists()
     assert fake_codex.plugins == {integration.PLUGIN_ID}
     assert fake_codex.marketplaces == {integration.MARKETPLACE_NAME: str(marketplace.resolve())}
@@ -634,10 +662,11 @@ def test_uninstall_without_codex_removes_owned_files_and_preserves_retry_receipt
     assert retried["registration_cleanup_deferred"] is False
     assert retried["plugin_removed"] is True
     assert retried["marketplace_removed"] is True
-    assert retried["marketplace_files_removed"] is False
-    assert retried["marketplace_files_state"] == "already_missing"
+    assert retried["marketplace_files_removed"] is True
+    assert retried["marketplace_files_state"] == "removed"
     assert fake_codex.plugins == set()
     assert fake_codex.marketplaces == {}
+    assert agents.read_bytes() == original
     assert not receipt.exists()
 
 
@@ -690,6 +719,263 @@ def test_uninstall_clears_receipt_when_owned_registrations_are_already_absent(
     assert not integration._receipt_path(home).exists()
 
 
+def test_legacy_missing_local_state_is_repaired_for_manifest_dependent_provider(
+    tmp_path: Path, fake_codex: FakeCodex
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    manifest = marketplace / ".agents/plugins/marketplace.json"
+    receipt = integration._receipt_path(home)
+    (home / "AGENTS.md").unlink()
+    shutil.rmtree(marketplace)
+    calls_before = len(fake_codex.calls)
+    fake_codex.required_manifest = manifest
+
+    removed = integration.uninstall_codex(codex_home=home)
+    uninstall_calls = fake_codex.calls[calls_before:]
+
+    assert removed["cleanup_complete"] is True
+    assert removed["provider_cleanup_verified"] is True
+    assert removed["local_cleanup_verified"] is True
+    assert removed["marketplace_files_state"] == "removed"
+    assert removed["plugin_removed"] is True
+    assert removed["marketplace_removed"] is True
+    assert not receipt.exists()
+    assert not marketplace.exists()
+    assert fake_codex.plugins == set()
+    assert fake_codex.marketplaces == {}
+    assert not any("add" in command for command in uninstall_calls)
+
+
+def test_provider_cleanup_runs_before_verified_marketplace_files_are_removed(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    manifest = marketplace / ".agents/plugins/marketplace.json"
+    agents = home / "AGENTS.md"
+    agents_before = agents.read_bytes()
+    digest_before = integration._tree_digest(marketplace)
+    fake_codex.required_manifest = manifest
+
+    def require_manifest(executable: str, arguments: list[str], codex_home: Path) -> dict[str, Any]:
+        assert manifest.is_file()
+        assert agents.read_bytes() == agents_before
+        assert integration._tree_digest(marketplace) == digest_before
+        return fake_codex.run(executable, arguments, codex_home)
+
+    monkeypatch.setattr(integration, "_run_json", require_manifest)
+    removed = integration.uninstall_codex(codex_home=home)
+
+    assert removed["cleanup_complete"] is True
+    assert removed["provider_cleanup_verified"] is True
+    assert removed["marketplace_files_state"] == "removed"
+    assert not marketplace.exists()
+    assert not agents.exists()
+
+
+def test_local_removal_failure_is_manual_but_can_retry_when_bytes_are_unchanged(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    manifest = marketplace / ".agents/plugins/marketplace.json"
+    receipt = integration._receipt_path(home)
+    fake_codex.required_manifest = manifest
+    real_rmtree = shutil.rmtree
+    failed = False
+
+    def fail_once(path: Path) -> None:
+        nonlocal failed
+        if Path(path) == marketplace and not failed:
+            failed = True
+            raise PermissionError("injected local deletion failure")
+        real_rmtree(path)
+
+    monkeypatch.setattr(shutil, "rmtree", fail_once)
+    removed = integration.uninstall_codex(codex_home=home)
+
+    assert removed["cleanup_complete"] is False
+    assert removed["provider_cleanup_verified"] is True
+    assert removed["local_cleanup_verified"] is False
+    assert removed["marketplace_files_state"] == "removal_failed"
+    assert removed["manual_review_required"] is True
+    assert "may have removed only part" in removed["next"]
+    assert "Re-run `gsv codex uninstall` to retry" not in removed["next"]
+    assert receipt.exists()
+    assert marketplace.exists()
+    assert fake_codex.plugins == set()
+    assert fake_codex.marketplaces == {}
+    assert not (home / "AGENTS.md").exists()
+    calls_before_retry = len(fake_codex.calls)
+
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    retried = integration.uninstall_codex(codex_home=home)
+    retry_calls = fake_codex.calls[calls_before_retry:]
+
+    assert retried["cleanup_complete"] is True
+    assert retried["provider_cleanup_verified"] is True
+    assert retried["marketplace_files_state"] == "removed"
+    assert not receipt.exists()
+    assert not marketplace.exists()
+    assert not any("add" in command for command in retry_calls)
+
+
+def test_partial_marketplace_deletion_is_not_promised_as_automatically_retriable(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    manifest = marketplace / ".agents/plugins/marketplace.json"
+    owned_skill = marketplace / "plugins/gsv/skills/gsv/SKILL.md"
+    receipt = integration._receipt_path(home)
+    fake_codex.required_manifest = manifest
+    real_rmtree = shutil.rmtree
+    failed = False
+
+    def delete_then_fail(path: Path) -> None:
+        nonlocal failed
+        if Path(path) == marketplace and not failed:
+            failed = True
+            owned_skill.unlink()
+            raise PermissionError("injected failure after partial deletion")
+        real_rmtree(path)
+
+    monkeypatch.setattr(shutil, "rmtree", delete_then_fail)
+    removed = integration.uninstall_codex(codex_home=home)
+
+    assert removed["cleanup_complete"] is False
+    assert removed["provider_cleanup_verified"] is True
+    assert removed["local_cleanup_verified"] is False
+    assert removed["marketplace_files_state"] == "removal_failed"
+    assert removed["manual_review_required"] is True
+    assert "may have removed only part" in removed["next"]
+    assert receipt.exists()
+    assert marketplace.exists()
+    assert not owned_skill.exists()
+    assert fake_codex.plugins == set()
+    assert fake_codex.marketplaces == {}
+    calls_before_retry = len(fake_codex.calls)
+
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    retried = integration.uninstall_codex(codex_home=home)
+
+    assert retried["cleanup_complete"] is False
+    assert retried["provider_cleanup_skipped"] is True
+    assert retried["marketplace_files_state"] == "changed_or_unsafe"
+    assert retried["manual_review_required"] is True
+    assert fake_codex.calls[calls_before_retry:] == []
+    assert receipt.exists()
+    assert marketplace.exists()
+
+
+def test_agents_change_after_provider_commit_is_not_overwritten_and_retry_is_idempotent(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    manifest = marketplace / ".agents/plugins/marketplace.json"
+    receipt = integration._receipt_path(home)
+    agents = home / "AGENTS.md"
+    fake_codex.required_manifest = manifest
+    provider_calls = 0
+
+    def change_after_final_list(
+        executable: str, arguments: list[str], codex_home: Path
+    ) -> dict[str, Any]:
+        nonlocal provider_calls
+        result = fake_codex.run(executable, arguments, codex_home)
+        provider_calls += 1
+        if provider_calls == 6:
+            agents.write_bytes(agents.read_bytes() + b"\n# Concurrent user note\n")
+        return result
+
+    monkeypatch.setattr(integration, "_run_json", change_after_final_list)
+    removed = integration.uninstall_codex(codex_home=home)
+
+    assert removed["cleanup_complete"] is False
+    assert removed["provider_cleanup_verified"] is True
+    assert removed["local_cleanup_verified"] is False
+    assert "changed after uninstall preflight" in removed["local_cleanup_error"]
+    assert b"# Concurrent user note" in agents.read_bytes()
+    assert marketplace.exists()
+    assert receipt.exists()
+    assert fake_codex.plugins == set()
+    assert fake_codex.marketplaces == {}
+    calls_before_retry = len(fake_codex.calls)
+
+    monkeypatch.setattr(integration, "_run_json", fake_codex.run)
+    retried = integration.uninstall_codex(codex_home=home)
+    retry_calls = fake_codex.calls[calls_before_retry:]
+
+    assert retried["cleanup_complete"] is True
+    assert agents.read_text(encoding="utf-8") == "# Concurrent user note\n"
+    assert not marketplace.exists()
+    assert not receipt.exists()
+    assert not any("add" in command for command in retry_calls)
+
+
+def test_marketplace_change_after_provider_commit_is_preserved_until_safe_retry(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    manifest = marketplace / ".agents/plugins/marketplace.json"
+    receipt = integration._receipt_path(home)
+    changed = marketplace / "concurrent-user-file.txt"
+    fake_codex.required_manifest = manifest
+    provider_calls = 0
+
+    def change_after_final_list(
+        executable: str, arguments: list[str], codex_home: Path
+    ) -> dict[str, Any]:
+        nonlocal provider_calls
+        result = fake_codex.run(executable, arguments, codex_home)
+        provider_calls += 1
+        if provider_calls == 6:
+            changed.write_text("preserve me\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(integration, "_run_json", change_after_final_list)
+    removed = integration.uninstall_codex(codex_home=home)
+
+    assert removed["cleanup_complete"] is False
+    assert removed["provider_cleanup_verified"] is True
+    assert removed["local_cleanup_verified"] is False
+    assert removed["marketplace_files_state"] == "changed_or_unsafe"
+    assert removed["manual_review_required"] is True
+    assert changed.read_text(encoding="utf-8") == "preserve me\n"
+    assert receipt.exists()
+    assert fake_codex.plugins == set()
+    assert fake_codex.marketplaces == {}
+    calls_before_retry = len(fake_codex.calls)
+
+    monkeypatch.setattr(integration, "_run_json", fake_codex.run)
+    still_partial = integration.uninstall_codex(codex_home=home)
+
+    assert still_partial["cleanup_complete"] is False
+    assert fake_codex.calls[calls_before_retry:] == []
+    assert changed.exists()
+    changed.unlink()
+    completed = integration.uninstall_codex(codex_home=home)
+
+    assert completed["cleanup_complete"] is True
+    assert not marketplace.exists()
+    assert not receipt.exists()
+
+
 def test_explicit_invalid_codex_override_fails_closed_during_uninstall(
     tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -726,6 +1012,8 @@ def test_changed_owned_marketplace_is_preserved_and_provider_cleanup_is_skipped(
     changed = marketplace / "locally-edited.txt"
     changed.write_text("keep this local change\n", encoding="utf-8")
     receipt = integration._receipt_path(home)
+    agents = home / "AGENTS.md"
+    agents_before = agents.read_bytes()
     calls_before = list(fake_codex.calls)
 
     removed = integration.uninstall_codex(codex_home=home)
@@ -745,7 +1033,7 @@ def test_changed_owned_marketplace_is_preserved_and_provider_cleanup_is_skipped(
     assert fake_codex.calls == calls_before
     assert fake_codex.plugins == {integration.PLUGIN_ID}
     assert integration.MARKETPLACE_NAME in fake_codex.marketplaces
-    assert not (home / "AGENTS.md").exists()
+    assert agents.read_bytes() == agents_before
 
 
 def test_redirected_marketplace_registration_is_not_removed(
@@ -761,6 +1049,8 @@ def test_redirected_marketplace_registration_is_not_removed(
     marker.write_text("user-owned\n", encoding="utf-8")
     fake_codex.marketplaces[integration.MARKETPLACE_NAME] = str(redirected)
     receipt = integration._receipt_path(home)
+    agents = home / "AGENTS.md"
+    agents_before = agents.read_bytes()
 
     removed = integration.uninstall_codex(codex_home=home)
 
@@ -769,10 +1059,11 @@ def test_redirected_marketplace_registration_is_not_removed(
     assert "points somewhere other" in removed["provider_cleanup_error"]
     assert removed["deferred_registrations"] == ["plugin", "marketplace"]
     assert receipt.exists()
-    assert not generated.exists()
+    assert generated.exists()
     assert fake_codex.plugins == {integration.PLUGIN_ID}
     assert fake_codex.marketplaces[integration.MARKETPLACE_NAME] == str(redirected)
     assert marker.read_text(encoding="utf-8") == "user-owned\n"
+    assert agents.read_bytes() == agents_before
 
 
 def test_receipt_removal_failure_is_partial_and_retriable(

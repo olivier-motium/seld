@@ -55,6 +55,7 @@ def run_e2e(
     *,
     native_codex: bool,
 ) -> dict[str, Any]:
+    root = root.resolve()
     if not binary.is_file():
         raise RuntimeError(f"release binary does not exist: {binary}")
     codex = shutil.which("codex")
@@ -110,6 +111,9 @@ def run_e2e(
     _run(install_command, environment)
     if not installed.is_file():
         raise RuntimeError("installer did not place the GSV executable")
+    # The first setup used the explicit isolated vault. All later bare commands
+    # must prove the persisted configuration path rather than an env override.
+    environment.pop("GSV_VAULT", None)
     installed_version = _run([str(installed), "--version"], environment).stdout.strip()
     binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
 
@@ -118,7 +122,12 @@ def run_e2e(
     if not bridge_status["running"] or not bridge_status["identity_verified"]:
         raise RuntimeError("installer did not leave a verified Bridge running")
     bridge_state = json.loads((data / "bridge-state.json").read_text(encoding="utf-8"))
-    _verify_bridge_http(bridge_status["url"], bridge_state["token"], status["vault_id"])
+    _verify_bridge_http(
+        bridge_status["url"],
+        bridge_state["token"],
+        status["vault_id"],
+        vault_path=vault,
+    )
     initial_bridge_pid = int(bridge_state["pid"])
     initial_instance_id = str(bridge_state["instance_id"])
     digest_before_upgrade = str(status["digest"])
@@ -138,7 +147,10 @@ def run_e2e(
             "live-Bridge upgrade did not replace the instance and preserve the vault"
         )
     _verify_bridge_http(
-        upgraded_bridge["url"], upgraded_state["token"], upgraded_status["vault_id"]
+        upgraded_bridge["url"],
+        upgraded_state["token"],
+        upgraded_status["vault_id"],
+        vault_path=vault,
     )
     status = upgraded_status
     bridge_status = upgraded_bridge
@@ -228,11 +240,20 @@ def run_e2e(
 
     source_digest_at_backup = _cli(installed, environment, ["status"])["digest"]
     backup = _cli(installed, environment, ["backup", "create"])
+    config_path = config / "config.json"
+    source_config = config_path.read_bytes()
+    config_path.write_bytes(b"{deliberately broken for restore proof")
+    verified_backup = _cli(installed, environment, ["backup", "verify", backup["backup"]])
     restored = _cli(
         installed,
         environment,
         ["backup", "restore", backup["backup"], str(restore)],
     )
+    if (
+        verified_backup.get("valid") is not True
+        or config_path.read_bytes() != b"{deliberately broken for restore proof"
+    ):
+        raise RuntimeError("config-independent backup verification or restore mutated config")
     restored_status = _cli(installed, environment, ["--vault", str(restore), "status"])
     if (
         restored["digest"] != restored_status["digest"]
@@ -240,6 +261,56 @@ def run_e2e(
         or status["vault_id"] != restored_status["vault_id"]
     ):
         raise RuntimeError("backup restore is not logically equivalent")
+    if (
+        restored.get("configuration_changed") is not False
+        or restored.get("configuration_matches_target") != "unknown"
+        or restored.get("activation_required") is not True
+        or restored.get("activation_commands")
+        != ["gsv bridge stop", f"gsv --vault {restore} setup"]
+    ):
+        raise RuntimeError("restore did not report the deliberate activation contract")
+    config_path.write_bytes(source_config)
+    if Path(_cli(installed, environment, ["status"])["vault"]) != vault:
+        raise RuntimeError("restore changed the configured vault before activation")
+
+    source_bridge_pid = int(bridge_state["pid"])
+    stopped_for_restore = _cli(installed, environment, ["bridge", "stop"])
+    if (
+        not stopped_for_restore["stopped"]
+        or (data / "bridge-state.json").exists()
+        or not _wait_for_process_exit(source_bridge_pid, timeout=8.0)
+    ):
+        raise RuntimeError("restore activation did not stop the verified source Bridge")
+    activated = _cli(
+        installed,
+        environment,
+        ["--vault", str(restore), "setup", "--no-browser"],
+    )
+    if activated.get("setup_complete") is not True:
+        raise RuntimeError("restored-vault setup did not complete")
+    activated_status = _cli(installed, environment, ["status"])
+    activated_bridge = _cli(installed, environment, ["bridge", "status"])
+    activated_state = json.loads((data / "bridge-state.json").read_text(encoding="utf-8"))
+    if (
+        Path(activated_status["vault"]) != restore
+        or activated_status["digest"] != restored["digest"]
+    ):
+        raise RuntimeError("bare status did not bind to the restored vault after setup")
+    if not activated_bridge["running"] or not activated_bridge["identity_verified"]:
+        raise RuntimeError("restored-vault setup did not start a verified Bridge")
+    _verify_bridge_http(
+        activated_bridge["url"],
+        activated_state["token"],
+        activated_status["vault_id"],
+        vault_path=restore,
+    )
+    activated_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    activated_server = activated_manifest["mcpServers"]["gsv"]
+    if activated_server.get("env", {}).get("GSV_VAULT") != str(restore):
+        raise RuntimeError("Codex MCP integration did not rebind to the restored vault")
+    status = activated_status
+    bridge_status = activated_bridge
+    bridge_state = activated_state
 
     native_result = False
     if native_codex:
@@ -251,9 +322,19 @@ def run_e2e(
         )
         _require_native_codex(native_result)
 
-    config_path = config / "config.json"
     config_before = config_path.read_bytes()
     vault_digest_before = _cli(installed, environment, ["status"])["digest"]
+    source_vault_before_legacy = _directory_digest(vault)
+    restored_vault_before_legacy = _directory_digest(restore)
+    marketplace_root = manifest_path.parents[2]
+    integration_receipts = list(data.glob("codex-integration-*.json"))
+    if len(integration_receipts) != 1:
+        raise RuntimeError("installed Codex integration did not have exactly one ownership receipt")
+    integration_receipt = integration_receipts[0]
+    (codex_home / "AGENTS.md").write_bytes(original_agents)
+    shutil.rmtree(marketplace_root)
+    if not integration_receipt.is_file() or marketplace_root.exists():
+        raise RuntimeError("could not stage the valid-receipt legacy uninstall state")
     config_path.unlink()
     removed = _cli(
         installed,
@@ -275,8 +356,15 @@ def run_e2e(
         raise RuntimeError("GSV plugin remains after uninstall")
     if any(item.get("name") == "gsv-local" for item in after_marketplaces["marketplaces"]):
         raise RuntimeError("GSV marketplace remains after uninstall")
-    if manifest_path.parents[2].exists():
-        raise RuntimeError("generated marketplace files remain after uninstall")
+    if marketplace_root.exists() or integration_receipt.exists():
+        raise RuntimeError("legacy removal scaffold or ownership receipt remains after uninstall")
+    if removed.get("marketplace_files_state") != "removed":
+        raise RuntimeError("legacy removal scaffold was not verified and removed")
+    if (
+        _directory_digest(vault) != source_vault_before_legacy
+        or _directory_digest(restore) != restored_vault_before_legacy
+    ):
+        raise RuntimeError("legacy Codex uninstall changed a user vault")
 
     stopped = _cli(installed, environment, ["bridge", "stop"])
     if not stopped["stopped"] or (data / "bridge-state.json").exists():
@@ -293,9 +381,15 @@ def run_e2e(
     live_pid = int(live_state["pid"])
     if restarted_status.get("pid") != live_pid or not _process_alive(live_pid):
         raise RuntimeError("restarted Bridge receipt did not match its live process")
-    _verify_bridge_http(restarted_status["url"], live_state["token"], status["vault_id"])
+    _verify_bridge_http(
+        restarted_status["url"],
+        live_state["token"],
+        status["vault_id"],
+        vault_path=restore,
+    )
 
     vault_files_before = _directory_digest(vault)
+    restored_files_before = _directory_digest(restore)
     if os.name == "nt":
         shell = shutil.which("pwsh") or shutil.which("powershell")
         if shell is None:
@@ -313,11 +407,18 @@ def run_e2e(
         raise RuntimeError("full uninstall left the GSV executable installed")
     if live_receipt.exists() or not _wait_for_process_exit(live_pid, timeout=8.0):
         raise RuntimeError("full uninstaller left the live Bridge running or its receipt behind")
-    if config_path.read_bytes() != config_before or _directory_digest(vault) != vault_files_before:
-        raise RuntimeError("full uninstall changed the user vault or configuration")
+    if (
+        config_path.read_bytes() != config_before
+        or _directory_digest(vault) != vault_files_before
+        or _directory_digest(restore) != restored_files_before
+    ):
+        raise RuntimeError("full uninstall changed configuration or a user vault")
 
     return {
         "backup_restore": True,
+        "backup_restore_activated": True,
+        "backup_restore_without_readable_config": True,
+        "backup_restore_preserved_both_vaults": True,
         "bridge_authenticated_loopback": True,
         "bridge_direct_stop": True,
         "binary_sha256": binary_sha256,
@@ -331,6 +432,7 @@ def run_e2e(
         "installer_upgrade_restarted_bridge": True,
         "native_codex_two_session": native_result,
         "native_auth_bridge_used": False,
+        "real_codex_legacy_missing_manifest_uninstall": True,
         "observed_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "stale_write_rejected": stale.returncode == 2,
         "two_mcp_processes": True,
@@ -443,7 +545,13 @@ def _mcp_call(
     return cast(dict[str, Any], payload["structuredContent"])
 
 
-def _verify_bridge_http(url: str, token: str, vault_id: str) -> None:
+def _verify_bridge_http(
+    url: str,
+    token: str,
+    vault_id: str,
+    *,
+    vault_path: Path | None = None,
+) -> None:
     snapshot_url = f"{url.rstrip('/')}/api/v1/snapshot"
     try:
         urlopen(Request(snapshot_url, headers={"Accept": "application/json"}), timeout=5)
@@ -460,6 +568,11 @@ def _verify_bridge_http(url: str, token: str, vault_id: str) -> None:
         snapshot = json.loads(response.read())
     if snapshot["status"]["vault_id"] != vault_id:
         raise RuntimeError("Bridge snapshot did not match the installed vault")
+    if (
+        vault_path is not None
+        and Path(snapshot["status"]["vault"]).resolve() != vault_path.resolve()
+    ):
+        raise RuntimeError("Bridge snapshot did not match the expected vault path")
     with urlopen(url, timeout=5) as response:
         static = response.read()
     if b"The agent is not the thread" not in static:

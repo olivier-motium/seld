@@ -182,10 +182,15 @@ sh scripts/uninstall.sh
 
 If Codex is unavailable or any cleanup step cannot be verified, uninstall keeps
 the executable and ownership receipt so the printed `gsv codex uninstall`
-recovery command still works. It may remove digest-verified local GSV files,
-but never calls partial cleanup complete. A changed or unsafe generated
-marketplace is left untouched for manual review, and Codex registrations are
-not changed until local cleanup is verified.
+recovery command still works. It may remove the verified managed instruction
+block, but retains provider-dependent marketplace files until Codex registration
+cleanup succeeds. It never calls partial cleanup complete. A changed or unsafe
+generated marketplace is left untouched for manual review, and Codex
+registrations are not changed until local ownership and instruction cleanup are
+verified. A valid legacy receipt with missing generated files is recovered with
+a packaged removal scaffold before Codex cleanup. If recursive local deletion
+fails after provider cleanup, GSV retains the receipt and requires inspection
+because the tree may already be only partly present.
 
 ## Develop
 

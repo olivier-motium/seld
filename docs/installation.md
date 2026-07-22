@@ -189,9 +189,18 @@ separate, deliberate user-data operation.
 
 If the Codex executable is unavailable, a command times out, or final provider
 verification fails, cleanup is explicitly partial. The uninstaller may remove
-the managed instruction block and a digest-matched generated marketplace, but
-keeps both the executable and owner-only receipt for the printed retry command.
-It returns a nonzero retry exit without requiring `jq` or another JSON parser.
+the managed instruction block, but it keeps the digest-matched generated
+marketplace available until Codex has removed and verified the registrations.
+That preserves the provider manifest needed by a retry. It also keeps the
+executable and owner-only receipt for the printed retry command, and returns a
+nonzero retry exit without requiring `jq` or another JSON parser.
+
+A valid older receipt whose generated marketplace is already missing is handled
+automatically: GSV restores a packaged, digest-checked removal scaffold at the
+receipt-bound path, lets Codex remove and verify the live registrations, then
+deletes the scaffold. If local recursive deletion itself raises, inspect the
+retained tree and receipt before another attempt; some owned files may already
+have been removed, so GSV does not promise an automatic retry.
 
 A changed, unreadable, symlinked, or out-of-bound generated marketplace is left
 untouched for manual review. Provider registration cleanup is skipped until

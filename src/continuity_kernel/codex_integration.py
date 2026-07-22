@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import lru_cache
 from hashlib import sha256
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -29,6 +30,8 @@ BLOCK_START: Final = "<!-- gsv-managed:start -->"
 BLOCK_END: Final = "<!-- gsv-managed:end -->"
 RECEIPT_FORMAT_VERSION: Final = 1
 RECEIPT_MAX_BYTES: Final = 64 * 1024
+LEGACY_REPAIR_MARKER: Final = b'{"format_version":1,"purpose":"gsv-uninstall-repair"}\n'
+LEGACY_REPAIR_MARKER_NAME: Final = ".gsv-uninstall-repair.json"
 
 MANAGED_BLOCK = f"""{BLOCK_START}
 ## GSV
@@ -65,6 +68,14 @@ class _InstructionChange:
 
 
 @dataclass(frozen=True)
+class _InstructionCleanupPlan:
+    path: Path
+    expected: bytes | None
+    replacement: bytes | None
+    block_present: bool
+
+
+@dataclass(frozen=True)
 class _MarketplaceChange:
     path: Path
     previous: Path | None
@@ -73,8 +84,11 @@ class _MarketplaceChange:
 
 class _MarketplaceCleanupState(StrEnum):
     NOT_OWNED = "not_owned"
+    VERIFIED_PRESENT = "verified_present"
+    LEGACY_REPAIR_PRESENT = "legacy_repair_present"
     REMOVED = "removed"
     ALREADY_MISSING = "already_missing"
+    REMOVAL_FAILED = "removal_failed"
     CHANGED_OR_UNSAFE = "changed_or_unsafe"
     UNOWNED_EVIDENCE = "unowned_evidence"
 
@@ -86,10 +100,19 @@ class _MarketplaceCleanup:
     error: str | None = None
 
     @property
-    def verified(self) -> bool:
+    def safe(self) -> bool:
         return self.state not in {
+            _MarketplaceCleanupState.REMOVAL_FAILED,
             _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
             _MarketplaceCleanupState.UNOWNED_EVIDENCE,
+        }
+
+    @property
+    def complete(self) -> bool:
+        return self.state in {
+            _MarketplaceCleanupState.NOT_OWNED,
+            _MarketplaceCleanupState.REMOVED,
+            _MarketplaceCleanupState.ALREADY_MISSING,
         }
 
 
@@ -281,6 +304,9 @@ def uninstall_codex(*, codex_home: Path | None = None) -> dict[str, Any]:
 
 
 def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
+    # Preserve the hard path/type boundary before translating later structural
+    # cleanup findings into a retryable partial result. The cleanup plan below
+    # takes a second exact-byte snapshot used for compare-before-delete.
     _read_agents_text(home)
     receipt_snapshot = _load_receipt_snapshot(home)
     receipt = receipt_snapshot.payload
@@ -298,20 +324,13 @@ def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
         executable = _codex_executable()
 
     instruction_error: str | None = None
-    instructions_removed = False
+    instruction_plan: _InstructionCleanupPlan | None = None
     try:
-        instructions_removed = _remove_instructions(home)
+        instruction_plan = _plan_instruction_removal(home)
     except (ContinuityError, OSError, UnicodeError) as exc:
         instruction_error = str(exc)
-    marketplace_files = _remove_owned_marketplace(receipt)
-    local_cleanup_verified = instruction_error is None and marketplace_files.verified
-    if instruction_error is None:
-        try:
-            if _instructions_installed(home):
-                instruction_error = "the managed GSV instruction block remained after removal"
-        except (ContinuityError, OSError, UnicodeError) as exc:
-            instruction_error = f"could not verify managed instruction removal: {exc}"
-        local_cleanup_verified = instruction_error is None and marketplace_files.verified
+    marketplace_files = _inspect_owned_marketplace(receipt)
+    local_preflight_verified = instruction_error is None and marketplace_files.safe
 
     codex_available: bool | None = None
     provider_error: str | None = None
@@ -320,19 +339,26 @@ def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
     recorded_marketplace_root: str | None = None
     registered_marketplace_root: str | None = None
     provider_cleanup_verified = not provider_required
-    provider_cleanup_skipped = provider_required and not local_cleanup_verified
-    if provider_required and local_cleanup_verified:
+    provider_cleanup_skipped = provider_required and not local_preflight_verified
+    if provider_required and local_preflight_verified:
         try:
             executable = executable or _codex_executable()
             codex_available = True
-            provider_cleanup = _remove_owned_registrations(
-                executable,
-                home,
-                plugin_owned=plugin_owned,
-                marketplace_owned=marketplace_owned,
-                marketplace_root=receipt.get("marketplace_root"),
-            )
-            provider_cleanup_verified = True
+            if marketplace_files.state is _MarketplaceCleanupState.ALREADY_MISSING:
+                marketplace_files = _restore_legacy_marketplace_for_uninstall(receipt)
+            if marketplace_files.safe:
+                provider_cleanup = _remove_owned_registrations(
+                    executable,
+                    home,
+                    plugin_owned=plugin_owned,
+                    marketplace_owned=marketplace_owned,
+                    marketplace_root=receipt.get("marketplace_root"),
+                )
+                provider_cleanup_verified = True
+            else:
+                local_preflight_verified = False
+                provider_cleanup_skipped = True
+                provider_error = marketplace_files.error
         except _ProviderOwnershipError as exc:
             codex_available = executable is not None
             provider_error = str(exc)
@@ -346,6 +372,17 @@ def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
             codex_available = executable is not None
             provider_error = f"Codex command could not be run: {exc}"
 
+    instructions_removed = False
+    if provider_cleanup_verified and local_preflight_verified:
+        try:
+            if instruction_plan is None:  # pragma: no cover - preflight invariant
+                raise SetupError("instruction cleanup plan was not available")
+            instructions_removed = _apply_instruction_removal(instruction_plan)
+        except (ContinuityError, OSError, UnicodeError) as exc:
+            instruction_error = f"could not remove verified Codex instructions: {exc}"
+        if instruction_error is None:
+            marketplace_files = _remove_owned_marketplace(receipt)
+    local_cleanup_verified = instruction_error is None and marketplace_files.complete
     cleanup_complete = local_cleanup_verified and provider_cleanup_verified
     receipt_error: str | None = None
     if cleanup_complete and receipt_snapshot.encoded is not None:
@@ -365,12 +402,20 @@ def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
     next_actions: list[str] = []
     if instruction_error is not None:
         next_actions.append(
-            f"Inspect {home / 'AGENTS.md'}; GSV could not safely remove its managed block."
+            f"Inspect {home / 'AGENTS.md'}; GSV could not safely remove its managed block. "
+            "After resolving or confirming the change, re-run `gsv codex uninstall`."
         )
-    if not marketplace_files.verified:
+    if marketplace_files.state is _MarketplaceCleanupState.REMOVAL_FAILED:
+        next_actions.append(
+            "Inspect the recorded GSV marketplace files; local deletion failed and may "
+            "have removed only part of the owned tree. The files and ownership receipt "
+            "were retained for manual recovery."
+        )
+    elif not marketplace_files.safe:
         next_actions.append(
             "Inspect the recorded GSV marketplace files; they changed or could not be "
-            "verified and were left untouched."
+            "verified and were left untouched. After resolving or confirming the change, "
+            "re-run `gsv codex uninstall`."
         )
     if provider_manual_review:
         next_actions.append(
@@ -399,7 +444,10 @@ def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
         "local_cleanup_error": instruction_error or marketplace_files.error,
         "local_cleanup_verified": local_cleanup_verified,
         "manual_review_required": (
-            not local_cleanup_verified or provider_manual_review or receipt_error is not None
+            instruction_error is not None
+            or not marketplace_files.safe
+            or provider_manual_review
+            or receipt_error is not None
         ),
         "marketplace_files_path": marketplace_files.path,
         "marketplace_files_removed": (marketplace_files.state is _MarketplaceCleanupState.REMOVED),
@@ -908,20 +956,37 @@ def _save_receipt(
     )
 
 
-def _remove_instructions(home: Path) -> bool:
+def _plan_instruction_removal(home: Path) -> _InstructionCleanupPlan:
     path = home / "AGENTS.md"
-    content = _read_agents_text(home)
-    if content is None:
-        return False
+    encoded = _read_regular_bytes(path, label="Codex AGENTS.md")
+    if encoded is None:
+        return _InstructionCleanupPlan(path, None, None, False)
+    try:
+        content = encoded.decode("utf-8")
+    except UnicodeError as exc:
+        raise ValidationError(f"Codex AGENTS.md must be UTF-8 text: {path}") from exc
     bounds = _instruction_block_bounds(content)
     if bounds is None:
-        return False
+        return _InstructionCleanupPlan(path, encoded, encoded, False)
     start, end = bounds
     updated = (content[:start].rstrip() + "\n\n" + content[end:].lstrip()).strip()
-    if updated:
-        atomic_write(path, (updated + "\n").encode("utf-8"))
+    replacement = (updated + "\n").encode("utf-8") if updated else None
+    return _InstructionCleanupPlan(path, encoded, replacement, True)
+
+
+def _apply_instruction_removal(plan: _InstructionCleanupPlan) -> bool:
+    current = _read_regular_bytes(plan.path, label="Codex AGENTS.md")
+    if current != plan.expected:
+        raise ConflictError("Codex AGENTS.md changed after uninstall preflight")
+    if not plan.block_present:
+        return False
+    if plan.replacement is None:
+        plan.path.unlink()
     else:
-        path.unlink()
+        atomic_write(plan.path, plan.replacement)
+    after = _read_regular_bytes(plan.path, label="Codex AGENTS.md")
+    if after != plan.replacement:
+        raise ConflictError("Codex AGENTS.md did not match the verified cleanup result")
     return True
 
 
@@ -976,7 +1041,7 @@ def _discard_instruction_backup(change: _InstructionChange | None) -> None:
         return
 
 
-def _remove_owned_marketplace(receipt: dict[str, Any]) -> _MarketplaceCleanup:
+def _inspect_owned_marketplace(receipt: dict[str, Any]) -> _MarketplaceCleanup:
     if not bool(receipt.get("marketplace_owned")):
         return _MarketplaceCleanup(_MarketplaceCleanupState.NOT_OWNED)
     raw_root = receipt.get("marketplace_root")
@@ -1010,16 +1075,90 @@ def _remove_owned_marketplace(receipt: dict[str, Any]) -> _MarketplaceCleanup:
             error=f"could not verify recorded marketplace files: {exc}",
         )
     if current_digest != digest:
+        try:
+            if current_digest == _legacy_repair_digest():
+                return _MarketplaceCleanup(
+                    _MarketplaceCleanupState.LEGACY_REPAIR_PRESENT,
+                    path=str(root),
+                )
+        except (OSError, ContinuityError) as exc:
+            return _MarketplaceCleanup(
+                _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+                path=str(root),
+                error=f"could not verify legacy marketplace recovery files: {exc}",
+            )
         return _MarketplaceCleanup(
             _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
             path=str(root),
             error="recorded marketplace files changed after installation",
         )
+    return _MarketplaceCleanup(_MarketplaceCleanupState.VERIFIED_PRESENT, path=str(root))
+
+
+def _restore_legacy_marketplace_for_uninstall(receipt: dict[str, Any]) -> _MarketplaceCleanup:
+    raw_root = receipt.get("marketplace_root")
+    if not isinstance(raw_root, str):  # pragma: no cover - receipt validation owns this
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            error="legacy marketplace recovery has no receipt-bound path",
+        )
+    root = Path(raw_root)
+    try:
+        root.parent.mkdir(parents=True, exist_ok=True)
+        root.mkdir()
+        _populate_legacy_repair_tree(root)
+    except FileExistsError:
+        return _inspect_owned_marketplace(receipt)
+    except (OSError, ContinuityError) as exc:
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error=f"could not restore the legacy marketplace removal scaffold: {exc}",
+        )
+    inspected = _inspect_owned_marketplace(receipt)
+    if inspected.state is not _MarketplaceCleanupState.LEGACY_REPAIR_PRESENT:
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error="legacy marketplace removal scaffold could not be verified",
+        )
+    return inspected
+
+
+def _populate_legacy_repair_tree(target: Path) -> None:
+    source = files("continuity_kernel") / "resources/marketplace"
+    with as_file(source) as source_path:
+        shutil.copytree(source_path, target, dirs_exist_ok=True)
+    atomic_write(target / LEGACY_REPAIR_MARKER_NAME, LEGACY_REPAIR_MARKER)
+
+
+@lru_cache(maxsize=1)
+def _legacy_repair_digest() -> str:
+    with tempfile.TemporaryDirectory(prefix="gsv-uninstall-repair-") as raw:
+        target = Path(raw) / "marketplace"
+        target.mkdir()
+        _populate_legacy_repair_tree(target)
+        return _tree_digest(target)
+
+
+def _remove_owned_marketplace(receipt: dict[str, Any]) -> _MarketplaceCleanup:
+    inspected = _inspect_owned_marketplace(receipt)
+    if inspected.state not in {
+        _MarketplaceCleanupState.VERIFIED_PRESENT,
+        _MarketplaceCleanupState.LEGACY_REPAIR_PRESENT,
+    }:
+        return inspected
+    if inspected.path is None:  # pragma: no cover - guarded by the state constructor
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            error="verified marketplace state omitted its path",
+        )
+    root = Path(inspected.path)
     try:
         shutil.rmtree(root)
     except OSError as exc:
         return _MarketplaceCleanup(
-            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            _MarketplaceCleanupState.REMOVAL_FAILED,
             path=str(root),
             error=f"could not remove verified marketplace files: {exc}",
         )
