@@ -1,18 +1,71 @@
 # Architecture
 
-## Components
+## Product hierarchy
+
+- **GSV** is the local vehicle: the vault, persistence protocol, recovery, and
+  adapters.
+- **Mind** is the authored point of view in durable documents and records.
+- **Hands** are replaceable MCP or Codex execution episodes using the same
+  kernel.
+- **Bridge** is the read-only human surface over current authored state.
+- **Pulse** and **Shipyard** are operating roles with durable review boundaries
+  in `0.2.0`, not autonomous scheduler or self-modification services.
+
+## Kernel
 
 `continuity_kernel.records` defines bounded task, entity, and work-thread
 records. `continuity_kernel.vault` owns validation, locking, atomic persistence,
-context rendering, backup, restore, and health checks. The CLI and dependency-
-free stdio MCP server are adapters over that same vault.
+context rendering, backup, restore, and health checks. The CLI and
+dependency-free stdio MCP server are adapters over that same vault.
 
-The Codex integration generates a per-Codex-home local marketplace containing
-the GSV plugin, MCP manifest, and skill. The manifest points directly to
-the installed standalone executable for release installs, or to the active
-console/module launcher for source installs.
+Markdown in the vault is authoritative. Deterministic code may persist,
+validate, traverse, and render authored facts. It may not infer task meaning,
+priority, identity, ownership, thread membership, or completion from prose or
+activity.
 
-## Write Flow
+## Codex integration
+
+Setup generates a per-Codex-home local marketplace containing the GSV plugin,
+MCP manifest, and skill. The manifest points directly to the standalone
+executable for release installs, or to the active module launcher for source
+installs.
+
+Installation is a staged transaction. Marketplace registration, plugin
+installation, and the managed `AGENTS.md` block are verified before setup
+starts the Bridge. A later setup failure rolls back only components introduced
+by that invocation. Existing or concurrently changed user components are left
+untouched.
+
+On the validated macOS path, Codex discovery checks an explicit `GSV_CODEX`,
+`PATH`, and known Codex Desktop app bundles. Codex does not have to be on
+`PATH` when the installed bundle exposes its command.
+
+## Bridge lifecycle
+
+The Bridge is a dependency-free loopback HTTP server over one exact vault. A
+child binds port `0`, lets the OS select an available port, creates a random
+instance identity and bearer capability, and atomically reports its bound port
+in an owner-only state receipt.
+
+The private snapshot and health endpoints require the per-launch bearer. The
+browser receives it in the URL fragment, moves it into `sessionStorage`, and
+removes it from the visible URL before requesting private data. Static assets
+do not require vault access. The Bridge rejects cross-origin requests, writes,
+path traversal, symlinked assets, and oversized assets.
+
+Stop is fail-closed. GSV signals a receipt PID only when the live authenticated
+health response matches the same instance, PID, port, and vault. A stale,
+forged, or PID-reused receipt with a concrete mismatch is removed without
+signaling the process. If the PID remains alive while health is unavailable,
+GSV preserves the receipt, starts no replacement, and asks the operator to
+retry; that keeps the only bearer and identity evidence available for a later
+safe stop.
+
+The Bridge renders authored documents and records live. Slower Codex and doctor
+metadata are cached briefly so the browser poll does not spawn subprocesses or
+run a full integrity check every ten seconds.
+
+## Write flow
 
 1. A caller reads an exact record and receives its SHA-256 revision.
 2. The caller submits an update with that revision.
@@ -26,22 +79,16 @@ console/module launcher for source installs.
 Global operations such as backup hold the global lock before record locks so a
 snapshot cannot mix record versions.
 
-## Ownership
+## Ownership and recovery
 
-The vault is user data. GSV never deletes it during Codex uninstall.
-The generated marketplace, plugin registration, managed instruction block, and
-installation receipt are integration state. The installer records what it
-owns and removes only those components when their expected content is still
-present.
-
-Installation failure rolls back components added by that invocation. Existing
-marketplaces, plugins, instructions, binaries, and unrelated concurrent edits
-are preserved. A conflicting unowned GSV marketplace is reported rather
-than adopted.
+The vault and backups are user data. GSV never deletes them during Codex
+uninstall. The generated marketplace, plugin registration, managed instruction
+block, Bridge receipt, and installation receipt are integration state. Removal
+touches only expected content recorded as GSV-owned.
 
 ## Portability
 
-The runtime uses only the Python standard library before freezing. PyInstaller
-produces one executable per OS and architecture. Vault records and backups are
-platform-neutral UTF-8/ZIP data and never contain executable installation
-state.
+The runtime uses the Python standard library before freezing, plus bundled
+static Bridge assets and fonts. PyInstaller produces one executable per OS and
+architecture. Vault records and backups are platform-neutral UTF-8/ZIP data and
+never contain executable installation state.

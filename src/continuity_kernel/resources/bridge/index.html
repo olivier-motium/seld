@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#f3f5f2">
+    <title>GSV Bridge</title>
+    <meta name="description" content="The human surface for your local GSV Mind.">
+    <link rel="icon" href="/static/gsv-mark.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/bridge.css">
+    <script type="module" src="/static/bridge.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <div class="shell" id="shell">
+      <aside class="rail" id="rail" aria-label="GSV Bridge">
+        <a class="brand" href="#now" data-view-link="now" aria-label="GSV Bridge home">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>GSV</span>
+        </a>
+
+        <nav class="nav" aria-label="Bridge views">
+          <button class="nav-item is-active" type="button" data-view="now" aria-current="page">
+            <span>Now</span>
+          </button>
+          <button class="nav-item" type="button" data-view="commitments">
+            <span>Commitments</span>
+            <span class="nav-count" id="task-count" hidden></span>
+          </button>
+          <button class="nav-item" type="button" data-view="storylines">
+            <span>Storylines</span>
+          </button>
+          <span class="nav-label">The vehicle</span>
+          <button class="nav-item" type="button" data-view="mind">
+            <span>Mind</span>
+          </button>
+          <button class="nav-item" type="button" data-view="system">
+            <span>System</span>
+          </button>
+        </nav>
+
+        <div class="rail-foot">
+          <span class="rail-rule" aria-hidden="true"></span>
+          <p>Local state. Authored judgment. Replaceable hands.</p>
+        </div>
+      </aside>
+
+      <button class="rail-backdrop" id="rail-backdrop" type="button" aria-label="Close navigation" hidden></button>
+
+      <div class="workspace">
+        <header class="topbar">
+          <button class="menu-button" id="menu-button" type="button" aria-label="Open navigation" aria-expanded="false">
+            <span></span><span></span>
+          </button>
+          <div class="local-status" id="local-status" role="status">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span>Reading local GSV</span>
+          </div>
+          <a class="codex-link" id="open-codex" href="#" hidden>
+            Open Codex <span aria-hidden="true">&#8599;</span>
+          </a>
+        </header>
+
+        <main class="main" id="main" tabindex="-1">
+          <header class="page-heading">
+            <p class="eyebrow">The agent is not the thread.</p>
+            <h1 id="page-title">Your Mind, between tasks.</h1>
+            <p class="page-intro" id="page-intro">Current orientation and the work that survives every hand.</p>
+          </header>
+
+          <div class="connection-notice" id="connection-notice" role="status" hidden>
+            <span id="connection-copy">The local vault could not be read.</span>
+            <button type="button" id="retry-button">Try again</button>
+          </div>
+
+          <section class="view" id="view" aria-live="polite" aria-busy="true">
+            <div class="loading-state">
+              <span class="loading-line is-wide"></span>
+              <span class="loading-line"></span>
+              <span class="loading-line is-short"></span>
+            </div>
+          </section>
+        </main>
+      </div>
+
+      <aside class="inspector" id="inspector" role="dialog" aria-modal="true" aria-label="Commitment details" aria-hidden="true">
+        <header class="inspector-head">
+          <div>
+            <p class="eyebrow" id="inspector-eyebrow">Commitment</p>
+            <h2 id="inspector-title">Nothing selected</h2>
+          </div>
+          <button class="close-button" id="close-inspector" type="button" aria-label="Close details">&#215;</button>
+        </header>
+        <div class="inspector-body" id="inspector-body"></div>
+        <footer class="inspector-foot" id="inspector-foot" hidden>
+          <a class="primary-action" id="continue-in-codex" href="#">
+            Continue in Codex <span aria-hidden="true">&#8599;</span>
+          </a>
+        </footer>
+      </aside>
+      <button class="inspector-backdrop" id="inspector-backdrop" type="button" aria-label="Close details" hidden></button>
+    </div>
+
+    <noscript>
+      <main class="noscript">
+        <h1>GSV Bridge needs JavaScript.</h1>
+        <p>Your local Markdown vault remains intact and available to Codex.</p>
+      </main>
+    </noscript>
+  </body>
+</html>

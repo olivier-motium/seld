@@ -9,8 +9,10 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, cast
+from urllib.request import Request, urlopen
 
 
 def main() -> int:
@@ -69,6 +71,7 @@ def main() -> int:
         timeout=30,
     ).stdout.strip()
     handshake = _mcp_handshake(target)
+    bridge_smoke = _bridge_static_smoke(target)
     result = handshake.get("result")
     if not isinstance(result, dict):
         raise RuntimeError("frozen MCP smoke test omitted its result")
@@ -79,6 +82,7 @@ def main() -> int:
         json.dumps(
             {
                 "artifact": str(target),
+                **bridge_smoke,
                 "mcp_server": server_info["name"],
                 "size": target.stat().st_size,
                 "version": version,
@@ -113,6 +117,85 @@ def _mcp_handshake(binary: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RuntimeError("frozen MCP smoke test returned an invalid response")
     return cast(dict[str, Any], payload)
+
+
+def _bridge_static_smoke(binary: Path) -> dict[str, bool]:
+    with tempfile.TemporaryDirectory(prefix="gsv-frozen-bridge-") as raw:
+        root = Path(raw)
+        home = root / "home"
+        config = root / "config"
+        data = root / "data"
+        temporary = root / "tmp"
+        vault = root / "vault"
+        for path in (home, config, data, temporary):
+            path.mkdir()
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "APPDATA": str(config),
+                "GSV_CONFIG_DIR": str(config),
+                "GSV_DATA_DIR": str(data),
+                "GSV_VAULT": str(vault),
+                "HOME": str(home),
+                "LOCALAPPDATA": str(data),
+                "TEMP": str(temporary),
+                "TMP": str(temporary),
+                "TMPDIR": str(temporary),
+                "USERPROFILE": str(home),
+            }
+        )
+        setup = subprocess.run(
+            [
+                str(binary),
+                "--json",
+                "--vault",
+                str(vault),
+                "setup",
+                "--no-codex",
+                "--no-browser",
+            ],
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            env=environment,
+            timeout=30,
+        )
+        if setup.returncode != 0:
+            raise RuntimeError(f"frozen Bridge setup failed: {setup.stderr[:1000]}")
+        state_path = data / "bridge-state.json"
+        if not state_path.is_file():
+            raise RuntimeError("frozen Bridge setup omitted its state receipt")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        url = str(state["url"])
+        try:
+            with urlopen(url, timeout=5) as response:
+                root_page = response.read()
+            with urlopen(f"{url.rstrip('/')}/static/bridge.css", timeout=5) as response:
+                stylesheet = response.read()
+            snapshot_request = Request(
+                f"{url.rstrip('/')}/api/v1/snapshot",
+                headers={"Authorization": f"Bearer {state['token']}"},
+            )
+            with urlopen(snapshot_request, timeout=5) as response:
+                snapshot = json.loads(response.read())
+            if b"The agent is not the thread" not in root_page:
+                raise RuntimeError("frozen Bridge root page was not bundled")
+            if b".connection-notice" not in stylesheet:
+                raise RuntimeError("frozen Bridge stylesheet was not bundled")
+            if snapshot.get("status", {}).get("vault_id") != state.get("vault_id"):
+                raise RuntimeError("frozen Bridge snapshot did not match its vault")
+        finally:
+            stopped = subprocess.run(
+                [str(binary), "--json", "--vault", str(vault), "bridge", "stop"],
+                check=False,
+                capture_output=True,
+                encoding="utf-8",
+                env=environment,
+                timeout=15,
+            )
+            if stopped.returncode != 0 or state_path.exists():
+                raise RuntimeError(f"frozen Bridge cleanup failed: {stopped.stderr[:1000]}")
+    return {"bridge_authenticated_snapshot": True, "bridge_static_assets": True}
 
 
 if __name__ == "__main__":

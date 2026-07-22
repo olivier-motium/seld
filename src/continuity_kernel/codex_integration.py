@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from importlib.resources import as_file, files
@@ -66,6 +68,16 @@ class _MarketplaceChange:
 
 
 def install_codex(*, vault: Path, codex_home: Path | None = None) -> CodexInstallResult:
+    with install_codex_transaction(vault=vault, codex_home=codex_home) as result:
+        return result
+
+
+@contextmanager
+def install_codex_transaction(
+    *, vault: Path, codex_home: Path | None = None
+) -> Iterator[CodexInstallResult]:
+    """Keep installer-owned changes reversible until the caller's checks pass."""
+
     home = (codex_home or default_codex_home()).expanduser().resolve()
     home.mkdir(parents=True, exist_ok=True)
     executable = _codex_executable()
@@ -121,6 +133,16 @@ def install_codex(*, vault: Path, codex_home: Path | None = None) -> CodexInstal
         status = codex_status(codex_home=home)
         if not status["plugin_installed"] or not status["instructions_installed"]:
             raise SetupError("Codex did not report the GSV integration as installed")
+        result = CodexInstallResult(
+            codex_home=str(home),
+            marketplace=MARKETPLACE_NAME,
+            marketplace_root=str(marketplace_root),
+            plugin=PLUGIN_ID,
+            plugin_installed=True,
+            instructions_installed=True,
+            backup=None,
+        )
+        yield result
         _save_receipt(
             home,
             marketplace_owned=added_marketplace or bool(prior_receipt.get("marketplace_owned")),
@@ -144,15 +166,6 @@ def install_codex(*, vault: Path, codex_home: Path | None = None) -> CodexInstal
         if isinstance(exc, ContinuityError):
             raise
         raise SetupError(f"Codex installation failed: {exc}") from exc
-    return CodexInstallResult(
-        codex_home=str(home),
-        marketplace=MARKETPLACE_NAME,
-        marketplace_root=str(marketplace_root),
-        plugin=PLUGIN_ID,
-        plugin_installed=True,
-        instructions_installed=True,
-        backup=None,
-    )
 
 
 def codex_status(*, codex_home: Path | None = None) -> dict[str, Any]:
@@ -208,21 +221,6 @@ def uninstall_codex(*, codex_home: Path | None = None) -> dict[str, Any]:
         "instructions_removed": bool(before["instructions_installed"]),
         "user_data_preserved": True,
     }
-
-
-def _prepare_marketplace(
-    vault: Path,
-    *,
-    runtime: tuple[str, list[str]] | None = None,
-    target: Path | None = None,
-) -> Path:
-    change = _replace_marketplace(
-        vault,
-        runtime=runtime,
-        target=target or data_dir() / "marketplace",
-    )
-    _commit_marketplace(change)
-    return change.path
 
 
 def _replace_marketplace(
@@ -467,13 +465,39 @@ def _remove_owned_marketplace(receipt: dict[str, Any]) -> bool:
 
 
 def _codex_executable() -> str:
+    override = os.environ.get("GSV_CODEX")
+    if override:
+        candidate = Path(override).expanduser().resolve()
+        if candidate.is_file() and not candidate.is_symlink():
+            return str(candidate)
+        raise SetupError(f"GSV_CODEX does not point to a regular Codex executable: {candidate}")
     executable = shutil.which("codex")
-    if executable is None:
-        raise SetupError(
-            "Codex CLI is not installed or is not on PATH. "
-            "Install the Codex desktop app or CLI first."
+    if executable is not None:
+        return executable
+    candidates: list[Path] = []
+    if sys.platform == "darwin":
+        for root in (Path("/Applications"), Path.home() / "Applications"):
+            candidates.extend(
+                (
+                    root / "ChatGPT.app/Contents/Resources/codex",
+                    root / "Codex.app/Contents/Resources/codex",
+                )
+            )
+    elif os.name == "nt":
+        local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
+        candidates.extend(
+            (
+                local / "Programs/ChatGPT/resources/codex.exe",
+                local / "Programs/Codex/resources/codex.exe",
+            )
         )
-    return executable
+    for candidate in candidates:
+        if candidate.is_file() and not candidate.is_symlink():
+            return str(candidate.resolve())
+    raise SetupError(
+        "Codex was not found. Install the Codex desktop app or CLI first, or set "
+        "GSV_CODEX to its executable."
+    )
 
 
 def _runtime_command() -> tuple[str, list[str]]:

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gsv"
-version = "0.1.0"
+version = "0.2.0"
 description = "A local-first durable state layer for coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,6 +33,10 @@ dev = [
 ]
 release = [
   "pyinstaller>=6.11,<7",
+]
+visual = [
+  "pillow>=11,<13",
+  "playwright>=1.49,<2",
 ]
 
 [project.scripts]

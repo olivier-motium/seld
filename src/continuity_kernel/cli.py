@@ -11,12 +11,26 @@ from typing import Any
 
 from continuity_kernel import __version__
 from continuity_kernel.atomic import atomic_write
+from continuity_kernel.bridge import (
+    bridge_status,
+    open_bridge,
+    open_bridge_in_browser,
+    serve_bridge,
+    stop_bridge,
+)
 from continuity_kernel.codex_integration import (
     codex_status,
     install_codex,
+    install_codex_transaction,
     uninstall_codex,
 )
-from continuity_kernel.config import codex_home, config_path, resolve_vault, save_config
+from continuity_kernel.config import (
+    codex_home,
+    config_path,
+    load_config,
+    resolve_vault,
+    save_config,
+)
 from continuity_kernel.demo import run_demo
 from continuity_kernel.errors import ContinuityError, SetupError
 from continuity_kernel.mcp_server import serve
@@ -27,10 +41,14 @@ from continuity_kernel.vault import Vault, doctor_dict
 def main(arguments: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(arguments)
-    if not getattr(args, "command", None):
-        parser.print_help()
-        return 0
     try:
+        if not getattr(args, "command", None):
+            if load_config(required=False) is None:
+                parser.print_help()
+                return 0
+            args.command = "bridge"
+            args.bridge_command = "open"
+            args.no_browser = False
         if args.command == "mcp":
             return serve()
         result = _dispatch(args)
@@ -56,12 +74,29 @@ def _dispatch(args: argparse.Namespace) -> Any:
         save_config(vault_path)
         installed_config = configuration.read_bytes()
         integration = None
+        bridge = None
+        browser_hint = ""
         try:
-            if not args.no_codex:
-                integration = asdict(
-                    install_codex(vault=vault_path, codex_home=Path(args.codex_home))
-                )
+            if args.no_codex:
+                doctor = doctor_dict(vault.doctor())
+                if not args.no_bridge:
+                    bridge = open_bridge(vault, open_browser=False)
+            else:
+                with install_codex_transaction(
+                    vault=vault_path, codex_home=Path(args.codex_home)
+                ) as staged:
+                    integration = asdict(staged)
+                    doctor = doctor_dict(vault.doctor())
+                    if not args.no_bridge:
+                        bridge = open_bridge(vault, open_browser=False)
+            if bridge is not None and not args.no_browser:
+                browser_opened = open_bridge_in_browser(vault)
+                bridge = {**bridge, "browser_opened": browser_opened}
+                if not browser_opened:
+                    browser_hint = "The Bridge is running; run gsv to open it. "
         except Exception as exc:
+            if bridge is not None and bridge.get("started"):
+                stop_bridge()
             rollback_error = _restore_setup_config(
                 configuration,
                 previous_exists=previous_config_exists,
@@ -71,11 +106,14 @@ def _dispatch(args: argparse.Namespace) -> Any:
             if rollback_error is not None:
                 raise SetupError(f"{exc}; {rollback_error}") from exc
             raise
-        doctor = doctor_dict(vault.doctor())
         return {
+            "bridge": bridge,
             "codex": integration,
             "doctor": doctor,
-            "next": "Restart Codex, then open a new task and ask: What do you remember?",
+            "next": (
+                f"{browser_hint}Restart Codex, then open a fresh task and ask: "
+                "What do you remember?"
+            ),
             "vault": initialized,
         }
 
@@ -97,6 +135,24 @@ def _dispatch(args: argparse.Namespace) -> Any:
         if args.codex_command == "uninstall":
             return uninstall_codex(codex_home=home)
         raise AssertionError("unreachable Codex command")
+    if args.command == "bridge":
+        if args.bridge_command == "status":
+            return bridge_status()
+        if args.bridge_command == "stop":
+            return stop_bridge()
+        vault = Vault(resolve_vault(explicit_vault))
+        if args.bridge_command == "open":
+            return open_bridge(vault, open_browser=not args.no_browser)
+        if args.bridge_command == "serve":
+            return {
+                "port": serve_bridge(
+                    vault,
+                    port=args.port,
+                    instance_id=args.instance_id,
+                ),
+                "stopped": True,
+            }
+        raise AssertionError("unreachable Bridge command")
 
     vault = Vault(resolve_vault(explicit_vault))
     if args.command == "status":
@@ -270,6 +326,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     setup.add_argument("--name", default="My GSV")
     setup.add_argument("--codex-home", default=str(codex_home()))
+    setup.add_argument("--no-bridge", action="store_true")
+    setup.add_argument("--no-browser", action="store_true")
     setup.add_argument("--no-codex", action="store_true")
 
     init = commands.add_parser("init", help="Initialize a vault without changing Codex.")
@@ -375,6 +433,16 @@ def _parser() -> argparse.ArgumentParser:
 
     demo = commands.add_parser("demo", help="Run the complete synthetic GSV proof.")
     demo.add_argument("--output")
+
+    bridge = commands.add_parser("bridge", help="Open or inspect the local GSV Bridge.")
+    bridge_commands = bridge.add_subparsers(dest="bridge_command", required=True)
+    bridge_open = bridge_commands.add_parser("open", help="Open The Bridge in your browser.")
+    bridge_open.add_argument("--no-browser", action="store_true")
+    bridge_commands.add_parser("status", help="Show the verified Bridge process state.")
+    bridge_commands.add_parser("stop", help="Stop only the verified GSV Bridge process.")
+    bridge_serve = bridge_commands.add_parser("serve", help=argparse.SUPPRESS)
+    bridge_serve.add_argument("--port", type=int, default=0)
+    bridge_serve.add_argument("--instance-id")
 
     codex = commands.add_parser("codex", help="Manage the supported Codex integration.")
     codex_commands = codex.add_subparsers(dest="codex_command", required=True)

@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Version = if ($env:GSV_VERSION) { $env:GSV_VERSION } else { "0.1.0" }
+$Version = if ($env:GSV_VERSION) { $env:GSV_VERSION } else { "0.2.0" }
 $ReleaseBase = if ($env:GSV_RELEASE_BASE_URL) {
     $env:GSV_RELEASE_BASE_URL
 } else {
@@ -13,10 +13,6 @@ $InstallDir = if ($env:GSV_BIN_DIR) {
 }
 $Target = Join-Path $InstallDir "gsv.exe"
 
-if (-not (Get-Command codex -ErrorAction SilentlyContinue)) {
-    throw "Codex CLI was not found on PATH. Install Codex Desktop or the Codex CLI first."
-}
-
 $Architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
     "X64" { "x86_64" }
     # Windows ARM64 uses the x64 asset through emulation; hosted E2E must validate it.
@@ -26,6 +22,43 @@ $Architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSA
 $Asset = "gsv-windows-$Architecture.exe"
 $Temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("gsv-install-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $Temporary | Out-Null
+
+function Invoke-VerifiedBridgeStop {
+    param([Parameter(Mandatory = $true)][string]$Executable)
+
+    $Raw = & $Executable --json bridge stop
+    $ExitCode = $LASTEXITCODE
+    if ($ExitCode -ne 0) {
+        throw "The existing Bridge could not be verified and stopped (exit $ExitCode)."
+    }
+    try {
+        $Payload = ($Raw | Out-String) | ConvertFrom-Json
+    } catch {
+        throw "The staged GSV executable returned an invalid Bridge stop result."
+    }
+    if (-not $Payload.ok) {
+        throw "The staged GSV executable did not confirm its Bridge stop result."
+    }
+    return $Payload.result
+}
+
+function Invoke-FileReplaceWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$Backup
+    )
+
+    for ($Attempt = 1; $Attempt -le 50; $Attempt++) {
+        try {
+            [System.IO.File]::Replace($Source, $Destination, $Backup, $true)
+            return
+        } catch [System.IO.IOException] {
+            if ($Attempt -eq 50) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+}
 
 try {
     $Download = Join-Path $Temporary $Asset
@@ -51,16 +84,23 @@ try {
     $Staged = Join-Path $InstallDir (".gsv.new." + [guid]::NewGuid() + ".exe")
     $Backup = $null
     $InstalledNew = $false
-    Copy-Item -LiteralPath $Download -Destination $Staged
-    if (Test-Path -LiteralPath $Target) {
-        if ((Get-Item -LiteralPath $Target).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-            throw "Refusing to replace a reparse-point GSV target: $Target"
-        }
-        $Backup = Join-Path $InstallDir (".gsv.previous." + [guid]::NewGuid() + ".exe")
-    }
+    $PriorBridgeStopped = $false
     try {
+        Copy-Item -LiteralPath $Download -Destination $Staged
+        & $Staged --version | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "The staged GSV executable did not pass its version preflight."
+        }
+        if (Test-Path -LiteralPath $Target) {
+            if ((Get-Item -LiteralPath $Target).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Refusing to replace a reparse-point GSV target: $Target"
+            }
+            $Backup = Join-Path $InstallDir (".gsv.previous." + [guid]::NewGuid() + ".exe")
+            $PriorStop = Invoke-VerifiedBridgeStop -Executable $Staged
+            $PriorBridgeStopped = [bool]$PriorStop.stopped
+        }
         if ($Backup) {
-            [System.IO.File]::Replace($Staged, $Target, $Backup, $true)
+            Invoke-FileReplaceWithRetry -Source $Staged -Destination $Target -Backup $Backup
         } else {
             [System.IO.File]::Move($Staged, $Target)
         }
@@ -73,11 +113,26 @@ try {
             Remove-Item -LiteralPath $Backup -Force
         }
     } catch {
+        $Failure = $_
+        $RollbackSafe = $true
+        if ($InstalledNew) {
+            try {
+                Invoke-VerifiedBridgeStop -Executable $Target | Out-Null
+            } catch {
+                $RollbackSafe = $false
+            }
+        }
+        if ($InstalledNew -and -not $RollbackSafe) {
+            if ($Backup) {
+                throw "GSV setup failed and its Bridge stop could not be verified; the previous executable remains staged at $Backup. Original error: $($Failure.Exception.Message)"
+            }
+            throw "GSV setup failed and its Bridge stop could not be verified; the candidate executable was left in place. Original error: $($Failure.Exception.Message)"
+        }
         if ($InstalledNew) {
             if ($Backup -and (Test-Path -LiteralPath $Backup)) {
                 if (Test-Path -LiteralPath $Target) {
                     $FailedCandidate = Join-Path $InstallDir (".gsv.failed." + [guid]::NewGuid() + ".exe")
-                    [System.IO.File]::Replace($Backup, $Target, $FailedCandidate, $true)
+                    Invoke-FileReplaceWithRetry -Source $Backup -Destination $Target -Backup $FailedCandidate
                     Remove-Item -LiteralPath $FailedCandidate -Force -ErrorAction SilentlyContinue
                 } else {
                     [System.IO.File]::Move($Backup, $Target)
@@ -86,7 +141,13 @@ try {
                 Remove-Item -LiteralPath $Target -Force -ErrorAction SilentlyContinue
             }
         }
-        throw
+        if ($PriorBridgeStopped -and (Test-Path -LiteralPath $Target -PathType Leaf)) {
+            & $Target --json bridge open --no-browser | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "The previous executable was restored, but its Bridge could not be restarted."
+            }
+        }
+        throw $Failure
     } finally {
         Remove-Item -LiteralPath $Staged -Force -ErrorAction SilentlyContinue
     }
@@ -95,4 +156,5 @@ try {
 }
 
 Write-Host "Installed GSV at $Target"
+Write-Host "The Bridge is ready. Run gsv anytime to reopen it."
 Write-Host "Restart Codex, open a fresh task, and ask: What do you remember?"

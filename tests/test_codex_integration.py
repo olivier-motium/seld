@@ -171,6 +171,27 @@ def test_failed_final_status_restores_existing_agents_and_removes_new_backup(
     assert fake_codex.marketplaces == {}
 
 
+def test_caller_failure_inside_staged_install_rolls_back_integration(
+    tmp_path: Path, fake_codex: FakeCodex
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    agents = home / "AGENTS.md"
+    original = b"# Existing instructions\n"
+    agents.write_bytes(original)
+
+    with (
+        pytest.raises(SetupError, match="Bridge failed"),
+        integration.install_codex_transaction(vault=tmp_path / "vault", codex_home=home),
+    ):
+        raise SetupError("Bridge failed after Codex verification")
+
+    assert agents.read_bytes() == original
+    assert fake_codex.plugins == set()
+    assert fake_codex.marketplaces == {}
+    assert not integration._receipt_path(home).exists()
+
+
 def test_failed_status_preserves_preexisting_components(
     tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -283,10 +304,21 @@ def _launch_generated_manifest(marketplace: Path) -> dict[str, Any]:
     return {"response": json.loads(line), "server": server}
 
 
+def _prepare_test_marketplace(
+    root: Path,
+    vault: Path,
+    runtime: tuple[str, list[str]],
+) -> Path:
+    change = integration._replace_marketplace(vault, runtime=runtime, target=root / "marketplace")
+    integration._commit_marketplace(change)
+    return change.path
+
+
 def test_exact_source_runtime_manifest_executes(tmp_path: Path) -> None:
-    marketplace = integration._prepare_marketplace(
+    marketplace = _prepare_test_marketplace(
+        tmp_path,
         tmp_path / "vault",
-        runtime=(sys.executable, ["-m", "continuity_kernel"]),
+        (sys.executable, ["-m", "continuity_kernel"]),
     )
 
     result = _launch_generated_manifest(marketplace)
@@ -309,9 +341,10 @@ def test_exact_frozen_runtime_manifest_executes_without_python_module_args(tmp_p
         encoding="utf-8",
     )
     launcher.chmod(0o755)
-    marketplace = integration._prepare_marketplace(
+    marketplace = _prepare_test_marketplace(
+        tmp_path,
         tmp_path / "vault",
-        runtime=(str(launcher), []),
+        (str(launcher), []),
     )
 
     result = _launch_generated_manifest(marketplace)

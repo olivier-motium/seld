@@ -9,11 +9,15 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+_IS_WINDOWS = os.name == "nt"
 
 
 def main() -> int:
@@ -21,39 +25,17 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--native-codex", action="store_true")
-    parser.add_argument(
-        "--codex-auth-from",
-        type=Path,
-        help="Maintainer-only auth copy for an isolated native proof; may rotate a refresh token.",
-    )
-    parser.add_argument(
-        "--acknowledge-auth-copy-risk",
-        action="store_true",
-        help="Acknowledge that a copied refresh token may invalidate the source Codex session.",
-    )
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
-    if args.codex_auth_from and not args.native_codex:
-        parser.error("--codex-auth-from requires --native-codex")
-    if args.codex_auth_from and not args.acknowledge_auth_copy_risk:
-        parser.error("--codex-auth-from requires --acknowledge-auth-copy-risk")
-    if args.codex_auth_from:
-        print(
-            "WARNING: the isolated auth copy may rotate its refresh token remotely and "
-            "invalidate the source Codex session.",
-            file=sys.stderr,
-        )
 
     root = Path(tempfile.mkdtemp(prefix="gsv-clean-e2e-"))
     report: dict[str, Any] = {"isolated_execution": True}
     try:
-        auth_source = args.codex_auth_from.resolve() if args.codex_auth_from else None
         report.update(
             run_e2e(
                 root,
                 args.binary.resolve(),
                 native_codex=args.native_codex,
-                codex_auth_from=auth_source,
             )
         )
         encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
@@ -72,7 +54,6 @@ def run_e2e(
     binary: Path,
     *,
     native_codex: bool,
-    codex_auth_from: Path | None = None,
 ) -> dict[str, Any]:
     if not binary.is_file():
         raise RuntimeError(f"release binary does not exist: {binary}")
@@ -115,17 +96,53 @@ def run_e2e(
         shell = shutil.which("pwsh") or shutil.which("powershell")
         if shell is None:
             raise RuntimeError("PowerShell is required for the Windows installer proof")
-        _run([shell, "-NoProfile", "-File", str(installer)], environment)
+        install_command = [
+            shell,
+            "-NoProfile",
+            "-File",
+            str(installer),
+            "--no-browser",
+        ]
         installed = install_bin / "gsv.exe"
     else:
-        _run(["/bin/sh", str(installer)], environment)
+        install_command = ["/bin/sh", str(installer), "--no-browser"]
         installed = install_bin / "gsv"
+    _run(install_command, environment)
     if not installed.is_file():
         raise RuntimeError("installer did not place the GSV executable")
     installed_version = _run([str(installed), "--version"], environment).stdout.strip()
     binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
 
     status = _cli(installed, environment, ["status"])
+    bridge_status = _cli(installed, environment, ["bridge", "status"])
+    if not bridge_status["running"] or not bridge_status["identity_verified"]:
+        raise RuntimeError("installer did not leave a verified Bridge running")
+    bridge_state = json.loads((data / "bridge-state.json").read_text(encoding="utf-8"))
+    _verify_bridge_http(bridge_status["url"], bridge_state["token"], status["vault_id"])
+    initial_bridge_pid = int(bridge_state["pid"])
+    initial_instance_id = str(bridge_state["instance_id"])
+    digest_before_upgrade = str(status["digest"])
+
+    _run(install_command, environment)
+    upgraded_status = _cli(installed, environment, ["status"])
+    upgraded_bridge = _cli(installed, environment, ["bridge", "status"])
+    upgraded_state = json.loads((data / "bridge-state.json").read_text(encoding="utf-8"))
+    if not upgraded_bridge["running"] or not upgraded_bridge["identity_verified"]:
+        raise RuntimeError("reinstall did not leave a verified candidate Bridge running")
+    if (
+        not _wait_for_process_exit(initial_bridge_pid, timeout=8.0)
+        or upgraded_state["instance_id"] == initial_instance_id
+        or upgraded_status["digest"] != digest_before_upgrade
+    ):
+        raise RuntimeError(
+            "live-Bridge upgrade did not replace the instance and preserve the vault"
+        )
+    _verify_bridge_http(
+        upgraded_bridge["url"], upgraded_state["token"], upgraded_status["vault_id"]
+    )
+    status = upgraded_status
+    bridge_status = upgraded_bridge
+    bridge_state = upgraded_state
     codex_status = _cli(
         installed, environment, ["codex", "status", "--codex-home", str(codex_home)]
     )
@@ -231,7 +248,6 @@ def run_e2e(
             environment=environment,
             workspace=workspace,
             output=root / "native-output",
-            auth_source=codex_auth_from,
         )
         _require_native_codex(native_result)
 
@@ -262,6 +278,23 @@ def run_e2e(
     if manifest_path.parents[2].exists():
         raise RuntimeError("generated marketplace files remain after uninstall")
 
+    stopped = _cli(installed, environment, ["bridge", "stop"])
+    if not stopped["stopped"] or (data / "bridge-state.json").exists():
+        raise RuntimeError("verified Bridge did not stop cleanly")
+
+    restarted = _cli(installed, environment, ["bridge", "open", "--no-browser"])
+    restarted_status = _cli(installed, environment, ["bridge", "status"])
+    live_receipt = data / "bridge-state.json"
+    if not restarted["started"] or not restarted_status["identity_verified"]:
+        raise RuntimeError("Bridge did not restart for the live-uninstall proof")
+    if not live_receipt.is_file():
+        raise RuntimeError("restarted Bridge omitted its state receipt")
+    live_state = json.loads(live_receipt.read_text(encoding="utf-8"))
+    live_pid = int(live_state["pid"])
+    if restarted_status.get("pid") != live_pid or not _process_alive(live_pid):
+        raise RuntimeError("restarted Bridge receipt did not match its live process")
+    _verify_bridge_http(restarted_status["url"], live_state["token"], status["vault_id"])
+
     vault_files_before = _directory_digest(vault)
     if os.name == "nt":
         shell = shutil.which("pwsh") or shutil.which("powershell")
@@ -278,11 +311,15 @@ def run_e2e(
         )
     if installed.exists():
         raise RuntimeError("full uninstall left the GSV executable installed")
+    if live_receipt.exists() or not _wait_for_process_exit(live_pid, timeout=8.0):
+        raise RuntimeError("full uninstaller left the live Bridge running or its receipt behind")
     if config_path.read_bytes() != config_before or _directory_digest(vault) != vault_files_before:
         raise RuntimeError("full uninstall changed the user vault or configuration")
 
     return {
         "backup_restore": True,
+        "bridge_authenticated_loopback": True,
+        "bridge_direct_stop": True,
         "binary_sha256": binary_sha256,
         "binary_version": installed_version,
         "codex_cli_contract": True,
@@ -291,11 +328,13 @@ def run_e2e(
         "frozen_manifest": True,
         "full_uninstall_removed_binary": True,
         "installer_without_python_uv_make": True,
+        "installer_upgrade_restarted_bridge": True,
         "native_codex_two_session": native_result,
-        "native_auth_bridge_used": native_codex and codex_auth_from is not None,
+        "native_auth_bridge_used": False,
         "observed_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "stale_write_rejected": stale.returncode == 2,
         "two_mcp_processes": True,
+        "uninstaller_stopped_live_bridge": True,
         "uninstall_preserved_config_and_vault": removed["user_data_preserved"],
         "updated_revision": updated["revision"],
         "vault_id": status["vault_id"],
@@ -404,13 +443,35 @@ def _mcp_call(
     return cast(dict[str, Any], payload["structuredContent"])
 
 
+def _verify_bridge_http(url: str, token: str, vault_id: str) -> None:
+    snapshot_url = f"{url.rstrip('/')}/api/v1/snapshot"
+    try:
+        urlopen(Request(snapshot_url, headers={"Accept": "application/json"}), timeout=5)
+    except HTTPError as exc:
+        if exc.code != 403:
+            raise RuntimeError(f"unauthenticated Bridge returned {exc.code}, expected 403") from exc
+    else:
+        raise RuntimeError("unauthenticated Bridge exposed the vault snapshot")
+    request = Request(
+        snapshot_url,
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    with urlopen(request, timeout=5) as response:
+        snapshot = json.loads(response.read())
+    if snapshot["status"]["vault_id"] != vault_id:
+        raise RuntimeError("Bridge snapshot did not match the installed vault")
+    with urlopen(url, timeout=5) as response:
+        static = response.read()
+    if b"The agent is not the thread" not in static:
+        raise RuntimeError("Bridge static product surface was not bundled")
+
+
 def _native_codex_sessions(
     *,
     codex: str,
     environment: dict[str, str],
     workspace: Path,
     output: Path,
-    auth_source: Path | None,
 ) -> bool:
     output.mkdir()
     first_message = output / "first.txt"
@@ -426,38 +487,8 @@ def _native_codex_sessions(
         "If its next action says Read this in a fresh Codex session, reply exactly NATIVE_RESUMED."
     )
     base = [codex, "exec", "--skip-git-repo-check", "-C", str(workspace), "--color", "never"]
-    auth_target: Path | None = None
-    auth_source_digest: str | None = None
-    if auth_source is not None:
-        if not auth_source.is_file():
-            raise RuntimeError("the requested Codex auth source is not a regular file")
-        auth_target = Path(environment["CODEX_HOME"]) / "auth.json"
-        if auth_target.exists():
-            raise RuntimeError("isolated Codex home unexpectedly already contains authentication")
-        auth_bytes = auth_source.read_bytes()
-        auth_source_digest = hashlib.sha256(auth_bytes).hexdigest()
-        auth_target.write_bytes(auth_bytes)
-        auth_target.chmod(0o600)
-    execution_error: BaseException | None = None
-    try:
-        _run([*base, "-o", str(first_message), first_prompt], environment, timeout=300)
-        _run([*base, "-o", str(second_message), second_prompt], environment, timeout=300)
-    except BaseException as exc:
-        execution_error = exc
-    finally:
-        if auth_target is not None:
-            auth_target.unlink(missing_ok=True)
-    auth_source_changed = auth_source_digest is not None and (
-        auth_source is None
-        or not auth_source.is_file()
-        or hashlib.sha256(auth_source.read_bytes()).hexdigest() != auth_source_digest
-    )
-    if execution_error is not None:
-        if auth_source_changed:
-            execution_error.add_note("the native Codex proof also changed its auth source")
-        raise execution_error
-    if auth_source_changed:
-        raise RuntimeError("native Codex proof changed its authentication source")
+    _run([*base, "-o", str(first_message), first_prompt], environment, timeout=300)
+    _run([*base, "-o", str(second_message), second_prompt], environment, timeout=300)
     return (
         first_message.read_text(encoding="utf-8").strip() == "NATIVE_CREATED"
         and second_message.read_text(encoding="utf-8").strip() == "NATIVE_RESUMED"
@@ -503,6 +534,55 @@ def _run(
             f"stdout: {result.stdout[-2000:]}\nstderr: {result.stderr[-2000:]}"
         )
     return result
+
+
+def _process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if _IS_WINDOWS:
+        return _windows_process_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _windows_process_alive(pid: int) -> bool:
+    """Check a Win32 process handle without delivering a signal."""
+
+    import ctypes
+
+    loader = cast(Any, getattr(ctypes, "WinDLL", None))
+    if loader is None:
+        return False
+    kernel32 = loader("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    open_process.restype = ctypes.c_void_p
+    wait_for_single_object = kernel32.WaitForSingleObject
+    wait_for_single_object.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    wait_for_single_object.restype = ctypes.c_uint32
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+
+    handle = open_process(0x00100000, 0, pid)
+    if not handle:
+        return False
+    try:
+        return int(wait_for_single_object(handle, 0)) == 0x00000102
+    finally:
+        close_handle(handle)
+
+
+def _wait_for_process_exit(pid: int, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not _process_alive(pid)
 
 
 def _directory_digest(root: Path) -> str:

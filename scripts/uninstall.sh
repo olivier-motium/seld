@@ -9,6 +9,7 @@ if [ ! -x "$TARGET" ]; then
   exit 2
 fi
 
+"$TARGET" bridge stop >/dev/null
 "$TARGET" codex uninstall "$@"
 rm "$TARGET"
 printf '%s\n' "Removed the GSV executable and Codex integration. Vault and config were preserved."

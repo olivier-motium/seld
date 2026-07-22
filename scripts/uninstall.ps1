@@ -11,6 +11,10 @@ if (-not (Test-Path -LiteralPath $Target -PathType Leaf)) {
     throw "GSV executable not found at $Target"
 }
 
+& $Target bridge stop | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "GSV Bridge stop failed with exit code $LASTEXITCODE."
+}
 & $Target codex uninstall @args
 if ($LASTEXITCODE -ne 0) {
     throw "GSV integration uninstall failed with exit code $LASTEXITCODE."
