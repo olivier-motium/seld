@@ -12,6 +12,8 @@ jobs:
   test:
     name: Python ${{ matrix.python }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    env:
+      UV_PYTHON: ${{ matrix.python }}
     strategy:
       fail-fast: false
       matrix:
