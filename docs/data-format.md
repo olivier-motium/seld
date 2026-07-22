@@ -54,6 +54,17 @@ duplicate archive paths are rejected. Unknown format versions fail closed.
 quotes stored content and labels it as data so text in the vault is not treated
 as higher-priority instructions.
 
+## Context Pack
+
+The context pack always preserves its fixed header plus Mind, Now, open-task,
+and active-work-thread sections. Mind and Now become clearly marked prefix
+excerpts when needed, with exact stored-character omission counts. Task and
+work-thread records are included only as complete blocks. The pack considers
+those records in canonical identifier order and admits a block only when it
+fits; this mechanical capacity rule is not a priority or recency signal. Both
+record sections report included, total, and omitted counts, including when no
+record fits. The final rendered string is never repaired by raw slicing.
+
 ## Journal
 
 `journal/events.jsonl` is a bounded, append-only audit aid for successful GSV

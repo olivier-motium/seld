@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -241,7 +242,135 @@ def test_context_bound_is_enforced(vault: Vault) -> None:
     context = vault.context_pack(max_characters=4_000)
 
     assert len(context) <= 4_000
-    assert "Context truncated" in context
+    assert "[Context truncated" not in context
+    assert "## Mind" in context
+    assert "## Now" in context
+    assert "## Open tasks" in context
+    assert "## Active work threads" in context
+    coverage = re.search(
+        r"Coverage: (\d+) of 25 open task records included; (\d+) omitted by capacity",
+        context,
+    )
+    assert coverage is not None
+    assert int(coverage.group(1)) + int(coverage.group(2)) == 25
+    assert context == vault.context_pack(max_characters=4_000)
+
+
+def test_context_floor_preserves_all_sections_and_exact_omissions(vault: Vault) -> None:
+    mind_before = vault.read_document("MIND.md")
+    mind = vault.write_document(
+        "MIND.md",
+        "# Mind\n\n## Stored Mind Heading\n\n" + ("m" * 12_000),
+        expected_revision=mind_before["revision"],
+    )
+    now_before = vault.read_document("NOW.md")
+    now = vault.write_document(
+        "NOW.md",
+        "# Now\n\n## Stored Now Heading\n\n" + ("n" * 12_000),
+        expected_revision=now_before["revision"],
+    )
+    for index in range(3):
+        vault.create_task(
+            identifier=f"oversized-task-{index}",
+            title=f"Oversized task {index}",
+            outcome="t" * 6_000,
+            status="ready",
+            next_actor="agent",
+            next_action="Continue only from the exact record.",
+        )
+        vault.create_thread(
+            identifier=f"oversized-thread-{index}",
+            title=f"Oversized thread {index}",
+            purpose="p" * 6_000,
+            summary="s" * 6_000,
+            next_move="Continue only from the exact record.",
+        )
+
+    context = vault.context_pack(max_characters=4_000)
+
+    assert len(context) <= 4_000
+    assert re.findall(r"^## .+$", context, flags=re.MULTILINE) == [
+        "## Mind",
+        "## Now",
+        "## Open tasks",
+        "## Active work threads",
+    ]
+    assert "> ## Stored Mind Heading" in context
+    assert "> ## Stored Now Heading" in context
+    assert "Coverage: 0 of 3 open task records included; 3 omitted by capacity" in context
+    assert "Coverage: 0 of 3 active work thread records included; 3 omitted by capacity" in context
+    assert "### Oversized task" not in context
+    assert "### Oversized thread" not in context
+    assert "Outcome (stored data):" not in context
+    assert "Purpose (stored data):" not in context
+    mind_marker = re.search(r"\[Mind excerpt; (\d+) of (\d+) stored characters omitted", context)
+    now_marker = re.search(r"\[Now excerpt; (\d+) of (\d+) stored characters omitted", context)
+    assert mind_marker is not None and int(mind_marker.group(2)) == len(mind["content"])
+    assert now_marker is not None and int(now_marker.group(2)) == len(now["content"])
+    assert int(mind_marker.group(1)) > 0
+    assert int(now_marker.group(1)) > 0
+
+
+def test_context_capacity_selection_is_canonical_and_all_or_nothing(vault: Vault) -> None:
+    oversized = vault.create_task(
+        identifier="a-oversized",
+        title="A oversized",
+        outcome="x" * 8_000,
+        status="ready",
+    )
+    included = vault.create_task(
+        identifier="z-small",
+        title="Z small",
+        outcome="The complete small record remains useful.",
+        status="ready",
+        next_actor="agent",
+        next_action="Read its exact revision.",
+    )
+
+    context = vault.context_pack(max_characters=4_000)
+
+    assert oversized.identifier not in context
+    assert included.identifier in context
+    assert included.revision in context
+    assert "The complete small record remains useful." in context
+    assert "Read its exact revision." in context
+    assert "Waiting (stored data):\n> Not recorded." in context
+    assert "Coverage: 1 of 2 open task records included; 1 omitted by capacity" in context
+
+
+def test_context_document_excerpt_reports_exact_omitted_characters() -> None:
+    from continuity_kernel.vault import _context_document_section
+
+    stored = "x" * 1_000
+
+    section, complete = _context_document_section("Mind", stored, budget=320)
+
+    assert not complete
+    excerpt_line = next(line for line in section.splitlines() if line.startswith("> x"))
+    marker = re.search(r"\[Mind excerpt; (\d+) of (\d+) stored characters omitted", section)
+    assert marker is not None
+    included = len(excerpt_line.removeprefix("> "))
+    omitted = int(marker.group(1))
+    total = int(marker.group(2))
+    assert total == len(stored)
+    assert included + omitted == total
+
+
+@pytest.mark.parametrize("long_document", ["MIND.md", "NOW.md"])
+def test_context_gives_all_remaining_capacity_to_sole_incomplete_document(
+    vault: Vault, long_document: str
+) -> None:
+    before = vault.read_document(long_document)
+    vault.write_document(
+        long_document,
+        f"# {long_document.removesuffix('.md').title()}\n\n" + ("x" * 12_000),
+        expected_revision=before["revision"],
+    )
+
+    context = vault.context_pack(max_characters=4_000)
+
+    assert 0 <= 4_000 - len(context) < 10
+    assert f"[{long_document.removesuffix('.md').title()} excerpt;" in context
 
 
 def test_record_id_must_match_its_filename(vault: Vault) -> None:
