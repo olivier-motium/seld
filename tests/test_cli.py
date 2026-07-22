@@ -114,6 +114,84 @@ def test_setup_reuses_configured_vault_when_no_override(
 
     assert result == 0
     assert Path(output["result"]["vault"]["vault"]) == configured.resolve()
+    assert "Codex integration was skipped" in output["result"]["next"]
+    assert "Restart Codex" not in output["result"]["next"]
+
+
+def test_unhealthy_setup_preserves_config_and_never_calls_provider_or_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    existing = tmp_path / "existing-vault"
+    corrupt = tmp_path / "corrupt-vault"
+    Vault(existing).initialize(name="Existing")
+    Vault(corrupt).initialize(name="Corrupt")
+    (corrupt / "tasks/broken.md").write_text("not a GSV task\n", encoding="utf-8")
+    save_config(existing)
+    events: list[str] = []
+
+    @contextmanager
+    def unexpected_install(**_: object) -> Iterator[CodexInstallResult]:
+        events.append("codex")
+        yield cast(CodexInstallResult, None)
+
+    def unexpected_bridge(*_: object, **__: object) -> dict[str, object]:
+        events.append("bridge")
+        return {}
+
+    def unexpected_browser(*_: object, **__: object) -> bool:
+        events.append("browser")
+        return True
+
+    monkeypatch.setattr(cli, "install_codex_transaction", unexpected_install)
+    monkeypatch.setattr(cli, "open_bridge", unexpected_bridge)
+    monkeypatch.setattr(cli, "open_bridge_in_browser", unexpected_browser)
+
+    exit_code = cli.main(["--json", "--vault", str(corrupt), "setup"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 3
+    assert payload["ok"] is False
+    assert payload["error"] == (
+        "GSV setup stopped because the vault is unhealthy; follow result.next."
+    )
+    assert payload["result"]["setup_complete"] is False
+    assert payload["result"]["doctor"]["healthy"] is False
+    assert payload["result"]["doctor"]["issues"][0]["path"] == "tasks/broken.md"
+    assert payload["result"]["codex"] is None
+    assert payload["result"]["bridge"] is None
+    assert f"gsv --vault {corrupt.resolve()} doctor" in payload["result"]["next"]
+    assert events == []
+    config = load_config()
+    assert config is not None
+    assert config.vault_path == existing.resolve()
+
+
+def test_setup_next_text_matches_every_feature_flag_combination() -> None:
+    for no_codex in (False, True):
+        for no_bridge in (False, True):
+            for no_browser in (False, True):
+                bridge = None if no_bridge else {"browser_opened": not no_browser}
+                message = cli._setup_next(
+                    no_codex=no_codex,
+                    no_bridge=no_bridge,
+                    no_browser=no_browser,
+                    bridge=bridge,
+                )
+                if no_codex:
+                    assert "Codex integration was skipped" in message
+                    assert "Restart Codex" not in message
+                else:
+                    assert "Restart Codex" in message
+                    assert "Codex integration was skipped" not in message
+                if no_bridge:
+                    assert "The Bridge was not started" in message
+                    assert "The Bridge is running" not in message
+                    assert "The Bridge is open" not in message
+                elif no_browser:
+                    assert "The Bridge is running locally" in message
+                    assert "The Bridge is open" not in message
+                else:
+                    assert "The Bridge is open" in message
 
 
 def test_failed_codex_install_never_starts_or_opens_bridge(
@@ -246,7 +324,7 @@ def test_setup_keeps_committed_install_when_browser_open_raises(
     assert result == 0
     assert events == ["codex-ready", "codex-committed"]
     assert output["bridge"]["browser_opened"] is False
-    assert "run gsv" in output["next"]
+    assert "run `gsv`" in output["next"]
     assert load_config() is not None
 
 
@@ -315,6 +393,48 @@ def test_vault_doctor_remains_usable_without_codex(
 
     assert result["healthy"] is True
     assert result["codex"]["available"] is False
+
+
+def test_unhealthy_doctor_returns_nonzero_and_json_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Unhealthy")
+    (vault.root / "tasks/broken.md").write_text("not a GSV task\n", encoding="utf-8")
+    save_config(vault.root)
+    monkeypatch.setattr(cli, "codex_status", lambda **_: {"plugin_installed": False})
+
+    exit_code = cli.main(["--json", "doctor"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 3
+    assert payload["ok"] is False
+    assert payload["error"] == (
+        "GSV doctor found unresolved integrity issues; follow result.issues."
+    )
+    assert payload["result"]["healthy"] is False
+    assert payload["result"]["issues"][0]["path"] == "tasks/broken.md"
+
+
+def test_repaired_healthy_doctor_returns_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Repairable")
+    orphan = vault.root.parent / f".{vault.root.name}.tmp-restore-crash"
+    orphan.mkdir()
+    (orphan / "partial").write_text("partial", encoding="utf-8")
+    save_config(vault.root)
+    monkeypatch.setattr(cli, "codex_status", lambda **_: {"plugin_installed": False})
+
+    exit_code = cli.main(["--json", "doctor", "--repair"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["ok"] is True
+    assert payload["result"]["healthy"] is True
+    assert payload["result"]["repaired"] == [f"../{orphan.name}"]
+    assert not orphan.exists()
 
 
 def test_codex_status_and_uninstall_do_not_require_vault_configuration(

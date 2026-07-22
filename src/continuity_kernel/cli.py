@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -52,28 +53,18 @@ def main(arguments: list[str] | None = None) -> int:
         if args.command == "mcp":
             return serve(Vault(resolve_vault(getattr(args, "vault", None))))
         result = _dispatch(args)
-        incomplete_cleanup = (
-            args.command == "codex"
-            and args.codex_command == "uninstall"
-            and isinstance(result, dict)
-            and result.get("cleanup_complete") is False
-        )
-        cleanup_error = (
-            "GSV cleanup is incomplete; follow result.next and retry."
-            if incomplete_cleanup
-            else None
-        )
+        failure = _result_failure(args, result)
         _print(
             result,
             json_output=args.json,
             raw=getattr(args, "raw", False),
-            ok=not incomplete_cleanup,
-            error=cleanup_error,
+            ok=failure is None,
+            error=failure[1] if failure is not None else None,
         )
-        if incomplete_cleanup:
+        if failure is not None:
             if not args.json:
-                print(f"Error: {cleanup_error}", file=sys.stderr)
-            return 3
+                print(f"Error: {failure[1]}", file=sys.stderr)
+            return failure[0]
         return 0
     except ContinuityError as exc:
         if getattr(args, "json", False):
@@ -89,6 +80,16 @@ def _dispatch(args: argparse.Namespace) -> Any:
         vault_path = resolve_vault(explicit_vault, require_config=False)
         vault = Vault(vault_path)
         initialized = vault.initialize(name=args.name, command="gsv")
+        doctor = doctor_dict(vault.doctor())
+        if not doctor["healthy"]:
+            return {
+                "bridge": None,
+                "codex": None,
+                "doctor": doctor,
+                "next": _doctor_next(vault_path, doctor),
+                "setup_complete": False,
+                "vault": initialized,
+            }
         configuration = config_path()
         previous_config_exists = configuration.exists()
         previous_config = configuration.read_bytes() if previous_config_exists else b""
@@ -96,10 +97,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         installed_config = configuration.read_bytes()
         integration = None
         bridge = None
-        browser_hint = ""
         try:
             if args.no_codex:
-                doctor = doctor_dict(vault.doctor())
                 if not args.no_bridge:
                     bridge = open_bridge(vault, open_browser=False)
             else:
@@ -107,14 +106,11 @@ def _dispatch(args: argparse.Namespace) -> Any:
                     vault=vault_path, codex_home=Path(args.codex_home)
                 ) as staged:
                     integration = asdict(staged)
-                    doctor = doctor_dict(vault.doctor())
                     if not args.no_bridge:
                         bridge = open_bridge(vault, open_browser=False)
             if bridge is not None and not args.no_browser:
                 browser_opened = open_bridge_in_browser(vault)
                 bridge = {**bridge, "browser_opened": browser_opened}
-                if not browser_opened:
-                    browser_hint = "The Bridge is running; run gsv to open it. "
         except Exception as exc:
             if bridge is not None and bridge.get("started"):
                 stop_bridge()
@@ -131,10 +127,13 @@ def _dispatch(args: argparse.Namespace) -> Any:
             "bridge": bridge,
             "codex": integration,
             "doctor": doctor,
-            "next": (
-                f"{browser_hint}Restart Codex, then open a fresh task and ask: "
-                "What do you remember?"
+            "next": _setup_next(
+                no_codex=args.no_codex,
+                no_bridge=args.no_bridge,
+                no_browser=args.no_browser,
+                bridge=bridge,
             ),
+            "setup_complete": True,
             "vault": initialized,
         }
 
@@ -225,6 +224,60 @@ def _restore_setup_config(
         return None
     except OSError as exc:
         return f"could not restore the previous GSV configuration: {exc}"
+
+
+def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | None:
+    if not isinstance(result, dict):
+        return None
+    if args.command == "setup" and result.get("setup_complete") is False:
+        return 3, "GSV setup stopped because the vault is unhealthy; follow result.next."
+    if args.command == "doctor" and result.get("healthy") is False:
+        return 3, "GSV doctor found unresolved integrity issues; follow result.issues."
+    if (
+        args.command == "codex"
+        and args.codex_command == "uninstall"
+        and result.get("cleanup_complete") is False
+    ):
+        return 3, "GSV cleanup is incomplete; follow result.next and retry."
+    return None
+
+
+def _doctor_next(vault_path: Path, doctor: dict[str, Any]) -> str:
+    command = f"gsv --vault {shlex.quote(str(vault_path))} doctor"
+    issues = doctor.get("issues")
+    repairable = isinstance(issues, list) and any(
+        isinstance(issue, dict) and issue.get("repairable") is True for issue in issues
+    )
+    if repairable:
+        return f"Run `{command} --repair`, then run `{command}` and inspect any remaining issues."
+    return f"Inspect the reported issues, then run `{command}` again."
+
+
+def _setup_next(
+    *,
+    no_codex: bool,
+    no_bridge: bool,
+    no_browser: bool,
+    bridge: dict[str, Any] | None,
+) -> str:
+    steps: list[str] = []
+    if no_bridge:
+        steps.append("The Bridge was not started.")
+    elif no_browser:
+        steps.append("The Bridge is running locally; run `gsv` when you want to open it.")
+    elif bridge is not None and bridge.get("browser_opened") is True:
+        steps.append("The Bridge is open.")
+    else:
+        steps.append("The Bridge is running; run `gsv` to open it.")
+
+    if no_codex:
+        steps.append(
+            "Codex integration was skipped; run `gsv codex install` when you want a new "
+            "Codex hand to load this vault."
+        )
+    else:
+        steps.append("Restart Codex, then open a fresh task and ask: What do you remember?")
+    return " ".join(steps)
 
 
 def _task(vault: Vault, args: argparse.Namespace) -> Any:
