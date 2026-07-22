@@ -49,7 +49,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "setup":
         vault_path = resolve_vault(explicit_vault, require_config=False)
         vault = Vault(vault_path)
-        initialized = vault.initialize(name=args.name, command="continuity")
+        initialized = vault.initialize(name=args.name, command="gsv")
         configuration = config_path()
         previous_config_exists = configuration.exists()
         previous_config = configuration.read_bytes() if previous_config_exists else b""
@@ -140,14 +140,14 @@ def _restore_setup_config(
     try:
         current = path.read_bytes() if path.exists() else b""
         if current != installed:
-            return "Continuity configuration changed concurrently and was left untouched"
+            return "GSV configuration changed concurrently and was left untouched"
         if previous_exists:
             atomic_write(path, previous)
         elif path.exists():
             path.unlink()
         return None
     except OSError as exc:
-        return f"could not restore the previous Continuity configuration: {exc}"
+        return f"could not restore the previous GSV configuration: {exc}"
 
 
 def _task(vault: Vault, args: argparse.Namespace) -> Any:
@@ -257,8 +257,8 @@ def _thread(vault: Vault, args: argparse.Namespace) -> Any:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="continuity",
-        description="Local-first continuity for coding agents.",
+        prog="gsv",
+        description="Local-first durable state for coding agents.",
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--vault", help="Override the configured vault path.")
@@ -268,12 +268,12 @@ def _parser() -> argparse.ArgumentParser:
     setup = commands.add_parser(
         "setup", help="Initialize a vault and install the Codex integration."
     )
-    setup.add_argument("--name", default="My Continuity")
+    setup.add_argument("--name", default="My GSV")
     setup.add_argument("--codex-home", default=str(codex_home()))
     setup.add_argument("--no-codex", action="store_true")
 
     init = commands.add_parser("init", help="Initialize a vault without changing Codex.")
-    init.add_argument("--name", default="My Continuity")
+    init.add_argument("--name", default="My GSV")
     init.add_argument("--configure", action="store_true")
 
     commands.add_parser("status", help="Show vault identity and counts.")
@@ -373,7 +373,7 @@ def _parser() -> argparse.ArgumentParser:
     backup_restore.add_argument("path")
     backup_restore.add_argument("target")
 
-    demo = commands.add_parser("demo", help="Run the complete synthetic continuity proof.")
+    demo = commands.add_parser("demo", help="Run the complete synthetic GSV proof.")
     demo.add_argument("--output")
 
     codex = commands.add_parser("codex", help="Manage the supported Codex integration.")

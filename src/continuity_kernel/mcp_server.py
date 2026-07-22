@@ -74,12 +74,12 @@ def _handle(message: dict[str, Any]) -> dict[str, Any] | None:
             {
                 "capabilities": {"tools": {"listChanged": False}},
                 "instructions": (
-                    "Continuity is a private local vault. Read exact records before writes, "
+                    "GSV is a private local vault. Read exact records before writes, "
                     "use compare-and-swap revisions, and never store secrets or raw provider "
                     "payloads."
                 ),
                 "protocolVersion": protocol_version,
-                "serverInfo": {"name": "continuity", "version": __version__},
+                "serverInfo": {"name": "gsv", "version": __version__},
             },
         )
     if method == "ping":
@@ -125,20 +125,20 @@ def _handle(message: dict[str, Any]) -> dict[str, Any] | None:
 
 def _call(name: str, values: dict[str, Any]) -> dict[str, Any]:
     vault = Vault(resolve_vault())
-    if name == "continuity_status":
+    if name == "gsv_status":
         return vault.status()
-    if name == "continuity_context":
+    if name == "gsv_context":
         return {
             "context": vault.context_pack(max_characters=_integer(values, "max_characters", 48_000))
         }
-    if name == "continuity_doctor":
+    if name == "gsv_doctor":
         return doctor_dict(vault.doctor(repair=False))
-    if name == "continuity_task_list":
+    if name == "gsv_task_list":
         status = _optional_string(values, "status")
         return {"tasks": [record_dict(item) for item in vault.list_tasks(status=status)]}
-    if name == "continuity_task_show":
+    if name == "gsv_task_show":
         return record_dict(vault.get_task(_string(values, "id")))
-    if name == "continuity_task_create":
+    if name == "gsv_task_create":
         return record_dict(
             vault.create_task(
                 identifier=_string(values, "id"),
@@ -151,7 +151,7 @@ def _call(name: str, values: dict[str, Any]) -> dict[str, Any]:
                 refs=_strings(values, "refs"),
             )
         )
-    if name == "continuity_task_update":
+    if name == "gsv_task_update":
         return record_dict(
             vault.update_task(
                 _string(values, "id"),
@@ -169,11 +169,11 @@ def _call(name: str, values: dict[str, Any]) -> dict[str, Any]:
                 remove_refs=_strings(values, "remove_refs"),
             )
         )
-    if name == "continuity_entity_list":
+    if name == "gsv_entity_list":
         return {"entities": [record_dict(item) for item in vault.list_entities()]}
-    if name == "continuity_entity_show":
+    if name == "gsv_entity_show":
         return record_dict(vault.get_entity(_string(values, "id")))
-    if name == "continuity_entity_create":
+    if name == "gsv_entity_create":
         return record_dict(
             vault.create_entity(
                 identifier=_string(values, "id"),
@@ -184,7 +184,7 @@ def _call(name: str, values: dict[str, Any]) -> dict[str, Any]:
                 refs=_strings(values, "refs"),
             )
         )
-    if name == "continuity_entity_update":
+    if name == "gsv_entity_update":
         return record_dict(
             vault.update_entity(
                 _string(values, "id"),
@@ -196,12 +196,12 @@ def _call(name: str, values: dict[str, Any]) -> dict[str, Any]:
                 remove_refs=_strings(values, "remove_refs"),
             )
         )
-    if name == "continuity_thread_list":
+    if name == "gsv_thread_list":
         status = _optional_string(values, "status")
         return {"threads": [record_dict(item) for item in vault.list_threads(status=status)]}
-    if name == "continuity_thread_show":
+    if name == "gsv_thread_show":
         return record_dict(vault.get_thread(_string(values, "id")))
-    if name == "continuity_thread_create":
+    if name == "gsv_thread_create":
         return record_dict(
             vault.create_thread(
                 identifier=_string(values, "id"),
@@ -215,7 +215,7 @@ def _call(name: str, values: dict[str, Any]) -> dict[str, Any]:
                 refs=_strings(values, "refs"),
             )
         )
-    if name == "continuity_thread_update":
+    if name == "gsv_thread_update":
         return record_dict(
             vault.update_thread(
                 _string(values, "id"),
@@ -232,15 +232,15 @@ def _call(name: str, values: dict[str, Any]) -> dict[str, Any]:
                 remove_refs=_strings(values, "remove_refs"),
             )
         )
-    if name == "continuity_document_show":
+    if name == "gsv_document_show":
         return vault.read_document(_string(values, "name"))
-    if name == "continuity_document_update":
+    if name == "gsv_document_update":
         return vault.write_document(
             _string(values, "name"),
             _string(values, "content"),
             expected_revision=_string(values, "expected_revision"),
         )
-    if name == "continuity_backup_create":
+    if name == "gsv_backup_create":
         return vault.create_backup()
     raise ValidationError(f"unknown tool: {name}")
 
@@ -276,29 +276,29 @@ TEXTS = {"items": {"type": "string"}, "type": "array"}
 BOOLEAN = {"type": "boolean"}
 
 TOOLS: Final = [
-    _tool("continuity_status", "Read vault identity, counts, and digest.", {}, read_only=True),
+    _tool("gsv_status", "Read vault identity, counts, and digest.", {}, read_only=True),
     _tool(
-        "continuity_context",
+        "gsv_context",
         "Read the bounded current context pack at the start of substantive work.",
         {"max_characters": {"maximum": 256000, "minimum": 4000, "type": "integer"}},
         read_only=True,
     ),
     _tool(
-        "continuity_doctor",
+        "gsv_doctor",
         "Validate vault structure and references without mutation.",
         {},
         read_only=True,
     ),
-    _tool("continuity_task_list", "List durable tasks.", {"status": TEXT}, read_only=True),
+    _tool("gsv_task_list", "List durable tasks.", {"status": TEXT}, read_only=True),
     _tool(
-        "continuity_task_show",
+        "gsv_task_show",
         "Read one exact task and its revision.",
         {"id": TEXT},
         ("id",),
         read_only=True,
     ),
     _tool(
-        "continuity_task_create",
+        "gsv_task_create",
         "Create one explicit durable outcome. Do not infer task meaning from source text.",
         {
             "id": TEXT,
@@ -314,7 +314,7 @@ TOOLS: Final = [
         read_only=False,
     ),
     _tool(
-        "continuity_task_update",
+        "gsv_task_update",
         "Update an exact task using its latest compare-and-swap revision.",
         {
             "add_refs": TEXTS,
@@ -334,16 +334,16 @@ TOOLS: Final = [
         ("id", "expected_revision"),
         read_only=False,
     ),
-    _tool("continuity_entity_list", "List canonical entities.", {}, read_only=True),
+    _tool("gsv_entity_list", "List canonical entities.", {}, read_only=True),
     _tool(
-        "continuity_entity_show",
+        "gsv_entity_show",
         "Read one exact canonical entity.",
         {"id": TEXT},
         ("id",),
         read_only=True,
     ),
     _tool(
-        "continuity_entity_create",
+        "gsv_entity_create",
         "Create a canonical entity only after deliberate identity resolution.",
         {
             "aliases": TEXTS,
@@ -357,7 +357,7 @@ TOOLS: Final = [
         read_only=False,
     ),
     _tool(
-        "continuity_entity_update",
+        "gsv_entity_update",
         "Update an exact canonical entity using its latest compare-and-swap revision.",
         {
             "add_refs": TEXTS,
@@ -371,16 +371,16 @@ TOOLS: Final = [
         ("id", "expected_revision"),
         read_only=False,
     ),
-    _tool("continuity_thread_list", "List durable work threads.", {"status": TEXT}, read_only=True),
+    _tool("gsv_thread_list", "List durable work threads.", {"status": TEXT}, read_only=True),
     _tool(
-        "continuity_thread_show",
+        "gsv_thread_show",
         "Read one exact work thread.",
         {"id": TEXT},
         ("id",),
         read_only=True,
     ),
     _tool(
-        "continuity_thread_create",
+        "gsv_thread_create",
         "Create an explicitly authored work thread with exact relationships.",
         {
             "entity_ids": TEXTS,
@@ -397,7 +397,7 @@ TOOLS: Final = [
         read_only=False,
     ),
     _tool(
-        "continuity_thread_update",
+        "gsv_thread_update",
         "Update an exact work thread using its latest compare-and-swap revision.",
         {
             "add_refs": TEXTS,
@@ -417,14 +417,14 @@ TOOLS: Final = [
         read_only=False,
     ),
     _tool(
-        "continuity_document_show",
+        "gsv_document_show",
         "Read MIND.md or NOW.md and its revision.",
         {"name": {"enum": ["MIND.md", "NOW.md"], "type": "string"}},
         ("name",),
         read_only=True,
     ),
     _tool(
-        "continuity_document_update",
+        "gsv_document_update",
         "Update MIND.md or NOW.md using its latest compare-and-swap revision.",
         {
             "content": TEXT,
@@ -435,7 +435,7 @@ TOOLS: Final = [
         read_only=False,
     ),
     _tool(
-        "continuity_backup_create",
+        "gsv_backup_create",
         "Create and verify a portable local vault backup.",
         {},
         read_only=False,

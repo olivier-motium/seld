@@ -12,11 +12,11 @@ the privacy gate, and package builds before producing native executables.
 
 The release matrix produces:
 
-- `continuity-macos-arm64`
-- `continuity-macos-x86_64`
-- `continuity-linux-x86_64`
-- `continuity-linux-arm64`
-- `continuity-windows-x86_64.exe`
+- `gsv-macos-arm64`
+- `gsv-macos-x86_64`
+- `gsv-linux-x86_64`
+- `gsv-linux-arm64`
+- `gsv-windows-x86_64.exe`
 
 Windows ARM64 uses the x64 asset through Windows' built-in emulation until a
 native ARM64 artifact has passed the same release gates. That emulated path is

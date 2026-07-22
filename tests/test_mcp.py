@@ -34,7 +34,7 @@ def _exchange(
 
 def _start(vault: Path) -> subprocess.Popen[str]:
     environment = os.environ.copy()
-    environment["CONTINUITY_VAULT"] = str(vault)
+    environment["GSV_VAULT"] = str(vault)
     return subprocess.Popen(
         [sys.executable, "-m", "continuity_kernel", "mcp", "serve"],
         stdin=subprocess.PIPE,
@@ -64,7 +64,7 @@ def test_two_independent_mcp_sessions_share_durable_state(tmp_path: Path) -> Non
         "tools/call",
         3,
         {
-            "name": "continuity_task_create",
+            "name": "gsv_task_create",
             "arguments": {
                 "id": "cross-session-proof",
                 "title": "Cross-session proof",
@@ -83,12 +83,12 @@ def test_two_independent_mcp_sessions_share_durable_state(tmp_path: Path) -> Non
         second,
         "tools/call",
         2,
-        {"name": "continuity_task_show", "arguments": {"id": "cross-session-proof"}},
+        {"name": "gsv_task_show", "arguments": {"id": "cross-session-proof"}},
     )
     _close(second)
 
-    assert initialized["result"]["serverInfo"]["name"] == "continuity"
-    assert any(tool["name"] == "continuity_task_create" for tool in tools["result"]["tools"])
+    assert initialized["result"]["serverInfo"]["name"] == "gsv"
+    assert any(tool["name"] == "gsv_task_create" for tool in tools["result"]["tools"])
     assert created["result"]["structuredContent"]["identifier"] == "cross-session-proof"
     assert resumed["result"]["structuredContent"]["next_action"] == ("Read from a second process.")
 
@@ -114,7 +114,7 @@ def test_mcp_returns_structured_conflict_instead_of_overwriting(tmp_path: Path) 
         "tools/call",
         1,
         {
-            "name": "continuity_task_update",
+            "name": "gsv_task_update",
             "arguments": {
                 "id": task.identifier,
                 "expected_revision": task.revision,
@@ -206,7 +206,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
     vault_path = tmp_path / "direct-vault"
     vault = Vault(vault_path)
     vault.initialize(name="Direct MCP")
-    monkeypatch.setenv("CONTINUITY_VAULT", str(vault_path))
+    monkeypatch.setenv("GSV_VAULT", str(vault_path))
 
     initialized = mcp_server._handle({"id": 1, "method": "initialize"})
     ping = mcp_server._handle({"id": 2, "method": "ping"})
@@ -214,7 +214,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
     assert mcp_server._handle({"method": "notifications/initialized"}) is None
 
     created_task = _direct_call(
-        "continuity_task_create",
+        "gsv_task_create",
         {
             "id": "direct-task",
             "title": "Direct task",
@@ -226,7 +226,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
         },
     )["result"]["structuredContent"]
     updated_task = _direct_call(
-        "continuity_task_update",
+        "gsv_task_update",
         {
             "id": "direct-task",
             "expected_revision": created_task["revision"],
@@ -235,7 +235,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
         },
     )["result"]["structuredContent"]
     created_entity = _direct_call(
-        "continuity_entity_create",
+        "gsv_entity_create",
         {
             "id": "person:direct-owner",
             "title": "Direct Owner",
@@ -245,7 +245,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
         },
     )["result"]["structuredContent"]
     updated_entity = _direct_call(
-        "continuity_entity_update",
+        "gsv_entity_update",
         {
             "id": created_entity["identifier"],
             "expected_revision": created_entity["revision"],
@@ -255,7 +255,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
         },
     )["result"]["structuredContent"]
     created_thread = _direct_call(
-        "continuity_thread_create",
+        "gsv_thread_create",
         {
             "id": "thread:direct",
             "title": "Direct thread",
@@ -266,7 +266,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
         },
     )["result"]["structuredContent"]
     updated_thread = _direct_call(
-        "continuity_thread_update",
+        "gsv_thread_update",
         {
             "id": created_thread["identifier"],
             "expected_revision": created_thread["revision"],
@@ -277,7 +277,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
 
     now = vault.read_document("NOW.md")
     updated_document = _direct_call(
-        "continuity_document_update",
+        "gsv_document_update",
         {
             "name": "NOW.md",
             "content": "# Now\n\nDirect MCP state.",
@@ -285,17 +285,17 @@ def test_direct_protocol_surface_exercises_all_record_types(
         },
     )["result"]["structuredContent"]
     calls = {
-        "status": _direct_call("continuity_status", {}),
-        "context": _direct_call("continuity_context", {"max_characters": 4000}),
-        "doctor": _direct_call("continuity_doctor", {}),
-        "task_list": _direct_call("continuity_task_list", {"status": "doing"}),
-        "task_show": _direct_call("continuity_task_show", {"id": "direct-task"}),
-        "entity_list": _direct_call("continuity_entity_list", {}),
-        "entity_show": _direct_call("continuity_entity_show", {"id": "person:direct-owner"}),
-        "thread_list": _direct_call("continuity_thread_list", {"status": "active"}),
-        "thread_show": _direct_call("continuity_thread_show", {"id": "thread:direct"}),
-        "document_show": _direct_call("continuity_document_show", {"name": "NOW.md"}),
-        "backup": _direct_call("continuity_backup_create", {}),
+        "status": _direct_call("gsv_status", {}),
+        "context": _direct_call("gsv_context", {"max_characters": 4000}),
+        "doctor": _direct_call("gsv_doctor", {}),
+        "task_list": _direct_call("gsv_task_list", {"status": "doing"}),
+        "task_show": _direct_call("gsv_task_show", {"id": "direct-task"}),
+        "entity_list": _direct_call("gsv_entity_list", {}),
+        "entity_show": _direct_call("gsv_entity_show", {"id": "person:direct-owner"}),
+        "thread_list": _direct_call("gsv_thread_list", {"status": "active"}),
+        "thread_show": _direct_call("gsv_thread_show", {"id": "thread:direct"}),
+        "document_show": _direct_call("gsv_document_show", {"name": "NOW.md"}),
+        "backup": _direct_call("gsv_backup_create", {}),
     }
 
     assert initialized and initialized["result"]["protocolVersion"]
@@ -313,7 +313,7 @@ def test_protocol_validation_and_tool_errors(
 ) -> None:
     vault_path = tmp_path / "errors"
     Vault(vault_path).initialize(name="MCP errors")
-    monkeypatch.setenv("CONTINUITY_VAULT", str(vault_path))
+    monkeypatch.setenv("GSV_VAULT", str(vault_path))
 
     missing_method = mcp_server._handle({"id": 1, "method": "unknown"})
     missing_name = mcp_server._handle({"id": 2, "method": "tools/call", "params": {}})
@@ -321,7 +321,7 @@ def test_protocol_validation_and_tool_errors(
         {"id": 3, "method": "tools/call", "params": {"name": "x", "arguments": []}}
     )
     unknown_tool = _direct_call("not_a_tool", {})
-    missing_field = _direct_call("continuity_task_show", {})
+    missing_field = _direct_call("gsv_task_show", {})
     unknown_notification = mcp_server._handle(
         {"jsonrpc": "2.0", "method": "notifications/future-extension"}
     )

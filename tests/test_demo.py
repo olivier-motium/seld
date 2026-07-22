@@ -8,7 +8,7 @@ from continuity_kernel.demo import run_demo
 from continuity_kernel.errors import ConflictError
 
 
-def test_demo_proves_all_public_continuity_guarantees(tmp_path: Path) -> None:
+def test_demo_proves_all_public_gsv_guarantees(tmp_path: Path) -> None:
     result = run_demo(tmp_path / "demo")
 
     assert result["backup_verified"] is True

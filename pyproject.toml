@@ -3,14 +3,14 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-continuity-kernel"
+name = "gsv"
 version = "0.1.0"
-description = "A local-first continuity kernel for coding agents"
+description = "A local-first durable state layer for coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
-authors = [{ name = "Continuity contributors" }]
-keywords = ["agents", "codex", "continuity", "local-first", "mcp"]
+authors = [{ name = "GSV contributors" }]
+keywords = ["agents", "codex", "gsv", "local-first", "mcp"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -36,11 +36,11 @@ release = [
 ]
 
 [project.scripts]
-continuity = "continuity_kernel.cli:main"
+gsv = "continuity_kernel.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/olivier-motium/agent-continuity-kernel"
-Issues = "https://github.com/olivier-motium/agent-continuity-kernel/issues"
+Homepage = "https://github.com/olivier-motium/gsv"
+Issues = "https://github.com/olivier-motium/gsv/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/continuity_kernel"]

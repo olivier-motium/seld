@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_posix_reinstall_failure_restores_previous_binary(tmp_path: Path) -> None:
     install_dir = tmp_path / "bin"
     install_dir.mkdir()
-    target = install_dir / "continuity"
+    target = install_dir / "gsv"
     old = b"#!/bin/sh\nprintf 'old binary\\n'\n"
     target.write_bytes(old)
     target.chmod(0o755)
@@ -34,9 +34,9 @@ def test_posix_reinstall_failure_restores_previous_binary(tmp_path: Path) -> Non
     environment = os.environ.copy()
     environment.update(
         {
-            "CONTINUITY_BINARY": str(candidate),
-            "CONTINUITY_BINARY_SHA256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
-            "CONTINUITY_BIN_DIR": str(install_dir),
+            "GSV_BINARY": str(candidate),
+            "GSV_BINARY_SHA256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            "GSV_BIN_DIR": str(install_dir),
             "HOME": str(tmp_path / "home"),
             "PATH": f"{fake_tools}{os.pathsep}{environment['PATH']}",
         }
@@ -53,7 +53,7 @@ def test_posix_reinstall_failure_restores_previous_binary(tmp_path: Path) -> Non
 
     assert result.returncode == 42
     assert target.read_bytes() == old, result.stderr
-    assert not list(install_dir.glob(".continuity.*"))
+    assert not list(install_dir.glob(".gsv.*"))
 
 
 def test_powershell_reinstall_failure_restores_previous_binary(tmp_path: Path) -> None:
@@ -62,7 +62,7 @@ def test_powershell_reinstall_failure_restores_previous_binary(tmp_path: Path) -
         pytest.skip("PowerShell is not installed on this runner")
     install_dir = tmp_path / "bin"
     install_dir.mkdir()
-    target = install_dir / "continuity.exe"
+    target = install_dir / "gsv.exe"
     old = b"synthetic previous executable"
     target.write_bytes(old)
     candidate = Path(sys.executable)
@@ -76,9 +76,9 @@ def test_powershell_reinstall_failure_restores_previous_binary(tmp_path: Path) -
     environment = os.environ.copy()
     environment.update(
         {
-            "CONTINUITY_BINARY": str(candidate),
-            "CONTINUITY_BINARY_SHA256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
-            "CONTINUITY_BIN_DIR": str(install_dir),
+            "GSV_BINARY": str(candidate),
+            "GSV_BINARY_SHA256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            "GSV_BIN_DIR": str(install_dir),
             "PATH": f"{fake_tools}{os.pathsep}{environment['PATH']}",
         }
     )
@@ -94,7 +94,7 @@ def test_powershell_reinstall_failure_restores_previous_binary(tmp_path: Path) -
 
     assert result.returncode != 0
     assert target.read_bytes() == old, result.stderr
-    assert not list(install_dir.glob(".continuity.*"))
+    assert not list(install_dir.glob(".gsv.*"))
 
 
 def test_history_privacy_scan_flags_oversized_blob(
@@ -124,12 +124,12 @@ def test_history_privacy_scan_flags_oversized_blob(
 def test_artifact_directory_scan_is_recursive(tmp_path: Path) -> None:
     nested = tmp_path / "artifacts/platform"
     nested.mkdir(parents=True)
-    (nested / "continuity").write_text("-----BEGIN " + "PRIVATE KEY-----", encoding="utf-8")
+    (nested / "gsv").write_text("-----BEGIN " + "PRIVATE KEY-----", encoding="utf-8")
 
     findings, scanned = privacy_check.scan_tree(tmp_path / "artifacts", privacy_check.PATTERNS)
 
     assert scanned == 1
-    assert findings == [privacy_check.Finding("platform/continuity", "working-tree")]
+    assert findings == [privacy_check.Finding("platform/gsv", "working-tree")]
 
 
 def test_privacy_scan_detects_json_escaped_windows_home(tmp_path: Path) -> None:

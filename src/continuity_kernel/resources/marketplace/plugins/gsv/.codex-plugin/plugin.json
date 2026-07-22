@@ -1,25 +1,25 @@
 {
-  "name": "continuity",
+  "name": "gsv",
   "version": "0.1.0",
   "description": "Durable local context, tasks, entities, and work threads for Codex.",
   "author": {
-    "name": "Continuity contributors"
+    "name": "GSV contributors"
   },
-  "homepage": "https://github.com/olivier-motium/agent-continuity-kernel",
-  "repository": "https://github.com/olivier-motium/agent-continuity-kernel",
+  "homepage": "https://github.com/olivier-motium/gsv",
+  "repository": "https://github.com/olivier-motium/gsv",
   "license": "Apache-2.0",
-  "keywords": ["agents", "codex", "continuity", "local-first", "memory"],
+  "keywords": ["agents", "codex", "gsv", "local-first", "memory"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Continuity",
+    "displayName": "GSV",
     "shortDescription": "Carry grounded context across Codex sessions",
     "longDescription": "Local-first durable context for coding agents, with inspectable Markdown, exact records, compare-and-swap writes, and portable backup and restore.",
-    "developerName": "Continuity contributors",
+    "developerName": "GSV contributors",
     "category": "Developer Tools",
     "capabilities": ["Read", "Write"],
     "defaultPrompt": [
-      "Show me what this Continuity vault currently knows",
+      "Show me what this GSV vault currently knows",
       "Create a durable task for this outcome",
       "Prepare a handoff for my next Codex session"
     ],

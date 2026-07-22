@@ -165,7 +165,7 @@ def scan_history(root: Path, patterns: tuple[re.Pattern[bytes], ...]) -> list[Fi
 
 
 def _private_term_patterns() -> tuple[re.Pattern[bytes], ...]:
-    raw = os.environ.get("CONTINUITY_PRIVATE_TERMS", "")
+    raw = os.environ.get("GSV_PRIVATE_TERMS", "")
     terms = [item.strip() for item in raw.split(",") if item.strip()]
     return tuple(re.compile(re.escape(term.encode("utf-8")), re.IGNORECASE) for term in terms)
 
@@ -178,7 +178,7 @@ def _relative(path: Path, root: Path) -> str:
 
 
 def _self_test() -> None:
-    with tempfile.TemporaryDirectory(prefix="continuity-privacy-self-test-") as raw:
+    with tempfile.TemporaryDirectory(prefix="gsv-privacy-self-test-") as raw:
         root = Path(raw)
         clean = root / "clean.txt"
         bad = root / "bad.txt"

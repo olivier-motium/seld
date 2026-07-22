@@ -75,7 +75,7 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
 
     first = integration.install_codex(vault=vault, codex_home=home)
     generated_marketplace = Path(first.marketplace_root)
-    assert not (home / "AGENTS.md.continuity-backup").exists()
+    assert not (home / "AGENTS.md.gsv-backup").exists()
     second = integration.install_codex(vault=vault, codex_home=home)
     removed = integration.uninstall_codex(codex_home=home)
 
@@ -166,7 +166,7 @@ def test_failed_final_status_restores_existing_agents_and_removes_new_backup(
         integration.install_codex(vault=tmp_path / "vault", codex_home=home)
 
     assert agents.read_bytes() == original
-    assert not (home / "AGENTS.md.continuity-backup").exists()
+    assert not (home / "AGENTS.md.gsv-backup").exists()
     assert fake_codex.plugins == set()
     assert fake_codex.marketplaces == {}
 
@@ -205,7 +205,7 @@ def test_failed_reinstall_restores_previous_marketplace_bytes(
     first_vault = tmp_path / "first-vault"
     second_vault = tmp_path / "second-vault"
     installed = integration.install_codex(vault=first_vault, codex_home=home)
-    manifest = Path(installed.marketplace_root) / "plugins/continuity/.mcp.json"
+    manifest = Path(installed.marketplace_root) / "plugins/gsv/.mcp.json"
     before = manifest.read_bytes()
     monkeypatch.setattr(
         integration,
@@ -218,9 +218,7 @@ def test_failed_reinstall_restores_previous_marketplace_bytes(
 
     assert manifest.read_bytes() == before
     payload = json.loads(before)
-    assert payload["mcpServers"]["continuity"]["env"]["CONTINUITY_VAULT"] == str(
-        first_vault.resolve()
-    )
+    assert payload["mcpServers"]["gsv"]["env"]["GSV_VAULT"] == str(first_vault.resolve())
 
 
 def test_existing_managed_block_is_restored_exactly_on_failure(
@@ -262,8 +260,8 @@ def test_conflicting_marketplace_root_fails_without_plugin_or_instruction_mutati
 
 
 def _launch_generated_manifest(marketplace: Path) -> dict[str, Any]:
-    payload = json.loads((marketplace / "plugins/continuity/.mcp.json").read_text(encoding="utf-8"))
-    server = payload["mcpServers"]["continuity"]
+    payload = json.loads((marketplace / "plugins/gsv/.mcp.json").read_text(encoding="utf-8"))
+    server = payload["mcpServers"]["gsv"]
     environment = os.environ.copy()
     environment.update(server["env"])
     process = subprocess.Popen(
@@ -295,12 +293,12 @@ def test_exact_source_runtime_manifest_executes(tmp_path: Path) -> None:
 
     assert result["server"]["command"] == sys.executable
     assert result["server"]["args"] == ["-m", "continuity_kernel", "mcp", "serve"]
-    assert result["response"]["result"]["serverInfo"]["name"] == "continuity"
+    assert result["response"]["result"]["serverInfo"]["name"] == "gsv"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="executable shebang fixture is POSIX-specific")
 def test_exact_frozen_runtime_manifest_executes_without_python_module_args(tmp_path: Path) -> None:
-    launcher = tmp_path / "continuity-frozen"
+    launcher = tmp_path / "gsv-frozen"
     launcher.write_text(
         f"#!{sys.executable}\n"
         "import sys\n"
@@ -320,7 +318,7 @@ def test_exact_frozen_runtime_manifest_executes_without_python_module_args(tmp_p
 
     assert result["server"]["command"] == str(launcher)
     assert result["server"]["args"] == ["mcp", "serve"]
-    assert result["response"]["result"]["serverInfo"]["name"] == "continuity"
+    assert result["response"]["result"]["serverInfo"]["name"] == "gsv"
 
 
 def test_runtime_command_switches_for_frozen_build(monkeypatch: pytest.MonkeyPatch) -> None:

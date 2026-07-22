@@ -8,7 +8,7 @@ context rendering, backup, restore, and health checks. The CLI and dependency-
 free stdio MCP server are adapters over that same vault.
 
 The Codex integration generates a per-Codex-home local marketplace containing
-the Continuity plugin, MCP manifest, and skill. The manifest points directly to
+the GSV plugin, MCP manifest, and skill. The manifest points directly to
 the installed standalone executable for release installs, or to the active
 console/module launcher for source installs.
 
@@ -16,7 +16,7 @@ console/module launcher for source installs.
 
 1. A caller reads an exact record and receives its SHA-256 revision.
 2. The caller submits an update with that revision.
-3. Continuity takes the appropriate cross-process lock and re-reads the record.
+3. GSV takes the appropriate cross-process lock and re-reads the record.
 4. A mismatched revision is rejected as a stale write.
 5. Valid content is written to a same-directory temporary file, flushed, and
    atomically replaced.
@@ -28,7 +28,7 @@ snapshot cannot mix record versions.
 
 ## Ownership
 
-The vault is user data. Continuity never deletes it during Codex uninstall.
+The vault is user data. GSV never deletes it during Codex uninstall.
 The generated marketplace, plugin registration, managed instruction block, and
 installation receipt are integration state. The installer records what it
 owns and removes only those components when their expected content is still
@@ -36,7 +36,7 @@ present.
 
 Installation failure rolls back components added by that invocation. Existing
 marketplaces, plugins, instructions, binaries, and unrelated concurrent edits
-are preserved. A conflicting unowned Continuity marketplace is reported rather
+are preserved. A conflicting unowned GSV marketplace is reported rather
 than adopted.
 
 ## Portability

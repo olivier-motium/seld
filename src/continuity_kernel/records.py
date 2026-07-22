@@ -20,7 +20,7 @@ MAX_RELATIONS: Final = 100
 SAFE_ID = re.compile(r"^[a-z][a-z0-9]*(?::[a-z0-9][a-z0-9-]{0,95})$")
 SAFE_TASK_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
-META = re.compile(r"^<!-- continuity:(\{.*\}) -->$")
+META = re.compile(r"^<!-- gsv:(\{.*\}) -->$")
 
 TaskStatus = Literal["captured", "ready", "doing", "waiting", "someday", "done", "dropped"]
 Actor = Literal["agent", "human", "external"]
@@ -456,7 +456,7 @@ def _validate_thread_state(thread: WorkThread) -> None:
 
 def _render(metadata: dict[str, Any], title: str, sections: tuple[tuple[str, str], ...]) -> str:
     meta = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    body = [f"<!-- continuity:{meta} -->", "", f"# {title_text(title)}", ""]
+    body = [f"<!-- gsv:{meta} -->", "", f"# {title_text(title)}", ""]
     for heading, content in sections:
         body.extend((f"## {heading}", body_text(content, heading, required=True), ""))
     markdown = "\n".join(body).rstrip() + "\n"

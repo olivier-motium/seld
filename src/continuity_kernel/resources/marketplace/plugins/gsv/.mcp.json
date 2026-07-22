@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "continuity": {
+    "gsv": {
       "command": "{{PYTHON}}",
       "args": ["-m", "continuity_kernel", "mcp", "serve"]
     }

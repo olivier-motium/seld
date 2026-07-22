@@ -1,9 +1,9 @@
-# Continuity
+# GSV
 
-Continuity is a local-first state kernel for coding agents. It gives Codex an
-inspectable, versioned place for durable tasks, entities, evidence, and work
-threads without a hosted service, database server, embedding model, API key, or
-background daemon.
+GSV gives Codex durable, inspectable memory across tasks and sessions. It keeps
+tasks, entities, evidence, and work threads in local, versioned Markdown without
+a hosted service, database server, embedding model, API key, or background
+daemon.
 
 The project is an early release candidate. Its format is intentionally small
 and human-readable, but backward compatibility is not guaranteed before `1.0`.
@@ -22,7 +22,7 @@ After a release is published, macOS and Linux users can run:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO \
-  https://raw.githubusercontent.com/olivier-motium/agent-continuity-kernel/main/scripts/install.sh
+  https://raw.githubusercontent.com/olivier-motium/gsv/main/scripts/install.sh
 sh install.sh
 ```
 
@@ -30,7 +30,7 @@ Windows users can run this in PowerShell:
 
 ```powershell
 Invoke-WebRequest `
-  https://raw.githubusercontent.com/olivier-motium/agent-continuity-kernel/main/scripts/install.ps1 `
+  https://raw.githubusercontent.com/olivier-motium/gsv/main/scripts/install.ps1 `
   -OutFile install.ps1
 .\install.ps1
 ```
@@ -40,7 +40,7 @@ SHA-256 checksum. It does not require Python, `uv`, or `make`. It stages the new
 binary in the destination directory, replaces an existing binary atomically,
 and restores the previous binary if setup fails.
 
-Setup creates `~/Continuity` by default, registers a local Codex marketplace
+Setup creates `~/GSV` by default, registers a local Codex marketplace
 and plugin through the Codex CLI, and adds one managed block to Codex's
 `AGENTS.md`. Existing instructions are preserved. Restart Codex after setup,
 open a fresh task, and ask:
@@ -53,13 +53,13 @@ upgrades, and removal.
 ## Verify
 
 ```bash
-continuity doctor
-continuity status
-continuity demo
-continuity context
+gsv doctor
+gsv status
+gsv demo
+gsv context
 ```
 
-`continuity demo` uses and removes an isolated temporary vault containing synthetic data.
+`gsv demo` uses and removes an isolated temporary vault containing synthetic data.
 It demonstrates same-name entity disambiguation, fresh-process resumption,
 stale-write rejection, crash recovery, backup verification, and logical restore
 equivalence.
@@ -67,21 +67,21 @@ equivalence.
 ## Use
 
 ```bash
-continuity task create --id ship-atlas --title "Ship Atlas" \
+gsv task create --id ship-atlas --title "Ship Atlas" \
   --outcome "Atlas is deployed with rollback evidence" \
   --status doing --next-actor agent \
   --next-action "Run the failover test"
 
-continuity task list
-continuity context
-continuity backup create
-continuity doctor
+gsv task list
+gsv context
+gsv backup create
+gsv doctor
 ```
 
 Every update requires the exact `revision` returned by the preceding read:
 
 ```bash
-continuity task update ship-atlas \
+gsv task update ship-atlas \
   --expected-revision '<sha256 revision>' \
   --next-action "Record the observed failover result"
 ```
@@ -94,7 +94,7 @@ The integration-only command removes installer-owned Codex components and
 leaves the executable installed:
 
 ```bash
-continuity codex uninstall
+gsv codex uninstall
 ```
 
 The release uninstall scripts remove the executable and Codex integration:
@@ -112,7 +112,7 @@ settings, and components the installer does not own.
 
 ## Boundaries
 
-Continuity is not a chat application, autonomous scheduler, vector database,
+GSV is not a chat application, autonomous scheduler, vector database,
 connector marketplace, secret store, or cloud sync service. Markdown is
 authoritative. The CLI and MCP server share the same typed kernel. Provider
 integrations, remote execution, and background polling are outside the initial

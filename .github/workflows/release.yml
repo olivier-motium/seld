@@ -45,15 +45,15 @@ jobs:
       matrix:
         include:
           - runner: macos-15
-            asset: continuity-macos-arm64
+            asset: gsv-macos-arm64
           - runner: macos-15-intel
-            asset: continuity-macos-x86_64
+            asset: gsv-macos-x86_64
           - runner: ubuntu-22.04
-            asset: continuity-linux-x86_64
+            asset: gsv-linux-x86_64
           - runner: ubuntu-24.04-arm
-            asset: continuity-linux-arm64
+            asset: gsv-linux-arm64
           - runner: windows-2025
-            asset: continuity-windows-x86_64.exe
+            asset: gsv-windows-x86_64.exe
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -106,4 +106,4 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" release/*
           --verify-tag
           --generate-notes
-          --title "Continuity ${GITHUB_REF_NAME}"
+          --title "GSV ${GITHUB_REF_NAME}"

@@ -1,6 +1,6 @@
 # Repository instructions
 
-This repository contains the public, owner-neutral Continuity kernel. Keep the
+This repository contains the public, owner-neutral GSV kernel. Keep the
 runtime local-first, dependency-light, and safe for nontechnical Codex users.
 
 - Never add real personal data, credentials, provider payloads, private paths,

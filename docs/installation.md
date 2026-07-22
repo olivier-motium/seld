@@ -10,16 +10,16 @@ installer uses PowerShell's `Invoke-WebRequest` and `Get-FileHash`.
 
 ## What Setup Changes
 
-- macOS/Linux executable: `${HOME}/.local/bin/continuity`
-- Windows executable: `%LOCALAPPDATA%\Continuity\bin\continuity.exe`
-- Default vault: `${HOME}/Continuity`
+- macOS/Linux executable: `${HOME}/.local/bin/gsv`
+- Windows executable: `%LOCALAPPDATA%\GSV\bin\gsv.exe`
+- Default vault: `${HOME}/GSV`
 - Codex home: `${CODEX_HOME}` or `${HOME}/.codex`
-- A generated local marketplace under Continuity's application-data directory
+- A generated local marketplace under GSV's application-data directory
 - One bounded managed block in Codex's `AGENTS.md`
 - A small ownership receipt and a config file pointing to the vault
 
-Set `CONTINUITY_BIN_DIR`, `CONTINUITY_VAULT`, `CONTINUITY_CONFIG_DIR`,
-`CONTINUITY_DATA_DIR`, or `CODEX_HOME` before installation to override those
+Set `GSV_BIN_DIR`, `GSV_VAULT`, `GSV_CONFIG_DIR`,
+`GSV_DATA_DIR`, or `CODEX_HOME` before installation to override those
 locations.
 
 ## Offline Or Controlled Install
@@ -28,8 +28,8 @@ Download a release asset and checksum through your approved channel, verify the
 checksum independently, then set:
 
 ```bash
-CONTINUITY_BINARY=/path/to/continuity \
-CONTINUITY_BINARY_SHA256='<expected sha256>' \
+GSV_BINARY=/path/to/gsv \
+GSV_BINARY_SHA256='<expected sha256>' \
 sh scripts/install.sh
 ```
 
@@ -51,8 +51,8 @@ only components added by that failed invocation.
 Back up the vault before a future release that announces a format migration:
 
 ```bash
-continuity backup create
-continuity backup verify /path/to/backup.zip
+gsv backup create
+gsv backup verify /path/to/backup.zip
 ```
 
 ## Source Development
@@ -61,19 +61,19 @@ The checkout path is deliberately separate from the consumer path:
 
 ```bash
 uv sync --extra dev --extra release
-uv run continuity setup
+uv run gsv setup
 ```
 
 That path requires Python 3.11+ and `uv`; the release installer does not.
 
 ## Removal
 
-`continuity codex uninstall` removes the plugin registration, owned marketplace,
+`gsv codex uninstall` removes the plugin registration, owned marketplace,
 generated marketplace files, managed instructions, and receipt. The release
 uninstall script also removes the executable. Both preserve the vault and
 configuration so reinstalling resumes the same state.
 
-Neither Codex status nor Codex uninstall requires a readable Continuity vault
+Neither Codex status nor Codex uninstall requires a readable GSV vault
 configuration. This keeps recovery possible when only the integration needs to
 be inspected or removed.
 

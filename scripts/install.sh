@@ -1,10 +1,10 @@
 #!/bin/sh
 set -eu
 
-VERSION="${CONTINUITY_VERSION:-0.1.0}"
-RELEASE_BASE="${CONTINUITY_RELEASE_BASE_URL:-https://github.com/olivier-motium/agent-continuity-kernel/releases/download/v${VERSION}}"
-INSTALL_DIR="${CONTINUITY_BIN_DIR:-${HOME}/.local/bin}"
-TARGET="${INSTALL_DIR}/continuity"
+VERSION="${GSV_VERSION:-0.1.0}"
+RELEASE_BASE="${GSV_RELEASE_BASE_URL:-https://github.com/olivier-motium/gsv/releases/download/v${VERSION}}"
+INSTALL_DIR="${GSV_BIN_DIR:-${HOME}/.local/bin}"
+TARGET="${INSTALL_DIR}/gsv"
 
 if ! command -v codex >/dev/null 2>&1; then
   printf '%s\n' "Codex CLI was not found on PATH. Install Codex Desktop or the Codex CLI first." >&2
@@ -23,16 +23,16 @@ case "$(uname -m)" in
   *) printf '%s\n' "Unsupported CPU architecture: $(uname -m)" >&2; exit 2 ;;
 esac
 
-asset="continuity-${platform}-${architecture}"
-temporary="$(mktemp -d "${TMPDIR:-/tmp}/continuity-install.XXXXXX")"
+asset="gsv-${platform}-${architecture}"
+temporary="$(mktemp -d "${TMPDIR:-/tmp}/gsv-install.XXXXXX")"
 trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 download="${temporary}/${asset}"
 
-if [ -n "${CONTINUITY_BINARY:-}" ]; then
-  cp "${CONTINUITY_BINARY}" "$download"
-  expected="${CONTINUITY_BINARY_SHA256:-}"
+if [ -n "${GSV_BINARY:-}" ]; then
+  cp "${GSV_BINARY}" "$download"
+  expected="${GSV_BINARY_SHA256:-}"
   if [ -z "$expected" ]; then
-    printf '%s\n' "CONTINUITY_BINARY_SHA256 is required with CONTINUITY_BINARY." >&2
+    printf '%s\n' "GSV_BINARY_SHA256 is required with GSV_BINARY." >&2
     exit 2
   fi
 else
@@ -55,25 +55,25 @@ else
 fi
 
 if [ "$actual" != "$expected" ]; then
-  printf '%s\n' "Continuity artifact checksum verification failed." >&2
+  printf '%s\n' "GSV artifact checksum verification failed." >&2
   exit 2
 fi
 
 mkdir -p "$INSTALL_DIR"
 if [ -L "$TARGET" ]; then
-  printf '%s\n' "Refusing to replace a symbolic-link Continuity target: $TARGET" >&2
+  printf '%s\n' "Refusing to replace a symbolic-link GSV target: $TARGET" >&2
   exit 2
 fi
-staged="$(mktemp "${INSTALL_DIR}/.continuity.new.XXXXXX")"
+staged="$(mktemp "${INSTALL_DIR}/.gsv.new.XXXXXX")"
 install -m 0755 "$download" "$staged"
 backup=""
 if [ -e "$TARGET" ]; then
-  backup="$(mktemp "${INSTALL_DIR}/.continuity.previous.XXXXXX")"
+  backup="$(mktemp "${INSTALL_DIR}/.gsv.previous.XXXXXX")"
   cp -p "$TARGET" "$backup"
 fi
 if ! mv "$staged" "$TARGET"; then
   [ -z "$backup" ] || rm -f "$backup"
-  printf '%s\n' "Could not atomically install the Continuity executable." >&2
+  printf '%s\n' "Could not atomically install the GSV executable." >&2
   exit 2
 fi
 
@@ -87,16 +87,16 @@ if [ "$setup_status" -ne 0 ]; then
   else
     rm -f "$TARGET"
   fi
-  printf '%s\n' "Continuity setup failed; the previous executable was restored." >&2
+  printf '%s\n' "GSV setup failed; the previous executable was restored." >&2
   exit "$setup_status"
 fi
 if [ -n "$backup" ] && [ -e "$backup" ]; then
   rm "$backup"
 fi
 
-printf '\nInstalled Continuity at %s\n' "$TARGET"
+printf '\nInstalled GSV at %s\n' "$TARGET"
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
-  *) printf 'Add %s to PATH to run continuity directly in future shells.\n' "$INSTALL_DIR" ;;
+  *) printf 'Add %s to PATH to run gsv directly in future shells.\n' "$INSTALL_DIR" ;;
 esac
 printf '%s\n' "Restart Codex, open a fresh task, and ask: What do you remember?"

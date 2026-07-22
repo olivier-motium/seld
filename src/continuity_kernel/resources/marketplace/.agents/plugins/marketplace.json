@@ -1,14 +1,14 @@
 {
-  "name": "continuity-local",
+  "name": "gsv-local",
   "interface": {
-    "displayName": "Continuity"
+    "displayName": "GSV"
   },
   "plugins": [
     {
-      "name": "continuity",
+      "name": "gsv",
       "source": {
         "source": "local",
-        "path": "./plugins/continuity"
+        "path": "./plugins/gsv"
       },
       "policy": {
         "installation": "AVAILABLE",

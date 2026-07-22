@@ -7,34 +7,6 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "agent-continuity-kernel"
-version = "0.1.0"
-source = { editable = "." }
-
-[package.optional-dependencies]
-dev = [
-    { name = "build" },
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
-release = [
-    { name = "pyinstaller" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "build", marker = "extra == 'dev'", specifier = ">=1.2.2" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.15" },
-    { name = "pyinstaller", marker = "extra == 'release'", specifier = ">=6.11,<7" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11" },
-]
-provides-extras = ["dev", "release"]
-
-[[package]]
 name = "altgraph"
 version = "0.17.5"
 source = { registry = "https://pypi.org/simple" }
@@ -195,6 +167,34 @@ wheels = [
 toml = [
     { name = "tomli", marker = "python_full_version <= '3.11'" },
 ]
+
+[[package]]
+name = "gsv"
+version = "0.1.0"
+source = { editable = "." }
+
+[package.optional-dependencies]
+dev = [
+    { name = "build" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+release = [
+    { name = "pyinstaller" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "build", marker = "extra == 'dev'", specifier = ">=1.2.2" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.15" },
+    { name = "pyinstaller", marker = "extra == 'release'", specifier = ">=6.11,<7" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
+    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11" },
+]
+provides-extras = ["dev", "release"]
 
 [[package]]
 name = "iniconfig"

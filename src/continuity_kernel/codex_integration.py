@@ -19,15 +19,15 @@ from continuity_kernel.config import codex_home as default_codex_home
 from continuity_kernel.config import data_dir
 from continuity_kernel.errors import ContinuityError, SetupError, ValidationError
 
-MARKETPLACE_NAME: Final = "continuity-local"
-PLUGIN_ID: Final = "continuity@continuity-local"
-BLOCK_START: Final = "<!-- continuity-managed:start -->"
-BLOCK_END: Final = "<!-- continuity-managed:end -->"
+MARKETPLACE_NAME: Final = "gsv-local"
+PLUGIN_ID: Final = "gsv@gsv-local"
+BLOCK_START: Final = "<!-- gsv-managed:start -->"
+BLOCK_END: Final = "<!-- gsv-managed:end -->"
 
 MANAGED_BLOCK = f"""{BLOCK_START}
-## Continuity
+## GSV
 
-For substantive work, use the installed Continuity plugin to load a bounded
+For substantive work, use the installed GSV plugin to load a bounded
 context pack before relying on conversational memory. Keep durable outcomes in
 exact task, entity, and work-thread records. Read a record immediately before
 mutation and use its compare-and-swap revision. A session ending never proves
@@ -87,7 +87,7 @@ def install_codex(*, vault: Path, codex_home: Path | None = None) -> CodexInstal
         )
     if existing is not None and not bool(prior_receipt.get("marketplace_owned")):
         raise SetupError(
-            "A pre-existing Continuity marketplace is not owned by this installer; "
+            "A pre-existing GSV marketplace is not owned by this installer; "
             "left it unchanged. Remove it explicitly before installing this copy."
         )
     plugins = _run_json(executable, ["plugin", "list", "--json"], home)
@@ -96,7 +96,7 @@ def install_codex(*, vault: Path, codex_home: Path | None = None) -> CodexInstal
     )
     if plugin_installed and not bool(prior_receipt.get("plugin_owned")):
         raise SetupError(
-            "A pre-existing Continuity plugin is not owned by this installer; "
+            "A pre-existing GSV plugin is not owned by this installer; "
             "left it unchanged. Remove it explicitly before installing this copy."
         )
     added_marketplace = False
@@ -120,7 +120,7 @@ def install_codex(*, vault: Path, codex_home: Path | None = None) -> CodexInstal
         instruction_change = _install_instructions(home)
         status = codex_status(codex_home=home)
         if not status["plugin_installed"] or not status["instructions_installed"]:
-            raise SetupError("Codex did not report the Continuity integration as installed")
+            raise SetupError("Codex did not report the GSV integration as installed")
         _save_receipt(
             home,
             marketplace_owned=added_marketplace or bool(prior_receipt.get("marketplace_owned")),
@@ -241,13 +241,13 @@ def _replace_marketplace(
     try:
         with as_file(source) as source_path:
             shutil.copytree(source_path, stage, dirs_exist_ok=True)
-        mcp_path = stage / "plugins/continuity/.mcp.json"
+        mcp_path = stage / "plugins/gsv/.mcp.json"
         payload = json.loads(mcp_path.read_text(encoding="utf-8"))
-        server = payload["mcpServers"]["continuity"]
+        server = payload["mcpServers"]["gsv"]
         command, arguments = runtime or _runtime_command()
         server["command"] = command
         server["args"] = [*arguments, "mcp", "serve"]
-        server["env"] = {"CONTINUITY_VAULT": str(vault.resolve())}
+        server["env"] = {"GSV_VAULT": str(vault.resolve())}
         atomic_write(mcp_path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode())
         installed_digest = _tree_digest(stage)
         if target.exists():
@@ -280,7 +280,7 @@ def _install_instructions(home: Path) -> _InstructionChange:
     path = home / "AGENTS.md"
     before = path.read_text(encoding="utf-8") if path.exists() else ""
     if (BLOCK_START in before) != (BLOCK_END in before):
-        raise ValidationError("existing Codex instructions contain an incomplete Continuity block")
+        raise ValidationError("existing Codex instructions contain an incomplete GSV block")
     if BLOCK_START in before:
         start = before.index(BLOCK_START)
         end = before.index(BLOCK_END, start) + len(BLOCK_END)
@@ -293,7 +293,7 @@ def _install_instructions(home: Path) -> _InstructionChange:
     backup: Path | None = None
     backup_created = False
     if before:
-        backup = home / "AGENTS.md.continuity-backup"
+        backup = home / "AGENTS.md.gsv-backup"
         if not backup.exists():
             atomic_write(backup, before.encode("utf-8"))
             backup_created = True
@@ -423,7 +423,7 @@ def _remove_instructions(home: Path) -> None:
     if BLOCK_START not in content and BLOCK_END not in content:
         return
     if (BLOCK_START in content) != (BLOCK_END in content):
-        raise ValidationError("cannot safely remove an incomplete Continuity instruction block")
+        raise ValidationError("cannot safely remove an incomplete GSV instruction block")
     start = content.index(BLOCK_START)
     end = content.index(BLOCK_END, start) + len(BLOCK_END)
     updated = (content[:start].rstrip() + "\n\n" + content[end:].lstrip()).strip()
@@ -480,7 +480,7 @@ def _runtime_command() -> tuple[str, list[str]]:
     if getattr(sys, "frozen", False):
         return sys.executable, []
     launcher = Path(sys.argv[0]).expanduser()
-    if launcher.name.lower() in {"continuity", "continuity.exe"} and launcher.exists():
+    if launcher.name.lower() in {"gsv", "gsv.exe"} and launcher.exists():
         return str(launcher.resolve()), []
     return sys.executable, ["-m", "continuity_kernel"]
 

@@ -1,19 +1,19 @@
 $ErrorActionPreference = "Stop"
 
-$InstallDir = if ($env:CONTINUITY_BIN_DIR) {
-    $env:CONTINUITY_BIN_DIR
+$InstallDir = if ($env:GSV_BIN_DIR) {
+    $env:GSV_BIN_DIR
 } else {
-    Join-Path $env:LOCALAPPDATA "Continuity\bin"
+    Join-Path $env:LOCALAPPDATA "GSV\bin"
 }
-$Target = Join-Path $InstallDir "continuity.exe"
+$Target = Join-Path $InstallDir "gsv.exe"
 
 if (-not (Test-Path -LiteralPath $Target -PathType Leaf)) {
-    throw "Continuity executable not found at $Target"
+    throw "GSV executable not found at $Target"
 }
 
 & $Target codex uninstall @args
 if ($LASTEXITCODE -ne 0) {
-    throw "Continuity integration uninstall failed with exit code $LASTEXITCODE."
+    throw "GSV integration uninstall failed with exit code $LASTEXITCODE."
 }
 Remove-Item -LiteralPath $Target -Force
-Write-Host "Removed the Continuity executable and Codex integration. Vault and config were preserved."
+Write-Host "Removed the GSV executable and Codex integration. Vault and config were preserved."

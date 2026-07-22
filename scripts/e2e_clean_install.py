@@ -44,7 +44,7 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    root = Path(tempfile.mkdtemp(prefix="continuity-clean-e2e-"))
+    root = Path(tempfile.mkdtemp(prefix="gsv-clean-e2e-"))
     report: dict[str, Any] = {"isolated_execution": True}
     try:
         auth_source = args.codex_auth_from.resolve() if args.codex_auth_from else None
@@ -116,12 +116,12 @@ def run_e2e(
         if shell is None:
             raise RuntimeError("PowerShell is required for the Windows installer proof")
         _run([shell, "-NoProfile", "-File", str(installer)], environment)
-        installed = install_bin / "continuity.exe"
+        installed = install_bin / "gsv.exe"
     else:
         _run(["/bin/sh", str(installer)], environment)
-        installed = install_bin / "continuity"
+        installed = install_bin / "gsv"
     if not installed.is_file():
-        raise RuntimeError("installer did not place the Continuity executable")
+        raise RuntimeError("installer did not place the GSV executable")
     installed_version = _run([str(installed), "--version"], environment).stdout.strip()
     binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
 
@@ -135,17 +135,15 @@ def run_e2e(
     )
     if not codex_status["plugin_installed"] or not codex_status["instructions_installed"]:
         raise RuntimeError("Codex integration did not report installed")
-    if not any(
-        item.get("pluginId") == "continuity@continuity-local" for item in plugin_list["installed"]
-    ):
-        raise RuntimeError("actual Codex plugin list does not contain Continuity")
+    if not any(item.get("pluginId") == "gsv@gsv-local" for item in plugin_list["installed"]):
+        raise RuntimeError("actual Codex plugin list does not contain GSV")
 
     marketplace = next(
-        item for item in marketplace_list["marketplaces"] if item.get("name") == "continuity-local"
+        item for item in marketplace_list["marketplaces"] if item.get("name") == "gsv-local"
     )
-    manifest_path = Path(str(marketplace["root"])) / "plugins/continuity/.mcp.json"
+    manifest_path = Path(str(marketplace["root"])) / "plugins/gsv/.mcp.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    server = manifest["mcpServers"]["continuity"]
+    server = manifest["mcpServers"]["gsv"]
     if Path(server["command"]).resolve() != installed.resolve() or server["args"] != [
         "mcp",
         "serve",
@@ -155,7 +153,7 @@ def run_e2e(
     created = _mcp_call(
         server,
         environment,
-        "continuity_task_create",
+        "gsv_task_create",
         {
             "id": "fresh-session-proof",
             "title": "Fresh session proof",
@@ -168,7 +166,7 @@ def run_e2e(
     resumed = _mcp_call(
         server,
         environment,
-        "continuity_task_show",
+        "gsv_task_show",
         {"id": "fresh-session-proof"},
     )
     if resumed["identifier"] != created["identifier"]:
@@ -257,12 +255,10 @@ def run_e2e(
     after_marketplaces = _json_command(
         [codex, "plugin", "marketplace", "list", "--json"], environment
     )
-    if any(
-        item.get("pluginId") == "continuity@continuity-local" for item in after_plugins["installed"]
-    ):
-        raise RuntimeError("Continuity plugin remains after uninstall")
-    if any(item.get("name") == "continuity-local" for item in after_marketplaces["marketplaces"]):
-        raise RuntimeError("Continuity marketplace remains after uninstall")
+    if any(item.get("pluginId") == "gsv@gsv-local" for item in after_plugins["installed"]):
+        raise RuntimeError("GSV plugin remains after uninstall")
+    if any(item.get("name") == "gsv-local" for item in after_marketplaces["marketplaces"]):
+        raise RuntimeError("GSV marketplace remains after uninstall")
     if manifest_path.parents[2].exists():
         raise RuntimeError("generated marketplace files remain after uninstall")
 
@@ -281,7 +277,7 @@ def run_e2e(
             environment,
         )
     if installed.exists():
-        raise RuntimeError("full uninstall left the Continuity executable installed")
+        raise RuntimeError("full uninstall left the GSV executable installed")
     if config_path.read_bytes() != config_before or _directory_digest(vault) != vault_files_before:
         raise RuntimeError("full uninstall changed the user vault or configuration")
 
@@ -347,12 +343,12 @@ def _isolated_environment(
         {
             "APPDATA": str(config),
             "CODEX_HOME": str(codex_home),
-            "CONTINUITY_BINARY": str(binary),
-            "CONTINUITY_BINARY_SHA256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-            "CONTINUITY_BIN_DIR": str(install_bin),
-            "CONTINUITY_CONFIG_DIR": str(config),
-            "CONTINUITY_DATA_DIR": str(data),
-            "CONTINUITY_VAULT": str(vault),
+            "GSV_BINARY": str(binary),
+            "GSV_BINARY_SHA256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+            "GSV_BIN_DIR": str(install_bin),
+            "GSV_CONFIG_DIR": str(config),
+            "GSV_DATA_DIR": str(data),
+            "GSV_VAULT": str(vault),
             "HOME": str(home),
             "LOCALAPPDATA": str(data),
             "PATH": minimal_path,
@@ -420,13 +416,13 @@ def _native_codex_sessions(
     first_message = output / "first.txt"
     second_message = output / "second.txt"
     first_prompt = (
-        "Use the Continuity MCP tool continuity_task_create to create task id native-codex-proof, "
+        "Use the GSV MCP tool gsv_task_create to create task id native-codex-proof, "
         "title Native Codex proof, outcome A separate native Codex session recovers this state, "
         "status doing, next actor agent, and next action Read this in a fresh Codex session. "
         "After the tool succeeds, reply exactly NATIVE_CREATED."
     )
     second_prompt = (
-        "Use the Continuity MCP tool continuity_task_show to read task native-codex-proof. "
+        "Use the GSV MCP tool gsv_task_show to read task native-codex-proof. "
         "If its next action says Read this in a fresh Codex session, reply exactly NATIVE_RESUMED."
     )
     base = [codex, "exec", "--skip-git-repo-check", "-C", str(workspace), "--color", "never"]
@@ -470,14 +466,14 @@ def _native_codex_sessions(
 
 def _require_native_codex(result: bool) -> None:
     if not result:
-        raise RuntimeError("fresh native Codex session did not recover synthetic Continuity state")
+        raise RuntimeError("fresh native Codex session did not recover synthetic GSV state")
 
 
 def _cli(binary: Path, environment: dict[str, str], arguments: list[str]) -> dict[str, Any]:
     result = _run([str(binary), "--json", *arguments], environment)
     payload = json.loads(result.stdout)
     if not payload.get("ok"):
-        raise RuntimeError(f"Continuity command failed: {arguments}")
+        raise RuntimeError(f"GSV command failed: {arguments}")
     return cast(dict[str, Any], payload["result"])
 
 

@@ -1,4 +1,4 @@
-"""Synthetic, privacy-safe demonstration of the continuity guarantees."""
+"""Synthetic, privacy-safe demonstration of the GSV guarantees."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from continuity_kernel.vault import Vault
 
 def run_demo(output: Path | None = None) -> dict[str, Any]:
     if output is None:
-        with tempfile.TemporaryDirectory(prefix="continuity-demo-") as raw:
+        with tempfile.TemporaryDirectory(prefix="gsv-demo-") as raw:
             return _run_demo(Path(raw))
     return _run_demo(output)
 
@@ -23,7 +23,7 @@ def _run_demo(output: Path) -> dict[str, Any]:
     if root.exists() and any(root.iterdir()):
         raise ConflictError(f"demo target is not empty: {root}")
     vault = Vault(root)
-    initialized = vault.initialize(name="Acme Continuity Demo")
+    initialized = vault.initialize(name="Acme GSV Demo")
 
     engineering = vault.create_entity(
         identifier="person:alex-chen-engineering",

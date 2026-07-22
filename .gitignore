@@ -10,4 +10,4 @@ dist/
 *.egg-info/
 *.py[cod]
 *.spec
-.continuity-test/
+.gsv-test/

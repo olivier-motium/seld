@@ -35,7 +35,7 @@ the release notes explicitly say otherwise.
 
 The privacy scanner fails closed on unreadable or oversized working-tree and
 history objects, reports filenames only, and accepts project-specific private
-terms through `CONTINUITY_PRIVATE_TERMS`.
+terms through `GSV_PRIVATE_TERMS`.
 
 The history scan covers reachable Git blob contents. It intentionally does not
 scan commit messages or author metadata: those are public release metadata,

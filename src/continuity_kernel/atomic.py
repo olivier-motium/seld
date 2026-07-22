@@ -69,8 +69,9 @@ def atomic_write(path: Path, content: bytes, *, mode: int = 0o600) -> None:
     descriptor, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
     temp = Path(raw_temp)
     try:
-        if os.name != "nt":
-            os.fchmod(descriptor, mode)
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(descriptor, mode)
         _write_all(descriptor, content)
         os.fsync(descriptor)
         os.close(descriptor)

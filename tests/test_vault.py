@@ -122,7 +122,7 @@ def test_initialize_is_idempotent_and_preserves_authored_documents(vault: Vault)
 
     assert second["created"] == []
     assert "Keep this handoff" in vault.read_document("NOW.md")["content"]
-    assert second["name"] == "Test Continuity"
+    assert second["name"] == "Test GSV"
 
 
 def test_thread_requires_existing_relationships(vault: Vault) -> None:

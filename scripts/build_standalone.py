@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and smoke-test one self-contained Continuity executable."""
+"""Build and smoke-test one self-contained GSV executable."""
 
 from __future__ import annotations
 
@@ -16,9 +16,7 @@ from typing import Any, cast
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=Path("dist"))
-    parser.add_argument(
-        "--asset-name", default="continuity.exe" if os.name == "nt" else "continuity"
-    )
+    parser.add_argument("--asset-name", default="gsv.exe" if os.name == "nt" else "gsv")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -34,7 +32,7 @@ def main() -> int:
     except ImportError as exc:
         raise SystemExit("PyInstaller is missing; run `uv sync --extra release`.") from exc
 
-    internal_name = "continuity"
+    internal_name = "gsv"
     pyinstaller.run(
         [
             "--clean",

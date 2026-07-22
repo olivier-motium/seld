@@ -15,14 +15,14 @@
 
 ## Assumptions
 
-Continuity trusts the local operating-system account, the installed Codex CLI,
+GSV trusts the local operating-system account, the installed Codex CLI,
 and the executable the user chose to run. Other local processes running as the
 same user can read or modify an unencrypted vault. File locks coordinate
-cooperating Continuity processes; they are not a defense against a hostile
+cooperating GSV processes; they are not a defense against a hostile
 same-user process.
 
 Vault text, imported references, and provider content are untrusted data.
-Continuity does not grant them authority to run commands, mutate external
+GSV does not grant them authority to run commands, mutate external
 systems, or override Codex instructions.
 
 ## Non-Goals

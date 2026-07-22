@@ -3,8 +3,8 @@
 ## Vault Layout
 
 ```text
-Continuity/
-  .continuity/
+GSV/
+  .gsv/
     manifest.json
     locks/
   MIND.md
@@ -22,7 +22,7 @@ Markdown is authoritative. Each typed record starts with one machine-readable
 HTML comment and remains understandable in a text editor:
 
 ```markdown
-<!-- continuity:{"id":"ship-atlas","kind":"task",...} -->
+<!-- gsv:{"id":"ship-atlas","kind":"task",...} -->
 # Ship Atlas
 
 ## Outcome

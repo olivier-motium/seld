@@ -1,6 +1,6 @@
 .PHONY: install test lint typecheck check build standalone privacy e2e
 
-E2E_BINARY ?= dist/continuity
+E2E_BINARY ?= dist/gsv
 
 install:
 	uv sync --extra dev

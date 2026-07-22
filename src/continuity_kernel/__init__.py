@@ -1,4 +1,4 @@
-"""Local-first continuity for coding agents."""
+"""The local-first state kernel behind GSV."""
 
 from __future__ import annotations
 
