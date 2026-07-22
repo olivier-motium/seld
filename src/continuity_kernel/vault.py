@@ -638,7 +638,7 @@ class Vault:
                     for relative, path in files:
                         archive.write(path, relative)
                     archive.writestr(BACKUP_MANIFEST, _json_bytes(manifest))
-                with temp.open("rb") as handle:
+                with temp.open("r+b") as handle:
                     os.fsync(handle.fileno())
                 durable_replace(temp, destination)
             finally:
@@ -783,7 +783,8 @@ class Vault:
     def _read_text(self, path: Path, *, max_bytes: int = 256 * 1024) -> str:
         self._assert_inside(path)
         if not path.exists():
-            raise NotFoundError(f"file does not exist: {path.relative_to(self.root)}")
+            relative = path.relative_to(self.root).as_posix()
+            raise NotFoundError(f"file does not exist: {relative}")
         if path.is_symlink() or not path.is_file():
             raise ValidationError(f"expected a regular file: {path}")
         if path.stat().st_size > max_bytes:
