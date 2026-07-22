@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import mimetypes
 import os
@@ -15,6 +16,8 @@ import time
 import uuid
 import webbrowser
 from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
 from hmac import compare_digest
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -60,6 +63,18 @@ _MIME_TYPES: Final = {
 }
 
 
+class _HealthOutcome(StrEnum):
+    RESPONSE = "response"
+    REFUSED = "refused"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class _HealthProbe:
+    outcome: _HealthOutcome
+    payload: dict[str, Any] | None = None
+
+
 def bridge_snapshot(
     vault: Vault,
     *,
@@ -68,11 +83,13 @@ def bridge_snapshot(
 ) -> dict[str, Any]:
     """Return the exact authored records needed by the read-only Bridge."""
 
-    status = vault.status()
     resolved_doctor = doctor if doctor is not None else doctor_dict(vault.doctor())
     resolved_integration = _codex_metadata() if integration is None else integration
+    task_records = vault.list_tasks()
+    thread_records = vault.list_threads()
+    entity_records = vault.list_entities()
     tasks = []
-    for item in vault.list_tasks():
+    for item in task_records:
         task = record_dict(item)
         task["codex_url"] = codex_deep_link(
             vault.root,
@@ -80,10 +97,18 @@ def bridge_snapshot(
             "and revision before deciding or changing anything.",
         )
         tasks.append(task)
-    threads = [record_dict(item) for item in vault.list_threads()]
-    entities = [record_dict(item) for item in vault.list_entities()]
+    threads = [record_dict(item) for item in thread_records]
+    entities = [record_dict(item) for item in entity_records]
     mind = vault.read_document("MIND.md")
     now = vault.read_document("NOW.md")
+    status = {
+        **vault.identity(),
+        "counts": {
+            "tasks": len(task_records),
+            "entities": len(entity_records),
+            "threads": len(thread_records),
+        },
+    }
     return {
         "bridge": {
             "local": True,
@@ -147,6 +172,7 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         self.access_token = access_token
         self.instance_id = instance_id
         self.vault = vault
+        self.vault_id = str(vault.identity()["vault_id"])
         self.static_root = static_root.resolve()
         self.integration_provider = integration_provider or _codex_metadata
         self._metadata: dict[str, Any] | None = None
@@ -216,7 +242,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                         "pid": os.getpid(),
                         "port": int(self.bridge.server_address[1]),
                         "service": "gsv-bridge",
-                        "vault_id": self.bridge.vault.status()["vault_id"],
+                        "vault_id": self.bridge.vault_id,
                         "version": __version__,
                     },
                     head_only=head_only,
@@ -384,7 +410,7 @@ def serve_bridge(
             "token": token,
             "url": f"http://{LOOPBACK_HOST}:{bound_port}/",
             "vault": str(vault.root),
-            "vault_id": vault.status()["vault_id"],
+            "vault_id": server.vault_id,
         }
         if write_state:
             _write_state(state)
@@ -443,7 +469,7 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
                 instance_id,
                 process.pid,
                 expected_pid=None if getattr(sys, "frozen", False) else process.pid,
-                vault_id=str(vault.status()["vault_id"]),
+                vault_id=str(vault.identity()["vault_id"]),
                 timeout=8.0,
             )
             if state is None:
@@ -519,19 +545,29 @@ def stop_bridge() -> dict[str, Any]:
         _remove_state_if_owned(pid, str(state["instance_id"]))
         return {
             "running": False,
+            "stale_reason": "process_not_running",
             "stale_receipt_removed": True,
             "stopped": False,
         }
-    health = _health_payload(str(state["url"]), token=str(state["token"]), timeout=0.75)
-    if health is None:
+    probe = _probe_health(str(state["url"]), token=str(state["token"]), timeout=0.75)
+    if probe.outcome is _HealthOutcome.UNAVAILABLE:
         raise SetupError(
             "The Bridge process is still alive, but its private health check did not answer. "
             "No process was signalled and the receipt was preserved; retry `gsv bridge stop`."
         )
-    if not _state_matches_health(state, health):
+    if probe.outcome is _HealthOutcome.REFUSED:
         _remove_state_if_owned(pid, str(state["instance_id"]))
         return {
             "running": False,
+            "stale_reason": "connection_refused",
+            "stale_receipt_removed": True,
+            "stopped": False,
+        }
+    if not _state_matches_health(state, probe.payload):
+        _remove_state_if_owned(pid, str(state["instance_id"]))
+        return {
+            "running": False,
+            "stale_reason": "identity_mismatch",
             "stale_receipt_removed": True,
             "stopped": False,
         }
@@ -601,10 +637,10 @@ def _current_state() -> tuple[dict[str, Any] | None, bool, bool]:
     if not _pid_alive(pid):
         _remove_state_if_owned(pid, str(state["instance_id"]))
         return None, False, False
-    health = _health_payload(str(state["url"]), token=str(state["token"]), timeout=0.5)
-    if health is None:
+    probe = _probe_health(str(state["url"]), token=str(state["token"]), timeout=0.5)
+    if probe.outcome is _HealthOutcome.UNAVAILABLE:
         return state, False, True
-    if not _state_matches_health(state, health):
+    if probe.outcome is _HealthOutcome.REFUSED or not _state_matches_health(state, probe.payload):
         _remove_state_if_owned(pid, str(state["instance_id"]))
         return None, False, False
     return state, True, False
@@ -628,8 +664,14 @@ def _discard_state() -> bool:
 
 
 def _health_payload(url: str, *, token: str, timeout: float) -> dict[str, Any] | None:
+    probe = _probe_health(url, token=token, timeout=timeout)
+    return probe.payload if probe.outcome is _HealthOutcome.RESPONSE else None
+
+
+def _probe_health(url: str, *, token: str, timeout: float) -> _HealthProbe:
     deadline = time.monotonic() + timeout
     health = f"{url.rstrip('/')}/api/v1/health"
+    loopback = urlsplit(url).hostname == LOOPBACK_HOST
     while True:
         try:
             request = Request(
@@ -639,19 +681,36 @@ def _health_payload(url: str, *, token: str, timeout: float) -> dict[str, Any] |
             with urlopen(request, timeout=min(0.5, max(timeout, 0.1))) as response:
                 payload = json.loads(response.read())
                 if response.status == HTTPStatus.OK and isinstance(payload, dict):
-                    return payload
+                    return _HealthProbe(_HealthOutcome.RESPONSE, payload)
         except HTTPError as exc:
             if exc.code in {
                 HTTPStatus.UNAUTHORIZED,
                 HTTPStatus.FORBIDDEN,
                 HTTPStatus.NOT_FOUND,
             }:
-                return {}
-        except (OSError, URLError, json.JSONDecodeError, ValueError):
+                return _HealthProbe(_HealthOutcome.RESPONSE, {})
+        except (OSError, URLError) as exc:
+            if loopback and _is_connection_refused(exc):
+                return _HealthProbe(_HealthOutcome.REFUSED)
+        except (json.JSONDecodeError, ValueError):
             pass
         if time.monotonic() >= deadline:
-            return None
+            return _HealthProbe(_HealthOutcome.UNAVAILABLE)
         time.sleep(0.05)
+
+
+def _is_connection_refused(error: BaseException) -> bool:
+    refused_codes = {errno.ECONNREFUSED, int(getattr(errno, "WSAECONNREFUSED", 10061))}
+    current: object = error
+    for _ in range(4):
+        if isinstance(current, ConnectionRefusedError):
+            return True
+        if isinstance(current, OSError) and current.errno in refused_codes:
+            return True
+        current = getattr(current, "reason", None)
+        if current is None:
+            return False
+    return False
 
 
 def _wait_for_state(

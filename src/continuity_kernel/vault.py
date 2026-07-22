@@ -201,18 +201,26 @@ class Vault:
         }
 
     def status(self) -> dict[str, Any]:
-        manifest = self._manifest()
+        identity = self.identity()
         return {
-            "format_version": manifest["format_version"],
-            "name": manifest["name"],
-            "vault": str(self.root),
-            "vault_id": manifest["vault_id"],
+            **identity,
             "counts": {
                 "tasks": len(self.list_tasks()),
                 "entities": len(self.list_entities()),
                 "threads": len(self.list_threads()),
             },
             "digest": self.logical_digest(),
+        }
+
+    def identity(self) -> dict[str, Any]:
+        """Return stable manifest identity without scanning vault content."""
+
+        manifest = self._manifest()
+        return {
+            "format_version": manifest["format_version"],
+            "name": manifest["name"],
+            "vault": str(self.root),
+            "vault_id": manifest["vault_id"],
         }
 
     def create_task(self, **values: Any) -> Task:

@@ -56,14 +56,21 @@ path traversal, symlinked assets, and oversized assets.
 Stop is fail-closed. GSV signals a receipt PID only when the live authenticated
 health response matches the same instance, PID, port, and vault. A stale,
 forged, or PID-reused receipt with a concrete mismatch is removed without
-signaling the process. If the PID remains alive while health is unavailable,
-GSV preserves the receipt, starts no replacement, and asks the operator to
-retry; that keeps the only bearer and identity evidence available for a later
-safe stop.
+signaling the process. A concrete refusal on the validated loopback port also
+removes only the stale receipt and permits a fresh Bridge; it never signals the
+unverified PID. Timeouts, resets, malformed responses, and other unavailable
+health outcomes preserve the receipt, start no replacement, and ask the
+operator to retry. That keeps the only bearer and identity evidence available
+for a later safe stop.
 
 The Bridge renders authored documents and records live. Slower Codex and doctor
 metadata are cached briefly so the browser poll does not spawn subprocesses or
-run a full integrity check every ten seconds.
+run a full integrity check every ten seconds. Health returns the manifest-only
+vault identity cached when the server binds; it never lists records, runs
+doctor, or hashes vault files. Each snapshot loads each record collection once
+and derives its counts from those records. Its `status` block intentionally
+contains identity and counts, not the explicit CLI status command's full-vault
+logical digest.
 
 ## Write flow
 

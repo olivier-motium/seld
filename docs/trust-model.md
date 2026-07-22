@@ -30,9 +30,11 @@ into session storage, and strips it from the address before API requests.
 Query strings, normal referrers, and static-asset requests do not carry it.
 
 An authenticated health timeout while the receipt PID is still alive preserves
-the receipt and blocks open, stop, upgrade, and uninstall from guessing. A dead
-PID or a concrete authenticated identity mismatch clears the stale receipt;
-only a complete identity match permits signalling.
+the receipt and blocks open, stop, upgrade, and uninstall from guessing. A
+concrete connection refusal on the receipt's validated loopback port clears the
+receipt without signalling its unverified PID, so a later open can recover. A
+dead PID or a concrete authenticated identity mismatch also clears the stale
+receipt; only a complete identity match permits signalling.
 
 The server binds only to `127.0.0.1`, validates the exact Host and Origin for
 its bound port, exposes no write API, and serves only bounded regular files

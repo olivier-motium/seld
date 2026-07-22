@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -9,7 +10,7 @@ from collections.abc import Iterator
 from http import HTTPStatus
 from importlib.resources import as_file, files
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
@@ -71,8 +72,16 @@ def _state(vault: Vault, *, port: int = 43117, pid: int = 4242) -> dict[str, obj
         "token": ACCESS_TOKEN,
         "url": f"http://{bridge.LOOPBACK_HOST}:{port}/",
         "vault": str(vault.root),
-        "vault_id": vault.status()["vault_id"],
+        "vault_id": vault.identity()["vault_id"],
     }
+
+
+def _health_response(payload: dict[str, object]) -> bridge._HealthProbe:
+    return bridge._HealthProbe(bridge._HealthOutcome.RESPONSE, payload)
+
+
+def _health_unavailable() -> bridge._HealthProbe:
+    return bridge._HealthProbe(bridge._HealthOutcome.UNAVAILABLE)
 
 
 def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> None:
@@ -100,6 +109,26 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
     assert query["path"] == [str(vault.root)]
     assert "ship-atlas" in query["prompt"][0]
     assert snapshot["bridge"] == {"local": True, "read_only": True, "version": __version__}
+
+
+def test_snapshot_never_calls_full_status_or_logical_digest(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Bridge snapshots must not hash the full vault")
+
+    monkeypatch.setattr(vault, "status", forbidden)
+    monkeypatch.setattr(vault, "logical_digest", forbidden)
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "plugin_installed": True},
+    )
+
+    assert snapshot["status"]["vault_id"] == vault.identity()["vault_id"]
+    assert snapshot["status"]["counts"] == {"tasks": 0, "entities": 0, "threads": 0}
+    assert "digest" not in snapshot["status"]
 
 
 def test_codex_deep_link_round_trips_encoded_prompt_path_and_origin(tmp_path: Path) -> None:
@@ -195,12 +224,56 @@ def test_http_surface_requires_per_launch_bearer_for_private_data(
 
     with urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2) as response:
         payload = json.loads(response.read())
-    assert payload["status"]["vault_id"] == server.vault.status()["vault_id"]
+    assert payload["status"]["vault_id"] == server.vault.identity()["vault_id"]
 
     with urlopen(_request(f"{base}/api/v1/health", token=ACCESS_TOKEN), timeout=2) as response:
         health = json.loads(response.read())
     assert health["instance_id"] == INSTANCE_ID
     assert health["port"] == server.server_address[1]
+
+
+def test_health_endpoint_uses_only_cached_manifest_identity(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, base = running_bridge
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("health must not scan or validate vault content")
+
+    for name in (
+        "identity",
+        "status",
+        "list_tasks",
+        "list_entities",
+        "list_threads",
+        "doctor",
+        "logical_digest",
+    ):
+        monkeypatch.setattr(server.vault, name, forbidden)
+
+    with urlopen(_request(f"{base}/api/v1/health", token=ACCESS_TOKEN), timeout=2) as response:
+        health = json.loads(response.read())
+
+    assert health["vault_id"] == server.vault_id
+    assert health["instance_id"] == INSTANCE_ID
+
+
+def test_snapshot_endpoint_never_calls_full_status_or_logical_digest(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, base = running_bridge
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("snapshot endpoint must not hash the full vault")
+
+    monkeypatch.setattr(server.vault, "status", forbidden)
+    monkeypatch.setattr(server.vault, "logical_digest", forbidden)
+
+    with urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2) as response:
+        snapshot = json.loads(response.read())
+
+    assert snapshot["status"]["vault_id"] == server.vault_id
+    assert "digest" not in snapshot["status"]
 
 
 def test_http_surface_rejects_cross_origin_and_writes(
@@ -237,14 +310,16 @@ def test_stop_never_signals_reused_pid_when_health_identity_mismatches(
     monkeypatch.setattr(bridge, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(
         bridge,
-        "_health_payload",
-        lambda *_args, **_kwargs: {
-            "service": "gsv-bridge",
-            "instance_id": "c" * 32,
-            "pid": 4242,
-            "port": 43117,
-            "vault_id": vault.status()["vault_id"],
-        },
+        "_probe_health",
+        lambda *_args, **_kwargs: _health_response(
+            {
+                "service": "gsv-bridge",
+                "instance_id": "c" * 32,
+                "pid": 4242,
+                "port": 43117,
+                "vault_id": vault.identity()["vault_id"],
+            }
+        ),
     )
     monkeypatch.setattr(bridge, "_terminate_pid", signaled.append)
 
@@ -252,6 +327,7 @@ def test_stop_never_signals_reused_pid_when_health_identity_mismatches(
 
     assert signaled == []
     assert result["stopped"] is False
+    assert result["stale_reason"] == "identity_mismatch"
     assert result["stale_receipt_removed"] is True
     assert not bridge._state_path().exists()
 
@@ -266,14 +342,16 @@ def test_stop_signals_only_a_fully_verified_bridge(
     monkeypatch.setattr(bridge, "_pid_alive", lambda pid: alive.get(pid, False))
     monkeypatch.setattr(
         bridge,
-        "_health_payload",
-        lambda *_args, **_kwargs: {
-            "service": "gsv-bridge",
-            "instance_id": INSTANCE_ID,
-            "pid": 4242,
-            "port": 43117,
-            "vault_id": vault.status()["vault_id"],
-        },
+        "_probe_health",
+        lambda *_args, **_kwargs: _health_response(
+            {
+                "service": "gsv-bridge",
+                "instance_id": INSTANCE_ID,
+                "pid": 4242,
+                "port": 43117,
+                "vault_id": vault.identity()["vault_id"],
+            }
+        ),
     )
 
     def terminate(pid: int) -> None:
@@ -299,14 +377,16 @@ def test_stop_failure_preserves_verified_receipt(
     monkeypatch.setattr("continuity_kernel.bridge.time.monotonic", lambda: next(clock))
     monkeypatch.setattr(
         bridge,
-        "_health_payload",
-        lambda *_args, **_kwargs: {
-            "service": "gsv-bridge",
-            "instance_id": INSTANCE_ID,
-            "pid": 4242,
-            "port": 43117,
-            "vault_id": vault.status()["vault_id"],
-        },
+        "_probe_health",
+        lambda *_args, **_kwargs: _health_response(
+            {
+                "service": "gsv-bridge",
+                "instance_id": INSTANCE_ID,
+                "pid": 4242,
+                "port": 43117,
+                "vault_id": vault.identity()["vault_id"],
+            }
+        ),
     )
     monkeypatch.setattr(bridge, "_terminate_pid", signaled.append)
 
@@ -387,7 +467,7 @@ def test_frozen_start_accepts_worker_pid_after_exact_launch_identity(
         INSTANCE_ID,
         4242,
         expected_pid=None,
-        vault_id=str(vault.status()["vault_id"]),
+        vault_id=str(vault.identity()["vault_id"]),
         timeout=0.1,
     )
 
@@ -405,7 +485,7 @@ def test_source_start_requires_receipt_to_match_launcher_pid(
         INSTANCE_ID,
         4242,
         expected_pid=4242,
-        vault_id=str(vault.status()["vault_id"]),
+        vault_id=str(vault.identity()["vault_id"]),
         timeout=0.1,
     )
 
@@ -436,7 +516,7 @@ def test_status_preserves_receipt_when_live_health_is_temporarily_unavailable(
 ) -> None:
     bridge._write_state(_state(vault))
     monkeypatch.setattr(bridge, "_pid_alive", lambda _pid: True)
-    monkeypatch.setattr(bridge, "_health_payload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bridge, "_probe_health", lambda *_args, **_kwargs: _health_unavailable())
 
     result = bridge.bridge_status()
 
@@ -451,7 +531,7 @@ def test_open_preserves_receipt_and_starts_nothing_when_live_health_is_unavailab
 ) -> None:
     bridge._write_state(_state(vault))
     monkeypatch.setattr(bridge, "_pid_alive", lambda _pid: True)
-    monkeypatch.setattr(bridge, "_health_payload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bridge, "_probe_health", lambda *_args, **_kwargs: _health_unavailable())
 
     def forbidden_popen(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("a replacement Bridge must not be started")
@@ -470,7 +550,7 @@ def test_stop_preserves_receipt_and_signals_nothing_when_live_health_is_unavaila
     bridge._write_state(_state(vault))
     signaled: list[int] = []
     monkeypatch.setattr(bridge, "_pid_alive", lambda _pid: True)
-    monkeypatch.setattr(bridge, "_health_payload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bridge, "_probe_health", lambda *_args, **_kwargs: _health_unavailable())
     monkeypatch.setattr(bridge, "_terminate_pid", signaled.append)
 
     with pytest.raises(SetupError, match="No process was signalled"):
@@ -478,6 +558,110 @@ def test_stop_preserves_receipt_and_signals_nothing_when_live_health_is_unavaila
 
     assert signaled == []
     assert bridge._state_path().is_file()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("injected timeout"),
+        ConnectionResetError(errno.ECONNRESET, "injected reset"),
+        OSError(errno.EHOSTUNREACH, "injected unreachable host"),
+    ],
+)
+def test_health_probe_treats_non_refusal_network_errors_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    def fail_request(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(bridge, "urlopen", fail_request)
+
+    probe = bridge._probe_health("http://127.0.0.1:43117/", token=ACCESS_TOKEN, timeout=0)
+
+    assert probe == bridge._HealthProbe(bridge._HealthOutcome.UNAVAILABLE)
+
+
+def test_health_probe_treats_malformed_response_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MalformedResponse:
+        status = HTTPStatus.OK
+
+        def __enter__(self) -> MalformedResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"not-json"
+
+    monkeypatch.setattr(bridge, "urlopen", lambda *_args, **_kwargs: MalformedResponse())
+
+    probe = bridge._probe_health("http://127.0.0.1:43117/", token=ACCESS_TOKEN, timeout=0)
+
+    assert probe == bridge._HealthProbe(bridge._HealthOutcome.UNAVAILABLE)
+
+
+def test_health_probe_never_classifies_remote_refusal_as_local_stale_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refused = URLError(ConnectionRefusedError(errno.ECONNREFUSED, "injected refusal"))
+
+    def fail_request(*_args: object, **_kwargs: object) -> None:
+        raise refused
+
+    monkeypatch.setattr(bridge, "urlopen", fail_request)
+
+    probe = bridge._probe_health("http://example.invalid:9/", token=ACCESS_TOKEN, timeout=0)
+
+    assert probe == bridge._HealthProbe(bridge._HealthOutcome.UNAVAILABLE)
+
+
+def test_stop_cleans_refused_receipt_without_signalling_unverified_pid(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signaled: list[int] = []
+    with socket.socket() as released:
+        released.bind((bridge.LOOPBACK_HOST, 0))
+        port = int(released.getsockname()[1])
+    bridge._write_state(_state(vault, port=port, pid=os.getpid()))
+    monkeypatch.setattr(bridge, "_terminate_pid", signaled.append)
+
+    result = bridge.stop_bridge()
+
+    assert signaled == []
+    assert result == {
+        "running": False,
+        "stale_reason": "connection_refused",
+        "stale_receipt_removed": True,
+        "stopped": False,
+    }
+    assert not bridge._state_path().exists()
+
+
+def test_open_replaces_refused_receipt_without_signalling_unverified_pid(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signaled: list[int] = []
+    with socket.socket() as released:
+        released.bind((bridge.LOOPBACK_HOST, 0))
+        port = int(released.getsockname()[1])
+    bridge._write_state(_state(vault, port=port, pid=os.getpid()))
+    with monkeypatch.context() as guarded:
+        guarded.setattr(bridge, "_terminate_pid", signaled.append)
+        opened = bridge.open_bridge(vault, open_browser=False)
+
+    try:
+        replacement = bridge._load_state()
+        assert opened["started"] is True
+        assert signaled == []
+        assert replacement is not None
+        assert replacement["pid"] != os.getpid()
+        assert replacement["instance_id"] != INSTANCE_ID
+    finally:
+        stopped = bridge.stop_bridge()
+    assert stopped["stopped"] is True
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission contract")
