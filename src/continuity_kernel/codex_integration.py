@@ -11,6 +11,7 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from hashlib import sha256
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -65,6 +66,31 @@ class _MarketplaceChange:
     path: Path
     previous: Path | None
     installed_digest: str
+
+
+class _MarketplaceCleanupState(StrEnum):
+    NOT_OWNED = "not_owned"
+    REMOVED = "removed"
+    ALREADY_MISSING = "already_missing"
+    CHANGED_OR_UNSAFE = "changed_or_unsafe"
+
+
+@dataclass(frozen=True)
+class _MarketplaceCleanup:
+    state: _MarketplaceCleanupState
+    path: str | None = None
+    error: str | None = None
+
+    @property
+    def verified(self) -> bool:
+        return self.state is not _MarketplaceCleanupState.CHANGED_OR_UNSAFE
+
+
+@dataclass(frozen=True)
+class _ProviderCleanup:
+    marketplace_removed: bool
+    plugin_removed: bool
+    preexisting_plugin_preserved: bool
 
 
 def install_codex(*, vault: Path, codex_home: Path | None = None) -> CodexInstallResult:
@@ -172,11 +198,9 @@ def codex_status(*, codex_home: Path | None = None) -> dict[str, Any]:
     home = (codex_home or default_codex_home()).expanduser().resolve()
     executable = _codex_executable()
     plugins = _run_json(executable, ["plugin", "list", "--json"], home)
-    agents = home / "AGENTS.md"
-    content = agents.read_text(encoding="utf-8") if agents.exists() else ""
     return {
         "codex_home": str(home),
-        "instructions_installed": BLOCK_START in content and BLOCK_END in content,
+        "instructions_installed": _instructions_installed(home),
         "plugin_installed": any(
             item.get("pluginId") == PLUGIN_ID and item.get("enabled") is True
             for item in plugins.get("installed", [])
@@ -186,41 +210,186 @@ def codex_status(*, codex_home: Path | None = None) -> dict[str, Any]:
 
 def uninstall_codex(*, codex_home: Path | None = None) -> dict[str, Any]:
     home = (codex_home or default_codex_home()).expanduser().resolve()
-    executable = _codex_executable()
-    before = codex_status(codex_home=home)
     receipt = _load_receipt(home)
     plugin_owned = bool(receipt.get("plugin_owned"))
     marketplace_owned = bool(receipt.get("marketplace_owned"))
-    marketplace_removed = False
-    if before["plugin_installed"] and plugin_owned:
+    provider_required = plugin_owned or marketplace_owned
+    executable: str | None = None
+    if provider_required and os.environ.get("GSV_CODEX"):
+        # An explicit bad override is an operator error, not evidence that Codex is absent.
+        # Validate it before changing any local integration state.
+        executable = _codex_executable()
+
+    instruction_error: str | None = None
+    instructions_removed = False
+    try:
+        instructions_removed = _remove_instructions(home)
+    except (ContinuityError, OSError, UnicodeError) as exc:
+        instruction_error = str(exc)
+    marketplace_files = _remove_owned_marketplace(receipt)
+    local_cleanup_verified = instruction_error is None and marketplace_files.verified
+    if instruction_error is None:
+        try:
+            if _instructions_installed(home):
+                instruction_error = "the managed GSV instruction block remained after removal"
+        except (ContinuityError, OSError, UnicodeError) as exc:
+            instruction_error = f"could not verify managed instruction removal: {exc}"
+        local_cleanup_verified = instruction_error is None and marketplace_files.verified
+
+    codex_available: bool | None = None
+    provider_error: str | None = None
+    provider_cleanup: _ProviderCleanup | None = None
+    provider_cleanup_verified = not provider_required
+    provider_cleanup_skipped = provider_required and not local_cleanup_verified
+    if provider_required and local_cleanup_verified:
+        try:
+            executable = executable or _codex_executable()
+            codex_available = True
+            provider_cleanup = _remove_owned_registrations(
+                executable,
+                home,
+                plugin_owned=plugin_owned,
+                marketplace_owned=marketplace_owned,
+                marketplace_root=receipt.get("marketplace_root"),
+            )
+            provider_cleanup_verified = True
+        except SetupError as exc:
+            codex_available = executable is not None
+            provider_error = str(exc)
+        except OSError as exc:
+            codex_available = executable is not None
+            provider_error = f"Codex command could not be run: {exc}"
+
+    cleanup_complete = local_cleanup_verified and provider_cleanup_verified
+    receipt_error: str | None = None
+    if cleanup_complete:
+        try:
+            _remove_receipt(home)
+        except OSError as exc:
+            receipt_error = f"could not remove the ownership receipt: {exc}"
+            cleanup_complete = False
+    deferred_registrations = [
+        name
+        for name, owned in (
+            ("plugin", plugin_owned),
+            ("marketplace", marketplace_owned),
+        )
+        if owned and not provider_cleanup_verified
+    ]
+    next_actions: list[str] = []
+    if instruction_error is not None:
+        next_actions.append(
+            f"Inspect {home / 'AGENTS.md'}; GSV could not safely remove its managed block."
+        )
+    if not marketplace_files.verified:
+        next_actions.append(
+            "Inspect the recorded GSV marketplace files; they changed or could not be "
+            "verified and were left untouched."
+        )
+    if deferred_registrations:
+        next_actions.append(
+            "Re-run `gsv codex uninstall` after the local issue is resolved and Codex is "
+            "available and responsive."
+        )
+    if receipt_error is not None:
+        next_actions.append(
+            "Re-run `gsv codex uninstall` to finish removing the ownership receipt."
+        )
+
+    return {
+        "cleanup_complete": cleanup_complete,
+        "codex_available": codex_available,
+        "codex_home": str(home),
+        "deferred_registrations": deferred_registrations,
+        "instructions_removed": instructions_removed and instruction_error is None,
+        "local_cleanup_error": instruction_error or marketplace_files.error,
+        "local_cleanup_verified": local_cleanup_verified,
+        "manual_review_required": not local_cleanup_verified or receipt_error is not None,
+        "marketplace_files_path": marketplace_files.path,
+        "marketplace_files_removed": (marketplace_files.state is _MarketplaceCleanupState.REMOVED),
+        "marketplace_files_state": marketplace_files.state,
+        "marketplace_removed": (
+            provider_cleanup.marketplace_removed if provider_cleanup is not None else None
+        ),
+        "next": " ".join(next_actions) or None,
+        "plugin_removed": provider_cleanup.plugin_removed if provider_cleanup is not None else None,
+        "preexisting_plugin_preserved": (
+            provider_cleanup.preexisting_plugin_preserved if provider_cleanup is not None else None
+        ),
+        "provider_cleanup_error": provider_error,
+        "provider_cleanup_skipped": provider_cleanup_skipped,
+        "provider_cleanup_verified": provider_cleanup_verified,
+        "receipt_cleanup_error": receipt_error,
+        "receipt_preserved_for_retry": not cleanup_complete and bool(receipt),
+        "registration_cleanup_deferred": bool(deferred_registrations),
+        "user_data_preserved": True,
+    }
+
+
+def _remove_owned_registrations(
+    executable: str,
+    home: Path,
+    *,
+    plugin_owned: bool,
+    marketplace_owned: bool,
+    marketplace_root: object,
+) -> _ProviderCleanup:
+    plugins_before = _run_json(executable, ["plugin", "list", "--json"], home)
+    marketplaces_before = _run_json(executable, ["plugin", "marketplace", "list", "--json"], home)
+    plugin_present = any(
+        item.get("pluginId") == PLUGIN_ID for item in plugins_before.get("installed", [])
+    )
+    marketplace_entry = next(
+        (
+            item
+            for item in marketplaces_before.get("marketplaces", [])
+            if item.get("name") == MARKETPLACE_NAME
+        ),
+        None,
+    )
+    marketplace_present = marketplace_entry is not None
+    if marketplace_owned and marketplace_entry is not None:
+        registered_root = marketplace_entry.get("root")
+        if not isinstance(marketplace_root, str) or not isinstance(registered_root, str):
+            raise SetupError(
+                "The GSV marketplace registration has no verifiable owned root; left it registered"
+            )
+        try:
+            registration_matches = (
+                Path(registered_root).expanduser().resolve()
+                == Path(marketplace_root).expanduser().resolve()
+            )
+        except OSError:
+            registration_matches = False
+        if not registration_matches:
+            raise SetupError(
+                "The GSV marketplace registration points somewhere other than the owned "
+                "receipt; left it registered"
+            )
+    if plugin_owned and plugin_present:
         _run_json(executable, ["plugin", "remove", PLUGIN_ID, "--json"], home)
-    marketplaces = _run_json(executable, ["plugin", "marketplace", "list", "--json"], home)
-    if marketplace_owned and any(
-        item.get("name") == MARKETPLACE_NAME for item in marketplaces.get("marketplaces", [])
-    ):
+    if marketplace_owned and marketplace_present:
         _run_json(
             executable,
             ["plugin", "marketplace", "remove", MARKETPLACE_NAME, "--json"],
             home,
         )
-        marketplace_removed = True
-    _remove_instructions(home)
-    after = codex_status(codex_home=home)
-    if (plugin_owned and after["plugin_installed"]) or after["instructions_installed"]:
-        raise SetupError("Codex integration still appears installed after uninstall")
-    marketplace_files_removed = _remove_owned_marketplace(receipt)
-    receipt_path = _receipt_path(home)
-    if receipt_path.exists():
-        receipt_path.unlink()
-    return {
-        "codex_home": str(home),
-        "marketplace_files_removed": marketplace_files_removed,
-        "marketplace_removed": marketplace_removed,
-        "plugin_removed": bool(before["plugin_installed"] and plugin_owned),
-        "preexisting_plugin_preserved": bool(before["plugin_installed"] and not plugin_owned),
-        "instructions_removed": bool(before["instructions_installed"]),
-        "user_data_preserved": True,
-    }
+
+    plugins_after = _run_json(executable, ["plugin", "list", "--json"], home)
+    marketplaces_after = _run_json(executable, ["plugin", "marketplace", "list", "--json"], home)
+    plugin_remains = any(
+        item.get("pluginId") == PLUGIN_ID for item in plugins_after.get("installed", [])
+    )
+    marketplace_remains = any(
+        item.get("name") == MARKETPLACE_NAME for item in marketplaces_after.get("marketplaces", [])
+    )
+    if (plugin_owned and plugin_remains) or (marketplace_owned and marketplace_remains):
+        raise SetupError("Codex still reports GSV-owned integration after uninstall")
+    return _ProviderCleanup(
+        marketplace_removed=marketplace_owned and marketplace_present,
+        plugin_removed=plugin_owned and plugin_present,
+        preexisting_plugin_preserved=plugin_present and not plugin_owned,
+    )
 
 
 def _replace_marketplace(
@@ -277,11 +446,9 @@ def _commit_marketplace(change: _MarketplaceChange) -> None:
 def _install_instructions(home: Path) -> _InstructionChange:
     path = home / "AGENTS.md"
     before = path.read_text(encoding="utf-8") if path.exists() else ""
-    if (BLOCK_START in before) != (BLOCK_END in before):
-        raise ValidationError("existing Codex instructions contain an incomplete GSV block")
-    if BLOCK_START in before:
-        start = before.index(BLOCK_START)
-        end = before.index(BLOCK_END, start) + len(BLOCK_END)
+    bounds = _instruction_block_bounds(before)
+    if bounds is not None:
+        start, end = bounds
         updated = (
             before[:start].rstrip() + "\n\n" + MANAGED_BLOCK + "\n" + before[end:].lstrip()
         ).strip() + "\n"
@@ -413,21 +580,50 @@ def _save_receipt(
     )
 
 
-def _remove_instructions(home: Path) -> None:
+def _remove_instructions(home: Path) -> bool:
     path = home / "AGENTS.md"
     if not path.exists():
-        return
+        return False
     content = path.read_text(encoding="utf-8")
-    if BLOCK_START not in content and BLOCK_END not in content:
-        return
-    if (BLOCK_START in content) != (BLOCK_END in content):
-        raise ValidationError("cannot safely remove an incomplete GSV instruction block")
-    start = content.index(BLOCK_START)
-    end = content.index(BLOCK_END, start) + len(BLOCK_END)
+    bounds = _instruction_block_bounds(content)
+    if bounds is None:
+        return False
+    start, end = bounds
     updated = (content[:start].rstrip() + "\n\n" + content[end:].lstrip()).strip()
     if updated:
         atomic_write(path, (updated + "\n").encode("utf-8"))
     else:
+        path.unlink()
+    return True
+
+
+def _instructions_installed(home: Path) -> bool:
+    path = home / "AGENTS.md"
+    if not path.exists():
+        return False
+    content = path.read_text(encoding="utf-8")
+    return _instruction_block_bounds(content) is not None
+
+
+def _instruction_block_bounds(content: str) -> tuple[int, int] | None:
+    starts = content.count(BLOCK_START)
+    ends = content.count(BLOCK_END)
+    if starts == 0 and ends == 0:
+        return None
+    if starts != ends:
+        raise ValidationError("Codex instructions contain an incomplete GSV managed block")
+    if starts != 1:
+        raise ValidationError("Codex instructions contain multiple or nested GSV managed blocks")
+    start = content.index(BLOCK_START)
+    closing = content.index(BLOCK_END)
+    if closing < start:
+        raise ValidationError("Codex instructions contain a reversed GSV managed block")
+    return start, closing + len(BLOCK_END)
+
+
+def _remove_receipt(home: Path) -> None:
+    path = _receipt_path(home)
+    if path.exists():
         path.unlink()
 
 
@@ -445,23 +641,54 @@ def _discard_instruction_backup(change: _InstructionChange | None) -> None:
         return
 
 
-def _remove_owned_marketplace(receipt: dict[str, Any]) -> bool:
+def _remove_owned_marketplace(receipt: dict[str, Any]) -> _MarketplaceCleanup:
     if not bool(receipt.get("marketplace_owned")):
-        return False
+        return _MarketplaceCleanup(_MarketplaceCleanupState.NOT_OWNED)
     raw_root = receipt.get("marketplace_root")
     digest = receipt.get("marketplace_digest")
     if not isinstance(raw_root, str) or not isinstance(digest, str):
-        return False
-    root = Path(raw_root).expanduser().resolve()
-    allowed = (data_dir() / "marketplaces").resolve()
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            error="the ownership receipt does not contain a valid marketplace path and digest",
+        )
+    recorded = Path(raw_root).expanduser()
     try:
+        if recorded.is_symlink():
+            raise ValidationError("the recorded marketplace path is a symbolic link")
+        root = recorded.resolve()
+        allowed = (data_dir() / "marketplaces").resolve()
         root.relative_to(allowed)
-    except ValueError:
-        return False
-    if not root.exists() or root.is_symlink() or _tree_digest(root) != digest:
-        return False
-    shutil.rmtree(root)
-    return True
+    except (OSError, ValueError, ValidationError) as exc:
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(recorded),
+            error=f"recorded marketplace path is unsafe: {exc}",
+        )
+    if not root.exists():
+        return _MarketplaceCleanup(_MarketplaceCleanupState.ALREADY_MISSING, path=str(root))
+    try:
+        current_digest = _tree_digest(root)
+    except (OSError, ContinuityError) as exc:
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error=f"could not verify recorded marketplace files: {exc}",
+        )
+    if current_digest != digest:
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error="recorded marketplace files changed after installation",
+        )
+    try:
+        shutil.rmtree(root)
+    except OSError as exc:
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error=f"could not remove verified marketplace files: {exc}",
+        )
+    return _MarketplaceCleanup(_MarketplaceCleanupState.REMOVED, path=str(root))
 
 
 def _codex_executable() -> str:

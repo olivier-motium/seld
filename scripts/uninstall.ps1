@@ -17,7 +17,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 & $Target codex uninstall @args
 if ($LASTEXITCODE -ne 0) {
-    throw "GSV integration uninstall failed with exit code $LASTEXITCODE."
+    throw "GSV cleanup is incomplete (exit $LASTEXITCODE). The executable was kept so you can run the printed retry command."
 }
 Remove-Item -LiteralPath $Target -Force
-Write-Host "Removed the GSV executable and Codex integration. Vault and config were preserved."
+Write-Host "Removed the GSV executable and verified GSV-owned integration. Vault and config were preserved."

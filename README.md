@@ -164,6 +164,13 @@ sh scripts/uninstall.sh
 .\scripts\uninstall.ps1
 ```
 
+If Codex is unavailable or any cleanup step cannot be verified, uninstall keeps
+the executable and ownership receipt so the printed `gsv codex uninstall`
+recovery command still works. It may remove digest-verified local GSV files,
+but never calls partial cleanup complete. A changed or unsafe generated
+marketplace is left untouched for manual review, and Codex registrations are
+not changed until local cleanup is verified.
+
 ## Develop
 
 Source development requires Python 3.11+ and `uv`:

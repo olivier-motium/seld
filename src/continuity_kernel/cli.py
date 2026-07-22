@@ -52,7 +52,28 @@ def main(arguments: list[str] | None = None) -> int:
         if args.command == "mcp":
             return serve(Vault(resolve_vault(getattr(args, "vault", None))))
         result = _dispatch(args)
-        _print(result, json_output=args.json, raw=getattr(args, "raw", False))
+        incomplete_cleanup = (
+            args.command == "codex"
+            and args.codex_command == "uninstall"
+            and isinstance(result, dict)
+            and result.get("cleanup_complete") is False
+        )
+        cleanup_error = (
+            "GSV cleanup is incomplete; follow result.next and retry."
+            if incomplete_cleanup
+            else None
+        )
+        _print(
+            result,
+            json_output=args.json,
+            raw=getattr(args, "raw", False),
+            ok=not incomplete_cleanup,
+            error=cleanup_error,
+        )
+        if incomplete_cleanup:
+            if not args.json:
+                print(f"Error: {cleanup_error}", file=sys.stderr)
+            return 3
         return 0
     except ContinuityError as exc:
         if getattr(args, "json", False):
@@ -479,14 +500,24 @@ def _thread_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ref", action="append", default=[])
 
 
-def _print(value: Any, *, json_output: bool, raw: bool) -> None:
+def _print(
+    value: Any,
+    *,
+    json_output: bool,
+    raw: bool,
+    ok: bool = True,
+    error: str | None = None,
+) -> None:
     if raw and isinstance(value, str) and not json_output:
         print(value, end="" if value.endswith("\n") else "\n")
         return
     if is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
     if json_output:
-        print(json.dumps({"ok": True, "result": value}, ensure_ascii=False, separators=(",", ":")))
+        payload = {"ok": ok, "result": value}
+        if error is not None:
+            payload["error"] = error
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     elif isinstance(value, str):
         print(value)
     else:

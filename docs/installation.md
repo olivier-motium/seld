@@ -154,3 +154,15 @@ Both paths preserve the vault, configuration, backups, unrelated Codex
 instructions, marketplaces, and plugins. Neither Codex status nor uninstall
 requires a readable vault configuration. Delete the vault or config only as a
 separate, deliberate user-data operation.
+
+If the Codex executable is unavailable, a command times out, or final provider
+verification fails, cleanup is explicitly partial. The uninstaller may remove
+the managed instruction block and a digest-matched generated marketplace, but
+keeps both the executable and owner-only receipt for the printed retry command.
+It returns a nonzero retry exit without requiring `jq` or another JSON parser.
+
+A changed, unreadable, symlinked, or out-of-bound generated marketplace is left
+untouched for manual review. Provider registration cleanup is skipped until
+that local state is resolved, so a modified tree is not orphaned by removing
+its ownership evidence. An explicit but invalid `GSV_CODEX` override fails
+closed before changing integration state.

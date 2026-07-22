@@ -329,7 +329,7 @@ def test_codex_status_and_uninstall_do_not_require_vault_configuration(
 
     def uninstall(*, codex_home: Path) -> dict[str, bool]:
         seen.append(("uninstall", codex_home))
-        return {"user_data_preserved": True}
+        return {"cleanup_complete": True, "user_data_preserved": True}
 
     monkeypatch.setattr(cli, "codex_status", status)
     monkeypatch.setattr(cli, "uninstall_codex", uninstall)
@@ -339,3 +339,50 @@ def test_codex_status_and_uninstall_do_not_require_vault_configuration(
     assert cli.main(["--json", "codex", "uninstall", "--codex-home", str(home)]) == 0
 
     assert seen == [("status", home.resolve()), ("uninstall", home.resolve())]
+
+
+def test_partial_codex_uninstall_prints_result_and_returns_retry_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "codex"
+    monkeypatch.setattr(
+        cli,
+        "uninstall_codex",
+        lambda **_: {
+            "cleanup_complete": False,
+            "next": "Re-run `gsv codex uninstall`.",
+            "provider_cleanup_error": "Codex timed out",
+        },
+    )
+
+    assert cli.main(["--json", "codex", "uninstall", "--codex-home", str(home)]) == 3
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["ok"] is False
+    assert payload["error"] == "GSV cleanup is incomplete; follow result.next and retry."
+    assert payload["result"]["cleanup_complete"] is False
+    assert payload["result"]["provider_cleanup_error"] == "Codex timed out"
+
+
+def test_partial_codex_uninstall_keeps_recovery_details_in_human_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "codex"
+    monkeypatch.setattr(
+        cli,
+        "uninstall_codex",
+        lambda **_: {
+            "cleanup_complete": False,
+            "manual_review_required": True,
+            "next": "Inspect the changed files, then re-run `gsv codex uninstall`.",
+            "provider_cleanup_error": "Codex timed out",
+        },
+    )
+
+    assert cli.main(["codex", "uninstall", "--codex-home", str(home)]) == 3
+    captured = capsys.readouterr()
+
+    assert '"manual_review_required": true' in captured.out
+    assert "Inspect the changed files" in captured.out
+    assert '"provider_cleanup_error": "Codex timed out"' in captured.out
+    assert "cleanup is incomplete" in captured.err

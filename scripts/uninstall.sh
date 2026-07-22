@@ -10,6 +10,13 @@ if [ ! -x "$TARGET" ]; then
 fi
 
 "$TARGET" bridge stop >/dev/null
+set +e
 "$TARGET" codex uninstall "$@"
+cleanup_status=$?
+set -e
+if [ "$cleanup_status" -ne 0 ]; then
+  printf '%s\n' "GSV cleanup is incomplete. The executable was kept so you can run the printed retry command." >&2
+  exit "$cleanup_status"
+fi
 rm "$TARGET"
-printf '%s\n' "Removed the GSV executable and Codex integration. Vault and config were preserved."
+printf '%s\n' "Removed the GSV executable and verified GSV-owned integration. Vault and config were preserved."

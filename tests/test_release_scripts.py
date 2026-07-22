@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -14,6 +15,27 @@ from scripts import e2e_clean_install, privacy_check
 from scripts.e2e_clean_install import _require_native_codex
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_uninstall_fixture(path: Path) -> None:
+    path.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[:2] == ['bridge', 'stop']:\n"
+        "    status = int(os.environ.get('GSV_TEST_BRIDGE_STATUS', '0'))\n"
+        "    print(json.dumps({'ok': status == 0, 'result': {'stopped': False}}))\n"
+        "    raise SystemExit(status)\n"
+        "if args[:2] == ['codex', 'uninstall']:\n"
+        "    status = int(os.environ.get('GSV_TEST_UNINSTALL_STATUS', '0'))\n"
+        "    print('Retry with gsv codex uninstall.' if status else 'Cleanup verified.')\n"
+        "    raise SystemExit(status)\n"
+        "raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
 
 
 def test_candidate_version_is_consistent_across_runtime_installers_and_lock() -> None:
@@ -260,6 +282,112 @@ exit 2
     assert backups[0].read_bytes() == old
     assert "previous executable remains staged" in result.stderr
     assert "exit 2" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX uninstaller test")
+@pytest.mark.parametrize(
+    ("bridge_status", "cleanup_status"),
+    [(0, 0), (0, 3), (4, 0)],
+)
+def test_posix_uninstaller_removes_binary_only_after_verified_cleanup(
+    tmp_path: Path, bridge_status: int, cleanup_status: int
+) -> None:
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+    target = install_dir / "gsv"
+    _write_uninstall_fixture(target)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GSV_BIN_DIR": str(install_dir),
+            "GSV_TEST_BRIDGE_STATUS": str(bridge_status),
+            "GSV_TEST_UNINSTALL_STATUS": str(cleanup_status),
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", str(ROOT / "scripts/uninstall.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    expected_status = bridge_status or cleanup_status
+    assert result.returncode == expected_status
+    if expected_status == 0:
+        assert not target.exists()
+        assert "verified GSV-owned integration" in result.stdout
+    else:
+        assert target.exists()
+        if cleanup_status:
+            assert "Retry with gsv codex uninstall" in result.stdout
+            assert "executable was kept" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX executable fixture under PowerShell")
+@pytest.mark.parametrize(
+    ("bridge_status", "cleanup_status"),
+    [(0, 0), (0, 3), (4, 0)],
+)
+def test_powershell_uninstaller_removes_binary_only_after_verified_cleanup(
+    tmp_path: Path, bridge_status: int, cleanup_status: int
+) -> None:
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if powershell is None:
+        pytest.skip("PowerShell is not installed on this runner")
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+    target = install_dir / "gsv.exe"
+    _write_uninstall_fixture(target)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GSV_BIN_DIR": str(install_dir),
+            "GSV_TEST_BRIDGE_STATUS": str(bridge_status),
+            "GSV_TEST_UNINSTALL_STATUS": str(cleanup_status),
+        }
+    )
+
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-File", str(ROOT / "scripts/uninstall.ps1")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    if bridge_status == 0 and cleanup_status == 0:
+        assert result.returncode == 0, result.stderr
+        assert not target.exists()
+        assert "verified GSV-owned integration" in result.stdout
+    else:
+        assert result.returncode != 0
+        assert target.exists()
+        if cleanup_status:
+            assert "Retry with gsv codex uninstall" in result.stdout
+            assert "executable was kept" in result.stderr
+        else:
+            assert "Bridge stop failed" in result.stderr
+
+
+def test_powershell_uninstaller_guards_both_failures_before_binary_removal() -> None:
+    script = (ROOT / "scripts/uninstall.ps1").read_text(encoding="utf-8")
+    bridge_call = script.index("& $Target bridge stop")
+    bridge_guard = script.index("if ($LASTEXITCODE -ne 0)", bridge_call)
+    codex_call = script.index("& $Target codex uninstall", bridge_guard)
+    cleanup_guard = script.index("if ($LASTEXITCODE -ne 0)", codex_call)
+    binary_removal = script.index("Remove-Item -LiteralPath $Target -Force", cleanup_guard)
+
+    assert bridge_call < bridge_guard < codex_call < cleanup_guard < binary_removal
+    assert "The executable was kept" in script
+
+
+def test_uninstallers_do_not_depend_on_jq_for_cleanup_decisions() -> None:
+    for name in ("uninstall.sh", "uninstall.ps1"):
+        assert "jq" not in (ROOT / "scripts" / name).read_text(encoding="utf-8").lower()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell executable rollback needs Windows")
