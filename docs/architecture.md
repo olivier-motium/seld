@@ -76,6 +76,20 @@ run a full integrity check every ten seconds.
 6. The containing directory is synchronized where the platform supports it.
 7. A bounded audit event is appended under the journal lock.
 
+This is deliberately not described as a multi-file transaction. For ordinary
+reported append failures, the append primitive first restores the journal to
+its exact previous length. GSV then restores the exact previous canonical bytes
+or removes an invocation-owned create, but only while the current bytes still
+match that invocation. A post-fsync cleanup failure is reported as committed;
+unknown journal state or failed canonical recovery is reported as degraded and
+left in place for inspection.
+
+A process or operating-system death between canonical replacement and journal
+append can still leave authoritative Markdown without its audit event. `0.2.0`
+does not ship a pending-mutation protocol and the journal is not authoritative.
+Callers must reload after any committed or degraded persistence error rather
+than retrying with a stale revision.
+
 Global operations such as backup hold the global lock before record locks so a
 snapshot cannot mix record versions.
 

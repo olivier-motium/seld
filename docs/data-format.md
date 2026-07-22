@@ -31,8 +31,9 @@ Atlas is deployed with rollback evidence.
 ```
 
 The `revision` returned by the CLI and MCP API is the SHA-256 digest of the
-complete stored Markdown bytes. It is computed, not stored in the record.
-Updates require that exact revision.
+complete stored Markdown bytes, including their exact line endings. Content is
+decoded and validated from that same bounded read. The revision is computed,
+not stored in the record. Updates require that exact revision.
 
 ## Identity And Relations
 
@@ -52,6 +53,19 @@ duplicate archive paths are rejected. Unknown format versions fail closed.
 `MIND.md` and `NOW.md` are bounded user-authored documents. Context rendering
 quotes stored content and labels it as data so text in the vault is not treated
 as higher-priority instructions.
+
+## Journal
+
+`journal/events.jsonl` is a bounded, append-only audit aid for successful GSV
+mutations. Markdown remains authoritative. A caught append failure has an
+explicit restored, committed, or unknown outcome; GSV rolls canonical bytes
+back only after the journal is known restored. The journal is not a multi-file
+transaction log and can lag canonical Markdown if the process or operating
+system dies in the narrow interval between the two durable writes. `gsv doctor
+--repair` can remove only an invalid, non-terminated final fragment after every
+complete preceding record validates; it synchronizes the truncation and never
+synthesizes an event or changes canonical Markdown. Complete invalid records
+and valid events missing only their final newline remain for manual review.
 
 ## Backups
 

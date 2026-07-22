@@ -4,6 +4,8 @@
 
 - A stale writer cannot silently replace a newer canonical record.
 - An interrupted write does not expose a partial canonical record.
+- A caught audit-append failure either restores exact prior bytes, reports that
+  the mutation committed, or reports unknown integrity without guessing.
 - A malformed, oversized, encrypted, duplicate, or path-traversing backup does
   not escape the restore target.
 - A failed install does not replace the last working executable or remove
@@ -49,6 +51,10 @@ discovers, and the executable the user chose to run. File locks coordinate
 cooperating GSV processes; they do not defend against a hostile same-user
 process.
 
+Durability and lock behavior assume a local filesystem with ordinary host OS
+semantics. Cloud-synchronized and network filesystems are not a supported
+durability boundary for the vault.
+
 Vault text, imported references, provider content, and repository pages are
 untrusted data. They do not gain authority to run commands, mutate external
 systems, alter account settings, or override Codex instructions.
@@ -60,6 +66,8 @@ does not roll back Codex integration or configuration.
 
 - Vault encryption, remote synchronization, multi-user authorization, and
   tamper-proof audit logs.
+- Multi-file atomicity or a complete audit journal across process or operating-
+  system death between canonical replacement and event append.
 - Secret storage or credential management.
 - Automatic task prioritization, semantic identity merging, or autonomous
   background action.

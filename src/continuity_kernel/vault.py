@@ -14,14 +14,24 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal, TypeVar
 
 from continuity_kernel.atomic import (
+    AppendOutcome,
+    DurableAppendError,
     append_durable,
     atomic_write,
     durable_replace,
+    durable_unlink,
     exclusive_lock,
     sha256_bytes,
     sha256_file,
 )
-from continuity_kernel.errors import ConflictError, NotFoundError, ValidationError
+from continuity_kernel.errors import (
+    ConflictError,
+    DegradedIntegrityError,
+    MutationCommittedError,
+    NotFoundError,
+    PersistenceError,
+    ValidationError,
+)
 from continuity_kernel.records import (
     Entity,
     Record,
@@ -427,8 +437,9 @@ class Vault:
 
     def read_document(self, name: str) -> dict[str, str]:
         path = self._document_path(name)
-        content = self._read_text(path, max_bytes=MAX_DOCUMENT_BYTES)
-        return {"content": content, "name": path.name, "revision": sha256_bytes(content.encode())}
+        stored = self._read_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
+        content = stored.decode("utf-8")
+        return {"content": content, "name": path.name, "revision": sha256_bytes(stored)}
 
     def write_document(self, name: str, content: str, *, expected_revision: str) -> dict[str, str]:
         path = self._document_path(name)
@@ -438,17 +449,25 @@ class Vault:
             exclusive_lock(self.state / "locks/global.lock"),
             exclusive_lock(self._record_lock("document", path.stem.lower())),
         ):
-            before = self._read_text(path, max_bytes=MAX_DOCUMENT_BYTES)
-            self._expect(sha256_bytes(before.encode()), expected_revision)
+            before_bytes = self._read_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
+            before_bytes.decode("utf-8")
+            self._expect(sha256_bytes(before_bytes), expected_revision)
             normalized = content.rstrip() + "\n"
-            atomic_write(path, normalized.encode("utf-8"))
-            self._event(
-                "document.update", path.name, expected_revision, sha256_bytes(normalized.encode())
+            after_bytes = normalized.encode("utf-8")
+            after_revision = sha256_bytes(after_bytes)
+            self._persist_with_event(
+                path=path,
+                content=after_bytes,
+                previous=before_bytes,
+                operation="document.update",
+                identifier=path.name,
+                before_revision=expected_revision,
+                after_revision=after_revision,
             )
             return {
                 "content": normalized,
                 "name": path.name,
-                "revision": sha256_bytes(normalized.encode()),
+                "revision": after_revision,
             }
 
     def context_pack(self, *, max_characters: int = 48_000) -> str:
@@ -583,19 +602,28 @@ class Vault:
                         )
                     )
 
-        journal = self.root / "journal/events.jsonl"
+        journal_relative = "journal/events.jsonl"
+        journal = self.root / journal_relative
         try:
-            with journal.open("rb") as handle:
-                for number, line in enumerate(handle, 1):
-                    if len(line) > MAX_JOURNAL_LINE_BYTES:
-                        raise ValidationError(f"journal line {number} exceeds its size bound")
-                    if not line.endswith(b"\n"):
-                        raise ValidationError(f"journal line {number} has no record terminator")
-                    value = json.loads(line)
-                    if not isinstance(value, dict):
-                        raise ValidationError(f"journal line {number} is not an object")
-        except (OSError, json.JSONDecodeError, ValidationError) as exc:
-            issues.append(DoctorIssue("invalid-journal", "journal/events.jsonl", str(exc)))
+            with exclusive_lock(self.state / "locks/journal.lock"):
+                journal_issue, valid_bytes = self._journal_issue(journal)
+                if repair and journal_issue is not None and journal_issue.repairable:
+                    removed_bytes = journal.stat().st_size - valid_bytes
+                    with journal.open("r+b") as handle:
+                        handle.truncate(valid_bytes)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    repaired.append(journal_relative)
+                    journal_issue = DoctorIssue(
+                        "repaired-journal-tail",
+                        journal_relative,
+                        f"removed {removed_bytes} invalid trailing bytes after all complete "
+                        "journal records validated",
+                    )
+                if journal_issue is not None:
+                    issues.append(journal_issue)
+        except (OSError, ConflictError) as exc:
+            issues.append(DoctorIssue("invalid-journal", journal_relative, str(exc)))
 
         counts = {
             "tasks": len(task_ids),
@@ -735,15 +763,68 @@ class Vault:
             if path.exists():
                 raise ConflictError(f"{kind} already exists: {record.identifier}")
             rendered = _render_record(record)
-            atomic_write(path, rendered.encode("utf-8"))
-            self._event(f"{kind}.create", record.identifier, None, record.revision)
+            self._persist_with_event(
+                path=path,
+                content=rendered.encode("utf-8"),
+                previous=None,
+                operation=f"{kind}.create",
+                identifier=record.identifier,
+                before_revision=None,
+                after_revision=record.revision,
+            )
         return record
 
     def _replace_record(
         self, path: Path, kind: RecordKind, before: Record, after: Record, rendered: str
     ) -> None:
-        atomic_write(path, rendered.encode("utf-8"))
-        self._event(f"{kind}.update", before.identifier, before.revision, after.revision)
+        self._persist_with_event(
+            path=path,
+            content=rendered.encode("utf-8"),
+            previous=path.read_bytes(),
+            operation=f"{kind}.update",
+            identifier=before.identifier,
+            before_revision=before.revision,
+            after_revision=after.revision,
+        )
+
+    def _persist_with_event(
+        self,
+        *,
+        path: Path,
+        content: bytes,
+        previous: bytes | None,
+        operation: str,
+        identifier: str,
+        before_revision: str | None,
+        after_revision: str,
+    ) -> None:
+        atomic_write(path, content)
+        try:
+            self._event(operation, identifier, before_revision, after_revision)
+        except (DegradedIntegrityError, MutationCommittedError):
+            raise
+        except Exception as event_error:
+            try:
+                current = path.read_bytes() if path.exists() else None
+                if current not in {None, previous, content}:
+                    raise OSError("canonical bytes changed while rollback was pending")
+                if previous is None:
+                    if current == content:
+                        durable_unlink(path)
+                elif current == content:
+                    atomic_write(path, previous)
+                elif current is None:
+                    raise OSError("canonical file disappeared while rollback was pending")
+            except Exception as rollback_error:
+                relative = path.relative_to(self.root).as_posix()
+                raise DegradedIntegrityError(
+                    f"could not restore {relative} after its audit event failed; "
+                    "canonical or journal state may have changed. Run gsv doctor before retrying"
+                ) from rollback_error
+            raise PersistenceError(
+                f"{operation} was not committed because its audit event could not be persisted; "
+                "the canonical file was restored"
+            ) from event_error
 
     def _read_task(self, identifier: str) -> Task:
         path = self._path("task", identifier)
@@ -781,6 +862,9 @@ class Vault:
             )
 
     def _read_text(self, path: Path, *, max_bytes: int = 256 * 1024) -> str:
+        return self._read_bytes(path, max_bytes=max_bytes).decode("utf-8")
+
+    def _read_bytes(self, path: Path, *, max_bytes: int = 256 * 1024) -> bytes:
         self._assert_inside(path)
         if not path.exists():
             relative = path.relative_to(self.root).as_posix()
@@ -789,7 +873,11 @@ class Vault:
             raise ValidationError(f"expected a regular file: {path}")
         if path.stat().st_size > max_bytes:
             raise ValidationError(f"file exceeds its size bound: {path}")
-        return path.read_text(encoding="utf-8")
+        with path.open("rb") as handle:
+            content = handle.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise ValidationError(f"file exceeds its size bound: {path}")
+        return content
 
     def _document_path(self, name: str) -> Path:
         upper = name.strip().upper()
@@ -818,8 +906,107 @@ class Vault:
             "observed_at": format_time(datetime.now(UTC)),
             "operation": operation,
         }
-        with exclusive_lock(self.state / "locks/journal.lock"):
-            append_durable(self.root / "journal/events.jsonl", _json_line(event))
+        committed = False
+        try:
+            with exclusive_lock(self.state / "locks/journal.lock"):
+                try:
+                    append_durable(self.root / "journal/events.jsonl", _json_line(event))
+                except DurableAppendError as exc:
+                    if exc.outcome is AppendOutcome.COMMITTED:
+                        raise MutationCommittedError(
+                            "the canonical mutation and audit event were committed, but append "
+                            "cleanup failed. Reload the record before any retry"
+                        ) from exc
+                    if exc.outcome is AppendOutcome.UNKNOWN:
+                        raise DegradedIntegrityError(
+                            "the audit journal state is unknown after a failed append; "
+                            "canonical state was retained. Run gsv doctor before retrying"
+                        ) from exc
+                    raise
+                committed = True
+        except (DegradedIntegrityError, MutationCommittedError):
+            raise
+        except Exception as exc:
+            if committed:
+                raise MutationCommittedError(
+                    "the canonical mutation and audit event were committed, but the journal "
+                    "lock did not release cleanly. Reload the record before any retry"
+                ) from exc
+            raise
+
+    def _journal_issue(self, path: Path) -> tuple[DoctorIssue | None, int]:
+        valid_bytes = 0
+        with path.open("rb") as handle:
+            number = 0
+            while True:
+                line = handle.readline(MAX_JOURNAL_LINE_BYTES + 1)
+                if not line:
+                    return None, valid_bytes
+                number += 1
+                if len(line) > MAX_JOURNAL_LINE_BYTES:
+                    return (
+                        DoctorIssue(
+                            "invalid-journal",
+                            "journal/events.jsonl",
+                            f"journal line {number} exceeds its size bound",
+                        ),
+                        valid_bytes,
+                    )
+                if not line.endswith(b"\n"):
+                    try:
+                        value = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        return (
+                            DoctorIssue(
+                                "invalid-journal",
+                                "journal/events.jsonl",
+                                f"journal line {number} is an invalid non-terminated fragment; "
+                                f"{len(line)} trailing bytes can be removed",
+                                True,
+                            ),
+                            valid_bytes,
+                        )
+                    if not isinstance(value, dict):
+                        return (
+                            DoctorIssue(
+                                "invalid-journal",
+                                "journal/events.jsonl",
+                                f"journal line {number} is not an object and has no record "
+                                "terminator; retained for manual review",
+                            ),
+                            valid_bytes,
+                        )
+                    return (
+                        DoctorIssue(
+                            "invalid-journal",
+                            "journal/events.jsonl",
+                            f"journal line {number} is a valid event without a record terminator; "
+                            "retained for manual review",
+                        ),
+                        valid_bytes,
+                    )
+                try:
+                    value = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return (
+                        DoctorIssue(
+                            "invalid-journal",
+                            "journal/events.jsonl",
+                            f"journal line {number} is a complete invalid JSON record; "
+                            "retained for manual review",
+                        ),
+                        valid_bytes,
+                    )
+                if not isinstance(value, dict):
+                    return (
+                        DoctorIssue(
+                            "invalid-journal",
+                            "journal/events.jsonl",
+                            f"journal line {number} is not an object",
+                        ),
+                        valid_bytes,
+                    )
+                valid_bytes += len(line)
 
     def _expect(self, actual: str, expected: str) -> None:
         if not expected or actual != expected:

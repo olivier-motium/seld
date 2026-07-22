@@ -10,6 +10,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from enum import StrEnum
 from pathlib import Path
 from typing import IO, Protocol, cast
 
@@ -29,6 +30,22 @@ class _WindowsLock(Protocol):
     LK_UNLCK: int
 
     def locking(self, descriptor: int, mode: int, length: int) -> None: ...
+
+
+class AppendOutcome(StrEnum):
+    RESTORED = "restored"
+    COMMITTED = "committed"
+    UNKNOWN = "unknown"
+
+
+class DurableAppendError(OSError):
+    """An append failed with an explicit durable-state outcome."""
+
+    outcome: AppendOutcome
+
+    def __init__(self, message: str, *, outcome: AppendOutcome):
+        super().__init__(message)
+        self.outcome = outcome
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -92,13 +109,56 @@ def durable_replace(source: Path, target: Path) -> None:
 
 
 def append_durable(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    """Append to an existing file or report restored, committed, or unknown state."""
+
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except Exception as exc:
+        raise DurableAppendError(
+            "could not open the existing append target", outcome=AppendOutcome.RESTORED
+        ) from exc
+    try:
+        original_size = os.fstat(descriptor).st_size
+    except Exception as exc:
+        with suppress(OSError):
+            os.close(descriptor)
+        raise DurableAppendError(
+            "could not inspect the append target", outcome=AppendOutcome.RESTORED
+        ) from exc
     try:
         _write_all(descriptor, content)
         os.fsync(descriptor)
-    finally:
+    except Exception as exc:
+        try:
+            os.ftruncate(descriptor, original_size)
+            os.fsync(descriptor)
+        except Exception as rollback_exc:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise DurableAppendError(
+                "append failed and the previous bytes could not be restored",
+                outcome=AppendOutcome.UNKNOWN,
+            ) from rollback_exc
+        with suppress(OSError):
+            os.close(descriptor)
+        raise DurableAppendError(
+            "append failed and the previous bytes were restored",
+            outcome=AppendOutcome.RESTORED,
+        ) from exc
+    try:
         os.close(descriptor)
+    except Exception as exc:
+        raise DurableAppendError(
+            "append was synchronized but descriptor close failed",
+            outcome=AppendOutcome.COMMITTED,
+        ) from exc
+
+
+def durable_unlink(path: Path) -> None:
+    """Remove one file and persist the containing directory entry where supported."""
+
+    path.unlink()
+    _fsync_directory(path.parent)
 
 
 def _write_all(descriptor: int, content: bytes) -> None:

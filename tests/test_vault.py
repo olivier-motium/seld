@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -111,6 +112,86 @@ def test_document_requires_exact_revision(vault: Vault) -> None:
         )
 
 
+def test_document_revision_hashes_exact_stored_crlf_bytes(vault: Vault) -> None:
+    path = vault.root / "NOW.md"
+    stored = b"# Now\r\n\r\nExact CRLF bytes.\r\n"
+    path.write_bytes(stored)
+
+    document = vault.read_document("NOW.md")
+
+    assert document["content"] == stored.decode("utf-8")
+    assert document["revision"] == sha256_bytes(stored)
+    assert document["revision"] != sha256_bytes(stored.replace(b"\r\n", b"\n"))
+    updated = vault.write_document(
+        "NOW.md",
+        "# Now\n\nUpdated from the exact CRLF revision.",
+        expected_revision=document["revision"],
+    )
+    assert updated["revision"] == sha256_bytes(path.read_bytes())
+
+
+def test_document_write_reads_previous_bytes_once(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = vault.read_document("NOW.md")
+    real_read = vault._read_bytes
+    calls = 0
+
+    def counted_read(path: Path, *, max_bytes: int = 256 * 1024) -> bytes:
+        nonlocal calls
+        calls += 1
+        return real_read(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(vault, "_read_bytes", counted_read)
+
+    vault.write_document(
+        "NOW.md",
+        "# Now\n\nOne read supplies validation, revision, and rollback bytes.",
+        expected_revision=document["revision"],
+    )
+
+    assert calls == 1
+
+
+def test_document_size_bound_rejects_before_open(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = vault.root / "NOW.md"
+    path.write_bytes(b"x" * (MAX_DOCUMENT_BYTES + 1))
+    real_open = Path.open
+
+    def guarded_open(target: Path, *args: Any, **kwargs: Any) -> Any:
+        if target == path:
+            raise AssertionError("oversized document should be rejected before opening")
+        return real_open(target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    with pytest.raises(ValidationError, match="size bound"):
+        vault.read_document("NOW.md")
+
+
+def test_document_size_bound_rechecks_bounded_read(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = vault.root / "NOW.md"
+    path.write_bytes(b"x" * (MAX_DOCUMENT_BYTES + 1))
+    real_stat = Path.stat
+
+    def stale_small_stat(target: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        result = real_stat(target, *args, **kwargs)
+        if target != path:
+            return result
+        values = list(result)
+        values[6] = 0
+        return os.stat_result(values)
+
+    monkeypatch.setattr(Path, "stat", stale_small_stat)
+
+    with pytest.raises(ValidationError, match="size bound"):
+        vault.read_document("NOW.md")
+
+
 def test_initialize_is_idempotent_and_preserves_authored_documents(vault: Vault) -> None:
     now = vault.read_document("NOW.md")
     vault.write_document(
@@ -211,17 +292,84 @@ def test_doctor_reports_torn_journal_line(vault: Vault) -> None:
     result = vault.doctor()
 
     assert not result.healthy
-    assert any(issue.code == "invalid-journal" for issue in result.issues)
+    issue = next(issue for issue in result.issues if issue.code == "invalid-journal")
+    assert issue.repairable
+    assert "can be removed" in issue.message
+
+
+def test_doctor_repairs_only_invalid_final_fragment_and_is_idempotent(vault: Vault) -> None:
+    journal = vault.root / "journal/events.jsonl"
+    canonical = vault.root / "NOW.md"
+    canonical_before = canonical.read_bytes()
+    complete = b'{"complete":true}\n'
+    fragment = b'{"torn":'
+    journal.write_bytes(complete + fragment)
+
+    unrepaired = vault.doctor()
+
+    assert not unrepaired.healthy
+    assert unrepaired.repaired == ()
+    assert journal.read_bytes() == complete + fragment
+
+    repaired = vault.doctor(repair=True)
+
+    assert repaired.healthy
+    assert repaired.repaired == ("journal/events.jsonl",)
+    issue = next(issue for issue in repaired.issues if issue.code == "repaired-journal-tail")
+    assert issue.message == (
+        "removed 8 invalid trailing bytes after all complete journal records validated"
+    )
+    assert journal.read_bytes() == complete
+    assert canonical.read_bytes() == canonical_before
+
+    repeated = vault.doctor(repair=True)
+
+    assert repeated.healthy
+    assert repeated.issues == ()
+    assert repeated.repaired == ()
+    assert journal.read_bytes() == complete
 
 
 def test_doctor_rejects_complete_journal_json_without_record_terminator(vault: Vault) -> None:
     journal = vault.root / "journal/events.jsonl"
-    journal.write_bytes(b'{"synthetic":"complete but torn"}')
+    complete = b'{"synthetic":"complete but missing terminator"}'
+    journal.write_bytes(complete)
 
-    result = vault.doctor()
+    result = vault.doctor(repair=True)
 
     assert not result.healthy
+    assert result.repaired == ()
     assert any("record terminator" in issue.message for issue in result.issues)
+    assert journal.read_bytes() == complete
+
+
+def test_doctor_never_repairs_complete_invalid_journal_record(vault: Vault) -> None:
+    journal = vault.root / "journal/events.jsonl"
+    complete_invalid = b'{"invalid":}\n'
+    journal.write_bytes(complete_invalid)
+
+    result = vault.doctor(repair=True)
+
+    assert not result.healthy
+    assert result.repaired == ()
+    issue = next(issue for issue in result.issues if issue.code == "invalid-journal")
+    assert not issue.repairable
+    assert "retained for manual review" in issue.message
+    assert journal.read_bytes() == complete_invalid
+
+
+def test_doctor_never_repairs_invalid_record_in_journal_middle(vault: Vault) -> None:
+    journal = vault.root / "journal/events.jsonl"
+    stored = b'{"first":true}\n{"invalid":}\n{"last":true}\n'
+    journal.write_bytes(stored)
+
+    result = vault.doctor(repair=True)
+
+    assert not result.healthy
+    assert result.repaired == ()
+    issue = next(issue for issue in result.issues if issue.code == "invalid-journal")
+    assert not issue.repairable
+    assert journal.read_bytes() == stored
 
 
 def test_doctor_reports_oversized_authored_document(vault: Vault) -> None:
