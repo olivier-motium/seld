@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-continuity-kernel"
+version = "0.1.0"
+description = "A local-first continuity kernel for coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Continuity contributors" }]
+keywords = ["agents", "codex", "continuity", "local-first", "mcp"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2.2",
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.11",
+]
+release = [
+  "pyinstaller>=6.11,<7",
+]
+
+[project.scripts]
+continuity = "continuity_kernel.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/olivier-motium/agent-continuity-kernel"
+Issues = "https://github.com/olivier-motium/agent-continuity-kernel/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/continuity_kernel"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["continuity_kernel"]
+
+[tool.coverage.run]
+branch = true
+source = ["continuity_kernel"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true

@@ -1,0 +1,21 @@
+{
+  "name": "continuity-local",
+  "interface": {
+    "displayName": "Continuity"
+  },
+  "plugins": [
+    {
+      "name": "continuity",
+      "source": {
+        "source": "local",
+        "path": "./plugins/continuity"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
+

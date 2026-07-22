@@ -1,0 +1,29 @@
+{
+  "name": "continuity",
+  "version": "0.1.0",
+  "description": "Durable local context, tasks, entities, and work threads for Codex.",
+  "author": {
+    "name": "Continuity contributors"
+  },
+  "homepage": "https://github.com/olivier-motium/agent-continuity-kernel",
+  "repository": "https://github.com/olivier-motium/agent-continuity-kernel",
+  "license": "Apache-2.0",
+  "keywords": ["agents", "codex", "continuity", "local-first", "memory"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Continuity",
+    "shortDescription": "Carry grounded context across Codex sessions",
+    "longDescription": "Local-first durable context for coding agents, with inspectable Markdown, exact records, compare-and-swap writes, and portable backup and restore.",
+    "developerName": "Continuity contributors",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Show me what this Continuity vault currently knows",
+      "Create a durable task for this outcome",
+      "Prepare a handoff for my next Codex session"
+    ],
+    "screenshots": []
+  }
+}
+
