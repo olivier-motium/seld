@@ -30,6 +30,10 @@ MCP manifest, and skill. The manifest points directly to the standalone
 executable for release installs, or to the active module launcher for source
 installs.
 
+The MCP adapter resolves one vault for its process lifetime. An explicit global
+`--vault` argument takes precedence over `GSV_VAULT` and user configuration, so
+later requests cannot silently drift to a different vault.
+
 Installation is a staged transaction. Marketplace registration, plugin
 installation, and the managed `AGENTS.md` block are verified before setup
 starts the Bridge. A later setup failure rolls back only components introduced

@@ -93,6 +93,63 @@ def test_two_independent_mcp_sessions_share_durable_state(tmp_path: Path) -> Non
     assert resumed["result"]["structuredContent"]["next_action"] == ("Read from a second process.")
 
 
+def test_cli_explicit_vault_overrides_mcp_environment_for_process_lifetime(
+    tmp_path: Path,
+) -> None:
+    environment_vault = tmp_path / "environment-vault"
+    explicit_vault = tmp_path / "explicit-vault"
+    Vault(environment_vault).initialize(name="Environment vault")
+    Vault(explicit_vault).initialize(name="Explicit vault")
+    environment = os.environ.copy()
+    environment["GSV_VAULT"] = str(environment_vault)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "continuity_kernel",
+            "--vault",
+            str(explicit_vault),
+            "mcp",
+            "serve",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+
+    try:
+        _exchange(process, "initialize", 1)
+        status = _exchange(
+            process,
+            "tools/call",
+            2,
+            {"name": "gsv_status", "arguments": {}},
+        )["result"]["structuredContent"]
+        created = _exchange(
+            process,
+            "tools/call",
+            3,
+            {
+                "name": "gsv_task_create",
+                "arguments": {
+                    "id": "explicit-route",
+                    "title": "Explicit route",
+                    "outcome": "The CLI override owns this MCP process.",
+                },
+            },
+        )["result"]["structuredContent"]
+    finally:
+        _close(process)
+
+    assert status["vault"] == str(explicit_vault.resolve())
+    assert created["identifier"] == "explicit-route"
+    assert Vault(explicit_vault).get_task("explicit-route").identifier == "explicit-route"
+    assert Vault(environment_vault).list_tasks() == []
+
+
 def test_mcp_returns_structured_conflict_instead_of_overwriting(tmp_path: Path) -> None:
     vault_path = tmp_path / "vault"
     vault = Vault(vault_path)
@@ -161,8 +218,11 @@ def test_bounded_line_reader_drains_oversized_frame() -> None:
 
 
 def test_serve_handles_bad_frames_and_continues(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    vault = Vault(tmp_path / "stream-vault")
+    vault.initialize(name="Stream vault")
     requests = (
         b"\n"
         b"\xff\n"
@@ -177,7 +237,7 @@ def test_serve_handles_bad_frames_and_continues(
     monkeypatch.setattr(sys, "stdin", stdin)
     monkeypatch.setattr(sys, "stdout", stdout)
 
-    assert mcp_server.serve() == 0
+    assert mcp_server.serve(vault) == 0
     responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
 
     assert [response.get("id") for response in responses] == [None, None, None, 4]
@@ -185,6 +245,48 @@ def test_serve_handles_bad_frames_and_continues(
     assert responses[1]["error"]["code"] == -32000
     assert responses[2]["error"]["code"] == -32600
     assert responses[3]["result"] == {}
+
+
+def test_serve_resolves_one_vault_for_the_whole_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_path = tmp_path / "first-vault"
+    second_path = tmp_path / "second-vault"
+    Vault(first_path).initialize(name="First vault")
+    Vault(second_path).initialize(name="Second vault")
+    resolved: list[Path] = []
+
+    def alternating_resolution() -> Path:
+        path = first_path if not resolved else second_path
+        resolved.append(path)
+        return path
+
+    requests = b"".join(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": "gsv_status", "arguments": {}},
+            }
+        ).encode("utf-8")
+        + b"\n"
+        for request_id in (1, 2)
+    )
+    stdin = io.TextIOWrapper(io.BytesIO(requests), encoding="utf-8")
+    stdout = io.StringIO()
+    monkeypatch.setattr(mcp_server, "resolve_vault", alternating_resolution)
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    assert mcp_server.serve() == 0
+    responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+
+    assert resolved == [first_path]
+    assert [response["result"]["structuredContent"]["vault"] for response in responses] == [
+        str(first_path.resolve()),
+        str(first_path.resolve()),
+    ]
 
 
 def _direct_call(name: str, arguments: dict[str, Any], request_id: int = 1) -> dict[str, Any]:

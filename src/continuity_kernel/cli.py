@@ -50,7 +50,7 @@ def main(arguments: list[str] | None = None) -> int:
             args.bridge_command = "open"
             args.no_browser = False
         if args.command == "mcp":
-            return serve()
+            return serve(Vault(resolve_vault(getattr(args, "vault", None))))
         result = _dispatch(args)
         _print(result, json_output=args.json, raw=getattr(args, "raw", False))
         return 0
