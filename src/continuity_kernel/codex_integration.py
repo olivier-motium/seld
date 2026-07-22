@@ -26,6 +26,7 @@ MARKETPLACE_NAME: Final = "gsv-local"
 PLUGIN_ID: Final = "gsv@gsv-local"
 BLOCK_START: Final = "<!-- gsv-managed:start -->"
 BLOCK_END: Final = "<!-- gsv-managed:end -->"
+RECEIPT_FORMAT_VERSION: Final = 1
 
 MANAGED_BLOCK = f"""{BLOCK_START}
 ## GSV
@@ -552,11 +553,41 @@ def _load_receipt(home: Path) -> dict[str, Any]:
     path = _receipt_path(home)
     if not path.exists():
         return {}
+    if path.is_symlink():
+        raise ValidationError(f"Codex integration receipt cannot be a symbolic link: {path}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValidationError(f"invalid Codex integration receipt: {path}") from exc
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        raise ValidationError(f"Codex integration receipt must be a JSON object: {path}")
+    if type(payload.get("format_version")) is not int:  # bool is not a valid version
+        raise ValidationError(f"Codex integration receipt has an invalid format version: {path}")
+    if payload["format_version"] != RECEIPT_FORMAT_VERSION:
+        raise ValidationError(f"unsupported Codex integration receipt version: {path}")
+    if payload.get("codex_home") != str(home):
+        raise ValidationError(
+            f"Codex integration receipt belongs to a different Codex home: {path}"
+        )
+    for field in ("marketplace_owned", "plugin_owned"):
+        if type(payload.get(field)) is not bool:
+            raise ValidationError(
+                f"Codex integration receipt field {field} must be a boolean: {path}"
+            )
+    if payload["marketplace_owned"]:
+        root = payload.get("marketplace_root")
+        digest = payload.get("marketplace_digest")
+        if not isinstance(root, str) or not root:
+            raise ValidationError(f"owned Codex marketplace receipt is missing its path: {path}")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValidationError(
+                f"owned Codex marketplace receipt has an invalid SHA-256 digest: {path}"
+            )
+    return payload
 
 
 def _save_receipt(
@@ -569,7 +600,7 @@ def _save_receipt(
 ) -> None:
     payload = {
         "codex_home": str(home),
-        "format_version": 1,
+        "format_version": RECEIPT_FORMAT_VERSION,
         "marketplace_owned": marketplace_owned,
         "marketplace_digest": marketplace_digest,
         "marketplace_root": str(marketplace_root),

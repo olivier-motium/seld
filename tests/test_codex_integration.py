@@ -218,6 +218,64 @@ def test_instruction_post_verification_failure_prevents_all_provider_calls(
     assert receipt.exists()
 
 
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "non_object",
+        "missing_version",
+        "boolean_version",
+        "unsupported_version",
+        "wrong_home",
+        "non_boolean_ownership",
+        "missing_owned_root",
+        "invalid_owned_digest",
+    ],
+)
+def test_invalid_receipt_shape_or_schema_fails_before_any_uninstall_mutation(
+    tmp_path: Path,
+    fake_codex: FakeCodex,
+    invalid_case: str,
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    receipt = integration._receipt_path(home)
+    payload: object = json.loads(receipt.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    if invalid_case == "non_object":
+        payload = []
+    elif invalid_case == "missing_version":
+        payload.pop("format_version")
+    elif invalid_case == "boolean_version":
+        payload["format_version"] = True
+    elif invalid_case == "unsupported_version":
+        payload["format_version"] = 99
+    elif invalid_case == "wrong_home":
+        payload["codex_home"] = str(tmp_path / "other-codex")
+    elif invalid_case == "non_boolean_ownership":
+        payload["plugin_owned"] = 1
+    elif invalid_case == "missing_owned_root":
+        payload.pop("marketplace_root")
+    elif invalid_case == "invalid_owned_digest":
+        payload["marketplace_digest"] = "not-a-sha256"
+    invalid = (json.dumps(payload, sort_keys=True) + "\n").encode()
+    receipt.write_bytes(invalid)
+    agents_before = (home / "AGENTS.md").read_bytes()
+    marketplace_digest = integration._tree_digest(marketplace)
+    provider_calls = list(fake_codex.calls)
+
+    with pytest.raises(ValidationError, match="receipt"):
+        integration.uninstall_codex(codex_home=home)
+
+    assert receipt.read_bytes() == invalid
+    assert (home / "AGENTS.md").read_bytes() == agents_before
+    assert integration._tree_digest(marketplace) == marketplace_digest
+    assert fake_codex.calls == provider_calls
+    assert fake_codex.plugins == {integration.PLUGIN_ID}
+    assert fake_codex.marketplaces == {integration.MARKETPLACE_NAME: str(marketplace.resolve())}
+
+
 def test_failed_final_status_restores_existing_agents_and_removes_new_backup(
     tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
 ) -> None:

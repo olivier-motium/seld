@@ -166,3 +166,9 @@ untouched for manual review. Provider registration cleanup is skipped until
 that local state is resolved, so a modified tree is not orphaned by removing
 its ownership evidence. An explicit but invalid `GSV_CODEX` override fails
 closed before changing integration state.
+
+The ownership receipt is also fail-closed: it must be a versioned JSON object
+bound to the exact Codex home, with typed ownership flags and a valid path and
+SHA-256 for owned marketplace files. A malformed or mismatched receipt is left
+byte-for-byte unchanged, no integration state is touched, and the release
+uninstaller keeps the executable.
