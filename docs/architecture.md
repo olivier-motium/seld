@@ -138,7 +138,12 @@ incomplete stage retains the ownership receipt and executable for the exact
 recovery path. A receipt-bound legacy state whose generated marketplace is
 already absent gets a deterministic packaged removal scaffold so a
 manifest-dependent Codex provider can finish cleanup. A recursive-delete error
-is manual-review state because deletion may have been partial.
+after provider verification retains a durable provider-complete phase and the
+exact owned entry hashes. A later offline retry may delete only an unchanged
+subset of that manifest; any added or changed entry remains a manual-review
+boundary. Legacy scaffolds are file- and directory-synchronized in an exclusive
+stage before no-replace publication and provider access. Duplicate target
+plugin or marketplace identities stop provider mutation as ambiguous state.
 
 ## Portability
 

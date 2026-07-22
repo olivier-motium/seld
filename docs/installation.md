@@ -121,8 +121,10 @@ checking `gsv bridge status` or `gsv bridge stop`.
 
 Setup is idempotent and integration rollback removes only components added by
 the failed invocation. Binary rollback restores the old executable and attempts
-to restore its prior Bridge lifecycle. A concurrent or unrelated user change
-is left untouched.
+to restore its prior Bridge lifecycle. If a new ownership receipt becomes
+visible but its write reports failure, first install removes only those exact
+new bytes; an upgrade restores and durability-checks the exact prior receipt.
+A concurrent or unrelated user change is left untouched.
 
 Back up the vault before any future release that announces a format migration:
 
@@ -198,9 +200,17 @@ nonzero retry exit without requiring `jq` or another JSON parser.
 A valid older receipt whose generated marketplace is already missing is handled
 automatically: GSV restores a packaged, digest-checked removal scaffold at the
 receipt-bound path, lets Codex remove and verify the live registrations, then
-deletes the scaffold. If local recursive deletion itself raises, inspect the
-retained tree and receipt before another attempt; some owned files may already
-have been removed, so GSV does not promise an automatic retry.
+deletes the scaffold. Immediately after provider verification GSV checkpoints
+that phase and an exact owned-file manifest in the receipt. If local recursive
+deletion raises after removing only some entries, re-run `gsv codex uninstall`;
+the retry skips Codex and removes only an unchanged subset of the recorded
+files. Added or changed entries remain untouched for manual review.
+
+The recovery scaffold is built in an exclusive sibling stage, each file and
+nested directory is synchronized, and the complete tree is published without
+replacement before any provider call. Duplicate GSV plugin IDs or marketplace
+names are provider ambiguity: GSV performs no add or remove action and asks for
+explicit inspection.
 
 A changed, unreadable, symlinked, or out-of-bound generated marketplace is left
 untouched for manual review. Provider registration cleanup is skipped until
