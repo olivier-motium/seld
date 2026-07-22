@@ -40,6 +40,7 @@ const viewCopy = {
 
 const state = {
   currentView: viewFromHash(),
+  integrationRetryTimer: null,
   lastSuccessAt: null,
   previouslyFocused: null,
   selectedTaskId: null,
@@ -79,7 +80,7 @@ window.addEventListener("keydown", (event) => {
 
 loadSnapshot();
 window.setInterval(() => loadSnapshot({ quiet: true }), 10_000);
-window.setInterval(updateFreshness, 5_000);
+window.setInterval(updateLiveLabels, 1_000);
 
 async function loadSnapshot({ quiet = false } = {}) {
   if (!quiet) {
@@ -105,6 +106,7 @@ async function loadSnapshot({ quiet = false } = {}) {
     state.lastSuccessAt = Date.now();
     setConnectionState(state.snapshot.doctor.healthy ? "healthy" : "partial");
     if (snapshotChanged) render();
+    scheduleIntegrationRefresh(snapshot);
   } catch (error) {
     const message = connectionMessage(error);
     if (state.snapshot) {
@@ -124,8 +126,13 @@ function render() {
   const [title, intro] = viewCopy[state.currentView] || viewCopy.now;
   ui.pageTitle.textContent = title;
   ui.pageIntro.textContent = intro;
-  ui.openCodex.href = snapshot.codex.new_mind_url;
-  ui.openCodex.hidden = false;
+  if (codexReady(snapshot)) {
+    ui.openCodex.href = snapshot.codex.new_mind_url;
+    ui.openCodex.hidden = false;
+  } else {
+    ui.openCodex.removeAttribute("href");
+    ui.openCodex.hidden = true;
+  }
 
   const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
   ui.taskCount.textContent = String(openTasks.length);
@@ -187,7 +194,7 @@ function renderContinuity(snapshot) {
     continuityStage(
       "02",
       "Hands",
-      inMotion ? `${inMotion} in motion` : "Replaceable",
+      inMotion ? `${inMotion} doing` : "Replaceable",
       "",
       inMotion ? "working" : "",
     ),
@@ -222,9 +229,7 @@ function renderFirstRun(snapshot) {
       "Codex will read the local GSV context, ask only what matters, and leave the first durable orientation behind.",
     ),
   );
-  const action = textElement("a", "primary-action", "Start in Codex");
-  action.href = snapshot.codex.new_mind_url;
-  empty.append(copy, action);
+  empty.append(copy, renderCodexAction(snapshot, "Start in Codex"));
   return empty;
 }
 
@@ -273,22 +278,26 @@ function renderTaskBoard(tasks, limit = null) {
 }
 
 function taskLanes(tasks) {
-  const human = tasks.filter((task) => task.next_actor === "human");
-  const waiting = tasks.filter(
-    (task) => task.next_actor !== "human" && (task.status === "waiting" || task.next_actor === "external"),
-  );
-  const agent = tasks.filter((task) => !human.includes(task) && !waiting.includes(task));
-  return [
-    { empty: "Nothing needs you now.", tasks: human, title: "Needs you" },
-    { empty: "No hand is carrying work.", tasks: agent, title: "In motion" },
-    { empty: "Nothing is waiting outside.", tasks: waiting, title: "Waiting" },
-  ];
+  const schemaOrder = ["captured", "ready", "doing", "waiting", "someday", "done", "dropped"];
+  const statuses = [...new Set(tasks.map((task) => String(task.status)))].sort((left, right) => {
+    const leftIndex = schemaOrder.indexOf(left);
+    const rightIndex = schemaOrder.indexOf(right);
+    if (leftIndex === -1 && rightIndex === -1) return left.localeCompare(right);
+    if (leftIndex === -1) return 1;
+    if (rightIndex === -1) return -1;
+    return leftIndex - rightIndex;
+  });
+  return statuses.map((status) => ({
+    empty: "No commitments in this lane.",
+    tasks: tasks.filter((task) => String(task.status) === status),
+    title: statusLabel({ status }),
+  }));
 }
 
 function renderTaskCard(task) {
   const card = element("button", "task-card", { type: "button" });
   card.addEventListener("click", () => openInspector(task.identifier));
-  const pillClass = task.next_actor === "human" ? "is-human" : `is-${task.status}`;
+  const pillClass = `is-${task.status}`;
   const pill = textElement("span", `status-pill ${pillClass}`, statusLabel(task));
   card.append(
     pill,
@@ -298,7 +307,7 @@ function renderTaskCard(task) {
   const foot = element("div", "task-foot");
   foot.append(
     textElement("span", "", task.next_actor ? actorLabel(task.next_actor) : "Actor open"),
-    textElement("span", "", relativeTime(task.updated_at)),
+    relativeTimeElement(task.updated_at),
   );
   card.append(foot);
   return card;
@@ -401,11 +410,9 @@ function renderSystem(snapshot) {
     ),
     systemRow(
       "Codex hands",
-      snapshot.codex.available
-        ? "The GSV plugin can load durable context in a fresh Codex task."
-        : "The local vault works, but Codex integration could not be verified.",
-      snapshot.codex.plugin_installed ? "Connected" : "Check setup",
-      snapshot.codex.plugin_installed ? "" : "is-warning",
+      codexSystemCopy(snapshot),
+      codexSystemStatus(snapshot),
+      codexReady(snapshot) ? "" : "is-warning",
     ),
     systemRow(
       "Bridge",
@@ -427,7 +434,115 @@ function renderSystem(snapshot) {
     ),
   );
   container.append(list);
+  if (!snapshot.doctor.healthy) container.append(renderDoctorRecovery(snapshot.doctor));
+  if (!codexReady(snapshot) && !snapshot.codex.checking) {
+    container.append(renderRecoveryCommand("Connect Codex", "gsv codex install"));
+  }
   return container;
+}
+
+function renderDoctorRecovery(doctor) {
+  const panel = element("section", "recovery-panel");
+  const copy = element("div");
+  copy.append(
+    textElement("p", "section-label", "Integrity check"),
+    textElement("h2", "", "The vault needs attention"),
+  );
+  const issues = element("ul", "issue-list");
+  for (const issue of doctor.issues || []) {
+    const item = element("li");
+    item.append(
+      textElement("strong", "", issue.path || issue.code || "Vault issue"),
+      textElement("span", "", issue.message || "The integrity check did not pass."),
+      textElement("small", "", issue.repairable ? "Repairable by GSV" : "Review required"),
+    );
+    issues.append(item);
+  }
+  const actions = element("div", "recovery-actions");
+  if ((doctor.issues || []).some((issue) => issue.repairable)) {
+    actions.append(commandAction("gsv doctor --repair"));
+  }
+  if ((doctor.issues || []).some((issue) => !issue.repairable)) {
+    actions.append(commandAction("gsv doctor"));
+  }
+  panel.append(copy, issues, actions);
+  return panel;
+}
+
+function renderRecoveryCommand(title, command) {
+  const panel = element("section", "recovery-panel is-compact");
+  const copy = element("div");
+  copy.append(
+    textElement("p", "section-label", "Recovery"),
+    textElement("h2", "", title),
+  );
+  panel.append(copy, commandAction(command));
+  return panel;
+}
+
+function commandAction(command) {
+  const action = element("div", "command-action");
+  const code = textElement("code", "", command);
+  const button = textElement("button", "command-copy", "Copy command");
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    const copied = await copyText(command);
+    button.textContent = copied ? "Copied" : "Select command";
+    if (!copied) window.getSelection()?.selectAllChildren(code);
+    window.setTimeout(() => {
+      button.textContent = "Copy command";
+    }, 1_600);
+  });
+  action.append(code, button);
+  return action;
+}
+
+async function copyText(value) {
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function renderCodexAction(snapshot, label) {
+  if (codexReady(snapshot)) {
+    const action = textElement("a", "primary-action", label);
+    action.href = snapshot.codex.new_mind_url;
+    return action;
+  }
+  if (snapshot.codex.checking) {
+    const checking = element("div", "checking-action");
+    checking.append(createThinkingOrb("searching", "Checking Codex setup"));
+    checking.append(textElement("span", "", "Checking Codex"));
+    return checking;
+  }
+  const recovery = element("div", "codex-recovery");
+  if (snapshot.codex.error) {
+    recovery.append(textElement("p", "recovery-message", snapshot.codex.error));
+  }
+  recovery.append(commandAction("gsv codex install"));
+  return recovery;
+}
+
+function codexReady(snapshot) {
+  return snapshot.codex.ready === true;
+}
+
+function codexSystemCopy(snapshot) {
+  if (snapshot.codex.checking) return "Checking the local Codex integration.";
+  if (codexReady(snapshot)) return "The GSV plugin can load durable context in a fresh Codex task.";
+  if (snapshot.codex.error) return snapshot.codex.error;
+  if (snapshot.codex.available) return "Codex is present, but its GSV integration is incomplete.";
+  return "The local vault works, but Codex could not be found.";
+}
+
+function codexSystemStatus(snapshot) {
+  if (snapshot.codex.checking) return "Checking";
+  if (codexReady(snapshot)) return "Connected";
+  if (snapshot.codex.available) return "Run setup";
+  return "Unavailable";
 }
 
 function systemRow(title, copy, status, statusClass) {
@@ -492,8 +607,15 @@ function renderInspector(task) {
     detail("Waiting on", task.waiting_on || "Nothing recorded."),
     detail("Record", `${task.identifier}\nUpdated ${task.updated_at}\nRevision ${task.revision}`),
   );
-  ui.continueInCodex.href = task.codex_url || state.snapshot.codex.new_mind_url;
-  ui.inspectorFoot.hidden = false;
+  if (codexReady(state.snapshot) && task.codex_url) {
+    ui.continueInCodex.href = task.codex_url;
+    ui.inspectorFoot.replaceChildren(ui.continueInCodex);
+    ui.inspectorFoot.hidden = false;
+  } else {
+    ui.continueInCodex.removeAttribute("href");
+    ui.inspectorFoot.replaceChildren(renderCodexAction(state.snapshot, "Open in new Codex hand"));
+    ui.inspectorFoot.hidden = false;
+  }
 }
 
 function detail(label, value) {
@@ -607,6 +729,26 @@ function updateFreshness() {
   }
 }
 
+function updateLiveLabels() {
+  updateFreshness();
+  for (const node of document.querySelectorAll("[data-relative-time]")) {
+    node.textContent = relativeTime(node.dataset.relativeTime);
+  }
+}
+
+function scheduleIntegrationRefresh(snapshot) {
+  if (!snapshot.codex.checking) {
+    if (state.integrationRetryTimer !== null) window.clearTimeout(state.integrationRetryTimer);
+    state.integrationRetryTimer = null;
+    return;
+  }
+  if (state.integrationRetryTimer !== null) return;
+  state.integrationRetryTimer = window.setTimeout(() => {
+    state.integrationRetryTimer = null;
+    loadSnapshot({ quiet: true });
+  }, 1_000);
+}
+
 function keepFocusInsideInspector(event) {
   const focusable = [...ui.inspector.querySelectorAll("button, a[href]")].filter(
     (node) => !node.hidden && node.getAttribute("aria-hidden") !== "true",
@@ -634,17 +776,17 @@ function captureBridgeToken() {
 }
 
 function statusLabel(task) {
-  if (task.next_actor === "human") return "Needs you";
   const labels = {
     captured: "Captured",
-    doing: "In motion",
+    doing: "Doing",
     done: "Done",
     dropped: "Dropped",
     ready: "Ready",
-    someday: "Later",
+    someday: "Someday",
     waiting: "Waiting",
   };
-  return labels[task.status] || task.status;
+  const status = String(task.status || "Unknown");
+  return labels[status] || `${status.charAt(0).toUpperCase()}${status.slice(1)}`;
 }
 
 function actorLabel(actor) {
@@ -659,6 +801,12 @@ function relativeTime(timestamp) {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
   if (seconds < 86_400) return `${Math.floor(seconds / 3600)}h ago`;
   return `${Math.floor(seconds / 86_400)}d ago`;
+}
+
+function relativeTimeElement(timestamp) {
+  const node = textElement("span", "task-time", relativeTime(timestamp));
+  node.dataset.relativeTime = timestamp;
+  return node;
 }
 
 function revisionLabel(revision) {

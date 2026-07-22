@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import tempfile
 import threading
+from datetime import UTC, datetime, timedelta
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any, cast
@@ -42,12 +44,16 @@ def main() -> int:
     result = {
         "gif": str(output / "gsv-handoff.gif"),
         "inspector": str(output / "bridge-inspector.png"),
+        "integrity_warning": str(output / "bridge-integrity-warning.png"),
         "mobile": str(output / "bridge-mobile.png"),
         "mobile_inspector": str(output / "bridge-mobile-inspector.png"),
+        "mobile_recovery": str(output / "bridge-mobile-recovery.png"),
         "screenshot": str(output / "bridge-overview.png"),
         "stale": str(output / "bridge-stale.png"),
         "synthetic": True,
+        "unknown_status": str(output / "bridge-unknown-status.png"),
         "unavailable": str(output / "bridge-unavailable.png"),
+        "unavailable_codex": str(output / "bridge-codex-unavailable.png"),
     }
     print(json.dumps(result, sort_keys=True))
     return 0
@@ -76,7 +82,7 @@ def _capture(root: Path, vault: Vault, output: Path) -> list[Path]:
 
 
 def _synthetic_codex_status() -> dict[str, Any]:
-    return {"instructions_installed": True, "plugin_installed": True}
+    return {"available": True, "instructions_installed": True, "plugin_installed": True}
 
 
 def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
@@ -109,12 +115,13 @@ def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
                 ) from exc
             _assert_visibility(page, "#connection-notice", visible=False)
             _assert_visibility(page, "#task-count", visible=True)
-            _assert_visibility(page, "#open-codex", visible=True)
             _assert_visibility(page, "#rail-backdrop", visible=False)
             _assert_visibility(page, "#inspector-backdrop", visible=False)
             _assert_visibility(page, "#inspector-foot", visible=False)
             _assert_visibility(page, "#connection-orb", visible=False)
             _assert_visibility(page, "#local-status .status-dot", visible=True)
+            page.locator("#open-codex").wait_for(state="visible", timeout=5_000)
+            _assert_codex_links(page, expected=True)
             _assert_orb_canvas(page, ".continuity-orb")
             _assert_reduced_orb_static(page, ".continuity-orb")
             _assert_no_browser_errors(console_errors, page_errors)
@@ -126,6 +133,7 @@ def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
 
             page.locator("button[data-view='commitments']").click()
             page.locator(".commitment-grid").wait_for()
+            _assert_exact_authored_task_state(page)
             frame_two = root / "02-commitments.png"
             page.screenshot(path=str(frame_two), animations="disabled")
 
@@ -158,6 +166,11 @@ def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
             _assert_no_browser_errors(console_errors, page_errors)
             page.unroute("**/api/v1/snapshot")
 
+            ready_snapshot = _read_snapshot(page)
+            _capture_codex_recovery_states(page, ready_snapshot, output)
+            _capture_unknown_status(page, ready_snapshot, output)
+            _capture_integrity_warning(page, ready_snapshot, output)
+
             unavailable = browser.new_page(
                 viewport={"width": 1024, "height": 760},
                 device_scale_factor=1,
@@ -188,6 +201,7 @@ def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
 
             page.reload(wait_until="networkidle")
             page.locator("#local-status.is-healthy").wait_for(timeout=10_000)
+            page.locator("#open-codex").wait_for(state="visible", timeout=5_000)
             page.set_viewport_size({"width": 390, "height": 844})
             page.locator("#menu-button").click()
             page.locator("#rail.is-open").wait_for()
@@ -215,13 +229,216 @@ def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
         frame_three,
         output / "bridge-overview.png",
         output / "bridge-inspector.png",
+        output / "bridge-integrity-warning.png",
         output / "bridge-mobile.png",
         output / "bridge-mobile-inspector.png",
+        output / "bridge-mobile-recovery.png",
         output / "bridge-stale.png",
+        output / "bridge-unknown-status.png",
         output / "bridge-unavailable.png",
+        output / "bridge-codex-unavailable.png",
     ):
         _assert_nonblank(image)
     return [frame_one, frame_two, frame_three]
+
+
+def _read_snapshot(page: Any) -> dict[str, Any]:
+    payload = page.evaluate(
+        """async () => {
+          const token = window.sessionStorage.getItem('gsv_bridge_token');
+          const response = await fetch('/api/v1/snapshot', {
+            cache: 'no-store',
+            headers: {Accept: 'application/json', Authorization: `Bearer ${token}`},
+          });
+          if (!response.ok) throw new Error(`snapshot ${response.status}`);
+          return response.json();
+        }"""
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("Bridge browser returned a non-object snapshot")
+    return cast(dict[str, Any], payload)
+
+
+def _route_snapshot(page: Any, payload: dict[str, Any]) -> Any:
+    def handler(route: Any) -> None:
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    page.route("**/api/v1/snapshot", handler)
+    return handler
+
+
+def _without_codex_links(snapshot: dict[str, Any], *, available: bool) -> dict[str, Any]:
+    payload = copy.deepcopy(snapshot)
+    payload["codex"] = {
+        "available": available,
+        "checking": False,
+        **(
+            {"error": "Codex executable was not found in the verified local paths."}
+            if not available
+            else {}
+        ),
+        "instructions_installed": False,
+        "plugin_installed": False,
+        "ready": False,
+    }
+    for task in payload["tasks"]:
+        task.pop("codex_url", None)
+    return payload
+
+
+def _capture_codex_recovery_states(page: Any, snapshot: dict[str, Any], output: Path) -> None:
+    uninstalled = _without_codex_links(snapshot, available=True)
+    handler = _route_snapshot(page, uninstalled)
+    try:
+        page.reload(wait_until="networkidle")
+        page.locator("#local-status.is-healthy").wait_for(timeout=5_000)
+        _assert_codex_links(page, expected=False)
+        page.locator("button[data-view='system']").click()
+        page.get_by_text("Run setup", exact=True).wait_for()
+        page.locator(".command-action code", has_text="gsv codex install").wait_for()
+        page.locator("button[data-view='commitments']").click()
+        page.locator(".task-card").first.click()
+        page.locator("#inspector.is-open").wait_for()
+        _assert_visibility(page, "#inspector-foot", visible=True)
+        if page.locator("#continue-in-codex").count() != 0:
+            raise RuntimeError("an unready inspector retained a hidden Codex anchor")
+        page.locator("#inspector-foot code", has_text="gsv codex install").wait_for()
+        page.keyboard.press("Escape")
+    finally:
+        page.unroute("**/api/v1/snapshot", handler)
+
+    unavailable = _without_codex_links(snapshot, available=False)
+    handler = _route_snapshot(page, unavailable)
+    try:
+        page.reload(wait_until="networkidle")
+        page.locator("#local-status.is-healthy").wait_for(timeout=5_000)
+        page.locator("button[data-view='system']").click()
+        page.get_by_text("Unavailable", exact=True).wait_for()
+        _assert_codex_links(page, expected=False)
+        page.get_by_text(
+            "Codex executable was not found in the verified local paths.", exact=True
+        ).wait_for()
+        command = page.locator(".command-action", has_text="gsv codex install")
+        button = command.locator("button")
+        button.click()
+        page.wait_for_function(
+            "button => ['Copied', 'Select command'].includes(button.textContent)",
+            arg=button.element_handle(),
+            timeout=2_000,
+        )
+        if button.inner_text() not in {"Copied", "Select command"}:
+            raise RuntimeError("the Codex recovery command did not acknowledge its copy action")
+        _reset_scroll(page)
+        page.screenshot(path=str(output / "bridge-codex-unavailable.png"), animations="disabled")
+    finally:
+        page.unroute("**/api/v1/snapshot", handler)
+
+
+def _capture_unknown_status(page: Any, snapshot: dict[str, Any], output: Path) -> None:
+    payload = copy.deepcopy(snapshot)
+    task = payload["tasks"][0]
+    task["status"] = "reviewing"
+    task["updated_at"] = (
+        (datetime.now(UTC) - timedelta(seconds=59.2)).isoformat().replace("+00:00", "Z")
+    )
+    handler = _route_snapshot(page, payload)
+    try:
+        page.reload(wait_until="networkidle")
+        page.locator("#local-status.is-healthy").wait_for(timeout=5_000)
+        page.locator("button[data-view='commitments']").click()
+        page.locator(".lane-head h3", has_text="Reviewing").wait_for()
+        lane_names = page.locator(".lane-head h3").all_inner_texts()
+        schema_order = ["Captured", "Ready", "Doing", "Waiting", "Someday"]
+        known = [name for name in lane_names if name in schema_order]
+        if known != sorted(known, key=schema_order.index) or lane_names[-1] != "Reviewing":
+            raise RuntimeError(f"task lanes are not in deterministic schema order: {lane_names}")
+        card = page.get_by_role("button", name=re.compile(re.escape(task["title"])))
+        if card.locator(".status-pill").inner_text() != "Reviewing":
+            raise RuntimeError("an unknown authored status was renamed or hidden")
+        timestamp = card.locator("[data-relative-time]")
+        if timestamp.inner_text() != "Just now":
+            raise RuntimeError("the relative-time fixture did not begin at Just now")
+        page.wait_for_timeout(2_000)
+        if timestamp.inner_text() != "1m ago":
+            raise RuntimeError("relative task time froze when the snapshot stayed unchanged")
+        _reset_scroll(page)
+        page.screenshot(path=str(output / "bridge-unknown-status.png"), animations="disabled")
+    finally:
+        page.unroute("**/api/v1/snapshot", handler)
+
+
+def _capture_integrity_warning(page: Any, snapshot: dict[str, Any], output: Path) -> None:
+    payload = copy.deepcopy(snapshot)
+    payload["doctor"] = {
+        **payload["doctor"],
+        "healthy": False,
+        "issues": [
+            {
+                "code": "invalid-journal",
+                "message": "invalid final journal fragment",
+                "path": ".gsv/events.jsonl",
+                "repairable": True,
+            },
+            {
+                "code": "invalid-record",
+                "message": "record metadata is invalid",
+                "path": "tasks/review-atlas.md",
+                "repairable": False,
+            },
+        ],
+    }
+    handler = _route_snapshot(page, payload)
+    try:
+        page.reload(wait_until="networkidle")
+        page.locator("#local-status.is-partial").wait_for(timeout=5_000)
+        page.locator("button[data-view='system']").click()
+        page.get_by_text(".gsv/events.jsonl", exact=True).wait_for()
+        page.get_by_text("invalid final journal fragment", exact=True).wait_for()
+        page.get_by_text("tasks/review-atlas.md", exact=True).wait_for()
+        page.get_by_text("record metadata is invalid", exact=True).wait_for()
+        commands = page.locator(".recovery-panel code").all_inner_texts()
+        if commands != ["gsv doctor --repair", "gsv doctor"]:
+            raise RuntimeError(
+                f"doctor recovery commands do not distinguish issue types: {commands}"
+            )
+        _reset_scroll(page)
+        page.screenshot(path=str(output / "bridge-integrity-warning.png"), animations="disabled")
+        page.set_viewport_size({"width": 390, "height": 844})
+        _reset_scroll(page)
+        page.locator(".recovery-panel").scroll_into_view_if_needed()
+        _assert_visibility(page, ".recovery-panel code", visible=True, first=True)
+        if page.locator(".recovery-panel code").count() != 2:
+            raise RuntimeError("mobile recovery did not retain both doctor commands")
+        _assert_viewport(page)
+        page.screenshot(path=str(output / "bridge-mobile-recovery.png"), animations="disabled")
+        page.set_viewport_size({"width": 1440, "height": 920})
+    finally:
+        page.unroute("**/api/v1/snapshot", handler)
+
+
+def _assert_exact_authored_task_state(page: Any) -> None:
+    lanes = page.locator(".lane-head h3").all_inner_texts()
+    if lanes != ["Ready", "Doing", "Waiting"]:
+        raise RuntimeError(f"task lanes do not preserve authored schema order: {lanes}")
+    pills = set(page.locator(".task-card .status-pill").all_inner_texts())
+    if pills != {"Ready", "Doing", "Waiting"}:
+        raise RuntimeError(f"task status labels were renamed: {sorted(pills)}")
+
+
+def _assert_codex_links(page: Any, *, expected: bool) -> None:
+    links = page.locator('a[href^="codex://new?"]')
+    if expected:
+        if links.count() < 1:
+            raise RuntimeError("a ready Codex integration exposed no new-hand action")
+        return
+    if links.count() != 0:
+        raise RuntimeError("an unready Codex integration exposed an actionable deep link")
+    if page.locator("#open-codex").get_attribute("href") is not None:
+        raise RuntimeError("the hidden top-bar Codex action retained an href")
 
 
 def _launch(browser_type: Any) -> Browser:
@@ -235,6 +452,25 @@ def _assert_viewport(page: Any) -> None:
     overflow = page.evaluate("document.documentElement.scrollWidth > window.innerWidth")
     if overflow:
         raise RuntimeError("Bridge content overflows the current viewport")
+
+
+def _reset_scroll(page: Any) -> None:
+    page.evaluate(
+        """() => {
+          window.scrollTo({top: 0, left: 0, behavior: 'auto'});
+          const rail = document.querySelector('.rail');
+          if (rail) rail.scrollTop = 0;
+        }"""
+    )
+    page.wait_for_timeout(50)
+    if page.evaluate("window.scrollY") > 1:
+        raise RuntimeError("Bridge state capture retained an unexpected vertical scroll offset")
+    viewport = page.viewport_size or {}
+    if viewport.get("width", 0) > 760:
+        _assert_visibility(page, ".brand", visible=True)
+        brand_top = page.locator(".brand").bounding_box()
+        if brand_top is None or not 0 <= brand_top["y"] <= 60:
+            raise RuntimeError(f"Bridge brand escaped the desktop viewport: {brand_top}")
 
 
 def _assert_mobile_heading(page: Any) -> None:
@@ -251,8 +487,9 @@ def _assert_mobile_heading(page: Any) -> None:
     _assert_visibility(page, ".page-heading > .eyebrow", visible=True)
 
 
-def _assert_visibility(page: Any, selector: str, *, visible: bool) -> None:
-    actual = page.locator(selector).is_visible()
+def _assert_visibility(page: Any, selector: str, *, visible: bool, first: bool = False) -> None:
+    locator = page.locator(selector)
+    actual = (locator.first if first else locator).is_visible()
     if actual is not visible:
         expectation = "visible" if visible else "hidden"
         raise RuntimeError(f"expected {selector} to be {expectation}")

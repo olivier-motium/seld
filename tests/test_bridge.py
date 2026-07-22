@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import threading
+import time
 from collections.abc import Iterator
 from http import HTTPStatus
 from importlib.resources import as_file, files
@@ -32,7 +33,11 @@ def running_bridge(
     monkeypatch.setattr(
         bridge,
         "codex_status",
-        lambda: {"instructions_installed": True, "plugin_installed": True},
+        lambda: {
+            "available": True,
+            "instructions_installed": True,
+            "plugin_installed": True,
+        },
     )
     resource = files("continuity_kernel") / "resources/bridge"
     with as_file(resource) as static_root:
@@ -97,7 +102,11 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
     snapshot = bridge.bridge_snapshot(
         vault,
         doctor=doctor_dict(vault.doctor()),
-        integration={"available": True, "plugin_installed": True},
+        integration={
+            "available": True,
+            "instructions_installed": True,
+            "plugin_installed": True,
+        },
     )
 
     projected = next(item for item in snapshot["tasks"] if item["identifier"] == task.identifier)
@@ -108,7 +117,37 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
     assert query["originUrl"] == [bridge.REPOSITORY_URL]
     assert query["path"] == [str(vault.root)]
     assert "ship-atlas" in query["prompt"][0]
+    assert snapshot["codex"]["ready"] is True
+    assert snapshot["codex"]["new_mind_url"].startswith("codex://new?")
     assert snapshot["bridge"] == {"local": True, "read_only": True, "version": __version__}
+
+
+@pytest.mark.parametrize(
+    "integration",
+    [
+        {"available": False, "instructions_installed": False, "plugin_installed": False},
+        {"available": True, "instructions_installed": False, "plugin_installed": True},
+        {"available": True, "instructions_installed": True, "plugin_installed": False},
+    ],
+)
+def test_snapshot_withholds_every_codex_url_until_integration_is_ready(
+    vault: Vault, integration: dict[str, bool]
+) -> None:
+    vault.create_task(
+        identifier="not-actionable",
+        title="Not actionable",
+        outcome="No deep link is exposed before setup is complete.",
+    )
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration=integration,
+    )
+
+    assert snapshot["codex"]["ready"] is False
+    assert "new_mind_url" not in snapshot["codex"]
+    assert all("codex_url" not in task for task in snapshot["tasks"])
 
 
 def test_snapshot_never_calls_full_status_or_logical_digest(
@@ -274,6 +313,63 @@ def test_snapshot_endpoint_never_calls_full_status_or_logical_digest(
 
     assert snapshot["status"]["vault_id"] == server.vault_id
     assert "digest" not in snapshot["status"]
+
+
+def test_snapshot_does_not_wait_for_slow_codex_status_and_refreshes_once(
+    vault: Vault,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def slow_integration() -> dict[str, object]:
+        calls.append("started")
+        started.set()
+        assert release.wait(timeout=3)
+        return {
+            "available": True,
+            "instructions_installed": True,
+            "plugin_installed": True,
+        }
+
+    resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(resource) as static_root:
+        server = bridge.BridgeHTTPServer(
+            (bridge.LOOPBACK_HOST, 0),
+            vault,
+            Path(static_root),
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            integration_provider=slow_integration,
+        )
+        try:
+            before = time.monotonic()
+            first = server.snapshot()
+            elapsed = time.monotonic() - before
+            second = server.snapshot()
+
+            assert elapsed < 0.5
+            assert started.wait(timeout=1)
+            assert first["codex"]["checking"] is True
+            assert second["codex"]["checking"] is True
+            assert calls == ["started"]
+
+            release.set()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                refreshed = server.snapshot()
+                if refreshed["codex"].get("available") is True:
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("Codex metadata did not finish its background refresh")
+
+            assert refreshed["codex"]["checking"] is False
+            assert refreshed["codex"]["plugin_installed"] is True
+            assert calls == ["started"]
+        finally:
+            release.set()
+            server.server_close()
 
 
 def test_http_surface_rejects_cross_origin_and_writes(

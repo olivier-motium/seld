@@ -85,17 +85,23 @@ def bridge_snapshot(
 
     resolved_doctor = doctor if doctor is not None else doctor_dict(vault.doctor())
     resolved_integration = _codex_metadata() if integration is None else integration
+    codex_ready = bool(
+        resolved_integration.get("available") is True
+        and resolved_integration.get("plugin_installed") is True
+        and resolved_integration.get("instructions_installed") is True
+    )
     task_records = vault.list_tasks()
     thread_records = vault.list_threads()
     entity_records = vault.list_entities()
     tasks = []
     for item in task_records:
         task = record_dict(item)
-        task["codex_url"] = codex_deep_link(
-            vault.root,
-            f"Resume the GSV commitment `{item.identifier}`. Load its exact current record "
-            "and revision before deciding or changing anything.",
-        )
+        if codex_ready:
+            task["codex_url"] = codex_deep_link(
+                vault.root,
+                f"Resume the GSV commitment `{item.identifier}`. Load its exact current record "
+                "and revision before deciding or changing anything.",
+            )
         tasks.append(task)
     threads = [record_dict(item) for item in thread_records]
     entities = [record_dict(item) for item in entity_records]
@@ -117,10 +123,17 @@ def bridge_snapshot(
         },
         "codex": {
             **resolved_integration,
-            "new_mind_url": codex_deep_link(
-                vault.root,
-                "Help me shape my GSV Mind. Read the installed GSV context first, then ask "
-                "only the few questions needed to make MIND.md and NOW.md useful.",
+            "ready": codex_ready,
+            **(
+                {
+                    "new_mind_url": codex_deep_link(
+                        vault.root,
+                        "Help me shape my GSV Mind. Read the installed GSV context first, then "
+                        "ask only the few questions needed to make MIND.md and NOW.md useful.",
+                    )
+                }
+                if codex_ready
+                else {}
             ),
         },
         "doctor": resolved_doctor,
@@ -175,26 +188,77 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         self.vault_id = str(vault.identity()["vault_id"])
         self.static_root = static_root.resolve()
         self.integration_provider = integration_provider or _codex_metadata
-        self._metadata: dict[str, Any] | None = None
-        self._metadata_at = 0.0
+        self._doctor: dict[str, Any] | None = None
+        self._doctor_at = 0.0
+        self._integration: dict[str, Any] = {
+            "available": False,
+            "checking": True,
+            "instructions_installed": False,
+            "plugin_installed": False,
+        }
+        self._integration_at = 0.0
+        self._integration_refreshing = False
         self._metadata_lock = threading.Lock()
         super().__init__(address, BridgeRequestHandler)
 
     def snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
-        with self._metadata_lock:
-            if self._metadata is None or now - self._metadata_at >= METADATA_CACHE_SECONDS:
-                self._metadata = {
-                    "doctor": doctor_dict(self.vault.doctor()),
-                    "integration": self.integration_provider(),
-                }
-                self._metadata_at = now
-            metadata = dict(self._metadata)
+        doctor = self._doctor_snapshot(now)
+        integration = self._integration_snapshot(now)
         return bridge_snapshot(
             self.vault,
-            doctor=metadata["doctor"],
-            integration=metadata["integration"],
+            doctor=doctor,
+            integration=integration,
         )
+
+    def _doctor_snapshot(self, now: float) -> dict[str, Any]:
+        with self._metadata_lock:
+            cached = self._doctor
+            cached_at = self._doctor_at
+        if cached is not None and now - cached_at < METADATA_CACHE_SECONDS:
+            return dict(cached)
+
+        refreshed = doctor_dict(self.vault.doctor())
+        with self._metadata_lock:
+            if self._doctor is None or self._doctor_at <= cached_at:
+                self._doctor = refreshed
+                self._doctor_at = time.monotonic()
+            return dict(self._doctor)
+
+    def _integration_snapshot(self, now: float) -> dict[str, Any]:
+        start_refresh = False
+        with self._metadata_lock:
+            if (
+                now - self._integration_at >= METADATA_CACHE_SECONDS
+                and not self._integration_refreshing
+            ):
+                self._integration_refreshing = True
+                start_refresh = True
+            integration = dict(self._integration)
+        if start_refresh:
+            thread = threading.Thread(
+                target=self._refresh_integration,
+                name="gsv-bridge-codex-status",
+                daemon=True,
+            )
+            thread.start()
+        return integration
+
+    def _refresh_integration(self) -> None:
+        try:
+            refreshed = {"checking": False, **self.integration_provider()}
+        except Exception as exc:  # pragma: no cover - final background safety net
+            refreshed = {
+                "available": False,
+                "checking": False,
+                "error": f"Codex integration check failed: {type(exc).__name__}",
+                "instructions_installed": False,
+                "plugin_installed": False,
+            }
+        with self._metadata_lock:
+            self._integration = refreshed
+            self._integration_at = time.monotonic()
+            self._integration_refreshing = False
 
 
 class BridgeRequestHandler(BaseHTTPRequestHandler):

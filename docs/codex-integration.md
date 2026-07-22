@@ -9,8 +9,10 @@ codex://new?prompt=<encoded>&originUrl=<encoded>&path=<encoded>
 ```
 
 Task links include an encoded prompt, the GSV repository as `originUrl`, and
-the resolved local vault as `path`. The README install link omits `path` because
-it opens a new task before a checkout or vault path can be assumed.
+the resolved local vault as `path`. The Bridge emits no task or new-Mind link
+until Codex discovery succeeds and both the managed instructions and GSV plugin
+are installed. The README install link omits `path` because it opens a new task
+before a checkout or vault path can be assumed.
 
 GSV does not use a legacy launch-route fallback.
 
