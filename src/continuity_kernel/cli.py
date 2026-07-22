@@ -173,6 +173,42 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 "stopped": True,
             }
         raise AssertionError("unreachable Bridge command")
+    if args.command == "backup":
+        if args.backup_command == "verify":
+            return Vault.verify_backup(Path(args.path))
+        if args.backup_command == "restore":
+            restored = Vault.restore_backup(Path(args.path), Path(args.target))
+            restored_path = Path(restored["restored"])
+            configuration_matches = _configuration_matches_target(restored_path)
+            setup_command = f"gsv --vault {shlex.quote(str(restored_path))} setup"
+            status_command = f"gsv --vault {shlex.quote(str(restored_path))} status"
+            if configuration_matches is True:
+                availability = (
+                    "The restored vault is usable now with the explicit status command, and the "
+                    "existing configuration already points to it."
+                )
+            elif configuration_matches is False:
+                availability = (
+                    "The restored vault is usable now with the explicit status command; the "
+                    "existing configuration was not changed."
+                )
+            else:
+                availability = (
+                    "The restored vault is usable now with the explicit status command. The "
+                    "existing configuration could not be read safely and was not changed."
+                )
+            return {
+                **restored,
+                "activation_commands": ["gsv bridge stop", setup_command],
+                "activation_required": True,
+                "configuration_changed": False,
+                "configuration_matches_target": configuration_matches,
+                "next": (
+                    f"{availability} Run `{status_command}` to inspect it. To bind Codex plus The "
+                    "Bridge to this restored vault, first run `gsv bridge stop`; after it confirms "
+                    f"the old Bridge stopped, run `{setup_command}`."
+                ),
+            }
 
     vault = Vault(resolve_vault(explicit_vault))
     if args.command == "status":
@@ -203,10 +239,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "backup":
         if args.backup_command == "create":
             return vault.create_backup(Path(args.output) if args.output else None)
-        if args.backup_command == "verify":
-            return Vault.verify_backup(Path(args.path))
-        if args.backup_command == "restore":
-            return Vault.restore_backup(Path(args.path), Path(args.target))
+        raise AssertionError("unreachable backup command")
     raise AssertionError("unreachable command")
 
 
@@ -234,12 +267,32 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
     if args.command == "doctor" and result.get("healthy") is False:
         return 3, "GSV doctor found unresolved integrity issues; follow result.issues."
     if (
+        args.command == "backup"
+        and args.backup_command == "verify"
+        and result.get("valid") is False
+    ):
+        return 3, "GSV backup verification failed; do not restore this archive."
+    if (
+        args.command == "backup"
+        and args.backup_command == "create"
+        and result.get("verified") is False
+    ):
+        return 3, "GSV backup creation did not verify; do not use the reported archive."
+    if (
         args.command == "codex"
         and args.codex_command == "uninstall"
         and result.get("cleanup_complete") is False
     ):
         return 3, "GSV cleanup is incomplete; follow result.next and retry."
     return None
+
+
+def _configuration_matches_target(target: Path) -> bool | str:
+    try:
+        configuration = load_config(required=False)
+        return configuration is not None and configuration.vault_path == target
+    except ContinuityError:
+        return "unknown"
 
 
 def _doctor_next(vault_path: Path, doctor: dict[str, Any]) -> str:

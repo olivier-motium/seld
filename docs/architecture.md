@@ -109,6 +109,22 @@ than retrying with a stale revision.
 Global operations such as backup hold the global lock before record locks so a
 snapshot cannot mix record versions.
 
+Backup creation reads each included regular file once, hashes those captured
+bytes, and writes the same bytes into a staged ZIP. Symlinks and other special
+files fail closed. Verification rejects unsafe or non-portable member names,
+non-regular Unix entry types, case or Unicode aliases, and size-bound failures.
+
+Restore keeps one archive descriptor open and reads each data member once into
+a sibling stage while computing the compared hash map. It then enumerates the
+staged regular files, checks vault identity, and runs doctor before an atomic
+publication. An existing target is accepted only when it is an empty real
+directory and is restored if publication did not occur. Rename failures are
+classified by source and target identity plus logical digest: unpublished work
+is rolled back, while a visible committed restore with unconfirmed directory
+durability is reported as degraded and left intact for explicit doctor review.
+Configuration and live Codex or Bridge state are outside this restore
+transaction and require the documented stop-plus-setup activation step.
+
 ## Ownership and recovery
 
 The vault and backups are user data. GSV never deletes them during Codex

@@ -136,6 +136,22 @@ gsv backup create
 gsv bridge stop
 ```
 
+Backup verification and restore do not depend on the configured vault, so they
+still work when configuration is missing or unreadable:
+
+```bash
+gsv backup verify /path/to/gsv-backup.zip
+gsv backup restore /path/to/gsv-backup.zip /path/to/restored-vault
+gsv --vault /path/to/restored-vault status
+```
+
+An invalid archive returns a nonzero exit and is never published. Restore
+extracts to a private stage, verifies exact hashes and vault health, then
+publishes only to an absent or empty directory. It does not change the current
+configuration. To activate the restored vault, first run `gsv bridge stop`,
+then `gsv --vault /path/to/restored-vault setup`; this deliberately rebinds
+Codex and The Bridge rather than silently switching a live installation.
+
 GSV has no hosted service, database server, embedding model, API key, cloud
 sync, or autonomous background worker. Local Markdown is authoritative. Other
 processes running as the same OS user remain inside the stated trust boundary.

@@ -131,6 +131,38 @@ gsv backup create
 gsv backup verify /path/to/backup.zip
 ```
 
+Verification and disaster-recovery restore are config-independent. This is
+intentional: both commands remain usable when `config.json` is absent or
+unreadable. A hash mismatch is reported as `valid: false`, `ok: false`, and a
+nonzero exit; restore never publishes that archive.
+
+```bash
+gsv backup restore /path/to/backup.zip /path/to/restored-vault
+gsv --vault /path/to/restored-vault status
+```
+
+Restore reads one pinned archive, writes into a private sibling stage, compares
+the staged regular files with the manifest, and runs doctor before publication.
+The target must be absent or an empty real directory. On success the result
+reports `published: true` and `durability_confirmed: true`. If the final rename
+is visible but its directory sync fails, GSV returns a nonzero committed-state
+error naming the published target and the exact doctor command; it does not
+pretend the target stayed untouched or retry over it. A prior empty target that
+cannot be removed after publication is preserved and reported as a cleanup
+warning.
+
+Restore never rewrites configuration. It reports whether existing configuration
+already matches the target when that can be determined safely. Activation is a
+deliberate second step:
+
+```bash
+gsv bridge stop
+gsv --vault /path/to/restored-vault setup
+```
+
+The first command must verify and stop the currently owned Bridge. The second
+configures the restored vault and rebinds the Codex integration and Bridge.
+
 ## Source development
 
 Source development is deliberately separate from the consumer promise:

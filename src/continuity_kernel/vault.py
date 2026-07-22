@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
+import stat
 import tempfile
+import unicodedata
 import uuid
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
-from typing import Any, Final, Literal, TypeVar
+from pathlib import Path
+from typing import IO, Any, Final, Literal, TypeVar
 
 from continuity_kernel.atomic import (
     AppendOutcome,
@@ -26,6 +31,7 @@ from continuity_kernel.atomic import (
 )
 from continuity_kernel.errors import (
     ConflictError,
+    ContinuityError,
     DegradedIntegrityError,
     MutationCommittedError,
     NotFoundError,
@@ -67,6 +73,16 @@ MAX_BACKUP_ENTRY_BYTES: Final = 16 * 1024 * 1024
 MAX_BACKUP_TOTAL_BYTES: Final = 512 * 1024 * 1024
 MAX_JOURNAL_LINE_BYTES: Final = 64 * 1024
 BACKUP_MANIFEST: Final = "GSV_BACKUP.json"
+_WINDOWS_RESERVED_NAMES: Final = {
+    "aux",
+    "con",
+    "conin$",
+    "conout$",
+    "nul",
+    "prn",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
 RecordKind = Literal["task", "entity", "thread"]
 RecordValue = TypeVar("RecordValue", Task, Entity, WorkThread)
 
@@ -136,6 +152,20 @@ class DoctorResult:
     counts: dict[str, int]
     issues: tuple[DoctorIssue, ...]
     repaired: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _BackupInspection:
+    infos: tuple[zipfile.ZipInfo, ...]
+    manifest: dict[str, Any]
+    actual: dict[str, str]
+
+    @property
+    def valid(self) -> bool:
+        expected = self.manifest["files"]
+        if not isinstance(expected, dict):  # validated before construction
+            return False
+        return expected == self.actual
 
 
 class Vault:
@@ -681,109 +711,209 @@ class Vault:
         if destination is None:
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             destination = self.root / "backups" / f"gsv-{stamp}.zip"
-        destination = destination.expanduser().resolve()
+        destination = _leaf_path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
+        _validate_backup_destination(destination)
         with exclusive_lock(self.state / "locks/global.lock"):
             files = self._backup_files(destination)
-            manifest = {
-                "created_at": format_time(datetime.now(UTC)),
-                "files": {relative: sha256_file(path) for relative, path in files},
-                "format_version": 1,
-                "vault_id": self._manifest()["vault_id"],
-            }
             descriptor, temp_name = tempfile.mkstemp(
                 prefix=".gsv-backup.tmp-", suffix=".zip", dir=destination.parent
             )
             os.close(descriptor)
             temp = Path(temp_name)
             try:
+                hashes: dict[str, str] = {}
+                total = 0
                 with zipfile.ZipFile(
                     temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
                 ) as archive:
                     for relative, path in files:
-                        archive.write(path, relative)
+                        content = _read_backup_source(path)
+                        total += len(content)
+                        if total > MAX_BACKUP_TOTAL_BYTES:
+                            raise ValidationError("vault backup exceeds its total size bound")
+                        hashes[relative] = sha256_bytes(content)
+                        archive.writestr(relative, content)
+                    manifest = {
+                        "created_at": format_time(datetime.now(UTC)),
+                        "files": hashes,
+                        "format_version": 1,
+                        "vault_id": self._manifest()["vault_id"],
+                    }
                     archive.writestr(BACKUP_MANIFEST, _json_bytes(manifest))
                 with temp.open("r+b") as handle:
                     os.fsync(handle.fileno())
-                durable_replace(temp, destination)
+                staged_verification = self.verify_backup(temp)
+                if not staged_verification["valid"]:
+                    raise PersistenceError(
+                        "backup staging verification failed; no backup was published"
+                    )
+                staged_identity = _path_identity(temp)
+                staged_hash = sha256_file(temp)
+                try:
+                    durable_replace(temp, destination)
+                except Exception as exc:
+                    if not temp.exists() and _regular_file_matches(
+                        destination, staged_identity, staged_hash
+                    ):
+                        raise MutationCommittedError(
+                            f"backup was published at {destination}, but directory durability "
+                            "could not be confirmed; run "
+                            f"`gsv backup verify {shlex.quote(str(destination))}` before using it"
+                        ) from exc
+                    if temp.exists():
+                        raise PersistenceError(
+                            f"backup was not published at {destination}; the staged archive was "
+                            "discarded"
+                        ) from exc
+                    raise DegradedIntegrityError(
+                        f"could not determine whether backup publication changed {destination}; "
+                        "inspect that path before retrying"
+                    ) from exc
             finally:
                 if temp.exists():
                     temp.unlink()
-        verification = self.verify_backup(destination)
+        try:
+            verification = self.verify_backup(destination)
+        except ValidationError as exc:
+            raise DegradedIntegrityError(
+                f"backup was published at {destination}, but post-publication verification failed; "
+                "do not use it until it passes `gsv backup verify`"
+            ) from exc
+        if not verification["valid"]:
+            raise DegradedIntegrityError(
+                f"backup was published at {destination}, but its hashes no longer verify; "
+                "do not use it until it passes `gsv backup verify`"
+            )
         return {
             "backup": str(destination),
             "files": len(files),
             "sha256": sha256_file(destination),
-            "verified": verification["valid"],
+            "verified": True,
             "vault_id": manifest["vault_id"],
         }
 
     @staticmethod
     def verify_backup(path: Path) -> dict[str, Any]:
-        path = path.expanduser().resolve()
-        try:
-            with zipfile.ZipFile(path, "r") as archive:
-                infos = archive.infolist()
-                _validate_archive_infos(infos)
-                manifest = json.loads(archive.read(BACKUP_MANIFEST))
-                if not isinstance(manifest, dict) or manifest.get("format_version") != 1:
-                    raise ValidationError("unsupported backup manifest version")
-                if not isinstance(manifest.get("vault_id"), str):
-                    raise ValidationError("backup manifest has no vault identity")
-                expected = manifest.get("files")
-                if not isinstance(expected, dict):
-                    raise ValidationError("backup manifest has no file map")
-                actual = {
-                    name: sha256_bytes(archive.read(name))
-                    for name in (item.filename for item in infos)
-                    if name != BACKUP_MANIFEST and not name.endswith("/")
-                }
-                valid = expected == actual
-                return {
-                    "backup": str(path),
-                    "files": len(actual),
-                    "valid": valid,
-                    "vault_id": manifest.get("vault_id"),
-                }
-        except (OSError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as exc:
-            raise ValidationError(f"invalid backup: {path}") from exc
+        with _open_backup(path) as (opened_path, handle):
+            inspection = _inspect_backup(handle, opened_path)
+        return {
+            "backup": str(opened_path),
+            "files": len(inspection.actual),
+            "valid": inspection.valid,
+            "vault_id": inspection.manifest["vault_id"],
+        }
 
     @staticmethod
     def restore_backup(path: Path, target: Path) -> dict[str, Any]:
-        verification = Vault.verify_backup(path)
-        if not verification["valid"]:
-            raise ValidationError("backup file hashes do not match its manifest")
-        target = target.expanduser().resolve()
-        if target.exists() and any(target.iterdir()):
-            raise ConflictError(f"restore target is not empty: {target}")
+        target = _restore_target(target)
         target.parent.mkdir(parents=True, exist_ok=True)
+        _validate_restore_target(target)
         stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-restore-", dir=target.parent))
+        prior_empty: Path | None = None
+        cleanup_warning: str | None = None
         try:
-            with zipfile.ZipFile(path, "r") as archive:
-                infos = archive.infolist()
-                _validate_archive_infos(infos)
-                for name in (item.filename for item in infos):
-                    if name == BACKUP_MANIFEST or name.endswith("/"):
-                        continue
-                    destination = stage / PurePosixPath(name)
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_write(destination, archive.read(name))
-            Vault(stage)._manifest()
-            if target.exists():
-                target.rmdir()
-            os.replace(stage, target)
+            with _open_backup(path) as (opened_path, handle):
+                inspection = _extract_backup(handle, opened_path, stage)
+                if not inspection.valid:
+                    raise ValidationError("backup file hashes do not match its manifest")
+            restored_stage = Vault(stage)
+            doctor = restored_stage.doctor()
+            if not doctor.healthy:
+                issue_summary = "; ".join(
+                    f"{issue.path}: {issue.message}" for issue in doctor.issues[:3]
+                )
+                raise ValidationError(
+                    f"restored vault did not pass validation before publication: {issue_summary}"
+                )
+            if restored_stage.identity()["vault_id"] != inspection.manifest["vault_id"]:
+                raise ValidationError("restored vault identity does not match its backup manifest")
+            digest = restored_stage.logical_digest()
+            staged_hashes = _hash_backup_files(restored_stage._backup_files(None))
+            if staged_hashes != inspection.manifest["files"]:
+                raise ValidationError(
+                    "staged vault files do not match the backup manifest before publication"
+                )
+            stage_identity = _path_identity(stage)
+
+            target_existed = _validate_restore_target(target)
+            prior_identity: tuple[int, int] | None = None
+            if target_existed:
+                prior_identity = _path_identity(target)
+                prior_empty = Path(
+                    tempfile.mkdtemp(prefix=f".{target.name}.tmp-restore-prior-", dir=target.parent)
+                )
+                prior_empty.rmdir()
+                try:
+                    durable_replace(target, prior_empty)
+                except Exception as exc:
+                    if not target.exists() and _directory_matches(prior_empty, prior_identity):
+                        # A successful stage publication fsyncs this same parent directory.
+                        pass
+                    elif _directory_matches(target, prior_identity) and not prior_empty.exists():
+                        raise PersistenceError(
+                            f"restore was not published; the existing empty target at {target} "
+                            "remains in place"
+                        ) from exc
+                    else:
+                        raise DegradedIntegrityError(
+                            "could not determine whether the existing empty restore target moved; "
+                            f"inspect {target} and {prior_empty} before retrying"
+                        ) from exc
+            try:
+                if prior_empty is not None:
+                    _validate_restore_target(prior_empty)
+                durable_replace(stage, target)
+            except Exception as exc:
+                if not stage.exists() and _restored_vault_matches(
+                    target,
+                    identity=stage_identity,
+                    vault_id=str(inspection.manifest["vault_id"]),
+                    digest=digest,
+                ):
+                    prior_note = (
+                        f" The prior empty target is preserved at {prior_empty}."
+                        if prior_empty is not None and prior_empty.exists()
+                        else ""
+                    )
+                    raise MutationCommittedError(
+                        f"restore was published at {target}, but directory durability could not be "
+                        "confirmed. Do not restore over this non-empty target; run "
+                        f"`gsv --vault {shlex.quote(str(target))} doctor` and inspect it."
+                        f"{prior_note}"
+                    ) from exc
+                if _directory_matches(stage, stage_identity):
+                    if prior_empty is not None:
+                        _restore_prior_target(
+                            prior_empty,
+                            target,
+                            identity=prior_identity,
+                            cause=exc,
+                        )
+                    raise PersistenceError(
+                        f"restore was not published at {target}; staged files were discarded"
+                    ) from exc
+                raise DegradedIntegrityError(
+                    f"could not determine whether the restore was published at {target}; run "
+                    f"`gsv --vault {shlex.quote(str(target))} doctor` if the target exists, and "
+                    "inspect restore temporary paths before retrying"
+                ) from exc
+            if prior_empty is not None and prior_empty.exists():
+                cleanup_warning = _remove_prior_empty(prior_empty)
+                if cleanup_warning is None:
+                    prior_empty = None
         finally:
             if stage.exists():
                 shutil.rmtree(stage)
-        restored = Vault(target)
-        doctor = restored.doctor()
-        if not doctor.healthy:
-            raise ValidationError("restored vault did not pass validation")
         return {
-            "backup": str(path.expanduser().resolve()),
+            "backup": str(opened_path),
+            "durability_confirmed": True,
             "restored": str(target),
-            "vault_id": verification["vault_id"],
-            "digest": restored.logical_digest(),
+            "published": True,
+            "vault_id": inspection.manifest["vault_id"],
+            "digest": digest,
+            "cleanup_warning": cleanup_warning,
+            "preserved_prior_target": str(prior_empty) if cleanup_warning else None,
         }
 
     def logical_digest(self) -> str:
@@ -1066,18 +1196,28 @@ class Vault:
     def _backup_files(self, destination: Path | None) -> list[tuple[str, Path]]:
         files: list[tuple[str, Path]] = []
         for path in sorted(self.root.rglob("*")):
-            if path.is_symlink():
+            try:
+                metadata = os.lstat(path)
+            except OSError as exc:
+                raise ValidationError(
+                    f"could not inspect vault backup path: {path}: {exc}"
+                ) from exc
+            if stat.S_ISLNK(metadata.st_mode):
                 raise ValidationError(
                     f"vault backup refuses symbolic link: {path.relative_to(self.root)}"
                 )
-            if not path.is_file():
+            if stat.S_ISDIR(metadata.st_mode):
                 continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValidationError(
+                    f"vault backup refuses unsupported file type: {path.relative_to(self.root)}"
+                )
             relative = path.relative_to(self.root).as_posix()
             if relative.startswith(".gsv/locks/") or ".tmp-" in path.name:
                 continue
             if relative.startswith("backups/"):
                 continue
-            if destination is not None and path.resolve() == destination:
+            if destination is not None and path == destination:
                 continue
             files.append((relative, path))
         return files
@@ -1114,23 +1254,364 @@ def _json_line(payload: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def _leaf_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    return expanded.parent.resolve() / expanded.name
+
+
+def _validate_backup_destination(path: Path) -> None:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValidationError(f"could not inspect backup destination: {path}: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValidationError(f"backup destination cannot be a symbolic link: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ConflictError(f"backup destination must be absent or a regular file: {path}")
+
+
+def _path_identity(path: Path) -> tuple[int, int]:
+    metadata = os.lstat(path)
+    return metadata.st_dev, metadata.st_ino
+
+
+def _regular_file_matches(path: Path, identity: tuple[int, int], digest: str) -> bool:
+    try:
+        metadata = os.lstat(path)
+        if not stat.S_ISREG(metadata.st_mode):
+            return False
+        if (metadata.st_dev, metadata.st_ino) != identity:
+            return False
+        return sha256_file(path) == digest
+    except OSError:
+        return False
+
+
+def _directory_matches(path: Path, identity: tuple[int, int] | None) -> bool:
+    if identity is None:
+        return False
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == identity
+
+
+def _restored_vault_matches(
+    path: Path, *, identity: tuple[int, int], vault_id: str, digest: str
+) -> bool:
+    if not _directory_matches(path, identity):
+        return False
+    try:
+        vault = Vault(path)
+        return vault.identity()["vault_id"] == vault_id and vault.logical_digest() == digest
+    except (OSError, ContinuityError):
+        return False
+
+
+def _restore_prior_target(
+    prior: Path,
+    target: Path,
+    *,
+    identity: tuple[int, int] | None,
+    cause: Exception,
+) -> None:
+    if not _directory_matches(prior, identity) or target.exists():
+        raise DegradedIntegrityError(
+            f"restore was not published, but the prior target could not be safely restored; "
+            f"inspect {target} and {prior} before retrying"
+        ) from cause
+    try:
+        durable_replace(prior, target)
+    except Exception as rollback_error:
+        if _directory_matches(target, identity) and not prior.exists():
+            raise DegradedIntegrityError(
+                f"restore was not published; the prior target is visible again at {target}, but "
+                "directory durability could not be confirmed. Inspect it before retrying"
+            ) from rollback_error
+        raise DegradedIntegrityError(
+            f"restore was not published and the prior target could not be restored; inspect "
+            f"{target} and {prior} before retrying"
+        ) from rollback_error
+    if not _directory_matches(target, identity) or prior.exists():
+        raise DegradedIntegrityError(
+            f"restore was not published, but prior-target recovery could not be verified; inspect "
+            f"{target} and {prior} before retrying"
+        ) from cause
+
+
+def _read_backup_source(path: Path) -> bytes:
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        raise ValidationError(f"could not inspect vault backup file: {path}: {exc}") from exc
+    if stat.S_ISLNK(before.st_mode):
+        raise ValidationError(f"vault backup refuses symbolic link: {path}")
+    if not stat.S_ISREG(before.st_mode):
+        raise ValidationError(f"vault backup refuses unsupported file type: {path}")
+    if before.st_size > MAX_BACKUP_ENTRY_BYTES:
+        raise ValidationError(f"vault backup file exceeds its size bound: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValidationError(f"vault backup source must remain a regular file: {path}")
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValidationError(f"vault backup source changed while it was opened: {path}")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            content = handle.read(MAX_BACKUP_ENTRY_BYTES + 1)
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError(f"could not read vault backup file: {path}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+    if len(content) > MAX_BACKUP_ENTRY_BYTES:
+        raise ValidationError(f"vault backup file exceeds its size bound: {path}")
+    return content
+
+
+def _hash_backup_files(files: list[tuple[str, Path]]) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    total = 0
+    for relative, path in files:
+        content = _read_backup_source(path)
+        total += len(content)
+        if total > MAX_BACKUP_TOTAL_BYTES:
+            raise ValidationError("vault backup exceeds its total size bound")
+        hashes[relative] = sha256_bytes(content)
+    return hashes
+
+
+@contextmanager
+def _open_backup(path: Path) -> Iterator[tuple[Path, IO[bytes]]]:
+    opened_path = _leaf_path(path)
+    try:
+        before = os.lstat(opened_path)
+    except OSError as exc:
+        raise ValidationError(f"invalid backup: {opened_path}: {exc}") from exc
+    if stat.S_ISLNK(before.st_mode):
+        raise ValidationError(f"backup cannot be a symbolic link: {opened_path}")
+    if not stat.S_ISREG(before.st_mode):
+        raise ValidationError(f"backup must be a regular file: {opened_path}")
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(opened_path, flags)
+    except OSError as exc:
+        raise ValidationError(f"invalid backup: {opened_path}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValidationError(f"backup must remain a regular file: {opened_path}")
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValidationError(f"backup changed while it was being opened: {opened_path}")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            yield opened_path, handle
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError(f"invalid backup: {opened_path}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _inspect_backup(handle: IO[bytes], path: Path) -> _BackupInspection:
+    try:
+        handle.seek(0)
+        with zipfile.ZipFile(handle, "r") as archive:
+            infos, manifest = _backup_metadata(archive)
+            actual: dict[str, str] = {}
+            total = 0
+            for info in infos:
+                if info.filename == BACKUP_MANIFEST or info.is_dir():
+                    continue
+                content = _read_archive_entry(archive, info)
+                total += len(content)
+                if total > MAX_BACKUP_TOTAL_BYTES:
+                    raise ValidationError("backup exceeds its actual total size bound")
+                actual[info.filename] = sha256_bytes(content)
+        return _BackupInspection(infos=infos, manifest=manifest, actual=actual)
+    except ValidationError:
+        raise
+    except (
+        OSError,
+        EOFError,
+        KeyError,
+        RuntimeError,
+        NotImplementedError,
+        UnicodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as exc:
+        raise ValidationError(f"invalid backup: {path}") from exc
+
+
+def _extract_backup(handle: IO[bytes], path: Path, stage: Path) -> _BackupInspection:
+    """Extract and hash each member from one read of one pinned archive descriptor."""
+
+    try:
+        handle.seek(0)
+        with zipfile.ZipFile(handle, "r") as archive:
+            infos, manifest = _backup_metadata(archive)
+            actual: dict[str, str] = {}
+            total = 0
+            for info in infos:
+                name = info.filename
+                parts, is_directory, _ = _portable_archive_path(name)
+                if name == BACKUP_MANIFEST or is_directory:
+                    continue
+                content = _read_archive_entry(archive, info)
+                total += len(content)
+                if total > MAX_BACKUP_TOTAL_BYTES:
+                    raise ValidationError("backup exceeds its actual total size bound")
+                actual[name] = sha256_bytes(content)
+                destination = stage.joinpath(*parts)
+                try:
+                    destination.relative_to(stage)
+                except ValueError as exc:
+                    raise ValidationError(f"unsafe backup entry: {name}") from exc
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write(destination, content)
+        return _BackupInspection(infos=infos, manifest=manifest, actual=actual)
+    except ValidationError:
+        raise
+    except (
+        OSError,
+        EOFError,
+        KeyError,
+        RuntimeError,
+        NotImplementedError,
+        UnicodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as exc:
+        raise ValidationError(f"invalid backup: {path}") from exc
+
+
+def _backup_metadata(
+    archive: zipfile.ZipFile,
+) -> tuple[tuple[zipfile.ZipInfo, ...], dict[str, Any]]:
+    infos = tuple(archive.infolist())
+    _validate_archive_infos(list(infos))
+    manifest = json.loads(_read_archive_entry(archive, archive.getinfo(BACKUP_MANIFEST)))
+    _validate_backup_manifest(manifest)
+    return infos, manifest
+
+
+def _read_archive_entry(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    with archive.open(info, "r") as member:
+        content = member.read(MAX_BACKUP_ENTRY_BYTES + 1)
+    if len(content) > MAX_BACKUP_ENTRY_BYTES:
+        raise ValidationError(f"backup entry exceeds its actual size bound: {info.filename}")
+    return content
+
+
+def _validate_backup_manifest(manifest: object) -> None:
+    if not isinstance(manifest, dict) or type(manifest.get("format_version")) is not int:
+        raise ValidationError("unsupported backup manifest version")
+    if manifest["format_version"] != 1:
+        raise ValidationError("unsupported backup manifest version")
+    vault_id = manifest.get("vault_id")
+    if not isinstance(vault_id, str) or not vault_id.strip():
+        raise ValidationError("backup manifest has no vault identity")
+    expected = manifest.get("files")
+    if not isinstance(expected, dict):
+        raise ValidationError("backup manifest has no file map")
+    for name, digest in expected.items():
+        if not isinstance(name, str) or not name:
+            raise ValidationError("backup manifest contains an invalid file name")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValidationError(f"backup manifest has an invalid SHA-256 digest: {name}")
+
+
+def _restore_target(path: Path) -> Path:
+    return _leaf_path(path)
+
+
+def _validate_restore_target(target: Path) -> bool:
+    try:
+        metadata = os.lstat(target)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ValidationError(f"could not inspect restore target: {target}: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValidationError(f"restore target cannot be a symbolic link: {target}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ConflictError(f"restore target must be an absent or empty directory: {target}")
+    try:
+        next(target.iterdir())
+    except StopIteration:
+        return True
+    except OSError as exc:
+        raise ValidationError(f"could not inspect restore target: {target}: {exc}") from exc
+    raise ConflictError(f"restore target is not empty: {target}")
+
+
+def _remove_prior_empty(path: Path) -> str | None:
+    try:
+        path.rmdir()
+    except OSError as exc:
+        return f"restored vault published, but the prior empty target remains at {path}: {exc}"
+    return None
+
+
 def _validate_archive_infos(infos: list[zipfile.ZipInfo]) -> None:
     names = [item.filename for item in infos]
     if BACKUP_MANIFEST not in names:
         raise ValidationError("backup manifest is missing")
     if len(infos) > MAX_BACKUP_ENTRIES:
         raise ValidationError("backup contains too many entries")
-    seen: set[str] = set()
+    seen: set[tuple[str, ...]] = set()
+    spellings: dict[tuple[str, ...], tuple[str, ...]] = {}
+    path_kinds: dict[tuple[str, ...], str] = {}
     total = 0
     for info in infos:
         name = info.filename
-        path = PurePosixPath(name)
-        if path.is_absolute() or ".." in path.parts or "\\" in name:
-            raise ValidationError(f"unsafe backup entry: {name}")
-        normalized = path.as_posix().casefold()
+        parts, is_directory, normalized = _portable_archive_path(name)
         if normalized in seen:
             raise ValidationError(f"duplicate backup entry: {name}")
         seen.add(normalized)
+        for index in range(1, len(parts) + 1):
+            key = normalized[:index]
+            spelling = parts[:index]
+            previous_spelling = spellings.setdefault(key, spelling)
+            if previous_spelling != spelling:
+                raise ValidationError(f"duplicate backup entry alias: {name}")
+            kind = "directory" if index < len(parts) or is_directory else "file"
+            previous_kind = path_kinds.setdefault(key, kind)
+            if previous_kind != kind:
+                raise ValidationError(f"conflicting backup entry path: {name}")
+        unix_mode = (info.external_attr >> 16) & 0xFFFF
+        file_type = stat.S_IFMT(unix_mode)
+        allowed_type = stat.S_IFDIR if is_directory else stat.S_IFREG
+        if file_type not in {0, allowed_type}:
+            raise ValidationError(f"unsupported backup entry type: {name}")
         if info.flag_bits & 0x1:
             raise ValidationError(f"encrypted backup entry is unsupported: {name}")
         if info.file_size > MAX_BACKUP_ENTRY_BYTES:
@@ -1138,6 +1619,29 @@ def _validate_archive_infos(infos: list[zipfile.ZipInfo]) -> None:
         total += info.file_size
         if total > MAX_BACKUP_TOTAL_BYTES:
             raise ValidationError("backup exceeds its total size bound")
+
+
+def _portable_archive_path(name: str) -> tuple[tuple[str, ...], bool, tuple[str, ...]]:
+    if not name or "\\" in name or name.startswith("/") or "\x00" in name:
+        raise ValidationError(f"unsafe backup entry: {name}")
+    is_directory = name.endswith("/")
+    raw = name[:-1] if is_directory else name
+    parts = tuple(raw.split("/"))
+    if not raw or any(part in {"", ".", ".."} for part in parts):
+        raise ValidationError(f"unsafe backup entry: {name}")
+
+    normalized: list[str] = []
+    for part in parts:
+        if ":" in part or any(character in '<>"|?*' for character in part):
+            raise ValidationError(f"non-portable backup entry: {name}")
+        if part.endswith((" ", ".")):
+            raise ValidationError(f"non-portable backup entry: {name}")
+        canonical = unicodedata.normalize("NFC", part)
+        device_stem = canonical.split(".", 1)[0].casefold()
+        if device_stem in _WINDOWS_RESERVED_NAMES:
+            raise ValidationError(f"non-portable backup entry: {name}")
+        normalized.append(canonical.casefold())
+    return parts, is_directory, tuple(normalized)
 
 
 def _blockquote(value: str) -> str:

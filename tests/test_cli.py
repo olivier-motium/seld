@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -435,6 +436,141 @@ def test_repaired_healthy_doctor_returns_success(
     assert payload["result"]["healthy"] is True
     assert payload["result"]["repaired"] == [f"../{orphan.name}"]
     assert not orphan.exists()
+
+
+def test_backup_verify_and_restore_do_not_require_readable_configuration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = Vault(tmp_path / "source")
+    source.initialize(name="Portable")
+    source.create_task(
+        identifier="portable-task",
+        title="Portable task",
+        outcome="Restore without prior configuration.",
+    )
+    backup = Path(source.create_backup(tmp_path / "portable.zip")["backup"])
+    configuration = config_path()
+    configuration.parent.mkdir(parents=True)
+    configuration.write_bytes(b"{broken configuration")
+    before = configuration.read_bytes()
+
+    assert cli.main(["--json", "backup", "verify", str(backup)]) == 0
+    verified = json.loads(capsys.readouterr().out)
+    assert verified["ok"] is True
+    assert verified["result"]["valid"] is True
+
+    target = tmp_path / "restored"
+    assert cli.main(["--json", "backup", "restore", str(backup), str(target)]) == 0
+    restored = json.loads(capsys.readouterr().out)
+
+    assert restored["ok"] is True
+    assert restored["result"]["configuration_changed"] is False
+    assert restored["result"]["configuration_matches_target"] == "unknown"
+    assert restored["result"]["activation_required"] is True
+    assert restored["result"]["activation_commands"] == [
+        "gsv bridge stop",
+        f"gsv --vault {target.resolve()} setup",
+    ]
+    assert "Codex plus The Bridge" in restored["result"]["next"]
+    assert configuration.read_bytes() == before
+
+    assert cli.main(["--json", "--vault", str(target), "status"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["result"]["vault_id"] == source.identity()["vault_id"]
+
+
+def test_restore_keeps_existing_configured_vault_until_explicit_setup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    configured = Vault(tmp_path / "configured")
+    configured.initialize(name="Configured")
+    source = Vault(tmp_path / "source")
+    source.initialize(name="Restored")
+    backup = Path(source.create_backup(tmp_path / "portable.zip")["backup"])
+    save_config(configured.root)
+    config_before = config_path().read_bytes()
+    target = tmp_path / "restored"
+
+    assert cli.main(["--json", "backup", "restore", str(backup), str(target)]) == 0
+    capsys.readouterr()
+    assert config_path().read_bytes() == config_before
+
+    assert cli.main(["--json", "status"]) == 0
+    bare_status = json.loads(capsys.readouterr().out)
+    assert bare_status["result"]["vault_id"] == configured.identity()["vault_id"]
+
+    assert cli.main(["--json", "--vault", str(target), "status"]) == 0
+    explicit_status = json.loads(capsys.readouterr().out)
+    assert explicit_status["result"]["vault_id"] == source.identity()["vault_id"]
+
+
+def test_restore_reports_when_existing_configuration_already_matches_target(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = Vault(tmp_path / "source")
+    source.initialize(name="Recovered")
+    backup = Path(source.create_backup(tmp_path / "portable.zip")["backup"])
+    target = tmp_path / "restored"
+    save_config(target)
+    before = config_path().read_bytes()
+
+    assert cli.main(["--json", "backup", "restore", str(backup), str(target)]) == 0
+    restored = json.loads(capsys.readouterr().out)
+
+    assert restored["result"]["configuration_changed"] is False
+    assert restored["result"]["configuration_matches_target"] is True
+    assert config_path().read_bytes() == before
+    assert cli.main(["--json", "status"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["result"]["vault_id"] == source.identity()["vault_id"]
+
+
+def test_invalid_backup_verification_returns_nonzero_json_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = Vault(tmp_path / "source")
+    source.initialize(name="Tamper proof")
+    original = Path(source.create_backup(tmp_path / "original.zip")["backup"])
+    tampered = tmp_path / "tampered.zip"
+    with zipfile.ZipFile(original, "r") as archive:
+        entries = {item.filename: archive.read(item.filename) for item in archive.infolist()}
+    entries["MIND.md"] += b"tampered"
+    with zipfile.ZipFile(tampered, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+
+    exit_code = cli.main(["--json", "backup", "verify", str(tampered)])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 3
+    assert payload["ok"] is False
+    assert payload["error"] == "GSV backup verification failed; do not restore this archive."
+    assert payload["result"]["valid"] is False
+
+
+def test_unverified_backup_creation_returns_nonzero_json_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Configured")
+    save_config(vault.root)
+    monkeypatch.setattr(
+        Vault,
+        "create_backup",
+        lambda _self, _destination=None: {
+            "backup": str(tmp_path / "invalid.zip"),
+            "verified": False,
+        },
+    )
+
+    exit_code = cli.main(["--json", "backup", "create"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 3
+    assert payload["ok"] is False
+    assert payload["error"] == (
+        "GSV backup creation did not verify; do not use the reported archive."
+    )
 
 
 def test_codex_status_and_uninstall_do_not_require_vault_configuration(
