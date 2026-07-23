@@ -938,6 +938,29 @@ def test_default_ephemeral_port_avoids_an_occupied_port(vault: Vault) -> None:
             server.server_close()
 
 
+def test_bridge_bind_never_depends_on_reverse_dns(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden_lookup(_host: str) -> str:
+        raise AssertionError("a loopback-only server must not perform reverse DNS")
+
+    monkeypatch.setattr("continuity_kernel.bridge.socket.getfqdn", forbidden_lookup)
+    resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(resource) as static_root:
+        server = bridge.BridgeHTTPServer(
+            (bridge.LOOPBACK_HOST, bridge.DEFAULT_PORT),
+            vault,
+            Path(static_root),
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+        )
+        try:
+            assert server.server_name == bridge.LOOPBACK_HOST
+            assert server.server_port == server.server_address[1]
+        finally:
+            server.server_close()
+
+
 def test_state_receipt_is_private_and_open_token_stays_in_fragment(vault: Vault) -> None:
     state = _state(vault)
     bridge._write_state(state)
@@ -1169,7 +1192,7 @@ def test_health_probe_confirms_opaque_loopback_refusal(
     monkeypatch.setattr("continuity_kernel.bridge.socket.socket", lambda *_args: connection)
     monkeypatch.setattr(
         "continuity_kernel.bridge.select.select",
-        lambda *_args: ([], [connection], []),
+        lambda *_args: ([], [], []),
     )
 
     probe = bridge._probe_health(

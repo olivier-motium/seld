@@ -27,6 +27,7 @@ from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import as_file, files
 from pathlib import Path, PurePosixPath
+from socketserver import TCPServer
 from typing import Any, BinaryIO, Final, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit
@@ -176,6 +177,13 @@ class BridgeHTTPServer(ThreadingHTTPServer):
 
     allow_reuse_address = True
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        """Bind the numeric loopback address without a reverse-DNS lookup."""
+
+        TCPServer.server_bind(self)
+        self.server_name = LOOPBACK_HOST
+        self.server_port = int(self.server_address[1])
 
     def __init__(
         self,
@@ -551,7 +559,9 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
                 # A frozen launcher may hand off to a worker process. Source and
                 # wheel installs launch the internal worker directly, so its PID
                 # must match the authenticated receipt.
-                expected_pid=None if getattr(sys, "frozen", False) else process.pid,
+                expected_pid=(
+                    None if _IS_WINDOWS or getattr(sys, "frozen", False) else process.pid
+                ),
                 vault_id=str(vault.identity()["vault_id"]),
                 timeout=20.0,
             )
@@ -837,10 +847,10 @@ def _loopback_connection_refused(url: str, *, timeout: float) -> bool:
                 return False
             wait = min(0.5, max(timeout, 0.05))
             _, writable, exceptional = select.select([], [connection], [connection], wait)
-            if not writable and not exceptional:
-                return False
             final_error = connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
             _ci_probe_marker("final", final_error)
+            if not writable and not exceptional and final_error == 0:
+                return False
             return _is_connection_refused(OSError(final_error, "loopback connection failed"))
     except (OSError, ValueError):
         return False
