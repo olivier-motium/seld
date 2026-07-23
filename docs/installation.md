@@ -211,10 +211,12 @@ A valid older receipt whose generated marketplace is already missing is handled
 automatically: GSV restores a packaged, digest-checked removal scaffold at the
 receipt-bound path, lets Codex remove and verify the live registrations, then
 deletes the scaffold. Immediately after provider verification GSV checkpoints
-that phase and an exact owned-file manifest in the receipt. If local recursive
-deletion raises after removing only some entries, re-run `gsv codex uninstall`;
+that phase and an exact owned-file manifest in the receipt. If local cleanup
+raises after removing only some entries, re-run `gsv codex uninstall`;
 the retry skips Codex and removes only an unchanged subset of the recorded
-files. Added or changed entries remain untouched for manual review.
+files. Cleanup first moves the tree to an exclusive sibling path, rescans it,
+then removes only exact manifest entries bottom-up. A newly appeared entry
+prevents directory removal and is restored or preserved for manual review.
 
 The recovery scaffold is built in an exclusive sibling stage, each file and
 nested directory is synchronized, and the complete tree is published without

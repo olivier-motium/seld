@@ -16,7 +16,7 @@ import pytest
 
 from continuity_kernel import atomic as atomic_module
 from continuity_kernel import codex_integration as integration
-from continuity_kernel.errors import SetupError, ValidationError
+from continuity_kernel.errors import ConflictError, SetupError, ValidationError
 
 
 @dataclass
@@ -142,6 +142,122 @@ def test_reinstall_refuses_changed_or_partial_receipt_owned_marketplace(
         assert sentinel.read_bytes() == b"preserve exact user bytes\n"
     else:
         assert not (marketplace / "plugins/gsv/skills/gsv/SKILL.md").exists()
+
+
+def test_reinstall_rechecks_prior_marketplace_immediately_before_replacement(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "first-vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    agents = home / "AGENTS.md"
+    receipt = integration._receipt_path(home)
+    agents_before = agents.read_bytes()
+    receipt_before = receipt.read_bytes()
+    manifest_before = integration._tree_manifest(marketplace)
+    calls_before = len(fake_codex.calls)
+    sentinel = marketplace / "concurrent-user-file.txt"
+    real_replace = integration._replace_marketplace
+
+    def mutate_before_replace(
+        vault: Path,
+        *,
+        runtime: tuple[str, list[str]] | None = None,
+        target: Path,
+        expected_prior_manifest: dict[str, str] | None = None,
+    ) -> integration._MarketplaceChange:
+        sentinel.write_bytes(b"preserve concurrent user bytes\n")
+        return real_replace(
+            vault,
+            runtime=runtime,
+            target=target,
+            expected_prior_manifest=expected_prior_manifest,
+        )
+
+    monkeypatch.setattr(integration, "_replace_marketplace", mutate_before_replace)
+
+    with pytest.raises(ConflictError, match="changed immediately before replacement"):
+        integration.install_codex(vault=tmp_path / "second-vault", codex_home=home)
+
+    new_calls = fake_codex.calls[calls_before:]
+    assert not any("add" in call or "remove" in call for call in new_calls)
+    assert agents.read_bytes() == agents_before
+    assert receipt.read_bytes() == receipt_before
+    assert sentinel.read_bytes() == b"preserve concurrent user bytes\n"
+    current = integration._tree_manifest(marketplace)
+    assert {key: current[key] for key in manifest_before} == manifest_before
+    assert not list(marketplace.parent.glob(f".{marketplace.name}.old-*"))
+
+
+def test_reinstall_rechecks_prior_marketplace_after_atomic_isolation(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "first-vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    receipt = integration._receipt_path(home)
+    receipt_before = receipt.read_bytes()
+    calls_before = len(fake_codex.calls)
+    real_publish = integration._publish_directory_new
+    injected = False
+
+    def mutate_after_isolation(source: Path, target: Path) -> None:
+        nonlocal injected
+        real_publish(source, target)
+        if source == marketplace and target.name.startswith(f".{marketplace.name}.old-"):
+            (target / "concurrent-user-file.txt").write_bytes(b"preserve move-boundary bytes\n")
+            injected = True
+
+    monkeypatch.setattr(integration, "_publish_directory_new", mutate_after_isolation)
+
+    with pytest.raises(ConflictError, match="replacement boundary"):
+        integration.install_codex(vault=tmp_path / "second-vault", codex_home=home)
+
+    assert injected is True
+    assert (marketplace / "concurrent-user-file.txt").read_bytes() == (
+        b"preserve move-boundary bytes\n"
+    )
+    assert receipt.read_bytes() == receipt_before
+    assert not any("add" in call or "remove" in call for call in fake_codex.calls[calls_before:])
+    assert not list(marketplace.parent.glob(f".{marketplace.name}.old-*"))
+
+
+def test_reinstall_preserves_both_trees_when_target_reappears_after_isolation(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "first-vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    receipt = integration._receipt_path(home)
+    receipt_before = receipt.read_bytes()
+    calls_before = len(fake_codex.calls)
+    real_publish = integration._publish_directory_new
+    sentinel = marketplace / "race-created-user-file.txt"
+
+    def recreate_target_after_isolation(source: Path, target: Path) -> None:
+        real_publish(source, target)
+        if source == marketplace and target.name.startswith(f".{marketplace.name}.old-"):
+            marketplace.mkdir()
+            sentinel.write_bytes(b"preserve replacement destination race\n")
+
+    monkeypatch.setattr(
+        integration,
+        "_publish_directory_new",
+        recreate_target_after_isolation,
+    )
+
+    with pytest.raises(ConflictError, match="preserved the destination"):
+        integration.install_codex(vault=tmp_path / "second-vault", codex_home=home)
+
+    previous = list(marketplace.parent.glob(f".{marketplace.name}.old-*"))
+    assert sentinel.read_bytes() == b"preserve replacement destination race\n"
+    assert len(previous) == 1
+    assert (previous[0] / "plugins/gsv/skills/gsv/SKILL.md").is_file()
+    assert receipt.read_bytes() == receipt_before
+    assert not any("add" in call or "remove" in call for call in fake_codex.calls[calls_before:])
 
 
 def test_preexisting_marketplace_and_plugin_are_rejected_without_mutation(
@@ -1278,17 +1394,17 @@ def test_local_removal_failure_retries_offline_from_provider_checkpoint(
     manifest = marketplace / ".agents/plugins/marketplace.json"
     receipt = integration._receipt_path(home)
     fake_codex.required_manifest = manifest
-    real_rmtree = shutil.rmtree
+    real_remove = integration._remove_verified_marketplace_tree
     failed = False
 
-    def fail_once(path: Path) -> None:
+    def fail_once(path: Path, expected: dict[str, str]) -> None:
         nonlocal failed
-        if Path(path) == marketplace and not failed:
+        if not failed:
             failed = True
             raise PermissionError("injected local deletion failure")
-        real_rmtree(path)
+        real_remove(path, expected)
 
-    monkeypatch.setattr(shutil, "rmtree", fail_once)
+    monkeypatch.setattr(integration, "_remove_verified_marketplace_tree", fail_once)
     removed = integration.uninstall_codex(codex_home=home)
 
     assert removed["cleanup_complete"] is False
@@ -1306,7 +1422,7 @@ def test_local_removal_failure_retries_offline_from_provider_checkpoint(
     assert not (home / "AGENTS.md").exists()
     calls_before_retry = len(fake_codex.calls)
 
-    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    monkeypatch.setattr(integration, "_remove_verified_marketplace_tree", real_remove)
     monkeypatch.setattr(
         integration,
         "_codex_executable",
@@ -1334,18 +1450,18 @@ def test_partial_marketplace_deletion_finishes_offline_from_exact_subset_manifes
     owned_skill = marketplace / "plugins/gsv/skills/gsv/SKILL.md"
     receipt = integration._receipt_path(home)
     fake_codex.required_manifest = manifest
-    real_rmtree = shutil.rmtree
+    real_remove = integration._remove_verified_marketplace_tree
     failed = False
 
-    def delete_then_fail(path: Path) -> None:
+    def delete_then_fail(path: Path, expected: dict[str, str]) -> None:
         nonlocal failed
-        if Path(path) == marketplace and not failed:
+        if not failed:
             failed = True
-            owned_skill.unlink()
+            (Path(path) / owned_skill.relative_to(marketplace)).unlink()
             raise PermissionError("injected failure after partial deletion")
-        real_rmtree(path)
+        real_remove(path, expected)
 
-    monkeypatch.setattr(shutil, "rmtree", delete_then_fail)
+    monkeypatch.setattr(integration, "_remove_verified_marketplace_tree", delete_then_fail)
     removed = integration.uninstall_codex(codex_home=home)
 
     assert removed["cleanup_complete"] is False
@@ -1362,7 +1478,7 @@ def test_partial_marketplace_deletion_finishes_offline_from_exact_subset_manifes
     assert fake_codex.marketplaces == {}
     calls_before_retry = len(fake_codex.calls)
 
-    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    monkeypatch.setattr(integration, "_remove_verified_marketplace_tree", real_remove)
     monkeypatch.setattr(
         integration,
         "_codex_executable",
@@ -1378,6 +1494,115 @@ def test_partial_marketplace_deletion_finishes_offline_from_exact_subset_manifes
     assert fake_codex.calls[calls_before_retry:] == []
     assert not receipt.exists()
     assert not marketplace.exists()
+
+
+def test_uninstall_isolates_and_rechecks_post_inspection_marketplace_race(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    receipt = integration._receipt_path(home)
+    sentinel = marketplace / "concurrent-user-file.txt"
+    real_publish = integration._publish_directory_new
+    injected = False
+
+    def mutate_before_isolation(source: Path, target: Path) -> None:
+        nonlocal injected
+        if source == marketplace and target.name.startswith(f".{marketplace.name}.remove-"):
+            sentinel.write_bytes(b"preserve post-inspection bytes\n")
+            injected = True
+        real_publish(source, target)
+
+    monkeypatch.setattr(integration, "_publish_directory_new", mutate_before_isolation)
+    removed = integration.uninstall_codex(codex_home=home)
+
+    assert injected is True
+    assert removed["cleanup_complete"] is False
+    assert removed["provider_cleanup_verified"] is True
+    assert removed["marketplace_files_state"] == "changed_or_unsafe"
+    assert removed["manual_review_required"] is True
+    assert removed["user_data_preserved"] is True
+    assert sentinel.read_bytes() == b"preserve post-inspection bytes\n"
+    assert receipt.exists()
+    assert not list(marketplace.parent.glob(f".{marketplace.name}.remove-*"))
+    assert fake_codex.plugins == set()
+    assert fake_codex.marketplaces == {}
+
+
+def test_uninstall_preserves_entry_added_at_manifest_deletion_boundary(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    receipt = integration._receipt_path(home)
+    real_remove = integration._remove_verified_marketplace_tree
+    real_rmtree = shutil.rmtree
+    injected = False
+
+    def add_entry_before_manifest_delete(root: Path, manifest: dict[str, str]) -> None:
+        nonlocal injected
+        (root / "late-user-file.txt").write_bytes(b"preserve deletion-boundary bytes\n")
+        injected = True
+        real_remove(root, manifest)
+
+    def forbid_quarantine_rmtree(path: Path, *args: Any, **kwargs: Any) -> None:
+        if Path(path).name.startswith(f".{marketplace.name}.remove-"):
+            raise AssertionError("verified marketplace deletion must not use rmtree")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        integration,
+        "_remove_verified_marketplace_tree",
+        add_entry_before_manifest_delete,
+    )
+    monkeypatch.setattr(shutil, "rmtree", forbid_quarantine_rmtree)
+    removed = integration.uninstall_codex(codex_home=home)
+
+    assert injected is True
+    assert removed["cleanup_complete"] is False
+    assert removed["marketplace_files_state"] == "changed_or_unsafe"
+    assert removed["manual_review_required"] is True
+    assert removed["user_data_preserved"] is True
+    assert (marketplace / "late-user-file.txt").read_bytes() == (
+        b"preserve deletion-boundary bytes\n"
+    )
+    assert receipt.exists()
+    assert not list(marketplace.parent.glob(f".{marketplace.name}.remove-*"))
+
+
+def test_uninstall_preserves_public_and_isolated_trees_on_destination_race(
+    tmp_path: Path, fake_codex: FakeCodex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
+    marketplace = Path(installed.marketplace_root)
+    receipt = integration._receipt_path(home)
+    real_publish = integration._publish_directory_new
+    sentinel = marketplace / "race-created-user-file.txt"
+
+    def recreate_after_isolation(source: Path, target: Path) -> None:
+        real_publish(source, target)
+        if source == marketplace and target.name.startswith(f".{marketplace.name}.remove-"):
+            marketplace.mkdir()
+            sentinel.write_bytes(b"preserve destination race bytes\n")
+
+    monkeypatch.setattr(integration, "_publish_directory_new", recreate_after_isolation)
+    removed = integration.uninstall_codex(codex_home=home)
+    quarantines = list(marketplace.parent.glob(f".{marketplace.name}.remove-*"))
+
+    assert removed["cleanup_complete"] is False
+    assert removed["marketplace_files_state"] == "changed_or_unsafe"
+    assert removed["manual_review_required"] is True
+    assert removed["user_data_preserved"] is True
+    assert sentinel.read_bytes() == b"preserve destination race bytes\n"
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "plugins/gsv/skills/gsv/SKILL.md").is_file()
+    assert receipt.exists()
 
 
 def test_agents_change_after_provider_commit_is_not_overwritten_and_retry_is_idempotent(

@@ -142,13 +142,18 @@ and verifies its registrations, then rechecks and deletes the local state. Any
 incomplete stage retains the ownership receipt and executable for the exact
 recovery path. A receipt-bound legacy state whose generated marketplace is
 already absent gets a deterministic packaged removal scaffold so a
-manifest-dependent Codex provider can finish cleanup. A recursive-delete error
+manifest-dependent Codex provider can finish cleanup. Reinstall and uninstall
+atomically isolate a receipt-owned marketplace under a unique sibling path and
+rescan it before replacement or deletion. Uninstall deletes exact verified
+manifest entries bottom-up and uses directory removal to detect any newly
+appeared entry; destination races preserve both trees. A local cleanup error
 after provider verification retains a durable provider-complete phase and the
 exact owned entry hashes. A later offline retry may delete only an unchanged
 subset of that manifest; any added or changed entry remains a manual-review
-boundary. Legacy scaffolds are file- and directory-synchronized in an exclusive
-stage before no-replace publication and provider access. Duplicate target
-plugin or marketplace identities stop provider mutation as ambiguous state.
+boundary. Legacy scaffolds are file- and directory-synchronized in an
+exclusive stage before no-replace publication and provider access. Duplicate
+target plugin or marketplace identities stop provider mutation as ambiguous
+state.
 
 ## Portability
 

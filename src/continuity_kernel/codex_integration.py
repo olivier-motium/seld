@@ -203,6 +203,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
     marketplace_root = _marketplace_root(home)
     prior_receipt_snapshot = _load_receipt_snapshot(home)
     prior_receipt = prior_receipt_snapshot.payload
+    prior_marketplace_manifest: dict[str, str] | None = None
     managed_instructions_present = _instruction_block_bounds(agents_content or "") is not None
     marketplace_files_present = marketplace_root.exists() or marketplace_root.is_symlink()
     if not prior_receipt and (managed_instructions_present or marketplace_files_present):
@@ -224,6 +225,9 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
                 "present. Run `gsv codex uninstall` or inspect the retained ownership "
                 "state before reinstalling."
             )
+        prior_marketplace_manifest = prior_marketplace.manifest
+        if prior_marketplace_manifest is None:  # pragma: no cover - state invariant
+            raise SetupError("The receipt-owned GSV marketplace has no verified manifest")
     executable = _codex_executable()
     marketplaces = _run_json(executable, ["plugin", "marketplace", "list", "--json"], home)
     existing = _unique_provider_item(
@@ -263,7 +267,11 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
     marketplace_change: _MarketplaceChange | None = None
     attempted_receipt: bytes | None = None
     try:
-        marketplace_change = _replace_marketplace(vault, target=marketplace_root)
+        marketplace_change = _replace_marketplace(
+            vault,
+            target=marketplace_root,
+            expected_prior_manifest=prior_marketplace_manifest,
+        )
         if existing is None:
             _run_json(
                 executable,
@@ -851,6 +859,7 @@ def _replace_marketplace(
     *,
     runtime: tuple[str, list[str]] | None = None,
     target: Path,
+    expected_prior_manifest: dict[str, str] | None = None,
 ) -> _MarketplaceChange:
     target = target.expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -872,14 +881,58 @@ def _replace_marketplace(
         atomic_write(mcp_path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode())
         installed_digest = _tree_digest(stage)
         if target.exists():
+            if expected_prior_manifest is None:
+                raise ConflictError(
+                    f"marketplace target appeared without a verified ownership snapshot: {target}"
+                )
+            current_manifest = _tree_manifest(target)
+            if current_manifest != expected_prior_manifest:
+                raise ConflictError(
+                    "receipt-owned marketplace changed immediately before replacement; "
+                    "left it untouched"
+                )
             previous = Path(tempfile.mkdtemp(prefix=f".{target.name}.old-", dir=target.parent))
             previous.rmdir()
-            durable_replace(target, previous)
+            try:
+                _publish_directory_new(target, previous)
+            except OSError as exc:
+                if _path_present(previous) and not _path_present(target):
+                    raise _restore_prior_marketplace_after_reinstall_conflict(
+                        previous,
+                        target,
+                        detail=f"marketplace isolation durability was not confirmed: {exc}",
+                    ) from exc
+                raise
+            try:
+                isolated_manifest = _tree_manifest(previous)
+            except (OSError, ContinuityError) as exc:
+                raise _restore_prior_marketplace_after_reinstall_conflict(
+                    previous,
+                    target,
+                    detail=f"could not verify isolated prior marketplace: {exc}",
+                ) from exc
+            if isolated_manifest != expected_prior_manifest:
+                raise _restore_prior_marketplace_after_reinstall_conflict(
+                    previous,
+                    target,
+                    detail=(
+                        "receipt-owned marketplace changed at the replacement boundary; "
+                        "the new marketplace was not published"
+                    ),
+                )
+        elif expected_prior_manifest is not None:
+            raise ConflictError(
+                "receipt-owned marketplace disappeared immediately before replacement"
+            )
         try:
-            durable_replace(stage, target)
-        except Exception:
-            if previous is not None and previous.exists() and not target.exists():
-                durable_replace(previous, target)
+            _publish_directory_new(stage, target)
+        except Exception as exc:
+            if previous is not None and _path_present(previous):
+                raise _restore_prior_marketplace_after_reinstall_conflict(
+                    previous,
+                    target,
+                    detail=f"the new marketplace could not be published safely: {exc}",
+                ) from exc
             raise
         return _MarketplaceChange(target, previous, installed_digest)
     finally:
@@ -890,6 +943,36 @@ def _replace_marketplace(
 def _marketplace_root(home: Path) -> Path:
     identity = sha256(str(home).encode("utf-8")).hexdigest()[:16]
     return (data_dir() / "marketplaces" / identity).resolve()
+
+
+def _restore_prior_marketplace_after_reinstall_conflict(
+    previous: Path,
+    target: Path,
+    *,
+    detail: str,
+) -> ContinuityError:
+    if not _path_present(previous):
+        if _path_present(target):
+            return ConflictError(f"{detail}; the marketplace target remains at {target}")
+        return SetupError(f"{detail}; neither the prior marketplace nor its target could be found")
+    if _path_present(target):
+        return ConflictError(
+            f"{detail}; preserved the destination at {target} and the isolated prior tree at "
+            f"{previous}"
+        )
+    try:
+        _publish_directory_new(previous, target)
+    except OSError as exc:
+        if _path_present(target) and not _path_present(previous):
+            return SetupError(
+                f"{detail}; the prior marketplace is visible again at {target}, but recovery "
+                f"durability is unconfirmed: {exc}"
+            )
+        return SetupError(
+            f"{detail}; could not restore the prior marketplace: {exc}. Preserved paths: "
+            f"{target} and {previous}"
+        )
+    return ConflictError(f"{detail}; restored the prior marketplace at {target}")
 
 
 def _integration_lock_path(home: Path) -> Path:
@@ -1540,13 +1623,12 @@ def _inspect_checkpointed_marketplace(
             path=str(resolved),
             error=f"could not verify checkpointed marketplace files: {exc}",
         )
-    for relative, value in current_manifest.items():
-        if expected_manifest.get(relative) != value:
-            return _MarketplaceCleanup(
-                _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
-                path=str(resolved),
-                error="checkpointed marketplace contains changed or unowned files",
-            )
+    if not _manifest_is_owned_subset(current_manifest, expected_manifest):
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(resolved),
+            error="checkpointed marketplace contains changed or unowned files",
+        )
     return _MarketplaceCleanup(
         _MarketplaceCleanupState.VERIFIED_PRESENT,
         path=str(resolved),
@@ -1824,15 +1906,188 @@ def _remove_owned_marketplace(
             error="verified marketplace state omitted its path",
         )
     root = Path(inspected.path)
+    if not isinstance(expected_manifest, dict):  # pragma: no cover - preflight owns this
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error="provider checkpoint omitted its exact marketplace manifest",
+        )
     try:
-        shutil.rmtree(root)
+        quarantine = Path(tempfile.mkdtemp(prefix=f".{root.name}.remove-", dir=root.parent))
+        quarantine.rmdir()
     except OSError as exc:
         return _MarketplaceCleanup(
             _MarketplaceCleanupState.REMOVAL_FAILED,
             path=str(root),
-            error=f"could not remove verified marketplace files: {exc}",
+            error=f"could not reserve isolated marketplace cleanup path: {exc}",
+        )
+    try:
+        _publish_directory_new(root, quarantine)
+    except OSError as exc:
+        if _path_present(quarantine) and not _path_present(root):
+            return _restore_quarantined_marketplace(
+                root,
+                quarantine,
+                state=_MarketplaceCleanupState.REMOVAL_FAILED,
+                detail=f"marketplace isolation durability was not confirmed: {exc}",
+            )
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.REMOVAL_FAILED,
+            path=str(root),
+            error=f"could not isolate verified marketplace files: {exc}",
+        )
+    try:
+        isolated_manifest = _tree_manifest(quarantine)
+    except (OSError, ContinuityError) as exc:
+        return _restore_quarantined_marketplace(
+            root,
+            quarantine,
+            state=_MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            detail=f"could not verify isolated marketplace files: {exc}",
+        )
+    if not _manifest_is_owned_subset(isolated_manifest, expected_manifest):
+        return _restore_quarantined_marketplace(
+            root,
+            quarantine,
+            state=_MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            detail="marketplace changed after cleanup preflight; no isolated bytes were deleted",
+        )
+    if _path_present(root):
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error=(
+                "a new marketplace path appeared during cleanup; it and the verified isolated "
+                f"tree at {quarantine} were preserved"
+            ),
+        )
+    try:
+        _remove_verified_marketplace_tree(quarantine, isolated_manifest)
+        _fsync_one_directory(root.parent)
+    except (OSError, ContinuityError) as exc:
+        if not _path_present(quarantine) and not _path_present(root):
+            return _MarketplaceCleanup(
+                _MarketplaceCleanupState.REMOVAL_FAILED,
+                path=str(root),
+                error=f"marketplace removal is visible but durability is unconfirmed: {exc}",
+            )
+        recovery_state = _MarketplaceCleanupState.REMOVAL_FAILED
+        recovery_detail = f"could not remove verified isolated marketplace files: {exc}"
+        if _path_present(quarantine):
+            try:
+                remaining_manifest = _tree_manifest(quarantine)
+                if not _manifest_is_owned_subset(remaining_manifest, expected_manifest):
+                    recovery_state = _MarketplaceCleanupState.CHANGED_OR_UNSAFE
+                    recovery_detail = (
+                        "an unowned marketplace entry appeared during isolated cleanup and was "
+                        "preserved"
+                    )
+            except (OSError, ContinuityError) as inspect_exc:
+                recovery_state = _MarketplaceCleanupState.CHANGED_OR_UNSAFE
+                recovery_detail = (
+                    "could not verify marketplace bytes remaining after cleanup failure: "
+                    f"{inspect_exc}"
+                )
+        return _restore_quarantined_marketplace(
+            root,
+            quarantine,
+            state=recovery_state,
+            detail=recovery_detail,
+        )
+    if _path_present(root):
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error="a new marketplace path appeared after isolated cleanup and was preserved",
         )
     return _MarketplaceCleanup(_MarketplaceCleanupState.REMOVED, path=str(root))
+
+
+def _manifest_is_owned_subset(
+    current: dict[str, str],
+    expected: dict[str, Any],
+) -> bool:
+    return all(expected.get(relative) == value for relative, value in current.items())
+
+
+def _remove_verified_marketplace_tree(root: Path, manifest: dict[str, str]) -> None:
+    files = [(relative, value) for relative, value in manifest.items() if value != "directory"]
+    directories = [relative for relative, value in manifest.items() if value == "directory"]
+    for relative, expected in sorted(
+        files,
+        key=lambda item: (len(PurePosixPath(item[0]).parts), item[0]),
+        reverse=True,
+    ):
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            raise ValidationError(f"could not inspect isolated marketplace file: {path}") from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValidationError(f"isolated marketplace file changed type: {path}")
+        actual = f"file:{_sha256_regular_file(path, metadata)}"
+        if actual != expected:
+            raise ConflictError(f"isolated marketplace file changed before deletion: {path}")
+        path.unlink()
+    for relative in sorted(
+        directories,
+        key=lambda value: (len(PurePosixPath(value).parts), value),
+        reverse=True,
+    ):
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            raise ValidationError(
+                f"could not inspect isolated marketplace directory: {path}"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValidationError(f"isolated marketplace directory changed type: {path}")
+        path.rmdir()
+    root.rmdir()
+
+
+def _path_present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _restore_quarantined_marketplace(
+    root: Path,
+    quarantine: Path,
+    *,
+    state: _MarketplaceCleanupState,
+    detail: str,
+) -> _MarketplaceCleanup:
+    if not _path_present(quarantine):
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error=f"{detail}; the isolated cleanup path disappeared before recovery",
+        )
+    if _path_present(root):
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error=(
+                f"{detail}; a destination race was preserved at {root}, and the isolated tree "
+                f"remains at {quarantine}"
+            ),
+        )
+    try:
+        _publish_directory_new(quarantine, root)
+    except OSError as exc:
+        if _path_present(root) and not _path_present(quarantine):
+            return _MarketplaceCleanup(
+                state,
+                path=str(root),
+                error=f"{detail}; recovery is visible but durability is unconfirmed: {exc}",
+            )
+        return _MarketplaceCleanup(
+            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
+            path=str(root),
+            error=(f"{detail}; recovery failed: {exc}. Preserved paths: {root} and {quarantine}"),
+        )
+    return _MarketplaceCleanup(state, path=str(root), error=detail)
 
 
 def _codex_executable() -> str:

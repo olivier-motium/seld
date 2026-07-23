@@ -196,11 +196,13 @@ cleanup succeeds. It never calls partial cleanup complete. A changed or unsafe
 generated marketplace is left untouched for manual review, and Codex
 registrations are not changed until local ownership and instruction cleanup are
 verified. A valid legacy receipt with missing generated files is recovered with
-a packaged removal scaffold before Codex cleanup. If recursive local deletion
-fails after provider cleanup, the receipt's provider-complete phase and exact
-owned-file manifest let a later uninstall finish locally without Codex. Added
-or changed files still stop deletion for manual review. Duplicate GSV provider
-identities stop before add/remove operations rather than guessing ownership.
+a packaged removal scaffold before Codex cleanup. Local removal atomically
+isolates the verified tree, rescans it, and deletes only exact manifest entries;
+new entries survive and stop directory removal. If that cleanup fails after
+provider cleanup, the receipt's provider-complete phase and exact owned-file
+manifest let a later uninstall finish locally without Codex. Added or changed
+files still stop deletion for manual review. Duplicate GSV provider identities
+stop before add/remove operations rather than guessing ownership.
 
 ## Develop
 

@@ -14,6 +14,9 @@
   and identity-checked across post-publication verification.
 - Keep backup verification and restore usable with missing or invalid UTF-8
   configuration, with structured failures for ordinary configured commands.
+- Recheck receipt-owned marketplace bytes after atomic isolation during
+  reinstall and uninstall, preserve destination races, and delete only exact
+  manifest entries rather than recursively removing a mutable public path.
 
 ## 0.1.0
 
