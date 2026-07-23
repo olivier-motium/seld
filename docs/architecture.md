@@ -129,6 +129,9 @@ directory and is restored if publication did not occur. Rename failures are
 classified by source and target identity plus logical digest: unpublished work
 is rolled back, while a visible committed restore with unconfirmed directory
 durability is reported as degraded and left intact for explicit doctor review.
+After a successful move, restore rechecks the public target's pinned directory
+identity, vault identity, and logical digest around the full read-back; a target
+swap is never reported as a successful restore.
 An unpublished failed stage is also retained and named instead of recursively
 deleted by a later pathname lookup. A changed stage pathname is an unknown
 recovery state: neither the replacement path nor a displaced original is

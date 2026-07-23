@@ -20,6 +20,8 @@
 - Keep failed unpublished restore stages as named recovery evidence, refuse
   recursive doctor cleanup, and structure staging/path I/O failures without a
   traceback.
+- Verify the published restore target against the staged directory identity,
+  vault identity, and logical digest before reporting success.
 - Recheck receipt-owned marketplace bytes after atomic isolation during
   reinstall and uninstall, preserve destination races, and delete only exact
   manifest entries rather than recursively removing a mutable public path.

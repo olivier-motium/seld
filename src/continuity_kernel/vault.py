@@ -1041,6 +1041,17 @@ class Vault:
                     f"`gsv --vault {shlex.quote(str(target))} doctor` if the target exists, and "
                     "inspect restore temporary paths before retrying"
                 ) from exc
+            if not _restored_vault_matches(
+                target,
+                identity=stage_identity,
+                vault_id=str(inspection.manifest["vault_id"]),
+                digest=digest,
+            ):
+                raise DegradedIntegrityError(
+                    f"restore target changed during post-publication verification: {target}; "
+                    "the reported target was not accepted as the restored vault. Inspect that "
+                    "path and any displaced sibling before retrying"
+                )
             if prior_empty is not None and prior_empty.exists():
                 cleanup_warning = _remove_prior_empty(prior_empty)
                 if cleanup_warning is None:
@@ -1610,9 +1621,10 @@ def _restored_vault_matches(
         return False
     try:
         vault = Vault(path)
-        return vault.identity()["vault_id"] == vault_id and vault.logical_digest() == digest
+        matches = vault.identity()["vault_id"] == vault_id and vault.logical_digest() == digest
     except (OSError, ContinuityError):
         return False
+    return matches and _directory_matches(path, identity)
 
 
 def _restore_prior_target(

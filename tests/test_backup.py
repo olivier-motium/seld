@@ -337,6 +337,29 @@ def test_restore_stage_path_swap_preserves_replacement_and_displaced_stage(
     assert all(issue.repairable is False for issue in retained)
 
 
+def test_restore_rejects_target_swap_immediately_after_publication(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backup = Path(vault.create_backup(tmp_path / "backup.zip")["backup"])
+    target = tmp_path / "restored"
+    displaced = tmp_path / ".restored.published-displaced"
+
+    def publish_then_swap(source: Path, destination: Path) -> None:
+        actual_durable_replace(source, destination)
+        if destination == target and source.name.startswith(".restored.tmp-restore-"):
+            destination.replace(displaced)
+            destination.mkdir()
+            (destination / "replacement-user-data.txt").write_bytes(b"preserve replacement\n")
+
+    monkeypatch.setattr(vault_module, "durable_replace", publish_then_swap)
+
+    with pytest.raises(DegradedIntegrityError, match="post-publication verification"):
+        Vault.restore_backup(backup, target)
+
+    assert (target / "replacement-user-data.txt").read_bytes() == b"preserve replacement\n"
+    assert Vault(displaced).logical_digest() == vault.logical_digest()
+
+
 def test_failed_publication_restores_preexisting_empty_target(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

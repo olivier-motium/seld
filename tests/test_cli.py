@@ -15,6 +15,7 @@ import pytest
 from continuity_kernel import bridge as bridge_module
 from continuity_kernel import cli
 from continuity_kernel import vault as vault_module
+from continuity_kernel.atomic import durable_replace as actual_durable_replace
 from continuity_kernel.codex_integration import CodexInstallResult
 from continuity_kernel.config import config_path, load_config, save_config
 from continuity_kernel.errors import SetupError, ValidationError
@@ -1058,6 +1059,39 @@ def test_restore_stage_allocation_failure_is_structured_cli_json(
     )
     assert "Traceback" not in captured.err
     assert not target.exists()
+
+
+def test_restore_target_swap_is_a_structured_degraded_cli_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Restore target swap")
+    backup = Path(vault.create_backup(tmp_path / "backup.zip")["backup"])
+    target = tmp_path / "restored"
+    displaced = tmp_path / ".restored.published-displaced"
+
+    def publish_then_swap(source: Path, destination: Path) -> None:
+        actual_durable_replace(source, destination)
+        if destination == target and source.name.startswith(".restored.tmp-restore-"):
+            destination.replace(displaced)
+            destination.mkdir()
+            (destination / "replacement.txt").write_bytes(b"preserve\n")
+
+    monkeypatch.setattr(vault_module, "durable_replace", publish_then_swap)
+
+    exit_code = cli.main(["--json", "backup", "restore", str(backup), str(target)])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert "post-publication verification" in payload["error"]
+    assert str(target) in payload["error"]
+    assert "Traceback" not in captured.err
+    assert (target / "replacement.txt").read_bytes() == b"preserve\n"
+    assert Vault(displaced).logical_digest() == vault.logical_digest()
 
 
 def test_codex_status_and_uninstall_do_not_require_vault_configuration(
