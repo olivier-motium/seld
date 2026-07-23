@@ -176,7 +176,7 @@ def test_setup_restores_configuration_even_when_bridge_cleanup_also_fails(
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
 def test_setup_refuses_fifo_configuration_without_blocking(tmp_path: Path) -> None:
-    if os.name == "nt":
+    if sys.platform == "win32":
         pytest.skip("FIFO creation is unavailable")
     configuration = config_path()
     configuration.parent.mkdir(parents=True)
