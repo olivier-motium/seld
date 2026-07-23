@@ -839,14 +839,26 @@ class Vault:
                     try:
                         durable_unlink(temp)
                     except OSError as cleanup_error:
+                        try:
+                            os.lstat(temp)
+                        except FileNotFoundError:
+                            cleanup_state = (
+                                "the staged archive is no longer visible, but deletion "
+                                "durability is unconfirmed"
+                            )
+                        except OSError:
+                            cleanup_state = "the staged archive path state is unknown"
+                        else:
+                            cleanup_state = "the staged archive remains"
                         if primary is None:
                             raise DegradedIntegrityError(
-                                f"backup staging cleanup failed at {temp}: {cleanup_error}"
+                                f"backup staging cleanup failed at {temp}; {cleanup_state}: "
+                                f"{cleanup_error}"
                             ) from cleanup_error
-                        primary.add_note(
-                            f"The staged archive remains at {temp}; durable cleanup failed: "
-                            f"{cleanup_error}"
-                        )
+                        raise DegradedIntegrityError(
+                            f"{primary}; backup staging cleanup failed at {temp}; "
+                            f"{cleanup_state}: {cleanup_error}"
+                        ) from primary
         try:
             if not _regular_file_matches(destination, published_identity, staged_hash):
                 raise DegradedIntegrityError(

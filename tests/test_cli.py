@@ -13,6 +13,7 @@ import pytest
 
 from continuity_kernel import bridge as bridge_module
 from continuity_kernel import cli
+from continuity_kernel import vault as vault_module
 from continuity_kernel.codex_integration import CodexInstallResult
 from continuity_kernel.config import config_path, load_config, save_config
 from continuity_kernel.errors import SetupError, ValidationError
@@ -740,6 +741,58 @@ def test_unverified_backup_creation_returns_nonzero_json_failure(
     assert payload["error"] == (
         "GSV backup creation did not verify; do not use the reported archive."
     )
+
+
+@pytest.mark.parametrize(
+    ("unlink_first", "expected_state"),
+    [
+        (False, "the staged archive remains"),
+        (True, "the staged archive is no longer visible, but deletion durability is unconfirmed"),
+    ],
+)
+def test_backup_cleanup_failure_is_visible_in_cli_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    unlink_first: bool,
+    expected_state: str,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Cleanup truth")
+    destination = tmp_path / "backup.zip"
+
+    def fail_source_capture(_: Path) -> bytes:
+        raise ValidationError("injected source capture failure")
+
+    def fail_cleanup(path: Path) -> None:
+        if unlink_first:
+            path.unlink()
+        raise OSError("injected cleanup durability failure")
+
+    monkeypatch.setattr(vault_module, "_read_backup_source", fail_source_capture)
+    monkeypatch.setattr(vault_module, "durable_unlink", fail_cleanup)
+
+    exit_code = cli.main(
+        [
+            "--json",
+            "--vault",
+            str(vault.root),
+            "backup",
+            "create",
+            "--output",
+            str(destination),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().err)
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert "injected source capture failure" in payload["error"]
+    assert "injected cleanup durability failure" in payload["error"]
+    assert expected_state in payload["error"]
+    assert ".gsv-backup.tmp-" in payload["error"]
+    assert not destination.exists()
+    assert bool(list(tmp_path.glob(".gsv-backup.tmp-*.zip"))) is (not unlink_first)
 
 
 def test_codex_status_and_uninstall_do_not_require_vault_configuration(
