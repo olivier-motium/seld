@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from continuity_kernel import atomic as atomic_module
 from continuity_kernel import vault as vault_module
 from continuity_kernel.atomic import durable_publish_new as actual_durable_publish_new
 from continuity_kernel.atomic import durable_replace as actual_durable_replace
@@ -463,6 +464,12 @@ def test_backup_rejects_nonregular_unix_archive_entries(tmp_path: Path, mode: in
         "payload.txt:alternate-stream",
         "CON",
         "aux.txt",
+        "COM¹.txt",
+        "COM²",
+        "COM³.log",
+        "LPT¹.txt",
+        "LPT²",
+        "LPT³.log",
         "trailing-dot.",
         "trailing-space ",
     ],
@@ -541,6 +548,46 @@ def test_backup_creation_hashes_and_writes_one_captured_source_read(
     with zipfile.ZipFile(result["backup"], "r") as archive:
         assert archive.read("MIND.md") == before
     assert (vault.root / "MIND.md").read_bytes() != before
+
+
+def test_backup_includes_authoritative_name_containing_tmp_marker(
+    vault: Vault, tmp_path: Path
+) -> None:
+    authoritative = vault.root / "notes.tmp-user.md"
+    content = b"authoritative content with a legitimate temp-like name\n"
+    authoritative.write_bytes(content)
+
+    result = vault.create_backup(tmp_path / "snapshot.zip")
+
+    with zipfile.ZipFile(result["backup"], "r") as archive:
+        assert archive.read(authoritative.name) == content
+
+
+def test_backup_excludes_only_exact_writer_owned_atomic_temps(vault: Vault, tmp_path: Path) -> None:
+    owned_temps = [
+        ".AGENTS.md.tmp-token",
+        ".MIND.md.tmp-token",
+        ".NOW.md.tmp-token",
+        ".README.md.tmp-token",
+        "tasks/.example.md.tmp-token",
+        "entities/.example.md.tmp-token",
+        "threads/.example.md.tmp-token",
+        ".gsv/.manifest.json.tmp-token",
+        "journal/.events.jsonl.tmp-token",
+    ]
+    for relative in owned_temps:
+        path = vault.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"interrupted owned write\n")
+    legitimate = vault.root / "tasks/.notes.tmp-user.md"
+    legitimate.write_bytes(b"legitimate authored bytes\n")
+
+    result = vault.create_backup(tmp_path / "snapshot.zip")
+
+    with zipfile.ZipFile(result["backup"], "r") as archive:
+        names = set(archive.namelist())
+        assert not names.intersection(owned_temps)
+        assert archive.read("tasks/.notes.tmp-user.md") == b"legitimate authored bytes\n"
 
 
 def test_restore_rechecks_staged_files_against_manifest(
@@ -683,6 +730,195 @@ def test_backup_fails_closed_when_hard_link_publication_is_unsupported(
     assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
 
 
+def test_backup_uses_atomic_no_replace_move_when_hard_links_are_unsupported(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "fallback.zip"
+    real_move = atomic_module.move_no_replace
+    observed_complete_stage = False
+
+    def unsupported_link(*_: object, **__: object) -> None:
+        raise OSError(errno.ENOTSUP, "injected hard-link limitation")
+
+    def observed_move(source: Path, target: Path) -> None:
+        nonlocal observed_complete_stage
+        assert not target.exists()
+        observed_complete_stage = Vault.verify_backup(source)["valid"] is True
+        real_move(source, target)
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+    monkeypatch.setattr(atomic_module, "move_no_replace", observed_move)
+
+    result = vault.create_backup(destination)
+
+    assert observed_complete_stage is True
+    assert result["verified"] is True
+    assert Vault.verify_backup(destination)["valid"] is True
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+
+
+def test_windows_hard_link_error_reaches_native_move_fallback(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "windows-fallback.zip"
+    real_move = atomic_module.move_no_replace
+    moved = False
+
+    class WindowsLinkError(OSError):
+        winerror = 50
+
+    def unsupported_link(*_: object, **__: object) -> None:
+        raise WindowsLinkError(errno.EINVAL, "injected Windows unsupported hard link")
+
+    def observed_move(source: Path, target: Path) -> None:
+        nonlocal moved
+        moved = True
+        real_move(source, target)
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+    monkeypatch.setattr(atomic_module, "move_no_replace", observed_move)
+
+    result = vault.create_backup(destination)
+
+    assert moved is True
+    assert result["verified"] is True
+    assert Vault.verify_backup(destination)["valid"] is True
+
+
+def test_native_move_fallback_preserves_existing_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "stage.zip"
+    target = tmp_path / "existing.zip"
+    source.write_bytes(b"complete staged archive")
+    target.write_bytes(b"existing user archive")
+
+    def unsupported_link(*_: object, **__: object) -> None:
+        raise OSError(errno.ENOTSUP, "injected hard-link limitation")
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+
+    with pytest.raises(FileExistsError):
+        atomic_module.durable_publish_new(source, target)
+
+    assert source.read_bytes() == b"complete staged archive"
+    assert target.read_bytes() == b"existing user archive"
+
+
+def test_backup_reports_unsupported_atomic_publication_without_final_path(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "unsupported-atomic-move.zip"
+
+    def unsupported_link(*_: object, **__: object) -> None:
+        raise OSError(errno.ENOTSUP, "injected hard-link limitation")
+
+    def unsupported_move(source: Path, target: Path) -> None:
+        assert source.exists()
+        assert not target.exists()
+        raise OSError(errno.ENOTSUP, "injected no-replace move limitation")
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+    monkeypatch.setattr(atomic_module, "move_no_replace", unsupported_move)
+
+    with pytest.raises(PersistenceError, match="does not support atomic no-clobber"):
+        vault.create_backup(destination)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+
+
+def test_committed_link_fsync_failure_preserves_exact_staged_archive(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "committed.zip"
+
+    def fail_directory_fsync(_: Path) -> None:
+        raise OSError("injected parent fsync failure")
+
+    monkeypatch.setattr(atomic_module, "_fsync_directory", fail_directory_fsync)
+
+    with pytest.raises(MutationCommittedError, match="staged file remains"):
+        vault.create_backup(destination)
+
+    staged = list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+    assert len(staged) == 1
+    assert os.path.samefile(staged[0], destination)
+    assert Vault.verify_backup(destination)["valid"] is True
+
+
+def test_committed_source_cleanup_failure_is_not_masked_or_retried(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "committed.zip"
+    original_unlink = Path.unlink
+    attempts = 0
+
+    def fail_staged_unlink(path: Path, missing_ok: bool = False) -> None:
+        nonlocal attempts
+        if path.name.startswith(".gsv-backup.tmp-"):
+            attempts += 1
+            raise PermissionError("injected staged cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_staged_unlink)
+
+    with pytest.raises(MutationCommittedError, match="staged file remains"):
+        vault.create_backup(destination)
+
+    staged = list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+    assert attempts == 1
+    assert len(staged) == 1
+    assert os.path.samefile(staged[0], destination)
+    assert Vault.verify_backup(destination)["valid"] is True
+
+
+def test_committed_move_fsync_failure_reports_consumed_stage(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "moved.zip"
+
+    def unsupported_link(*_: object, **__: object) -> None:
+        raise OSError(errno.ENOTSUP, "injected hard-link limitation")
+
+    def fail_directory_fsync(_: Path) -> None:
+        raise OSError("injected post-move parent fsync failure")
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+    monkeypatch.setattr(atomic_module, "_fsync_directory", fail_directory_fsync)
+
+    with pytest.raises(MutationCommittedError, match="staged path was consumed"):
+        vault.create_backup(destination)
+
+    assert Vault.verify_backup(destination)["valid"] is True
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+
+
+def test_unknown_move_outcome_preserves_stage_and_both_paths(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "ambiguous.zip"
+
+    def unsupported_link(*_: object, **__: object) -> None:
+        raise OSError(errno.ENOTSUP, "injected hard-link limitation")
+
+    def ambiguous_move(source: Path, target: Path) -> None:
+        assert source.exists()
+        target.write_bytes(b"unrelated race-created bytes")
+        raise OSError(errno.EIO, "injected ambiguous move outcome")
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+    monkeypatch.setattr(atomic_module, "move_no_replace", ambiguous_move)
+
+    with pytest.raises(DegradedIntegrityError, match="unknown outcome"):
+        vault.create_backup(destination)
+
+    staged = list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+    assert len(staged) == 1
+    assert Vault.verify_backup(staged[0])["valid"] is True
+    assert destination.read_bytes() == b"unrelated race-created bytes"
+
+
 def test_backup_publication_replace_then_fsync_failure_reports_committed_archive(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -727,6 +963,60 @@ def test_backup_target_swap_after_link_never_reports_success(
 
     assert swapped is True
     assert destination.read_bytes() == replacement_bytes
+
+
+def test_backup_destination_policy_detects_case_alias_of_vault_root(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "MixedCaseVault")
+    vault.initialize(name="Case alias proof")
+    alias = tmp_path / "mixedcasevault"
+    if not alias.exists() or not os.path.samefile(alias, vault.root):
+        pytest.skip("filesystem is case-sensitive")
+    before = vault.logical_digest()
+    destination = alias / "tasks" / "backup.md"
+
+    with pytest.raises(ValidationError, match="owned backups"):
+        vault.create_backup(destination)
+
+    assert not destination.exists()
+    assert vault.logical_digest() == before
+    assert vault.doctor().healthy is True
+
+
+def test_backup_destination_policy_detects_unicode_alias_of_vault_root(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "caf\N{LATIN SMALL LETTER E WITH ACUTE}")
+    vault.initialize(name="Unicode alias proof")
+    alias = tmp_path / "cafe\N{COMBINING ACUTE ACCENT}"
+    if not alias.exists() or not os.path.samefile(alias, vault.root):
+        pytest.skip("filesystem does not normalize Unicode path aliases")
+    before = vault.logical_digest()
+    destination = alias / "exports" / "backup.zip"
+
+    with pytest.raises(ValidationError, match="owned backups"):
+        vault.create_backup(destination)
+
+    assert not destination.exists()
+    assert not (vault.root / "exports").exists()
+    assert vault.logical_digest() == before
+    assert vault.doctor().healthy is True
+
+
+def test_backup_excludes_owned_backup_directory_through_case_alias(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Owned backup alias proof")
+    first = Path(vault.create_backup()["backup"])
+    renamed = vault.root / "Backups"
+    (vault.root / "backups").rename(renamed)
+    if not (vault.root / "backups").exists() or not os.path.samefile(
+        vault.root / "backups", renamed
+    ):
+        pytest.skip("filesystem is case-sensitive")
+
+    second = Path(vault.create_backup()["backup"])
+
+    assert first.exists()
+    assert second.exists()
+    with zipfile.ZipFile(second, "r") as archive:
+        assert all(not name.casefold().startswith("backups/") for name in archive.namelist())
 
 
 def test_prior_target_move_replace_then_fsync_failure_can_finish_durably(

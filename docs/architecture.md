@@ -112,7 +112,9 @@ snapshot cannot mix record versions.
 Backup creation reads each included regular file once, hashes those captured
 bytes, and writes the same bytes into a staged ZIP. Symlinks and other special
 files and traversal errors fail closed. Publication uses a same-directory
-no-replace hard link and never falls back to overwriting. Default names include
+no-replace hard link or a native atomic no-replace move of the complete stage;
+it never falls back to replacement or a partial final-path copy. If neither
+primitive is available, the archive remains unpublished. Default names include
 a random suffix. The destination must match the staged inode and SHA-256 before
 and after archive verification, and the returned digest is the captured staged
 digest. Verification rejects unsafe or non-portable member names, non-regular

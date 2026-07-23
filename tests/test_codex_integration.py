@@ -2367,7 +2367,7 @@ def test_marketplace_manifest_propagates_nested_scandir_failure(
         integration._tree_manifest(marketplace)
 
 
-def test_windows_directory_durability_uses_typed_handles_and_write_through(
+def test_windows_directory_durability_uses_typed_handles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class FakeFunction:
@@ -2386,7 +2386,6 @@ def test_windows_directory_durability_uses_typed_handles_and_write_through(
             self.CreateFileW = FakeFunction(0x123456789)
             self.FlushFileBuffers = FakeFunction(1)
             self.CloseHandle = FakeFunction(1)
-            self.MoveFileExW = FakeFunction(1)
 
     kernel32 = FakeKernel32()
 
@@ -2413,19 +2412,9 @@ def test_windows_directory_durability_uses_typed_handles_and_write_through(
     assert kernel32.FlushFileBuffers.restype is wintypes.BOOL
     assert kernel32.CloseHandle.argtypes == [wintypes.HANDLE]
     assert kernel32.CloseHandle.restype is wintypes.BOOL
-    assert kernel32.MoveFileExW.argtypes == [
-        wintypes.LPCWSTR,
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-    ]
-    assert kernel32.MoveFileExW.restype is wintypes.BOOL
-
     directory = tmp_path / "stage"
-    source = tmp_path / "source"
-    target = tmp_path / "target"
     monkeypatch.setattr(integration, "_windows_kernel32", lambda: kernel32)
     integration._flush_windows_directory(directory)
-    integration._move_windows_directory_new(source, target)
 
     assert kernel32.CreateFileW.calls == [
         (
@@ -2440,6 +2429,49 @@ def test_windows_directory_durability_uses_typed_handles_and_write_through(
     ]
     assert kernel32.FlushFileBuffers.calls == [(0x123456789,)]
     assert kernel32.CloseHandle.calls == [(0x123456789,)]
+
+
+def test_windows_no_replace_move_uses_typed_write_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeFunction:
+        def __init__(self, result: object) -> None:
+            self.result = result
+            self.calls: list[tuple[object, ...]] = []
+            self.argtypes: list[object] | None = None
+            self.restype: object | None = None
+
+        def __call__(self, *arguments: object) -> object:
+            self.calls.append(arguments)
+            return self.result
+
+    class FakeKernel32:
+        def __init__(self) -> None:
+            self.MoveFileExW = FakeFunction(1)
+
+    kernel32 = FakeKernel32()
+
+    def fake_loader(name: str, *, use_last_error: bool) -> FakeKernel32:
+        assert name == "kernel32"
+        assert use_last_error is True
+        return kernel32
+
+    monkeypatch.setitem(ctypes.__dict__, "WinDLL", fake_loader)
+    configured = atomic_module._windows_move_kernel32()
+
+    assert configured is kernel32
+    assert kernel32.MoveFileExW.argtypes == [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+    ]
+    assert kernel32.MoveFileExW.restype is wintypes.BOOL
+
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    monkeypatch.setattr(atomic_module, "_windows_move_kernel32", lambda: kernel32)
+    atomic_module._move_windows_path_new(source, target)
+
     assert kernel32.MoveFileExW.calls == [(str(source), str(target), 0x00000008)]
 
 

@@ -136,15 +136,24 @@ gsv backup verify /path/to/backup.zip
 Default backup names include a random suffix and are published without
 replacing an existing path. Explicit output paths must be absent, and paths
 inside the vault are accepted only below its owned `backups/` directory. GSV
-fails closed when it cannot enumerate every source entry or encounters a
-symlink or other special file. It checks the published path against the staged
-inode and SHA-256 immediately before and after archive verification; a target
-swap is a degraded nonzero result rather than a successful backup.
+identifies the vault and owned backup directory by filesystem identity, so case
+or Unicode aliases cannot bypass that policy. It excludes only exact
+GSV-writer temporary names; legitimate files that merely contain `.tmp-` are
+included. GSV fails closed when it cannot enumerate every source entry or
+encounters a symlink or other special file. Publication uses a hard link when
+available and otherwise a platform atomic no-replace move of the complete
+same-directory stage. It never streams partial bytes into the final path and
+reports an unsupported filesystem when neither primitive exists. It checks the
+published path against the staged inode and SHA-256 immediately before and
+after archive verification; a target swap is a degraded nonzero result rather
+than a successful backup.
 
 Verification and disaster-recovery restore are config-independent. This is
 intentional: both commands remain usable when `config.json` is absent or
-unreadable, including invalid UTF-8. Other commands report invalid
-configuration as a structured validation error. A hash mismatch is reported
+unreadable, including invalid UTF-8, symlinks, FIFOs, and invalid configured
+paths. Configuration reads are bounded, no-follow, and regular-file-only.
+Other commands report invalid configuration as a structured validation error.
+A hash mismatch is reported
 as `valid: false`, `ok: false`, and a nonzero exit; restore never publishes
 that archive.
 

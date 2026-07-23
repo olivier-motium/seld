@@ -8,6 +8,7 @@ import os
 import shlex
 import shutil
 import stat
+import sys
 import tempfile
 import unicodedata
 import uuid
@@ -16,12 +17,14 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import IO, Any, Final, Literal, TypeVar
 
 from continuity_kernel.atomic import (
     AppendOutcome,
     DurableAppendError,
+    DurablePublishError,
+    PublishOutcome,
     append_durable,
     atomic_write,
     durable_publish_new,
@@ -84,6 +87,12 @@ _WINDOWS_RESERVED_NAMES: Final = {
     "prn",
     *(f"com{number}" for number in range(1, 10)),
     *(f"lpt{number}" for number in range(1, 10)),
+    "com¹",
+    "com²",
+    "com³",
+    "lpt¹",
+    "lpt²",
+    "lpt³",
 }
 RecordKind = Literal["task", "entity", "thread"]
 RecordValue = TypeVar("RecordValue", Task, Entity, WorkThread)
@@ -726,6 +735,7 @@ class Vault:
             )
             os.close(descriptor)
             temp = Path(temp_name)
+            preserve_staged = False
             try:
                 hashes: dict[str, str] = {}
                 total = 0
@@ -755,10 +765,11 @@ class Vault:
                     )
                 staged_identity = _path_identity(temp)
                 staged_hash = sha256_file(temp)
+                published_identity = staged_identity
                 collisions = 0
                 while True:
                     try:
-                        durable_publish_new(temp, destination)
+                        published_identity = durable_publish_new(temp, destination)
                     except FileExistsError as exc:
                         if not generated_destination:
                             raise ConflictError(
@@ -772,20 +783,50 @@ class Vault:
                             ) from exc
                         destination = _generated_backup_destination(self.root)
                         continue
+                    except DurablePublishError as exc:
+                        if exc.outcome is PublishOutcome.COMMITTED:
+                            preserve_staged = True
+                            raise MutationCommittedError(str(exc)) from exc
+                        if exc.outcome is PublishOutcome.UNPUBLISHED:
+                            try:
+                                durable_unlink(temp)
+                            except OSError as cleanup_error:
+                                preserve_staged = True
+                                raise DegradedIntegrityError(
+                                    f"{exc}; the unpublished staged archive remains at {temp} "
+                                    f"because durable cleanup failed: {cleanup_error}"
+                                ) from exc
+                            raise PersistenceError(str(exc)) from exc
+                        preserve_staged = True
+                        raise DegradedIntegrityError(str(exc)) from exc
                     except Exception as exc:
                         if _regular_file_matches(destination, staged_identity, staged_hash):
+                            preserve_staged = temp.exists()
+                            staged_note = (
+                                f"; the staged archive also remains at {temp}"
+                                if preserve_staged
+                                else ""
+                            )
                             raise MutationCommittedError(
                                 f"backup was published at {destination}, but directory durability "
                                 "could not be confirmed; run "
                                 "`gsv backup verify "
-                                f"{shlex.quote(str(destination))}` before using it"
+                                f"{shlex.quote(str(destination))}` before using it{staged_note}"
                             ) from exc
                         if temp.exists():
+                            try:
+                                durable_unlink(temp)
+                            except OSError as cleanup_error:
+                                preserve_staged = True
+                                raise DegradedIntegrityError(
+                                    f"backup was not published at {destination}, but staged "
+                                    f"archive cleanup failed at {temp}: {cleanup_error}"
+                                ) from exc
                             raise PersistenceError(
                                 f"backup was not published at {destination}; the staged archive "
-                                "was "
-                                "discarded"
+                                "was durably discarded"
                             ) from exc
+                        preserve_staged = True
                         raise DegradedIntegrityError(
                             "could not determine whether backup publication changed "
                             f"{destination}; "
@@ -793,10 +834,21 @@ class Vault:
                         ) from exc
                     break
             finally:
-                if temp.exists():
-                    temp.unlink()
+                if temp.exists() and not preserve_staged:
+                    primary = sys.exc_info()[1]
+                    try:
+                        durable_unlink(temp)
+                    except OSError as cleanup_error:
+                        if primary is None:
+                            raise DegradedIntegrityError(
+                                f"backup staging cleanup failed at {temp}: {cleanup_error}"
+                            ) from cleanup_error
+                        primary.add_note(
+                            f"The staged archive remains at {temp}; durable cleanup failed: "
+                            f"{cleanup_error}"
+                        )
         try:
-            if not _regular_file_matches(destination, staged_identity, staged_hash):
+            if not _regular_file_matches(destination, published_identity, staged_hash):
                 raise DegradedIntegrityError(
                     f"backup destination changed before verification: {destination}"
                 )
@@ -806,7 +858,7 @@ class Vault:
                 f"backup was published at {destination}, but post-publication verification failed; "
                 "do not use it until it passes `gsv backup verify`"
             ) from exc
-        if not _regular_file_matches(destination, staged_identity, staged_hash):
+        if not _regular_file_matches(destination, published_identity, staged_hash):
             raise DegradedIntegrityError(
                 f"backup destination changed during verification: {destination}; inspect it before "
                 "retrying"
@@ -1274,11 +1326,10 @@ def _generated_backup_destination(root: Path) -> Path:
 
 
 def _validate_backup_destination_policy(root: Path, destination: Path) -> None:
-    try:
-        relative = destination.relative_to(root)
-    except ValueError:
+    relative = _relative_to_directory_identity(root, destination)
+    if relative is None:
         return
-    if len(relative.parts) < 2 or relative.parts[0] != "backups":
+    if len(relative) < 2 or not _owned_backups_component(root, relative[0]):
         raise ValidationError(
             "a backup stored inside the vault must be within its owned backups/ directory"
         )
@@ -1314,15 +1365,86 @@ def _scan_backup_directory(
         if stat.S_ISLNK(metadata.st_mode):
             raise ValidationError(f"vault backup refuses symbolic link: {relative}")
         if stat.S_ISDIR(metadata.st_mode):
-            if relative in {"backups", ".gsv/locks"}:
+            if relative == ".gsv/locks" or (
+                directory == root and _owned_backups_component(root, entry.name)
+            ):
                 continue
             _scan_backup_directory(root, path, files)
             continue
         if not stat.S_ISREG(metadata.st_mode):
             raise ValidationError(f"vault backup refuses unsupported file type: {relative}")
-        if ".tmp-" in path.name:
+        if _is_owned_vault_temp(relative):
             continue
         files.append((relative, path))
+
+
+def _relative_to_directory_identity(root: Path, path: Path) -> tuple[str, ...] | None:
+    try:
+        root_metadata = os.lstat(root)
+    except OSError as exc:  # pragma: no cover - manifest validation owns this boundary
+        raise ValidationError(f"could not inspect vault root: {root}: {exc}") from exc
+    root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+    current = path
+    parts: list[str] = []
+    while True:
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            metadata = None
+        except OSError as exc:
+            raise ValidationError(
+                f"could not inspect backup destination ancestor: {current}"
+            ) from exc
+        if metadata is not None and (metadata.st_dev, metadata.st_ino) == root_identity:
+            return tuple(parts)
+        parent = current.parent
+        if parent == current:
+            return None
+        parts.insert(0, current.name)
+        current = parent
+
+
+def _owned_backups_component(root: Path, component: str) -> bool:
+    owned = root / "backups"
+    candidate = root / component
+    try:
+        owned_metadata = os.lstat(owned)
+    except FileNotFoundError:
+        return component == "backups"
+    except OSError as exc:
+        raise ValidationError(f"could not inspect owned backup directory: {owned}") from exc
+    try:
+        candidate_metadata = os.lstat(candidate)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ValidationError(
+            f"could not inspect backup destination directory: {candidate}"
+        ) from exc
+    return (
+        stat.S_ISDIR(owned_metadata.st_mode)
+        and stat.S_ISDIR(candidate_metadata.st_mode)
+        and (owned_metadata.st_dev, owned_metadata.st_ino)
+        == (candidate_metadata.st_dev, candidate_metadata.st_ino)
+    )
+
+
+def _is_owned_vault_temp(relative: str) -> bool:
+    path = PurePosixPath(relative)
+    name = path.name
+    if not name.startswith(".") or ".tmp-" not in name:
+        return False
+    target_name, token = name[1:].rsplit(".tmp-", 1)
+    if not target_name or not token or "." in token:
+        return False
+    parent = path.parent.as_posix()
+    if parent == ".":
+        return target_name in {"AGENTS.md", "MIND.md", "NOW.md", "README.md"}
+    if parent in {"tasks", "entities", "threads"}:
+        return target_name.endswith(".md")
+    return (parent == ".gsv" and target_name == "manifest.json") or (
+        parent == "journal" and target_name == "events.jsonl"
+    )
 
 
 def _path_identity(path: Path) -> tuple[int, int]:

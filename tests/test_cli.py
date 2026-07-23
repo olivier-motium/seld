@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -532,6 +534,101 @@ def test_invalid_utf8_configuration_is_structured_for_loader_and_cli(
     }
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
+def test_restore_publishes_without_opening_fifo_configuration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = Vault(tmp_path / "source")
+    source.initialize(name="FIFO recovery")
+    backup = Path(source.create_backup(tmp_path / "portable.zip")["backup"])
+    configuration = config_path()
+    configuration.parent.mkdir(parents=True)
+    os.mkfifo(configuration)
+    target = tmp_path / "restored"
+
+    assert cli.main(["--json", "backup", "restore", str(backup), str(target)]) == 0
+    restored = json.loads(capsys.readouterr().out)
+
+    assert restored["result"]["published"] is True
+    assert restored["result"]["configuration_matches_target"] == "unknown"
+    assert stat.S_ISFIFO(os.lstat(configuration).st_mode)
+    assert Vault(target).doctor().healthy is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation may require elevated privileges")
+def test_restore_publishes_with_dangling_configuration_symlink(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = Vault(tmp_path / "source")
+    source.initialize(name="Symlink recovery")
+    backup = Path(source.create_backup(tmp_path / "portable.zip")["backup"])
+    configuration = config_path()
+    configuration.parent.mkdir(parents=True)
+    missing = configuration.parent / "missing-config.json"
+    configuration.symlink_to(missing)
+    target = tmp_path / "restored"
+
+    assert cli.main(["--json", "backup", "restore", str(backup), str(target)]) == 0
+    restored = json.loads(capsys.readouterr().out)
+
+    assert restored["result"]["published"] is True
+    assert restored["result"]["configuration_matches_target"] == "unknown"
+    assert configuration.is_symlink()
+    assert os.readlink(configuration) == str(missing)
+    assert Vault(target).doctor().healthy is True
+
+
+def test_restore_publishes_when_configured_vault_contains_nul(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = Vault(tmp_path / "source")
+    source.initialize(name="Invalid path recovery")
+    backup = Path(source.create_backup(tmp_path / "portable.zip")["backup"])
+    configuration = config_path()
+    configuration.parent.mkdir(parents=True)
+    before = (json.dumps({"format_version": 1, "vault": "bad\x00path"}) + "\n").encode()
+    configuration.write_bytes(before)
+    target = tmp_path / "restored"
+
+    assert cli.main(["--json", "backup", "restore", str(backup), str(target)]) == 0
+    restored = json.loads(capsys.readouterr().out)
+
+    assert restored["result"]["published"] is True
+    assert restored["result"]["configuration_matches_target"] == "unknown"
+    assert configuration.read_bytes() == before
+    assert Vault(target).doctor().healthy is True
+
+    assert cli.main(["--json", "status"]) == 2
+    failure = json.loads(capsys.readouterr().err)
+    assert failure["ok"] is False
+    assert failure["error"] == "GSV configuration has an invalid vault path"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation may require elevated privileges")
+def test_restore_publishes_when_configured_vault_is_a_symlink_loop(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = Vault(tmp_path / "source")
+    source.initialize(name="Loop recovery")
+    backup = Path(source.create_backup(tmp_path / "portable.zip")["backup"])
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop.name)
+    configuration = config_path()
+    configuration.parent.mkdir(parents=True)
+    before = (json.dumps({"format_version": 1, "vault": str(loop)}) + "\n").encode()
+    configuration.write_bytes(before)
+    target = tmp_path / "restored"
+
+    assert cli.main(["--json", "backup", "restore", str(backup), str(target)]) == 0
+    restored = json.loads(capsys.readouterr().out)
+
+    assert restored["result"]["published"] is True
+    assert restored["result"]["configuration_matches_target"] == "unknown"
+    assert configuration.read_bytes() == before
+    assert loop.is_symlink()
+    assert Vault(target).doctor().healthy is True
+
+
 def test_restore_keeps_existing_configured_vault_until_explicit_setup(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -576,6 +673,25 @@ def test_restore_reports_when_existing_configuration_already_matches_target(
     assert cli.main(["--json", "status"]) == 0
     status = json.loads(capsys.readouterr().out)
     assert status["result"]["vault_id"] == source.identity()["vault_id"]
+
+
+def test_restore_matches_configured_target_through_filesystem_case_identity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = Vault(tmp_path / "source")
+    source.initialize(name="Case identity recovery")
+    backup = Path(source.create_backup(tmp_path / "portable.zip")["backup"])
+    configured_alias = tmp_path / "restored"
+    target = tmp_path / "Restored"
+    save_config(configured_alias)
+
+    assert cli.main(["--json", "backup", "restore", str(backup), str(target)]) == 0
+    restored = json.loads(capsys.readouterr().out)
+    if not configured_alias.exists() or not os.path.samefile(configured_alias, target):
+        pytest.skip("filesystem is case-sensitive")
+
+    assert restored["result"]["configuration_matches_target"] is True
+    assert cli._configuration_matches_target(target) is True
 
 
 def test_invalid_backup_verification_returns_nonzero_json_failure(

@@ -84,8 +84,9 @@ A backup contains vault files plus a manifest of relative names and SHA-256
 digests. Archive-entry and total expanded sizes are validated separately before
 contents are read. Portable paths exclude platform aliases and control
 characters. Verification checks the manifest before restore. Backup creation
-publishes without replacing existing paths and verifies the staged inode and
-digest around archive validation. Restore writes to a staging directory and
+publishes the complete same-directory stage with a hard link or native atomic
+no-replace move, never a partial copy into the destination, and verifies the
+staged inode and digest around archive validation. Restore writes to a staging directory and
 publishes the completed vault only after every member passes validation.
 Checksums detect accidental corruption; they are not cryptographic
 authentication or encryption.

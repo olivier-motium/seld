@@ -22,7 +22,13 @@ from importlib.resources import as_file, files
 from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
-from continuity_kernel.atomic import atomic_write, durable_replace, durable_unlink, exclusive_lock
+from continuity_kernel.atomic import (
+    atomic_write,
+    durable_replace,
+    durable_unlink,
+    exclusive_lock,
+    move_no_replace,
+)
 from continuity_kernel.config import codex_home as default_codex_home
 from continuity_kernel.config import data_dir
 from continuity_kernel.errors import ConflictError, ContinuityError, SetupError, ValidationError
@@ -1805,46 +1811,7 @@ def _flush_windows_directory(path: Path) -> None:
 
 
 def _publish_directory_new(source: Path, target: Path) -> None:
-    if sys.platform == "darwin":
-        library: Any = ctypes.CDLL(None, use_errno=True)
-        rename_exclusive = library.renamex_np
-        result = rename_exclusive(
-            ctypes.c_char_p(os.fsencode(source)),
-            ctypes.c_char_p(os.fsencode(target)),
-            ctypes.c_uint(0x00000004),
-        )
-        if result != 0:
-            _raise_publish_error(ctypes.get_errno(), target)
-    elif sys.platform.startswith("linux"):
-        library = ctypes.CDLL(None, use_errno=True)
-        rename_no_replace = getattr(library, "renameat2", None)
-        if rename_no_replace is None:
-            raise OSError(errno.ENOTSUP, "renameat2 is unavailable for no-replace publish")
-        result = rename_no_replace(
-            ctypes.c_int(-100),
-            ctypes.c_char_p(os.fsencode(source)),
-            ctypes.c_int(-100),
-            ctypes.c_char_p(os.fsencode(target)),
-            ctypes.c_uint(1),
-        )
-        if result != 0:
-            _raise_publish_error(ctypes.get_errno(), target)
-    elif os.name == "nt":
-        _move_windows_directory_new(source, target)
-    else:
-        raise OSError(errno.ENOTSUP, "no no-replace directory publish primitive is available")
-    if os.name != "nt":
-        descriptor = os.open(target.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-
-
-def _raise_publish_error(error: int, target: Path) -> None:
-    if error in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise FileExistsError(error, "publish target already exists", str(target))
-    raise OSError(error, "could not publish directory without replacement", str(target))
+    move_no_replace(source, target)
 
 
 def _windows_kernel32() -> Any:
@@ -1866,8 +1833,6 @@ def _windows_kernel32() -> Any:
     kernel32.FlushFileBuffers.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
-    kernel32.MoveFileExW.restype = wintypes.BOOL
     return kernel32
 
 
@@ -1876,17 +1841,6 @@ def _windows_last_error() -> int:
     if not callable(getter):  # pragma: no cover - only reachable on a broken Windows runtime
         return errno.EIO
     return int(getter())
-
-
-def _move_windows_directory_new(source: Path, target: Path) -> None:
-    kernel32 = _windows_kernel32()
-    moved = kernel32.MoveFileExW(str(source), str(target), 0x00000008)
-    if moved:
-        return
-    error = _windows_last_error()
-    if error in {80, 183}:
-        raise FileExistsError(error, "publish target already exists", str(target))
-    raise OSError(error, "could not publish directory without replacement", str(target))
 
 
 def _remove_owned_marketplace(

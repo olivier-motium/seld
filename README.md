@@ -140,12 +140,16 @@ gsv bridge stop
 `backups/` directory. An explicit output must not already exist; GSV never
 overwrites it. A destination elsewhere inside the vault is refused. Source
 traversal and unsupported file types fail closed instead of producing a
-partial archive. After no-clobber publication, GSV verifies the exact staged
-inode and SHA-256 before and after archive verification; a concurrently
-replaced destination is reported as degraded, never successful.
+partial archive. Publication uses a same-directory hard link when available
+and otherwise an operating-system atomic no-replace move; it never copies
+partial bytes into the final filename. Unsupported filesystems fail before a
+final path appears. After publication, GSV verifies the exact staged inode and
+SHA-256 before and after archive verification; a concurrently replaced
+destination is reported as degraded, never successful.
 
 Backup verification and restore do not depend on the configured vault, so they
-still work when configuration is missing or unreadable:
+still work when configuration is missing, malformed, a symlink, or another
+non-regular file:
 
 ```bash
 gsv backup verify /path/to/gsv-backup.zip

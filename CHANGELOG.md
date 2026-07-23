@@ -11,9 +11,12 @@
 - Add the killed-hand synthetic continuity proof and regenerable README
   visuals.
 - Make backup creation no-clobber, collision-resistant, traversal-complete,
-  and identity-checked across post-publication verification.
+  alias-safe, and identity-checked across post-publication verification. Use
+  native atomic no-replace moves when hard links are unavailable, without ever
+  exposing a partial final-path archive.
 - Keep backup verification and restore usable with missing or invalid UTF-8
-  configuration, with structured failures for ordinary configured commands.
+  configuration, including symlink and special-file configuration paths, with
+  structured failures for ordinary configured commands.
 - Recheck receipt-owned marketplace bytes after atomic isolation during
   reinstall and uninstall, preserve destination races, and delete only exact
   manifest entries rather than recursively removing a mutable public path.

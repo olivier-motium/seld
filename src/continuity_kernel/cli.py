@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import sys
 from dataclasses import asdict, is_dataclass
@@ -290,8 +291,17 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
 def _configuration_matches_target(target: Path) -> bool | str:
     try:
         configuration = load_config(required=False)
-        return configuration is not None and configuration.vault_path == target
-    except (ContinuityError, OSError, UnicodeError):
+        if configuration is None:
+            return False
+        configured = configuration.vault_path
+        if configured == target:
+            return True
+        return (
+            os.path.samefile(configured, target)
+            if configured.exists() and target.exists()
+            else False
+        )
+    except (ContinuityError, OSError, UnicodeError, ValueError, RuntimeError):
         return "unknown"
 
 
