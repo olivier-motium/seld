@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import continuity_kernel.cli as cli_module
 from continuity_kernel import __version__
 from scripts import e2e_clean_install, privacy_check
 from scripts.e2e_clean_install import _require_native_codex
@@ -24,13 +25,30 @@ def _write_uninstall_fixture(path: Path) -> None:
         "import os\n"
         "import sys\n"
         "args = sys.argv[1:]\n"
+        "json_mode = bool(args and args[0] == '--json')\n"
+        "if json_mode:\n"
+        "    args = args[1:]\n"
         "if args[:2] == ['bridge', 'stop']:\n"
         "    status = int(os.environ.get('GSV_TEST_BRIDGE_STATUS', '0'))\n"
         "    print(json.dumps({'ok': status == 0, 'result': {'stopped': False}}))\n"
         "    raise SystemExit(status)\n"
         "if args[:2] == ['codex', 'uninstall']:\n"
         "    status = int(os.environ.get('GSV_TEST_UNINSTALL_STATUS', '0'))\n"
-        "    print('Retry with gsv codex uninstall.' if status else 'Cleanup verified.')\n"
+        "    retained = os.environ.get('GSV_TEST_RECOVERY_RETAINED', '0') == '1'\n"
+        "    mode = os.environ.get('GSV_TEST_OUTPUT_MODE', 'compact')\n"
+        "    if mode == 'malformed':\n"
+        "        print('not-json')\n"
+        "        raise SystemExit(status)\n"
+        "    cleanup_complete = status == 0 and not retained and mode != 'cleanup-false'\n"
+        "    payload = {'ok': status == 0, 'result': {"
+        "'cleanup_complete': cleanup_complete, "
+        "'integration_removed': status in (0, 3), 'recovery_retained': retained, "
+        "'retained_cleanup_paths': ['/synthetic/recovery'] if retained else []}, "
+        "'error': 'Retry with gsv codex uninstall.' if status else None}\n"
+        "    if mode == 'pretty':\n"
+        "        print(json.dumps(payload, indent=2))\n"
+        "    else:\n"
+        "        print(json.dumps(payload, separators=(',', ':')))\n"
         "    raise SystemExit(status)\n"
         "raise SystemExit(2)\n",
         encoding="utf-8",
@@ -51,6 +69,79 @@ def test_candidate_version_is_consistent_across_runtime_installers_and_lock() ->
     assert f'else {{ "{__version__}" }}' in (ROOT / "scripts/install.ps1").read_text(
         encoding="utf-8"
     )
+
+
+def test_cli_json_keeps_the_posix_cleanup_gate_stable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli_module._print(
+        {"cleanup_complete": True, "integration_removed": True, "recovery_retained": False},
+        json_output=True,
+        raw=False,
+        ok=True,
+    )
+
+    output = capsys.readouterr().out
+    assert output.startswith('{"ok":true,"result":{"cleanup_complete":true')
+
+
+def test_e2e_helper_accepts_only_structured_exit_three_cleanup(
+    tmp_path: Path,
+) -> None:
+    binary = tmp_path / "gsv"
+    _write_uninstall_fixture(binary)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GSV_TEST_UNINSTALL_STATUS": "3",
+            "GSV_TEST_RECOVERY_RETAINED": "1",
+        }
+    )
+
+    result = e2e_clean_install._cli_expected_incomplete_cleanup(
+        binary,
+        environment,
+        ["codex", "uninstall"],
+    )
+
+    assert result["cleanup_complete"] is False
+    assert result["integration_removed"] is True
+    assert result["recovery_retained"] is True
+
+
+def test_clean_e2e_manifest_matches_receipt_shape(tmp_path: Path) -> None:
+    root = tmp_path / "marketplace"
+    nested = root / "plugins/gsv"
+    nested.mkdir(parents=True)
+    skill = nested / "SKILL.md"
+    skill.write_bytes(b"# Synthetic skill\n")
+
+    assert e2e_clean_install._directory_manifest(root) == {
+        "plugins": "directory",
+        "plugins/gsv": "directory",
+        "plugins/gsv/SKILL.md": f"file:{hashlib.sha256(skill.read_bytes()).hexdigest()}",
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX minimal-PATH proof")
+def test_clean_e2e_minimal_path_includes_uninstaller_json_normalizer(
+    tmp_path: Path,
+) -> None:
+    binary = tmp_path / "candidate"
+    binary.write_bytes(b"synthetic candidate")
+    environment = e2e_clean_install._isolated_environment(
+        root=tmp_path,
+        home=tmp_path / "home",
+        config=tmp_path / "config",
+        data=tmp_path / "data",
+        codex_home=tmp_path / "codex",
+        vault=tmp_path / "vault",
+        install_bin=tmp_path / "bin",
+        binary=binary,
+        codex=Path(shutil.which("codex") or "/usr/bin/true"),
+    )
+
+    assert shutil.which("tr", path=environment["PATH"]) is not None
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer test")
@@ -324,15 +415,97 @@ def test_posix_uninstaller_removes_binary_only_after_verified_cleanup(
         if cleanup_status:
             assert "Retry with gsv codex uninstall" in result.stdout
             assert "executable was kept" in result.stderr
+        else:
+            assert "Bridge could not be stopped" in result.stderr
+            assert "executable was kept" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX uninstaller test")
+@pytest.mark.parametrize("output_mode", ["compact", "pretty"])
+def test_posix_uninstaller_keeps_binary_until_recovery_evidence_is_retired(
+    tmp_path: Path,
+    output_mode: str,
+) -> None:
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+    target = install_dir / "gsv"
+    _write_uninstall_fixture(target)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GSV_BIN_DIR": str(install_dir),
+            "GSV_TEST_BRIDGE_STATUS": "0",
+            "GSV_TEST_UNINSTALL_STATUS": "3",
+            "GSV_TEST_RECOVERY_RETAINED": "1",
+            "GSV_TEST_OUTPUT_MODE": output_mode,
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", str(ROOT / "scripts/uninstall.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode == 3
+    assert target.exists()
+    assert '"recovery_retained"' in result.stdout
+    assert "exact retained_cleanup_paths" in result.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX uninstaller test")
+@pytest.mark.parametrize("output_mode", ["malformed", "cleanup-false"])
+def test_posix_uninstaller_keeps_binary_on_unverified_exit_zero_output(
+    tmp_path: Path,
+    output_mode: str,
+) -> None:
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+    target = install_dir / "gsv"
+    _write_uninstall_fixture(target)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GSV_BIN_DIR": str(install_dir),
+            "GSV_TEST_BRIDGE_STATUS": "0",
+            "GSV_TEST_UNINSTALL_STATUS": "0",
+            "GSV_TEST_OUTPUT_MODE": output_mode,
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", str(ROOT / "scripts/uninstall.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode == 3
+    assert target.exists()
+    assert "did not verify result.cleanup_complete:true" in result.stderr
 
 
 @pytest.mark.skipif(os.name == "nt", reason="uses a POSIX executable fixture under PowerShell")
 @pytest.mark.parametrize(
-    ("bridge_status", "cleanup_status"),
-    [(0, 0), (0, 3), (4, 0)],
+    ("bridge_status", "cleanup_status", "output_mode"),
+    [
+        (0, 0, "compact"),
+        (0, 3, "compact"),
+        (4, 0, "compact"),
+        (0, 0, "malformed"),
+        (0, 0, "cleanup-false"),
+    ],
 )
 def test_powershell_uninstaller_removes_binary_only_after_verified_cleanup(
-    tmp_path: Path, bridge_status: int, cleanup_status: int
+    tmp_path: Path,
+    bridge_status: int,
+    cleanup_status: int,
+    output_mode: str,
 ) -> None:
     powershell = shutil.which("pwsh") or shutil.which("powershell")
     if powershell is None:
@@ -347,6 +520,7 @@ def test_powershell_uninstaller_removes_binary_only_after_verified_cleanup(
             "GSV_BIN_DIR": str(install_dir),
             "GSV_TEST_BRIDGE_STATUS": str(bridge_status),
             "GSV_TEST_UNINSTALL_STATUS": str(cleanup_status),
+            "GSV_TEST_OUTPUT_MODE": output_mode,
         }
     )
 
@@ -359,14 +533,16 @@ def test_powershell_uninstaller_removes_binary_only_after_verified_cleanup(
         timeout=30,
     )
 
-    if bridge_status == 0 and cleanup_status == 0:
+    if bridge_status == 0 and cleanup_status == 0 and output_mode == "compact":
         assert result.returncode == 0, result.stderr
         assert not target.exists()
         assert "verified GSV-owned integration" in result.stdout
     else:
         assert result.returncode != 0
         assert target.exists()
-        if cleanup_status:
+        if output_mode in {"malformed", "cleanup-false"}:
+            assert "executable was kept" in result.stderr.lower()
+        elif cleanup_status:
             assert "Retry with gsv codex uninstall" in result.stdout
             assert "executable was kept" in result.stderr
         else:
@@ -377,11 +553,16 @@ def test_powershell_uninstaller_guards_both_failures_before_binary_removal() -> 
     script = (ROOT / "scripts/uninstall.ps1").read_text(encoding="utf-8")
     bridge_call = script.index("& $Target bridge stop")
     bridge_guard = script.index("if ($LASTEXITCODE -ne 0)", bridge_call)
-    codex_call = script.index("& $Target codex uninstall", bridge_guard)
-    cleanup_guard = script.index("if ($LASTEXITCODE -ne 0)", codex_call)
-    binary_removal = script.index("Remove-Item -LiteralPath $Target -Force", cleanup_guard)
+    codex_call = script.index("& $Target --json codex uninstall", bridge_guard)
+    cleanup_guard = script.index("if ($CleanupStatus -ne 0)", codex_call)
+    completion_guard = script.index(
+        "$CleanupPayload.result.cleanup_complete -ne $true", cleanup_guard
+    )
+    binary_removal = script.index("Remove-Item -LiteralPath $Target -Force", completion_guard)
 
-    assert bridge_call < bridge_guard < codex_call < cleanup_guard < binary_removal
+    assert (
+        bridge_call < bridge_guard < codex_call < cleanup_guard < completion_guard < binary_removal
+    )
     assert "The executable was kept" in script
 
 

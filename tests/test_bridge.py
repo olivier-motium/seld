@@ -11,15 +11,16 @@ from collections.abc import Iterator
 from http import HTTPStatus
 from importlib.resources import as_file, files
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 import pytest
 
-from continuity_kernel import __version__, bridge
+from continuity_kernel import __version__, bridge, mcp_server
 from continuity_kernel.config import data_dir
-from continuity_kernel.errors import SetupError
+from continuity_kernel.errors import SetupError, ValidationError
 from continuity_kernel.vault import Vault, doctor_dict
 
 INSTANCE_ID = "a" * 32
@@ -118,8 +119,111 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
     assert query["path"] == [str(vault.root)]
     assert "ship-atlas" in query["prompt"][0]
     assert snapshot["codex"]["ready"] is True
-    assert snapshot["codex"]["new_mind_url"].startswith("codex://new?")
+    assert "new_mind_url" not in snapshot["codex"]
+    new_hand = parse_qs(urlsplit(snapshot["codex"]["new_hand_url"]).query)
+    assert new_hand == {
+        "originUrl": [bridge.REPOSITORY_URL],
+        "path": [str(vault.root)],
+        "prompt": [
+            "Start a new GSV hand. Read the installed GSV context and exact current records "
+            "before deciding what deserves attention."
+        ],
+    }
+    assert all(
+        forbidden not in new_hand["prompt"][0].casefold()
+        for forbidden in ("ship-atlas", "resume", "continue", "first run")
+    )
+    assert snapshot["projection"]["sections"]["tasks"] == {
+        "issues": [],
+        "readable": 1,
+        "state": "complete",
+        "unreadable": 0,
+    }
     assert snapshot["bridge"] == {"local": True, "read_only": True, "version": __version__}
+
+
+def test_snapshot_exposes_mind_shaping_only_for_a_proven_empty_ledger(vault: Vault) -> None:
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={
+            "available": True,
+            "instructions_installed": True,
+            "plugin_installed": True,
+        },
+    )
+
+    mind_link = urlsplit(snapshot["codex"]["new_mind_url"])
+    hand_link = urlsplit(snapshot["codex"]["new_hand_url"])
+    assert (mind_link.scheme, mind_link.netloc) == ("codex", "new")
+    assert (hand_link.scheme, hand_link.netloc) == ("codex", "new")
+    assert parse_qs(mind_link.query)["path"] == [str(vault.root)]
+    assert "shape my GSV Mind" in parse_qs(mind_link.query)["prompt"][0]
+    assert parse_qs(hand_link.query)["originUrl"] == [bridge.REPOSITORY_URL]
+
+
+@pytest.mark.parametrize("status", ["done", "dropped"])
+def test_terminal_history_gets_new_hand_but_never_resume_or_first_run(
+    vault: Vault, status: str
+) -> None:
+    terminal = vault.create_task(
+        identifier=f"terminal-{status}",
+        title=f"Terminal {status}",
+        outcome="The exact outcome remains in the closed record.",
+        status=status,
+    )
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={
+            "available": True,
+            "instructions_installed": True,
+            "plugin_installed": True,
+        },
+    )
+
+    projected = next(
+        item for item in snapshot["tasks"] if item["identifier"] == terminal.identifier
+    )
+    assert "codex_url" not in projected
+    assert "new_mind_url" not in snapshot["codex"]
+    assert snapshot["codex"]["new_hand_url"].startswith("codex://new?")
+
+
+def test_only_nonterminal_tasks_receive_resume_links(vault: Vault) -> None:
+    vault.create_task(
+        identifier="closed",
+        title="Closed",
+        outcome="Closed deliberately.",
+        status="done",
+    )
+    vault.create_task(
+        identifier="open",
+        title="Open",
+        outcome="Still open.",
+        status="ready",
+        next_actor="agent",
+        next_action="Continue from exact current truth.",
+    )
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={
+            "available": True,
+            "instructions_installed": True,
+            "plugin_installed": True,
+        },
+    )
+    by_id = {task["identifier"]: task for task in snapshot["tasks"]}
+
+    assert "codex_url" not in by_id["closed"]
+    assert (
+        "Resume the GSV commitment `open`"
+        in parse_qs(urlsplit(by_id["open"]["codex_url"]).query)["prompt"][0]
+    )
+    assert "new_mind_url" not in snapshot["codex"]
 
 
 @pytest.mark.parametrize(
@@ -168,6 +272,234 @@ def test_snapshot_never_calls_full_status_or_logical_digest(
     assert snapshot["status"]["vault_id"] == vault.identity()["vault_id"]
     assert snapshot["status"]["counts"] == {"tasks": 0, "entities": 0, "threads": 0}
     assert "digest" not in snapshot["status"]
+
+
+def test_authenticated_snapshot_keeps_valid_tasks_when_one_record_is_malformed(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+) -> None:
+    server, base = running_bridge
+    valid = server.vault.create_task(
+        identifier="still-readable",
+        title="Still readable",
+        outcome="This exact valid record remains visible.",
+        status="ready",
+        next_actor="agent",
+        next_action="Keep the valid record visible.",
+    )
+    invalid = server.vault.root / "tasks/broken.md"
+    invalid.write_text("# Missing typed metadata\n", encoding="utf-8")
+    nonregular = server.vault.root / "tasks/not-a-file.md"
+    nonregular.mkdir()
+
+    with urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2) as response:
+        assert response.status == HTTPStatus.OK
+        snapshot = json.loads(response.read())
+
+    assert [task["identifier"] for task in snapshot["tasks"]] == [valid.identifier]
+    section = snapshot["projection"]["sections"]["tasks"]
+    assert section["state"] == "partial"
+    assert section["readable"] == 1
+    assert section["unreadable"] == 2
+    assert {issue["path"] for issue in section["issues"]} == {
+        "tasks/broken.md",
+        "tasks/not-a-file.md",
+    }
+    assert snapshot["doctor"]["healthy"] is False
+    assert {issue["path"] for issue in snapshot["doctor"]["issues"]} >= {
+        "tasks/broken.md",
+        "tasks/not-a-file.md",
+    }
+
+    with pytest.raises(ValidationError):
+        server.vault.list_tasks()
+    with pytest.raises(ValidationError):
+        server.vault.status()
+    with pytest.raises(ValidationError):
+        server.vault.context_pack()
+    with pytest.raises(ValidationError):
+        mcp_server._call("gsv_context", {"max_characters": 4_000}, vault=server.vault)
+    doctor = doctor_dict(server.vault.doctor())
+    assert {issue["path"] for issue in doctor["issues"]} >= {
+        "tasks/broken.md",
+        "tasks/not-a-file.md",
+    }
+
+
+def test_only_bad_tasks_return_http_200_but_never_become_a_first_run(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+) -> None:
+    server, base = running_bridge
+    invalid = server.vault.root / "tasks/only-bad.md"
+    invalid.write_bytes(b"\xff\xfe\x00")
+
+    with urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2) as response:
+        assert response.status == HTTPStatus.OK
+        snapshot = json.loads(response.read())
+    ready_snapshot = bridge.bridge_snapshot(
+        server.vault,
+        doctor=doctor_dict(server.vault.doctor()),
+        integration={
+            "available": True,
+            "instructions_installed": True,
+            "plugin_installed": True,
+        },
+    )
+
+    assert snapshot["tasks"] == []
+    assert snapshot["projection"]["sections"]["tasks"]["state"] == "partial"
+    assert snapshot["projection"]["sections"]["tasks"]["readable"] == 0
+    assert "new_mind_url" not in ready_snapshot["codex"]
+    assert ready_snapshot["codex"]["new_hand_url"].startswith("codex://new?")
+
+
+def test_malformed_entities_and_threads_degrade_only_their_sections(vault: Vault) -> None:
+    task = vault.create_task(
+        identifier="healthy-task",
+        title="Healthy task",
+        outcome="The task section remains complete.",
+    )
+    (vault.root / "entities/broken.md").write_text("not an entity\n", encoding="utf-8")
+    (vault.root / "threads/broken.md").write_bytes(b"\xff\xfe")
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": False},
+    )
+    sections = snapshot["projection"]["sections"]
+
+    assert [item["identifier"] for item in snapshot["tasks"]] == [task.identifier]
+    assert sections["tasks"]["state"] == "complete"
+    assert sections["entities"]["state"] == "partial"
+    assert sections["threads"]["state"] == "partial"
+    assert sections["entities"]["issues"][0]["path"] == "entities/broken.md"
+    assert sections["threads"]["issues"][0]["path"] == "threads/broken.md"
+
+
+def test_missing_or_linked_record_directory_is_unavailable_not_empty(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str], tmp_path: Path
+) -> None:
+    server, base = running_bridge
+    tasks = server.vault.root / "tasks"
+    tasks.rmdir()
+
+    with urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2) as response:
+        assert response.status == HTTPStatus.OK
+        missing = json.loads(response.read())
+    assert missing["projection"]["sections"]["tasks"]["state"] == "unavailable"
+    assert missing["projection"]["sections"]["tasks"]["issues"][0]["path"] == "tasks"
+    assert "new_mind_url" not in missing["codex"]
+
+    outside = tmp_path / "outside-tasks"
+    outside.mkdir()
+    try:
+        tasks.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+    with urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2) as response:
+        assert response.status == HTTPStatus.OK
+        linked = json.loads(response.read())
+    assert linked["projection"]["sections"]["tasks"]["state"] == "unavailable"
+    assert linked["tasks"] == []
+    assert linked["doctor"]["healthy"] is False
+
+
+def test_failed_section_enumeration_is_unavailable(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cached_doctor = doctor_dict(vault.doctor())
+    original_scandir = os.scandir
+
+    def fail_tasks(path: str | os.PathLike[str]) -> Any:
+        if Path(path) == vault.root / "tasks":
+            raise OSError("injected enumeration failure")
+        return original_scandir(path)
+
+    monkeypatch.setattr("continuity_kernel.bridge.os.scandir", fail_tasks)
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=cached_doctor,
+        integration={"available": False},
+    )
+
+    section = snapshot["projection"]["sections"]["tasks"]
+    assert section["state"] == "unavailable"
+    assert section["readable"] == 0
+    assert section["issues"][0]["path"] == "tasks"
+
+
+def test_record_created_between_projection_scans_makes_section_unavailable(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cached_doctor = doctor_dict(vault.doctor())
+    tasks = vault.root / "tasks"
+    original_scandir = os.scandir
+    task_scans = 0
+
+    def add_record_before_confirmation(path: str | os.PathLike[str]) -> Any:
+        nonlocal task_scans
+        if Path(path) == tasks:
+            task_scans += 1
+            if task_scans == 2:
+                (tasks / "appeared-late.md").write_text("not a valid task\n", encoding="utf-8")
+        return original_scandir(path)
+
+    monkeypatch.setattr("continuity_kernel.bridge.os.scandir", add_record_before_confirmation)
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=cached_doctor,
+        integration={"available": False},
+    )
+
+    section = snapshot["projection"]["sections"]["tasks"]
+    assert task_scans == 2
+    assert section["state"] == "unavailable"
+    assert section["readable"] == 0
+    assert section["issues"][0]["path"] == "tasks"
+    assert "changed during inspection" in section["issues"][0]["message"]
+
+
+def test_same_named_record_inode_swap_between_projection_scans_is_detected(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = vault.create_task(
+        identifier="stable-name",
+        title="Stable name",
+        outcome="Detect replacement even when its content and name are unchanged.",
+    )
+    cached_doctor = doctor_dict(vault.doctor())
+    task_path = vault.root / "tasks" / f"{task.identifier}.md"
+    original_text = task_path.read_text(encoding="utf-8")
+    original_inode = os.lstat(task_path).st_ino
+    original_scandir = os.scandir
+    task_scans = 0
+
+    def replace_record_before_confirmation(path: str | os.PathLike[str]) -> Any:
+        nonlocal task_scans
+        if Path(path) == vault.root / "tasks":
+            task_scans += 1
+            if task_scans == 2:
+                replacement = vault.root / "tasks/replacement.tmp"
+                replacement.write_text(original_text, encoding="utf-8")
+                os.replace(replacement, task_path)
+        return original_scandir(path)
+
+    monkeypatch.setattr("continuity_kernel.bridge.os.scandir", replace_record_before_confirmation)
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=cached_doctor,
+        integration={"available": False},
+    )
+
+    section = snapshot["projection"]["sections"]["tasks"]
+    assert task_scans == 2
+    assert os.lstat(task_path).st_ino != original_inode
+    assert section["state"] == "unavailable"
+    assert section["readable"] == 0
+    assert section["issues"][0]["path"] == "tasks"
 
 
 def test_codex_deep_link_round_trips_encoded_prompt_path_and_origin(tmp_path: Path) -> None:
@@ -240,6 +572,13 @@ def test_bridge_ui_tokens_and_dependency_free_orb_contract() -> None:
     assert "IntersectionObserver" in javascript
     assert "Math.min(2, window.devicePixelRatio || 1)" in javascript
     assert "snapshotSignature" in javascript
+    assert "snapshot.codex.new_hand_url" in javascript
+    assert '"new_mind_url"' in javascript
+    assert "No commitments are open." in javascript
+    assert "more · View Commitments" in javascript
+    assert "more entities not shown." in javascript
+    assert 'taskProjection.state !== "complete"' in javascript
+    assert 'readable: fallback, state: "unavailable", unreadable: 0' in javascript
     assert 'from "react"' not in javascript
     assert 'aria-live="polite"' not in html
     assert ".woff2" not in bridge._MIME_TYPES

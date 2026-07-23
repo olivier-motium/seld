@@ -9,6 +9,8 @@ import json
 import re
 import tempfile
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -167,6 +169,8 @@ def _capture_browser(root: Path, output: Path, url: str) -> list[Path]:
             page.unroute("**/api/v1/snapshot")
 
             ready_snapshot = _read_snapshot(page)
+            _verify_consumer_states(page, ready_snapshot)
+            _verify_live_vault_states(browser, root)
             _capture_codex_recovery_states(page, ready_snapshot, output)
             _capture_unknown_status(page, ready_snapshot, output)
             _capture_integrity_warning(page, ready_snapshot, output)
@@ -269,6 +273,326 @@ def _route_snapshot(page: Any, payload: dict[str, Any]) -> Any:
 
     page.route("**/api/v1/snapshot", handler)
     return handler
+
+
+def _verify_consumer_states(page: Any, snapshot: dict[str, Any]) -> None:
+    terminal = copy.deepcopy(snapshot)
+    for index, task in enumerate(terminal["tasks"]):
+        task["status"] = "done" if index % 2 == 0 else "dropped"
+        task["next_actor"] = None
+        task["next_action"] = None
+        task["waiting_on"] = None
+        task.pop("codex_url", None)
+    terminal["projection"]["sections"]["tasks"] = {
+        "issues": [],
+        "readable": len(terminal["tasks"]),
+        "state": "complete",
+        "unreadable": 0,
+    }
+    handler = _route_snapshot(page, terminal)
+    try:
+        page.set_viewport_size({"width": 1440, "height": 920})
+        page.evaluate("window.location.hash = '#now'")
+        page.reload(wait_until="networkidle")
+        page.get_by_text("All clear", exact=True).wait_for()
+        page.get_by_text("No commitments are open.", exact=True).wait_for()
+        if page.get_by_text("Your first hand", exact=True).count() != 0:
+            raise RuntimeError("terminal history was rendered as a first run")
+        if page.locator(".task-row").count() != len(terminal["tasks"]):
+            raise RuntimeError("Now did not preserve every closed task record")
+        page.locator(".task-row").first.click()
+        page.locator("#inspector.is-open").wait_for()
+        action = page.locator("#inspector-foot a.primary-action")
+        if action.inner_text() != "Start a new hand":
+            raise RuntimeError("a terminal inspector offered resume copy")
+        if action.get_attribute("href") != terminal["codex"]["new_hand_url"]:
+            raise RuntimeError("a terminal inspector did not use the generic new-hand link")
+        page.keyboard.press("Escape")
+        page.locator("button[data-view='commitments']").click()
+        page.get_by_text("All clear", exact=True).wait_for()
+        if page.locator(".task-row").count() != len(terminal["tasks"]):
+            raise RuntimeError("Commitments did not preserve every closed task record")
+        _assert_viewport(page)
+        page.set_viewport_size({"width": 390, "height": 844})
+        _assert_viewport(page)
+        page.locator("#menu-button").click()
+        page.locator("button[data-view='now']").click()
+        page.get_by_text("All clear", exact=True).wait_for()
+        if page.locator(".task-row").count() != len(terminal["tasks"]):
+            raise RuntimeError("mobile Now hid closed task history")
+        _assert_viewport(page)
+    finally:
+        page.unroute("**/api/v1/snapshot", handler)
+
+    partial = copy.deepcopy(snapshot)
+    partial_issue = {
+        "code": "invalid-record",
+        "message": "record metadata is invalid",
+        "path": "tasks/unreadable.md",
+        "repairable": False,
+    }
+    partial["projection"]["sections"]["tasks"] = {
+        "issues": [partial_issue],
+        "readable": len(partial["tasks"]),
+        "state": "partial",
+        "unreadable": 1,
+    }
+    partial["doctor"] = {
+        **partial["doctor"],
+        "healthy": False,
+        "issues": [*partial["doctor"].get("issues", []), partial_issue],
+    }
+    handler = _route_snapshot(page, partial)
+    try:
+        page.set_viewport_size({"width": 1440, "height": 920})
+        page.evaluate("window.location.hash = '#now'")
+        page.reload(wait_until="networkidle")
+        page.locator("#local-status.is-partial").wait_for()
+        page.get_by_text("Some commitments could not be read", exact=True).wait_for()
+        page.get_by_text(re.compile(r"tasks/unreadable\.md"), exact=False).wait_for()
+        if page.get_by_text("All clear", exact=True).count() != 0:
+            raise RuntimeError("a partial task projection claimed all-clear")
+        if page.get_by_text("Your first hand", exact=True).count() != 0:
+            raise RuntimeError("a partial task projection claimed first-run")
+        expected_badge = f"{len(partial['tasks'])}+"
+        if page.locator("#task-count").inner_text() != expected_badge:
+            raise RuntimeError("the partial task badge hid unreadable records")
+        _assert_viewport(page)
+        page.set_viewport_size({"width": 390, "height": 844})
+        _assert_viewport(page)
+    finally:
+        page.unroute("**/api/v1/snapshot", handler)
+
+    only_bad = copy.deepcopy(partial)
+    only_bad["tasks"] = []
+    only_bad["projection"]["sections"]["tasks"]["readable"] = 0
+    handler = _route_snapshot(page, only_bad)
+    try:
+        page.set_viewport_size({"width": 1440, "height": 920})
+        page.reload(wait_until="networkidle")
+        page.get_by_text("Some commitments could not be read", exact=True).wait_for()
+        if page.get_by_text("All clear", exact=True).count() != 0:
+            raise RuntimeError("an only-bad task section claimed all-clear")
+        if page.get_by_text("Your first hand", exact=True).count() != 0:
+            raise RuntimeError("an only-bad task section claimed first-run")
+    finally:
+        page.unroute("**/api/v1/snapshot", handler)
+
+    missing_projection = copy.deepcopy(snapshot)
+    missing_projection["tasks"] = []
+    missing_projection.pop("projection", None)
+    missing_projection["codex"]["new_mind_url"] = (
+        "codex://new?prompt=Legacy%20Mind%20action&originUrl=gsv%3A%2F%2Fbridge"
+    )
+    handler = _route_snapshot(page, missing_projection)
+    try:
+        page.set_viewport_size({"width": 1440, "height": 920})
+        page.evaluate("window.location.hash = '#now'")
+        page.reload(wait_until="networkidle")
+        page.get_by_text("Commitments unavailable", exact=True).wait_for()
+        for forbidden in (
+            "All clear",
+            "Your first hand",
+            "Shape the Mind that will meet you here.",
+        ):
+            if page.get_by_text(forbidden, exact=True).count() != 0:
+                raise RuntimeError(
+                    f"a snapshot without projection metadata exposed unsafe copy: {forbidden}"
+                )
+        if page.locator(f'a[href="{missing_projection["codex"]["new_mind_url"]}"]').count() != 0:
+            raise RuntimeError("a snapshot without projection metadata exposed a Mind action")
+        _assert_viewport(page)
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.get_by_text("Commitments unavailable", exact=True).wait_for()
+        _assert_viewport(page)
+    finally:
+        page.unroute("**/api/v1/snapshot", handler)
+
+    overflow = copy.deepcopy(snapshot)
+    template = copy.deepcopy(snapshot["tasks"][0])
+    overflow_tasks = []
+    for status, count in (("ready", 4), ("waiting", 5)):
+        for index in range(count):
+            task = copy.deepcopy(template)
+            task["identifier"] = f"{status}-{index + 1}"
+            task["title"] = f"{status.title()} commitment {index + 1}"
+            task["status"] = status
+            task["next_actor"] = "agent" if status == "ready" else "external"
+            task["next_action"] = f"Inspect {status} commitment {index + 1}."
+            task["waiting_on"] = "A bounded external event." if status == "waiting" else None
+            overflow_tasks.append(task)
+    overflow["tasks"] = overflow_tasks
+    overflow["projection"]["sections"]["tasks"] = {
+        "issues": [],
+        "readable": len(overflow_tasks),
+        "state": "complete",
+        "unreadable": 0,
+    }
+    overflow["entities"] = [
+        {
+            "entity_type": "topic",
+            "identifier": f"topic:entity-{index + 1}",
+            "title": f"Entity {index + 1}",
+        }
+        for index in range(13)
+    ]
+    overflow["projection"]["sections"]["entities"] = {
+        "issues": [],
+        "readable": 13,
+        "state": "complete",
+        "unreadable": 0,
+    }
+    handler = _route_snapshot(page, overflow)
+    try:
+        page.set_viewport_size({"width": 1440, "height": 920})
+        page.evaluate("window.location.hash = '#now'")
+        page.reload(wait_until="networkidle")
+        page.get_by_role("button", name="1 more · View Commitments", exact=True).wait_for()
+        page.get_by_role("button", name="2 more · View Commitments", exact=True).wait_for()
+        page.get_by_role("button", name="1 more · View Commitments", exact=True).click()
+        page.locator("button[data-view='commitments'].is-active").wait_for()
+        if page.locator(".task-card").count() != 9:
+            raise RuntimeError("the Now disclosure did not navigate to every commitment")
+        page.locator("button[data-view='mind']").click()
+        page.get_by_text("1 more entities not shown.", exact=True).wait_for()
+        _assert_viewport(page)
+        page.set_viewport_size({"width": 390, "height": 844})
+        _assert_viewport(page)
+        page.locator("#menu-button").click()
+        page.locator("button[data-view='now']").click()
+        page.get_by_role("button", name="1 more · View Commitments", exact=True).wait_for()
+        page.get_by_role("button", name="2 more · View Commitments", exact=True).wait_for()
+        _assert_viewport(page)
+    finally:
+        page.unroute("**/api/v1/snapshot", handler)
+        page.set_viewport_size({"width": 1440, "height": 920})
+
+
+def _verify_live_vault_states(browser: Browser, root: Path) -> None:
+    terminal = Vault(root / "terminal-vault")
+    terminal.initialize(name="Terminal state proof")
+    for status in ("done", "dropped"):
+        terminal.create_task(
+            identifier=f"closed-{status}",
+            title=f"Closed {status}",
+            outcome=f"The {status} record remains visible.",
+            status=status,
+        )
+    with _state_page(browser, terminal) as page:
+        page.get_by_text("All clear", exact=True).wait_for(timeout=10_000)
+        page.get_by_text("No commitments are open.", exact=True).wait_for()
+        if page.locator(".task-row").count() != 2:
+            raise RuntimeError("the real terminal vault hid closed history in Now")
+        page.locator(".task-row").first.click()
+        page.locator("#inspector-foot a", has_text="Start a new hand").wait_for(timeout=10_000)
+        page.keyboard.press("Escape")
+        page.locator("button[data-view='commitments']").click()
+        if page.locator(".task-row").count() != 2:
+            raise RuntimeError("the real terminal vault hid closed history in Commitments")
+        _assert_viewport(page)
+        page.set_viewport_size({"width": 390, "height": 844})
+        _assert_viewport(page)
+
+    partial = Vault(root / "partial-vault")
+    partial.initialize(name="Partial state proof")
+    partial.create_task(
+        identifier="readable-task",
+        title="Readable task",
+        outcome="The valid task remains exact.",
+        status="ready",
+        next_actor="agent",
+        next_action="Keep this readable while reporting the damaged neighbor.",
+    )
+    (partial.root / "tasks/unreadable.md").write_bytes(b"\xff\xfe")
+    with _state_page(browser, partial) as page:
+        page.locator("#local-status.is-partial").wait_for(timeout=10_000)
+        page.get_by_text("Some commitments could not be read", exact=True).wait_for()
+        page.get_by_text(re.compile(r"tasks/unreadable\.md"), exact=False).wait_for()
+        if page.locator("#task-count").inner_text() != "1+":
+            raise RuntimeError("the real partial vault hid its unreadable task count")
+        if page.get_by_text("All clear", exact=True).count() != 0:
+            raise RuntimeError("the real partial vault claimed all-clear")
+        if page.get_by_text("Your first hand", exact=True).count() != 0:
+            raise RuntimeError("the real partial vault claimed first-run")
+        _assert_viewport(page)
+        page.set_viewport_size({"width": 390, "height": 844})
+        _assert_viewport(page)
+
+    overflow = Vault(root / "overflow-vault")
+    overflow.initialize(name="Overflow state proof")
+    for status, count in (("ready", 4), ("waiting", 5)):
+        for index in range(count):
+            overflow.create_task(
+                identifier=f"{status}-{index + 1}",
+                title=f"{status.title()} commitment {index + 1}",
+                outcome="Every commitment remains available in the complete view.",
+                status=status,
+                next_actor="agent" if status == "ready" else "external",
+                next_action=f"Inspect {status} commitment {index + 1}.",
+                waiting_on="A bounded external event." if status == "waiting" else None,
+            )
+    for index in range(13):
+        overflow.create_entity(
+            identifier=f"topic:entity-{index + 1}",
+            title=f"Entity {index + 1}",
+            entity_type="topic",
+            summary="Synthetic entity used only for bounded disclosure proof.",
+        )
+    with _state_page(browser, overflow) as page:
+        page.get_by_role("button", name="1 more · View Commitments", exact=True).wait_for()
+        page.get_by_role("button", name="2 more · View Commitments", exact=True).wait_for()
+        page.get_by_role("button", name="1 more · View Commitments", exact=True).click()
+        if page.locator(".task-card").count() != 9:
+            raise RuntimeError("the real overflow vault did not disclose all commitments")
+        page.locator("button[data-view='mind']").click()
+        page.get_by_text("1 more entities not shown.", exact=True).wait_for()
+        _assert_viewport(page)
+        page.set_viewport_size({"width": 390, "height": 844})
+        _assert_viewport(page)
+        page.locator("#menu-button").click()
+        page.locator("button[data-view='now']").click()
+        page.get_by_role("button", name="2 more · View Commitments", exact=True).wait_for()
+        _assert_viewport(page)
+
+
+@contextmanager
+def _state_page(browser: Browser, vault: Vault) -> Iterator[Any]:
+    console_errors: list[str] = []
+    page_errors: list[str] = []
+    resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(resource) as static_root:
+        server = bridge.BridgeHTTPServer(
+            (bridge.LOOPBACK_HOST, 0),
+            vault,
+            Path(static_root),
+            access_token=TOKEN,
+            instance_id=INSTANCE,
+            integration_provider=_synthetic_codex_status,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        page = browser.new_page(
+            viewport={"width": 1440, "height": 920},
+            device_scale_factor=1,
+            reduced_motion="reduce",
+        )
+        page.on(
+            "console",
+            lambda message: (
+                console_errors.append(message.text) if message.type == "error" else None
+            ),
+        )
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        url = f"http://{bridge.LOOPBACK_HOST}:{server.server_address[1]}/#token={TOKEN}"
+        try:
+            page.goto(url, wait_until="networkidle")
+            yield page
+            _assert_no_browser_errors(console_errors, page_errors)
+        finally:
+            page.close()
+            server.shutdown()
+            thread.join(timeout=3)
+            server.server_close()
 
 
 def _without_codex_links(snapshot: dict[str, Any], *, available: bool) -> dict[str, Any]:

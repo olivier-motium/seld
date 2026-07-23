@@ -29,8 +29,10 @@ does not ship an autonomous wake scheduler or a self-modifying daemon.
 2. The agent selects the native release for the current platform, verifies its
    checksum, runs the reversible setup, and opens the Bridge.
 3. The Bridge shows the local Mind, current orientation, and durable work. An
-   empty vault offers one real action: start the first Mind-shaping task in
-   Codex.
+   empty, completely inspected task ledger offers one real action: start the
+   first Mind-shaping task in Codex. A vault with only done or dropped work says
+   `All clear`, preserves every closed record, and offers a genuinely new hand;
+   it never pretends to be a first run.
 4. A synthetic proof can be run without touching the user's vault. It shows an
    open commitment surviving a killed hand, a fresh hand resuming it without a
    rebrief, a stale write being rejected, and unavailable evidence remaining
@@ -58,7 +60,14 @@ does not ship an autonomous wake scheduler or a self-modifying daemon.
   or `make`.
 - The Bridge is useful when empty, loading, healthy, stale, and partially
   unavailable, on desktop and mobile-sized viewports.
+- First-run and all-clear are shown only from complete Task projections. Partial
+  sections keep valid exact records visible, name the affected paths, and never
+  turn unreadable work into an empty ledger.
+- Now may show three cards per authored status lane only when every hidden card
+  has an explicit remainder link to the complete Commitments view; bounded
+  entity previews disclose their remainder too.
 - The published visual proof uses synthetic data and can be regenerated from
   the repository.
-- Recovery, backup/restore, stale-write rejection, clean uninstall, privacy
-  scanning, and a fresh second Codex session must pass before release.
+- Recovery, backup/restore, stale-write rejection, deliberate retirement of
+  receipt-bound uninstall evidence, privacy scanning, and a fresh second Codex
+  session must pass before release.

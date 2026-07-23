@@ -72,14 +72,27 @@ cached briefly and refreshed outside the metadata lock. Codex discovery runs as
 one background refresh, so an initial snapshot returns an explicit `checking`
 state instead of waiting on a subprocess; concurrent polls cannot start more
 checks. The backend derives one `codex.ready` value from successful discovery,
-the managed instruction block, and the installed plugin. It emits task and
-new-Mind deep links only when that value is true.
+the managed instruction block, and the installed plugin. It emits deep links
+only when that value is true: a Mind-shaping link only for a proven zero-task
+vault, a generic new-hand link for established use, and task-specific resume
+links only for nonterminal commitments.
+
+Record projection is deliberately more available than the strict Vault, CLI,
+context pack, and MCP surfaces. The Bridge inspects Tasks, Entities, and Threads
+independently and reports each section as `complete`, `partial`, or
+`unavailable`, with exact readable records and bounded issue paths. One malformed,
+oversized, invalid-UTF-8, symlinked, or nonregular record cannot hide valid
+records in another section. A missing, linked, non-directory, or untrustworthy
+record directory is unavailable, never an empty ledger. Fresh projection issues
+are merged into the cached doctor view immediately, so a partial snapshot cannot
+inherit a briefly stale healthy label. The authoritative Vault read APIs remain
+strict and fail closed on the same invalid state.
 
 Health returns the manifest-only vault identity cached when the server binds;
-it never lists records, runs doctor, or hashes vault files. Each snapshot loads
-each record collection once and derives its counts from those records. Its
-`status` block intentionally contains identity and counts, not the explicit CLI
-status command's full-vault logical digest.
+it never lists records, runs doctor, or hashes vault files. Each snapshot derives
+its counts from the exact readable projection and exposes section completeness
+separately. Its `status` block intentionally contains identity and counts, not
+the explicit CLI status command's full-vault logical digest.
 
 ## Write flow
 
@@ -148,21 +161,20 @@ block, Bridge receipt, and installation receipt are integration state. Removal
 touches only expected content recorded as GSV-owned. Uninstall snapshots the
 exact managed instruction bytes and verifies the marketplace digest before
 provider mutation, keeps the marketplace manifest present while Codex removes
-and verifies its registrations, then rechecks and deletes the local state. Any
+and verifies its registrations, then rechecks and isolates the local state. Any
 incomplete stage retains the ownership receipt and executable for the exact
 recovery path. A receipt-bound legacy state whose generated marketplace is
 already absent gets a deterministic packaged removal scaffold so a
 manifest-dependent Codex provider can finish cleanup. Reinstall and uninstall
 atomically isolate a receipt-owned marketplace under a unique sibling path and
-rescan it before replacement or deletion. Uninstall deletes exact verified
-manifest entries bottom-up and uses directory removal to detect any newly
-appeared entry; destination races preserve both trees. A local cleanup error
-after provider verification retains a durable provider-complete phase and the
-exact owned entry hashes. A later offline retry may delete only an unchanged
-subset of that manifest; any added or changed entry remains a manual-review
-boundary. Legacy scaffolds are file- and directory-synchronized in an
-exclusive stage before no-replace publication and provider access. Duplicate
-target plugin or marketplace identities stop provider mutation as ambiguous
+rescan it before replacement or quarantine. Lifecycle trees are never
+recursively or manifest-deleted: inactive recovery catalogs retain their exact
+paths and hashes while active integration removal completes independently. Any
+added or changed entry remains a manual-review boundary. Legacy scaffold paths
+and manifests are durable before materialization, then file- and
+directory-synchronized before no-replace publication and provider access.
+Duplicate target plugin or marketplace identities stop provider mutation as
+ambiguous
 state.
 
 ## Portability

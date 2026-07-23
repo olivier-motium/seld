@@ -15,9 +15,9 @@
   pre-existing Codex components.
 - Uninstall removes only expected GSV-owned integration and preserves vault,
   configuration, backups, and unrelated Codex state.
-- Marketplace replacement and deletion recheck an atomically isolated tree;
-  destination races and newly appeared entries are preserved, not recursively
-  removed.
+- Marketplace replacement and uninstall recheck an atomically isolated tree;
+  lifecycle trees are retained under receipt-bound paths, never recursively or
+  manifest-deleted, and destination races preserve both trees.
 - MCP requests are bounded, validated, and mapped to the same kernel as the
   CLI.
 - A loopback caller without the current per-launch bearer cannot read the

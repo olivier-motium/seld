@@ -126,8 +126,8 @@ function render() {
   const [title, intro] = viewCopy[state.currentView] || viewCopy.now;
   ui.pageTitle.textContent = title;
   ui.pageIntro.textContent = intro;
-  if (codexReady(snapshot)) {
-    ui.openCodex.href = snapshot.codex.new_mind_url;
+  if (codexReady(snapshot) && snapshot.codex.new_hand_url) {
+    ui.openCodex.href = snapshot.codex.new_hand_url;
     ui.openCodex.hidden = false;
   } else {
     ui.openCodex.removeAttribute("href");
@@ -135,8 +135,14 @@ function render() {
   }
 
   const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
-  ui.taskCount.textContent = String(openTasks.length);
-  ui.taskCount.hidden = openTasks.length === 0;
+  const taskProjection = projectionSection(snapshot, "tasks");
+  ui.taskCount.textContent =
+    taskProjection.state === "unavailable"
+      ? "!"
+      : taskProjection.state === "partial"
+        ? `${openTasks.length}+`
+        : String(openTasks.length);
+  ui.taskCount.hidden = taskProjection.state === "complete" && openTasks.length === 0;
   setActiveNavigation();
 
   const views = {
@@ -168,27 +174,61 @@ function renderNow(snapshot) {
   orientation.append(kicker, renderDocument(snapshot.now.content));
   fragment.append(orientation, renderContinuity(snapshot));
 
+  const taskProjection = projectionSection(snapshot, "tasks");
   const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
-  if (openTasks.length === 0) {
+  const completed = snapshot.tasks.filter((task) => ["done", "dropped"].includes(task.status));
+  if (taskProjection.state !== "complete") {
+    fragment.append(renderProjectionWarning(taskProjection, "commitments"));
+    if (openTasks.length > 0) {
+      fragment.append(renderOpenTaskHeading(openTasks.length), renderTaskBoard(openTasks, 3));
+    }
+    appendClosedHistory(fragment, completed);
+    return fragment;
+  }
+  if (snapshot.tasks.length === 0) {
     fragment.append(renderFirstRun(snapshot));
     return fragment;
   }
+  if (openTasks.length === 0) {
+    fragment.append(renderAllClear(snapshot));
+    appendClosedHistory(fragment, completed);
+    return fragment;
+  }
 
+  fragment.append(renderOpenTaskHeading(openTasks.length), renderTaskBoard(openTasks, 3));
+  return fragment;
+}
+
+function renderOpenTaskHeading(count) {
   const heading = element("div", "section-head");
   const headingText = element("div");
   headingText.append(
     textElement("p", "section-label", "Open work"),
     textElement("h2", "", "What remains true after this task"),
   );
-  heading.append(headingText, textElement("p", "section-meta", `${openTasks.length} open`));
-  fragment.append(heading, renderTaskBoard(openTasks, 3));
-  return fragment;
+  heading.append(headingText, textElement("p", "section-meta", `${count} open`));
+  return heading;
 }
 
 function renderContinuity(snapshot) {
   const line = element("section", "continuity-line", { "aria-label": "GSV continuity" });
+  const taskProjection = projectionSection(snapshot, "tasks");
   const open = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status)).length;
   const inMotion = snapshot.tasks.filter((task) => task.status === "doing").length;
+  const commitments =
+    taskProjection.state === "unavailable"
+      ? "Unavailable"
+      : taskProjection.state === "partial"
+        ? `${open} shown · partial`
+        : open
+          ? `${open} held`
+          : "Clear";
+  const nextHand =
+    taskProjection.state === "complete"
+      ? open
+        ? "Can resume"
+        : "Ready when needed"
+      : "Review needed";
   line.append(
     continuityStage("01", "Mind", snapshot.mind.revision ? "Authored" : "Ready", "is-persistent"),
     continuityStage(
@@ -198,8 +238,8 @@ function renderContinuity(snapshot) {
       "",
       inMotion ? "working" : "",
     ),
-    continuityStage("03", "Commitments", open ? `${open} held` : "Clear", "is-held"),
-    continuityStage("04", "Next hand", open ? "Can resume" : "Ready when needed"),
+    continuityStage("03", "Commitments", commitments, "is-held"),
+    continuityStage("04", "Next hand", nextHand),
   );
   return line;
 }
@@ -229,32 +269,54 @@ function renderFirstRun(snapshot) {
       "Codex will read the local GSV context, ask only what matters, and leave the first durable orientation behind.",
     ),
   );
-  empty.append(copy, renderCodexAction(snapshot, "Start in Codex"));
+  empty.append(copy, renderCodexAction(snapshot, "Start in Codex", "new_mind_url"));
+  return empty;
+}
+
+function renderAllClear(snapshot) {
+  const empty = element("section", "empty-state");
+  const copy = element("div");
+  copy.append(
+    textElement("p", "section-label", "Commitments"),
+    textElement("h2", "", "All clear"),
+    textElement("p", "", "No commitments are open."),
+  );
+  empty.append(copy, renderCodexAction(snapshot, "Start a new hand"));
   return empty;
 }
 
 function renderCommitments(snapshot) {
   const container = element("div");
+  const taskProjection = projectionSection(snapshot, "tasks");
   const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
-  if (openTasks.length === 0) {
+  const completed = snapshot.tasks.filter((task) => ["done", "dropped"].includes(task.status));
+  if (taskProjection.state !== "complete") {
+    container.append(renderProjectionWarning(taskProjection, "commitments"));
+  }
+  if (taskProjection.state === "complete" && snapshot.tasks.length === 0) {
     container.append(renderFirstRun(snapshot));
     return container;
   }
-  container.append(renderTaskBoard(openTasks));
-
-  const completed = snapshot.tasks.filter((task) => ["done", "dropped"].includes(task.status));
-  if (completed.length > 0) {
-    const heading = element("div", "section-head");
-    const headingText = element("div");
-    headingText.append(
-      textElement("p", "section-label", "Record"),
-      textElement("h2", "", "Closed deliberately"),
-    );
-    heading.append(headingText, textElement("p", "section-meta", `${completed.length} recorded`));
-    heading.style.marginTop = "48px";
-    container.append(heading, renderCompactTasks(completed));
+  if (taskProjection.state === "complete" && openTasks.length === 0) {
+    container.append(renderAllClear(snapshot));
+  } else if (openTasks.length > 0) {
+    container.append(renderTaskBoard(openTasks));
   }
+  appendClosedHistory(container, completed);
   return container;
+}
+
+function appendClosedHistory(container, tasks) {
+  if (tasks.length === 0) return;
+  const heading = element("div", "section-head");
+  const headingText = element("div");
+  headingText.append(
+    textElement("p", "section-label", "Record"),
+    textElement("h2", "", "Closed deliberately"),
+  );
+  heading.append(headingText, textElement("p", "section-meta", `${tasks.length} recorded`));
+  heading.style.marginTop = "48px";
+  container.append(heading, renderCompactTasks(tasks));
 }
 
 function renderTaskBoard(tasks, limit = null) {
@@ -270,6 +332,17 @@ function renderTaskBoard(tasks, limit = null) {
       list.append(textElement("div", "empty-lane", lane.empty));
     } else {
       for (const task of visible) list.append(renderTaskCard(task));
+      const remaining = lane.tasks.length - visible.length;
+      if (remaining > 0) {
+        const disclosure = textElement(
+          "button",
+          "primary-action",
+          `${remaining} more · View Commitments`,
+        );
+        disclosure.type = "button";
+        disclosure.addEventListener("click", () => navigate("commitments"));
+        list.append(disclosure);
+      }
     }
     section.append(head, list);
     board.append(section);
@@ -321,7 +394,7 @@ function renderCompactTasks(tasks) {
     row.append(
       textElement("h3", "", task.title),
       textElement("p", "", task.outcome),
-      textElement("span", "system-state", task.status),
+      textElement("span", "system-state", statusLabel(task)),
     );
     list.append(row);
   }
@@ -330,6 +403,7 @@ function renderCompactTasks(tasks) {
 
 function renderStorylines(snapshot) {
   const container = element("div");
+  const threadProjection = projectionSection(snapshot, "threads");
   const heading = element("div", "section-head");
   const headingText = element("div");
   headingText.append(
@@ -338,8 +412,13 @@ function renderStorylines(snapshot) {
   );
   heading.append(headingText, textElement("p", "section-meta", `${snapshot.threads.length} total`));
   container.append(heading);
+  if (threadProjection.state !== "complete") {
+    container.append(renderProjectionWarning(threadProjection, "storylines"));
+  }
   if (snapshot.threads.length === 0) {
-    container.append(textElement("div", "empty-lane", "No storylines have been authored yet."));
+    if (threadProjection.state === "complete") {
+      container.append(textElement("div", "empty-lane", "No storylines have been authored yet."));
+    }
     return container;
   }
   const list = element("div", "storyline-list");
@@ -361,6 +440,7 @@ function renderStorylines(snapshot) {
 }
 
 function renderMind(snapshot) {
+  const entityProjection = projectionSection(snapshot, "entities");
   const layout = element("div", "mind-layout");
   const main = element("section");
   const head = element("div", "section-head");
@@ -374,8 +454,13 @@ function renderMind(snapshot) {
 
   const side = element("aside", "mind-side");
   side.append(textElement("h3", "", "Known entities"));
+  if (entityProjection.state !== "complete") {
+    side.append(renderProjectionWarning(entityProjection, "entities"));
+  }
   if (snapshot.entities.length === 0) {
-    side.append(textElement("p", "section-meta", "No canonical entities yet."));
+    if (entityProjection.state === "complete") {
+      side.append(textElement("p", "section-meta", "No canonical entities yet."));
+    }
   } else {
     const list = element("ul", "entity-list");
     for (const entity of snapshot.entities.slice(0, 12)) {
@@ -387,9 +472,40 @@ function renderMind(snapshot) {
       list.append(item);
     }
     side.append(list);
+    const remaining = snapshot.entities.length - 12;
+    if (remaining > 0) {
+      side.append(textElement("p", "section-meta", `${remaining} more entities not shown.`));
+    }
   }
   layout.append(main, side);
   return layout;
+}
+
+function projectionSection(snapshot, name) {
+  const section = snapshot.projection?.sections?.[name];
+  if (section && ["complete", "partial", "unavailable"].includes(section.state)) return section;
+  const fallback = Array.isArray(snapshot[name]) ? snapshot[name].length : 0;
+  return { issues: [], readable: fallback, state: "unavailable", unreadable: 0 };
+}
+
+function renderProjectionWarning(section, label) {
+  const warning = element("section", "unavailable-state");
+  const title = section.state === "unavailable" ? `${capitalize(label)} unavailable` : `Some ${label} could not be read`;
+  const paths = (section.issues || [])
+    .map((issue) => issue.path)
+    .filter(Boolean)
+    .join(", ");
+  const readable = Number(section.readable || 0);
+  const summary =
+    section.state === "unavailable"
+      ? `GSV could not trust this record section. Review ${paths || label} with gsv doctor.`
+      : `${readable} exact ${readable === 1 ? "record is" : "records are"} shown. Review ${paths || label} with gsv doctor.`;
+  warning.append(
+    textElement("p", "section-label", "Integrity warning"),
+    textElement("h2", "", title),
+    textElement("p", "", summary),
+  );
+  return warning;
 }
 
 function renderSystem(snapshot) {
@@ -506,10 +622,10 @@ async function copyText(value) {
   }
 }
 
-function renderCodexAction(snapshot, label) {
-  if (codexReady(snapshot)) {
+function renderCodexAction(snapshot, label, urlKey = "new_hand_url") {
+  if (codexReady(snapshot) && snapshot.codex[urlKey]) {
     const action = textElement("a", "primary-action", label);
-    action.href = snapshot.codex.new_mind_url;
+    action.href = snapshot.codex[urlKey];
     return action;
   }
   if (snapshot.codex.checking) {
@@ -613,7 +729,7 @@ function renderInspector(task) {
     ui.inspectorFoot.hidden = false;
   } else {
     ui.continueInCodex.removeAttribute("href");
-    ui.inspectorFoot.replaceChildren(renderCodexAction(state.snapshot, "Open in new Codex hand"));
+    ui.inspectorFoot.replaceChildren(renderCodexAction(state.snapshot, "Start a new hand"));
     ui.inspectorFoot.hidden = false;
   }
 }
@@ -787,6 +903,11 @@ function statusLabel(task) {
   };
   const status = String(task.status || "Unknown");
   return labels[status] || `${status.charAt(0).toUpperCase()}${status.slice(1)}`;
+}
+
+function capitalize(value) {
+  const text = String(value || "");
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
 }
 
 function actorLabel(actor) {

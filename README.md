@@ -202,13 +202,26 @@ cleanup succeeds. It never calls partial cleanup complete. A changed or unsafe
 generated marketplace is left untouched for manual review, and Codex
 registrations are not changed until local ownership and instruction cleanup are
 verified. A valid legacy receipt with missing generated files is recovered with
-a packaged removal scaffold before Codex cleanup. Local removal atomically
-isolates the verified tree, rescans it, and deletes only exact manifest entries;
-new entries survive and stop directory removal. If that cleanup fails after
-provider cleanup, the receipt's provider-complete phase and exact owned-file
-manifest let a later uninstall finish locally without Codex. Added or changed
-files still stop deletion for manual review. Duplicate GSV provider identities
-stop before add/remove operations rather than guessing ownership.
+a receipt-first packaged removal scaffold before Codex cleanup. Local removal
+atomically isolates the verified tree under a unique, receipt-bound recovery
+path and never recursively or manifest-deletes lifecycle trees. Once the public
+path, provider registrations, and managed instructions are gone,
+`integration_removed` is true; cleanup stays incomplete while
+`recovery_retained` and `retained_cleanup_paths` report immutable local recovery
+bytes. A changed retained tree remains explicit and
+stops recovery verification. Duplicate GSV provider identities stop before
+add/remove operations rather than guessing ownership.
+
+Uninstall results use `result_format_version` and report active removal,
+physical retained bytes, and receipt state separately. The release uninstaller
+keeps the executable and exits with retry status `3` while receipt-bound
+recovery evidence remains; its JSON output names the exact paths. After optional
+inspection and retirement of only those paths, re-running the uninstaller
+compacts the catalog and removes the executable.
+
+Both release scripts fail closed on malformed or unexpected cleanup output.
+They remove the executable only after the cleanup output is verified to report
+`ok: true` and `result.cleanup_complete: true`.
 
 ## Develop
 

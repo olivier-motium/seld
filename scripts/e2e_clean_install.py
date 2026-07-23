@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -331,12 +332,34 @@ def run_e2e(
     if len(integration_receipts) != 1:
         raise RuntimeError("installed Codex integration did not have exactly one ownership receipt")
     integration_receipt = integration_receipts[0]
+    current_receipt = json.loads(integration_receipt.read_text(encoding="utf-8"))
+    for retained_record in current_receipt.get("cleanup_pending", []):
+        retained_path = marketplace_root.parent / retained_record.get("basename", "")
+        if (
+            retained_path.parent != marketplace_root.parent
+            or not retained_path.is_dir()
+            or _directory_manifest(retained_path) != retained_record.get("manifest")
+        ):
+            raise RuntimeError("could not isolate a clean synthetic v1 receipt fixture")
+        shutil.rmtree(retained_path)
+    legacy_receipt = {
+        "codex_home": current_receipt["codex_home"],
+        "format_version": 1,
+        "marketplace_digest": current_receipt["marketplace_digest"],
+        "marketplace_owned": True,
+        "marketplace_root": current_receipt["marketplace_root"],
+        "plugin_owned": True,
+    }
+    integration_receipt.write_text(
+        json.dumps(legacy_receipt, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     (codex_home / "AGENTS.md").write_bytes(original_agents)
     shutil.rmtree(marketplace_root)
     if not integration_receipt.is_file() or marketplace_root.exists():
         raise RuntimeError("could not stage the valid-receipt legacy uninstall state")
     config_path.unlink()
-    removed = _cli(
+    removed = _cli_expected_incomplete_cleanup(
         installed,
         environment,
         ["codex", "uninstall", "--codex-home", str(codex_home)],
@@ -356,10 +379,35 @@ def run_e2e(
         raise RuntimeError("GSV plugin remains after uninstall")
     if any(item.get("name") == "gsv-local" for item in after_marketplaces["marketplaces"]):
         raise RuntimeError("GSV marketplace remains after uninstall")
-    if marketplace_root.exists() or integration_receipt.exists():
-        raise RuntimeError("legacy removal scaffold or ownership receipt remains after uninstall")
-    if removed.get("marketplace_files_state") != "removed":
-        raise RuntimeError("legacy removal scaffold was not verified and removed")
+    if marketplace_root.exists() or not integration_receipt.is_file():
+        raise RuntimeError("legacy uninstall did not isolate its recovery state")
+    if (
+        removed.get("cleanup_complete") is not False
+        or removed.get("integration_removed") is not True
+        or removed.get("marketplace_files_state") != "retained"
+        or removed.get("recovery_retained") is not True
+    ):
+        raise RuntimeError("legacy removal scaffold was not retained as explicit recovery evidence")
+    retained_paths = removed.get("retained_cleanup_paths")
+    if not isinstance(retained_paths, list) or len(retained_paths) != 1:
+        raise RuntimeError("legacy uninstall did not report its one exact recovery path")
+    recovery_receipt = json.loads(integration_receipt.read_text(encoding="utf-8"))
+    recovery_records = recovery_receipt.get("cleanup_pending")
+    if (
+        recovery_receipt.get("format_version") != 2
+        or recovery_receipt.get("integration_active") is not False
+        or not isinstance(recovery_records, list)
+        or len(recovery_records) != 1
+    ):
+        raise RuntimeError("legacy uninstall did not migrate to one inactive recovery catalog")
+    retained_path = Path(retained_paths[0])
+    recovery_record = recovery_records[0]
+    if (
+        retained_path != marketplace_root.parent / recovery_record.get("basename", "")
+        or not retained_path.is_dir()
+        or _directory_manifest(retained_path) != recovery_record.get("manifest")
+    ):
+        raise RuntimeError("legacy recovery path does not match its receipt-bound manifest")
     if (
         _directory_digest(vault) != source_vault_before_legacy
         or _directory_digest(restore) != restored_vault_before_legacy
@@ -394,15 +442,34 @@ def run_e2e(
         shell = shutil.which("pwsh") or shutil.which("powershell")
         if shell is None:
             raise RuntimeError("PowerShell is required for the Windows uninstall proof")
-        _run(
-            [shell, "-NoProfile", "-File", str(uninstaller), "--codex-home", str(codex_home)],
-            environment,
-        )
+        uninstall_command = [
+            shell,
+            "-NoProfile",
+            "-File",
+            str(uninstaller),
+            "--codex-home",
+            str(codex_home),
+        ]
     else:
-        _run(
-            ["/bin/sh", str(uninstaller), "--codex-home", str(codex_home)],
-            environment,
-        )
+        uninstall_command = [
+            "/bin/sh",
+            str(uninstaller),
+            "--codex-home",
+            str(codex_home),
+        ]
+    retained_gate = _run(uninstall_command, environment, check=False)
+    if (
+        retained_gate.returncode != 3
+        or not installed.is_file()
+        or "retained_cleanup_paths" not in retained_gate.stdout
+    ):
+        raise RuntimeError("release uninstaller did not gate executable removal on recovery")
+    if live_receipt.exists() or not _wait_for_process_exit(live_pid, timeout=8.0):
+        raise RuntimeError("recovery-gated uninstaller left the live Bridge running")
+    if _directory_manifest(retained_path) != recovery_record["manifest"]:
+        raise RuntimeError("synthetic recovery evidence changed before explicit retirement")
+    shutil.rmtree(retained_path)
+    _run(uninstall_command, environment)
     if installed.exists():
         raise RuntimeError("full uninstall left the GSV executable installed")
     if live_receipt.exists() or not _wait_for_process_exit(live_pid, timeout=8.0):
@@ -437,6 +504,7 @@ def run_e2e(
         "stale_write_rejected": stale.returncode == 2,
         "two_mcp_processes": True,
         "uninstaller_stopped_live_bridge": True,
+        "uninstaller_retained_recovery_gate": True,
         "uninstall_preserved_config_and_vault": removed["user_data_preserved"],
         "updated_revision": updated["revision"],
         "vault_id": status["vault_id"],
@@ -466,7 +534,18 @@ def _isolated_environment(
         runtime_paths.append(str(Path(os.environ["SYSTEMROOT"]) / "System32"))
         minimal_path = os.pathsep.join(dict.fromkeys(runtime_paths))
     else:
-        required = ("uname", "mktemp", "cp", "awk", "mkdir", "install", "mv", "rm", "env")
+        required = (
+            "uname",
+            "mktemp",
+            "cp",
+            "awk",
+            "mkdir",
+            "install",
+            "mv",
+            "rm",
+            "env",
+            "tr",
+        )
         for name in required:
             source = shutil.which(name)
             if source is None:
@@ -621,6 +700,25 @@ def _cli(binary: Path, environment: dict[str, str], arguments: list[str]) -> dic
     return cast(dict[str, Any], payload["result"])
 
 
+def _cli_expected_incomplete_cleanup(
+    binary: Path,
+    environment: dict[str, str],
+    arguments: list[str],
+) -> dict[str, Any]:
+    result = _run([str(binary), "--json", *arguments], environment, check=False)
+    if result.returncode != 3:
+        raise RuntimeError(
+            f"GSV incomplete-cleanup command returned {result.returncode}, expected 3: {arguments}"
+        )
+    payload = json.loads(result.stdout)
+    cleanup = payload.get("result")
+    if payload.get("ok") is not False or not isinstance(cleanup, dict):
+        raise RuntimeError(f"GSV incomplete-cleanup JSON was not fail-closed: {arguments}")
+    if cleanup.get("cleanup_complete") is not False:
+        raise RuntimeError(f"GSV incomplete-cleanup result claimed completion: {arguments}")
+    return cast(dict[str, Any], cleanup)
+
+
 def _json_command(command: list[str], environment: dict[str, str]) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(_run(command, environment).stdout))
 
@@ -706,6 +804,22 @@ def _directory_digest(root: Path) -> str:
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _directory_manifest(root: Path) -> dict[str, str]:
+    manifest: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        relative = path.relative_to(root).as_posix()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"synthetic marketplace contains a symbolic link: {relative}")
+        if stat.S_ISDIR(metadata.st_mode):
+            manifest[relative] = "directory"
+        elif stat.S_ISREG(metadata.st_mode):
+            manifest[relative] = f"file:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+        else:
+            raise RuntimeError(f"synthetic marketplace contains a special file: {relative}")
+    return manifest
 
 
 if __name__ == "__main__":

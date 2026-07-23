@@ -8,11 +8,21 @@ The Bridge creates new-task links with this shape:
 codex://new?prompt=<encoded>&originUrl=<encoded>&path=<encoded>
 ```
 
-Task links include an encoded prompt, the GSV repository as `originUrl`, and
-the resolved local vault as `path`. The Bridge emits no task or new-Mind link
-until Codex discovery succeeds and both the managed instructions and GSV plugin
-are installed. The README install link omits `path` because it opens a new task
-before a checkout or vault path can be assumed.
+Every link includes an encoded prompt, the GSV repository as `originUrl`, and
+the resolved local vault as `path`. The Bridge distinguishes three actions:
+
+- `new_mind_url` exists only when the Tasks section is completely inspected and
+  contains zero records. Its prompt starts the first Mind-shaping hand.
+- `new_hand_url` starts an established, generic GSV hand. Its prompt contains no
+  task identifier, resume language, or first-run language.
+- a task `codex_url` resumes one exact commitment and therefore exists only for
+  nonterminal tasks. Done and dropped records never receive one.
+
+The top bar, all-clear state, and terminal-task inspector use `new_hand_url`;
+only the true first-run panel uses `new_mind_url`. The Bridge emits none of
+these links until Codex discovery succeeds and both the managed instructions
+and GSV plugin are installed. The README install link omits `path` because it
+opens a new task before a checkout or vault path can be assumed.
 
 GSV does not use a legacy launch-route fallback.
 
@@ -38,5 +48,5 @@ an official supported contract before claiming compatibility with a later app
 version. The copyable installation instruction in the README remains usable
 without the custom scheme.
 
-`tests/test_bridge.py` verifies URL encoding and round-tripping for the prompt,
-origin URL, and local path.
+`tests/test_bridge.py` verifies URL encoding, action qualification, and
+round-tripping for each prompt, origin URL, and local path.

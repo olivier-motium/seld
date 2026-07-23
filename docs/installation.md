@@ -202,8 +202,9 @@ consumer artifact installs on a clean machine.
 
 `gsv codex uninstall` removes GSV-owned Codex integration while keeping the
 executable. The release uninstall script first stops only a Bridge instance
-whose live health identity matches its owner-only receipt, then removes the
-executable and GSV-owned integration.
+whose live health identity matches its owner-only receipt. It removes the
+executable only after both the active integration and receipt-bound recovery
+catalog are retired.
 
 Both paths preserve the vault, configuration, backups, unrelated Codex
 instructions, marketplaces, and plugins. Neither Codex status nor uninstall
@@ -219,21 +220,44 @@ executable and owner-only receipt for the printed retry command, and returns a
 nonzero retry exit without requiring `jq` or another JSON parser.
 
 A valid older receipt whose generated marketplace is already missing is handled
-automatically: GSV restores a packaged, digest-checked removal scaffold at the
-receipt-bound path, lets Codex remove and verify the live registrations, then
-deletes the scaffold. Immediately after provider verification GSV checkpoints
-that phase and an exact owned-file manifest in the receipt. If local cleanup
-raises after removing only some entries, re-run `gsv codex uninstall`;
-the retry skips Codex and removes only an unchanged subset of the recorded
-files. Cleanup first moves the tree to an exclusive sibling path, rescans it,
-then removes only exact manifest entries bottom-up. A newly appeared entry
-prevents directory removal and is restored or preserved for manual review.
+automatically: GSV first records a unique repair transition, builds a packaged,
+digest-checked removal scaffold at that receipt-bound path, and lets Codex
+remove and verify the live registrations. Immediately after provider
+verification GSV checkpoints that phase and one exact no-replace quarantine
+path. Cleanup moves the public tree there and retains it as immutable recovery
+evidence; it never recursively or manifest-deletes lifecycle trees. The active
+integration can therefore be completely removed while the result separately
+reports `recovery_retained` and every `retained_cleanup_paths` entry. A changed
+or unexpected entry blocks verification and is preserved for manual review.
 
-The recovery scaffold is built in an exclusive sibling stage, each file and
-nested directory is synchronized, and the complete tree is published without
-replacement before any provider call. Duplicate GSV plugin IDs or marketplace
-names are provider ambiguity: GSV performs no add or remove action and asks for
-explicit inspection.
+Uninstall result objects use `result_format_version: 1`. The fields describe
+separate facts: `cleanup_complete` is true only when active integration and
+receipt-bound recovery bytes are both gone; `integration_removed` means the public
+marketplace and managed instruction block are absent;
+`marketplace_files_removed` is true only when no marketplace bytes remain;
+`recovery_retained` means immutable receipt-bound evidence still exists; and
+`receipt_state` reports whether the exact catalog receipt is still owned. A
+successful retained quarantine therefore reports `cleanup_complete: false`,
+`integration_removed: true`, `marketplace_files_removed: false`, and
+`recovery_retained: true` without conflating those outcomes.
+
+When recovery evidence remains, the release uninstaller prints its exact paths,
+keeps the executable, and exits with retry status `3`. This is an intentionally
+incomplete physical cleanup even though `integration_removed` is true. Inspect and delete only
+those paths if you choose to retire the evidence, then re-run the uninstaller;
+the recovery-only pass compacts the catalog and removes the executable once no
+retained bytes remain.
+
+The release scripts also fail closed on malformed or unexpected cleanup output.
+They remove the executable only when the cleanup output is verified to report
+`ok: true` and `result.cleanup_complete: true`; an exit code alone is never
+treated as proof of complete cleanup.
+
+The recovery scaffold's exact path and manifest are durable before its first
+directory appears. Each file and nested directory is synchronized, and the
+complete tree is published without replacement before any provider call.
+Duplicate GSV plugin IDs or marketplace names are provider ambiguity: GSV
+performs no add or remove action and asks for explicit inspection.
 
 A changed, unreadable, symlinked, or out-of-bound generated marketplace is left
 untouched for manual review. Provider registration cleanup is skipped until
