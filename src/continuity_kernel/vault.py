@@ -725,14 +725,24 @@ class Vault:
         assert destination is not None
         destination = _leaf_path(destination)
         _validate_backup_destination_policy(self.root, destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise PersistenceError(
+                f"could not prepare backup destination directory for {destination}: {exc}"
+            ) from exc
         if not generated_destination:
             _validate_backup_destination(destination)
         with exclusive_lock(self.state / "locks/global.lock"):
             files = self._backup_files()
-            descriptor, temp_name = tempfile.mkstemp(
-                prefix=".gsv-backup.tmp-", suffix=".zip", dir=destination.parent
-            )
+            try:
+                descriptor, temp_name = tempfile.mkstemp(
+                    prefix=".gsv-backup.tmp-", suffix=".zip", dir=destination.parent
+                )
+            except OSError as exc:
+                raise PersistenceError(
+                    f"could not allocate a staged backup beside {destination}: {exc}"
+                ) from exc
             os.close(descriptor)
             temp = Path(temp_name)
             preserve_staged = False

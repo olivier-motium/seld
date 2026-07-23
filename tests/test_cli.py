@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tempfile
 import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -793,6 +794,46 @@ def test_backup_cleanup_failure_is_visible_in_cli_json(
     assert ".gsv-backup.tmp-" in payload["error"]
     assert not destination.exists()
     assert bool(list(tmp_path.glob(".gsv-backup.tmp-*.zip"))) is (not unlink_first)
+
+
+def test_backup_staging_allocation_failure_is_structured_cli_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Unwritable output")
+    destination = tmp_path / "unwritable" / "backup.zip"
+    destination.parent.mkdir()
+
+    def fail_staging(*_: object, **__: object) -> tuple[int, str]:
+        raise PermissionError("injected unwritable output directory")
+
+    monkeypatch.setattr(tempfile, "mkstemp", fail_staging)
+
+    exit_code = cli.main(
+        [
+            "--json",
+            "--vault",
+            str(vault.root),
+            "backup",
+            "create",
+            "--output",
+            str(destination),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"] == (
+        f"could not allocate a staged backup beside {destination}: "
+        "injected unwritable output directory"
+    )
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+    assert not destination.exists()
 
 
 def test_codex_status_and_uninstall_do_not_require_vault_configuration(
