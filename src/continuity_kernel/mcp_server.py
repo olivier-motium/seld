@@ -18,9 +18,10 @@ SUPPORTED_PROTOCOL_VERSIONS: Final = frozenset({PROTOCOL_VERSION})
 MAX_REQUEST_BYTES: Final = 1024 * 1024
 
 
-def serve() -> int:
+def serve(vault: Vault | None = None) -> int:
     """Serve line-delimited MCP JSON-RPC until stdin closes."""
 
+    bound = vault or Vault(resolve_vault())
     for raw_line in _bounded_lines(sys.stdin.buffer):
         if raw_line is None:
             _write(_error(None, -32600, "JSON-RPC request exceeds its size bound"))
@@ -33,7 +34,7 @@ def serve() -> int:
             if not isinstance(message, dict):
                 raise ValidationError("JSON-RPC message must be an object")
             request_id = message.get("id")
-            response = _handle(message)
+            response = _handle(message, vault=bound)
             if response is not None:
                 _write(response)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -58,7 +59,7 @@ def _bounded_lines(stream: IO[bytes]) -> Iterator[bytes | None]:
         yield None
 
 
-def _handle(message: dict[str, Any]) -> dict[str, Any] | None:
+def _handle(message: dict[str, Any], *, vault: Vault | None = None) -> dict[str, Any] | None:
     method = message.get("method")
     request_id = message.get("id")
     if method == "notifications/initialized":
@@ -94,7 +95,7 @@ def _handle(message: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(arguments, dict):
             return _error(request_id, -32602, "tool arguments must be an object")
         try:
-            payload = _call(params["name"], arguments)
+            payload = _call(params["name"], arguments, vault=vault)
             return _result(
                 request_id,
                 {
@@ -123,8 +124,8 @@ def _handle(message: dict[str, Any]) -> dict[str, Any] | None:
     return _error(request_id, -32601, f"method not found: {method}")
 
 
-def _call(name: str, values: dict[str, Any]) -> dict[str, Any]:
-    vault = Vault(resolve_vault())
+def _call(name: str, values: dict[str, Any], *, vault: Vault | None = None) -> dict[str, Any]:
+    vault = vault or Vault(resolve_vault())
     if name == "gsv_status":
         return vault.status()
     if name == "gsv_context":

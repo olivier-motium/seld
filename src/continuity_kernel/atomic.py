@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import hashlib
 import importlib
 import os
+import stat
+import sys
 import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from ctypes import wintypes
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
-from typing import IO, Protocol, cast
+from typing import IO, Any, Protocol, cast
 
-from continuity_kernel.errors import ConflictError
+from continuity_kernel.errors import ConflictError, ValidationError
 
 
 class _PosixLock(Protocol):
@@ -29,6 +35,161 @@ class _WindowsLock(Protocol):
     LK_UNLCK: int
 
     def locking(self, descriptor: int, mode: int, length: int) -> None: ...
+
+
+class AppendOutcome(StrEnum):
+    RESTORED = "restored"
+    COMMITTED = "committed"
+    UNKNOWN = "unknown"
+
+
+class DurableAppendError(OSError):
+    """An append failed with an explicit durable-state outcome."""
+
+    outcome: AppendOutcome
+
+    def __init__(self, message: str, *, outcome: AppendOutcome):
+        super().__init__(message)
+        self.outcome = outcome
+
+
+class PublishOutcome(StrEnum):
+    UNPUBLISHED = "unpublished"
+    COMMITTED = "committed"
+    UNKNOWN = "unknown"
+
+
+class DurablePublishError(OSError):
+    """A no-clobber publication failed with an explicit visible-state outcome."""
+
+    outcome: PublishOutcome
+
+    def __init__(self, message: str, *, outcome: PublishOutcome):
+        super().__init__(message)
+        self.outcome = outcome
+
+
+@dataclass(frozen=True)
+class RegularFileSnapshot:
+    """Stable metadata captured from an already-open regular file."""
+
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+
+
+def _snapshot(metadata: os.stat_result) -> RegularFileSnapshot:
+    return RegularFileSnapshot(
+        device=int(metadata.st_dev),
+        inode=int(metadata.st_ino),
+        size=int(metadata.st_size),
+        modified_ns=int(metadata.st_mtime_ns),
+    )
+
+
+def _same_file(left: RegularFileSnapshot, right: RegularFileSnapshot) -> bool:
+    if os.name != "nt":
+        return (left.device, left.inode) == (right.device, right.inode)
+    # CPython can expose different Windows file-index encodings for path and
+    # descriptor stat calls. Size and timestamp are checked here and again
+    # after the bounded read; lstat also rejects reparse-point swaps.
+    return (
+        left.device == right.device
+        and left.size == right.size
+        and left.modified_ns == right.modified_ns
+    )
+
+
+@contextmanager
+def open_regular_file(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int | None = None,
+) -> Iterator[tuple[int, RegularFileSnapshot]]:
+    """Open one stable regular file without following links or special files."""
+
+    try:
+        listed = os.lstat(path)
+    except OSError as exc:
+        raise ValidationError(f"could not inspect {label}: {path}: {exc}") from exc
+    if stat.S_ISLNK(listed.st_mode):
+        raise ValidationError(f"{label} cannot be a symbolic link: {path}")
+    if not stat.S_ISREG(listed.st_mode):
+        raise ValidationError(f"{label} must be a regular file: {path}")
+    if max_bytes is not None and listed.st_size > max_bytes:
+        raise ValidationError(f"{label} exceeds its size bound: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise ValidationError(f"could not open {label}: {path}: {exc}") from exc
+        opened = os.fstat(descriptor)
+        listed_snapshot = _snapshot(listed)
+        opened_snapshot = _snapshot(opened)
+        if not stat.S_ISREG(opened.st_mode) or not _same_file(listed_snapshot, opened_snapshot):
+            raise ValidationError(f"{label} changed while it was opened: {path}")
+        yield descriptor, opened_snapshot
+        finished = _snapshot(os.fstat(descriptor))
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or finished != opened_snapshot
+            or not _same_file(_snapshot(current), opened_snapshot)
+        ):
+            raise ValidationError(f"{label} changed while it was read: {path}")
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError(f"could not read {label}: {path}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def read_regular_file(path: Path, *, label: str, max_bytes: int) -> bytes:
+    """Read a stable regular file through the canonical bounded binary path."""
+
+    chunks: list[bytes] = []
+    remaining = max_bytes + 1
+    with open_regular_file(path, label=label, max_bytes=max_bytes) as (descriptor, _):
+        while remaining:
+            block = os.read(descriptor, min(64 * 1024, remaining))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+    content = b"".join(chunks)
+    if len(content) > max_bytes:
+        raise ValidationError(f"{label} exceeds its size bound: {path}")
+    return content
+
+
+def sha256_regular_file(path: Path, *, label: str, max_bytes: int | None = None) -> str:
+    """Hash one stable regular file through the same no-follow open boundary."""
+
+    digest = hashlib.sha256()
+    total = 0
+    with open_regular_file(path, label=label, max_bytes=max_bytes) as (descriptor, _):
+        while block := os.read(descriptor, 1024 * 1024):
+            total += len(block)
+            if max_bytes is not None and total > max_bytes:
+                raise ValidationError(f"{label} exceeds its size bound: {path}")
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def portable_relative(path: Path, root: Path) -> str:
+    """Serialize an API/archive path with stable POSIX separators on every OS."""
+
+    return path.relative_to(root).as_posix()
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -91,14 +252,252 @@ def durable_replace(source: Path, target: Path) -> None:
     _fsync_directory(target.parent)
 
 
+def durable_publish_new(source: Path, target: Path) -> tuple[int, int]:
+    """Publish one staged regular file without replacing any existing path."""
+
+    if source.parent.resolve() != target.parent.resolve():
+        raise OSError(errno.EXDEV, "no-clobber publication requires one directory")
+    source_metadata = os.lstat(source)
+    if not stat.S_ISREG(source_metadata.st_mode):
+        raise OSError(errno.EINVAL, "no-clobber publication source must be a regular file")
+    identity = (source_metadata.st_dev, source_metadata.st_ino)
+    try:
+        os.link(source, target, follow_symlinks=False)
+    except (NotImplementedError, OSError) as exc:
+        error = exc.errno if isinstance(exc, OSError) else errno.ENOTSUP
+        windows_error = getattr(exc, "winerror", None)
+        fallback_errors = {
+            errno.EXDEV,
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EPERM,
+            getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+        }
+        if error not in fallback_errors and windows_error not in {1, 50}:
+            raise
+        return _publish_new_by_move(source, target, identity=identity)
+    try:
+        _fsync_directory(target.parent)
+    except OSError as exc:
+        raise DurablePublishError(
+            f"target is visible at {target}, but publication durability is unconfirmed; "
+            f"the staged file remains at {source}",
+            outcome=PublishOutcome.COMMITTED,
+        ) from exc
+    try:
+        source.unlink()
+    except OSError as exc:
+        raise DurablePublishError(
+            f"target is committed at {target}, but the staged file remains at {source}: {exc}",
+            outcome=PublishOutcome.COMMITTED,
+        ) from exc
+    try:
+        _fsync_directory(target.parent)
+    except OSError as exc:
+        raise DurablePublishError(
+            f"target is committed at {target}, but staged-file cleanup durability is unconfirmed",
+            outcome=PublishOutcome.COMMITTED,
+        ) from exc
+    return identity
+
+
+def move_no_replace(source: Path, target: Path) -> None:
+    """Atomically move one staged path without replacing an existing target."""
+
+    if source.parent.resolve() != target.parent.resolve():
+        raise OSError(errno.EXDEV, "no-replace move requires one directory")
+    if sys.platform == "darwin":
+        library: Any = ctypes.CDLL(None, use_errno=True)
+        rename_exclusive = library.renamex_np
+        rename_exclusive.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename_exclusive.restype = ctypes.c_int
+        result = rename_exclusive(
+            ctypes.c_char_p(os.fsencode(source)),
+            ctypes.c_char_p(os.fsencode(target)),
+            ctypes.c_uint(0x00000004),
+        )
+        if result != 0:
+            _raise_move_error(ctypes.get_errno(), target)
+    elif sys.platform.startswith("linux"):
+        library = ctypes.CDLL(None, use_errno=True)
+        rename_no_replace = getattr(library, "renameat2", None)
+        if rename_no_replace is None:
+            raise OSError(errno.ENOTSUP, "renameat2 is unavailable for no-replace move")
+        rename_no_replace.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_no_replace.restype = ctypes.c_int
+        result = rename_no_replace(
+            ctypes.c_int(-100),
+            ctypes.c_char_p(os.fsencode(source)),
+            ctypes.c_int(-100),
+            ctypes.c_char_p(os.fsencode(target)),
+            ctypes.c_uint(1),
+        )
+        if result != 0:
+            _raise_move_error(ctypes.get_errno(), target)
+    elif os.name == "nt":
+        _move_windows_path_new(source, target)
+    else:
+        raise OSError(errno.ENOTSUP, "no atomic no-replace move primitive is available")
+    if os.name != "nt":
+        _fsync_directory(target.parent)
+
+
+def _publish_new_by_move(
+    source: Path,
+    target: Path,
+    *,
+    identity: tuple[int, int],
+) -> tuple[int, int]:
+    try:
+        move_no_replace(source, target)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        source_matches = _path_matches_identity(source, identity)
+        target_matches = _path_matches_identity(target, identity)
+        if target_matches and not source_matches:
+            raise DurablePublishError(
+                f"target is visible at {target}, but publication durability is unconfirmed; "
+                f"the staged path was consumed: {exc}",
+                outcome=PublishOutcome.COMMITTED,
+            ) from exc
+        target_absent = _path_absent(target)
+        if source_matches and target_absent:
+            detail = (
+                "filesystem does not support atomic no-clobber publication"
+                if exc.errno in _UNSUPPORTED_MOVE_ERRORS
+                else "atomic no-clobber publication failed before the target became visible"
+            )
+            raise DurablePublishError(
+                f"{detail} for {target}: {exc}",
+                outcome=PublishOutcome.UNPUBLISHED,
+            ) from exc
+        raise DurablePublishError(
+            f"atomic no-clobber publication has an unknown outcome for {target}; inspect "
+            f"{source} and {target} before retrying: {exc}",
+            outcome=PublishOutcome.UNKNOWN,
+        ) from exc
+    return identity
+
+
+_UNSUPPORTED_MOVE_ERRORS = {
+    errno.ENOSYS,
+    errno.ENOTSUP,
+    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+}
+
+
+def _raise_move_error(error: int, target: Path) -> None:
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error, "publish target already exists", str(target))
+    raise OSError(error, "could not move path without replacement", str(target))
+
+
+def _windows_move_kernel32() -> Any:
+    loader = ctypes.__dict__.get("WinDLL")
+    if not callable(loader):
+        raise OSError(errno.ENOTSUP, "Windows atomic move APIs are unavailable")
+    kernel32 = loader("kernel32", use_last_error=True)
+    kernel32.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    kernel32.MoveFileExW.restype = wintypes.BOOL
+    return kernel32
+
+
+def _windows_last_error() -> int:
+    getter = ctypes.__dict__.get("get_last_error")
+    if not callable(getter):  # pragma: no cover - only reachable on a broken Windows runtime
+        return errno.EIO
+    return int(getter())
+
+
+def _move_windows_path_new(source: Path, target: Path) -> None:
+    kernel32 = _windows_move_kernel32()
+    moved = kernel32.MoveFileExW(str(source), str(target), 0x00000008)
+    if moved:
+        return
+    error = _windows_last_error()
+    if error in {80, 183}:
+        raise FileExistsError(error, "publish target already exists", str(target))
+    if error in {1, 50}:
+        error = errno.ENOTSUP
+    raise OSError(error, "could not move path without replacement", str(target))
+
+
+def _path_matches_identity(path: Path, identity: tuple[int, int]) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return False
+    return (metadata.st_dev, metadata.st_ino) == identity
+
+
+def _path_absent(path: Path) -> bool:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def append_durable(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    """Append to an existing file or report restored, committed, or unknown state."""
+
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0))
+    except Exception as exc:
+        raise DurableAppendError(
+            "could not open the existing append target", outcome=AppendOutcome.RESTORED
+        ) from exc
+    try:
+        original_size = os.fstat(descriptor).st_size
+    except Exception as exc:
+        with suppress(OSError):
+            os.close(descriptor)
+        raise DurableAppendError(
+            "could not inspect the append target", outcome=AppendOutcome.RESTORED
+        ) from exc
     try:
         _write_all(descriptor, content)
         os.fsync(descriptor)
-    finally:
+    except Exception as exc:
+        try:
+            os.ftruncate(descriptor, original_size)
+            os.fsync(descriptor)
+        except Exception as rollback_exc:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise DurableAppendError(
+                "append failed and the previous bytes could not be restored",
+                outcome=AppendOutcome.UNKNOWN,
+            ) from rollback_exc
+        with suppress(OSError):
+            os.close(descriptor)
+        raise DurableAppendError(
+            "append failed and the previous bytes were restored",
+            outcome=AppendOutcome.RESTORED,
+        ) from exc
+    try:
         os.close(descriptor)
+    except Exception as exc:
+        raise DurableAppendError(
+            "append was synchronized but descriptor close failed",
+            outcome=AppendOutcome.COMMITTED,
+        ) from exc
+
+
+def durable_unlink(path: Path) -> None:
+    """Remove one file and persist the containing directory entry where supported."""
+
+    path.unlink()
+    _fsync_directory(path.parent)
 
 
 def _write_all(descriptor: int, content: bytes) -> None:

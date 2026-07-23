@@ -7,6 +7,9 @@ the same build and acceptance matrix without publishing, so every target can be
 proved before the first tag. The workflow installs the locked development and
 release environments, runs lint, formatting, strict typing, tests, coverage,
 the privacy gate, and package builds before producing native executables.
+The quality job also installs an isolated Chromium runtime and drives the real
+bearer-gated Bridge through healthy, inspector, mobile, stale, and unavailable
+states. The gate persists no screenshots, GIFs, or other generated media.
 
 ## Assets
 
@@ -45,21 +48,17 @@ An asset is not release-ready until its exact bytes pass:
    backup verification, logical restore equivalence, and full uninstall while
    preserving user data.
 6. Native two-session Codex resume on at least the promoted desktop platform.
-7. Independent final review with every finding explicitly dispositioned.
+7. Authenticated Bridge lifecycle, browser-error resilience, packaged static
+   resources, and real desktop/mobile/stale/unavailable rendering.
+8. Reinstall over a verified live Bridge, with old-process exit, a fresh
+   candidate instance, and unchanged vault digest.
+9. Independent final review with every finding explicitly dispositioned.
 
 CI can exercise the local Codex CLI contract with synthetic roots. A native
 model-backed Codex session depends on runner authentication and is therefore a
-release-promotion proof, not a unit-test substitute.
-
-For a one-time local native-session proof, `--codex-auth-from` plus the required
-`--acknowledge-auth-copy-risk` flag copies the chosen Codex `auth.json` into an
-isolated, mode-0600 Codex home and removes it in a `finally` block. The source
-file is digest-checked for local mutation. A forced process kill can still
-leave the temporary copy until that isolated root is deleted, and a copied
-refresh token may be rotated remotely and invalidate the real session even
-when the source bytes are unchanged. This is an explicitly accepted maintainer
-test-harness limitation, not a product invariant; never use the bridge in
-shared CI.
+release-promotion proof, not a unit-test substitute. Authenticate the isolated
+Codex home directly for that proof; the harness has no credential-copy path.
+Never copy or use live Codex authentication in shared CI.
 
 ## Signing
 
@@ -71,7 +70,9 @@ The build must never persist signing credentials in the repository or artifact.
 Publishing a repository, tag, release, or package is an external action and is
 separate from local release validation.
 
-At this release-candidate checkpoint, only the local macOS Apple Silicon asset
-has completed the full native two-session proof. Public multi-platform support
-requires a green manual hosted-runner matrix and remains unclaimed until that
-evidence exists.
+At this release-candidate checkpoint, the exact local macOS Apple Silicon asset
+has passed two independent MCP-process sessions and installed Codex
+integration/manifest checks. It has not passed a model-backed native second
+Codex task. That remains a release-promotion gate, along with a green manual
+hosted-runner matrix; public multi-platform support remains unclaimed until the
+corresponding evidence exists.

@@ -1,4 +1,4 @@
-.PHONY: install test lint typecheck check build standalone privacy e2e
+.PHONY: install test lint typecheck check build standalone privacy e2e browser
 
 E2E_BINARY ?= dist/gsv
 
@@ -20,6 +20,9 @@ privacy:
 
 e2e:
 	uv run python scripts/e2e_clean_install.py --binary "$(E2E_BINARY)"
+
+browser:
+	uv run python scripts/verify_bridge_browser.py
 
 check: lint typecheck test privacy
 

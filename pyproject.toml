@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gsv"
-version = "0.1.0"
+version = "0.2.0"
 description = "A local-first durable state layer for coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,6 +30,9 @@ dev = [
   "pytest>=8.3",
   "pytest-cov>=6.0",
   "ruff>=0.11",
+]
+browser-test = [
+  "playwright>=1.52,<2",
 ]
 release = [
   "pyinstaller>=6.11,<7",
@@ -61,6 +64,10 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 python_version = "3.11"
 strict = true
 packages = ["continuity_kernel"]
+
+[[tool.mypy.overrides]]
+module = "playwright.*"
+ignore_missing_imports = true
 
 [tool.coverage.run]
 branch = true

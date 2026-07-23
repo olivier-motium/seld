@@ -32,6 +32,24 @@ TASK_STATUSES: Final = frozenset(
 TERMINAL_TASK_STATUSES: Final = frozenset({"done", "dropped"})
 ACTORS: Final = frozenset({"agent", "human", "external"})
 THREAD_STATUSES: Final = frozenset({"active", "waiting", "dormant", "closed"})
+WINDOWS_RESERVED_NAMES: Final = frozenset(
+    {
+        "aux",
+        "con",
+        "conin$",
+        "conout$",
+        "nul",
+        "prn",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+        "com¹",
+        "com²",
+        "com³",
+        "lpt¹",
+        "lpt²",
+        "lpt³",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -95,8 +113,13 @@ def new_task(
     observed_at: datetime | None = None,
 ) -> Task:
     now = format_time(observed_at or datetime.now(UTC))
+    identifier = task_id(identifier)
+    if identifier.rstrip(" .").casefold() in WINDOWS_RESERVED_NAMES:
+        raise ValidationError(
+            "task ID is reserved by Windows; choose a portable identifier before creating it"
+        )
     task = Task(
-        identifier=task_id(identifier),
+        identifier=identifier,
         title=title_text(title),
         status=task_status(status),
         next_actor=actor(next_actor),

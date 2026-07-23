@@ -8,8 +8,10 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from continuity_kernel.atomic import atomic_write
+from continuity_kernel.atomic import atomic_write, durable_unlink, exclusive_lock, read_regular_file
 from continuity_kernel.errors import SetupError, ValidationError
+
+CONFIG_MAX_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -19,7 +21,13 @@ class Config:
 
     @property
     def vault_path(self) -> Path:
-        return Path(self.vault).expanduser().resolve()
+        return _resolve_configured_vault(self.vault)
+
+
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    exists: bool
+    encoded: bytes
 
 
 def config_dir() -> Path:
@@ -56,27 +64,50 @@ def config_path() -> Path:
     return config_dir() / "config.json"
 
 
+def _config_lock_path() -> Path:
+    return config_dir() / "locks/config.lock"
+
+
 def load_config(*, required: bool = True) -> Config | None:
     path = config_path()
-    if not path.exists():
-        if required:
-            raise SetupError("GSV is not configured. Run `gsv setup` first.")
-        return None
-    if path.is_symlink():
-        raise ValidationError(f"configuration cannot be a symbolic link: {path}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        encoded = read_regular_file(
+            path,
+            label="GSV configuration",
+            max_bytes=CONFIG_MAX_BYTES,
+        )
+    except ValidationError as exc:
+        if not os.path.lexists(path):
+            if required:
+                raise SetupError("GSV is not configured. Run `gsv setup` first.") from None
+            return None
+        raise ValidationError(f"invalid GSV configuration: {path}") from exc
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValidationError(f"invalid GSV configuration: {path}") from exc
     if not isinstance(payload, dict) or payload.get("format_version") != 1:
         raise ValidationError("unsupported GSV configuration version")
     vault = payload.get("vault")
     if not isinstance(vault, str) or not vault.strip():
         raise ValidationError("GSV configuration has no valid vault path")
-    return Config(format_version=1, vault=vault)
+    return Config(format_version=1, vault=str(_resolve_configured_vault(vault)))
+
+
+def _resolve_configured_vault(value: str) -> Path:
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ValidationError("GSV configuration has an invalid vault path") from exc
 
 
 def save_config(vault: Path) -> Config:
+    with exclusive_lock(_config_lock_path()):
+        config, _ = _save_config_unlocked(vault)
+    return config
+
+
+def _save_config_unlocked(vault: Path) -> tuple[Config, bytes]:
     target = config_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -84,7 +115,51 @@ def save_config(vault: Path) -> Config:
     config = Config(format_version=1, vault=str(vault.expanduser().resolve()))
     encoded = (json.dumps(asdict(config), indent=2, sort_keys=True) + "\n").encode()
     atomic_write(target, encoded)
-    return config
+    return config, encoded
+
+
+def _capture_config_unlocked() -> ConfigSnapshot:
+    path = config_path()
+    if not os.path.lexists(path):
+        return ConfigSnapshot(False, b"")
+    return ConfigSnapshot(
+        True,
+        read_regular_file(path, label="GSV configuration", max_bytes=CONFIG_MAX_BYTES),
+    )
+
+
+def activate_config(vault: Path) -> tuple[Config, ConfigSnapshot, bytes]:
+    """Install setup configuration and return one exact rollback checkpoint."""
+
+    with exclusive_lock(_config_lock_path()):
+        previous = _capture_config_unlocked()
+        config, installed = _save_config_unlocked(vault)
+    return config, previous, installed
+
+
+def restore_config(snapshot: ConfigSnapshot, *, expected: bytes) -> str | None:
+    """Restore a snapshot only when the setup-owned bytes are still present."""
+
+    path = config_path()
+    try:
+        with exclusive_lock(_config_lock_path()):
+            if not os.path.lexists(path):
+                current = b""
+            else:
+                current = read_regular_file(
+                    path,
+                    label="GSV configuration",
+                    max_bytes=CONFIG_MAX_BYTES,
+                )
+            if current != expected:
+                return "GSV configuration changed concurrently and was left untouched"
+            if snapshot.exists:
+                atomic_write(path, snapshot.encoded)
+            elif os.path.lexists(path):
+                durable_unlink(path)
+        return None
+    except (OSError, ValidationError) as exc:
+        return f"could not restore the previous GSV configuration: {exc}"
 
 
 def resolve_vault(explicit: str | Path | None = None, *, require_config: bool = True) -> Path:

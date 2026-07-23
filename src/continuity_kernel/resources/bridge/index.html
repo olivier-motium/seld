@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#ffffff">
+    <title>GSV Bridge</title>
+    <meta name="description" content="The human surface for your local GSV Mind.">
+    <link rel="icon" href="/static/gsv-mark.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/bridge.css">
+    <link rel="stylesheet" href="/static/bridge-components.css">
+    <link rel="stylesheet" href="/static/bridge-responsive.css">
+    <script type="module" src="/static/bridge.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <div class="shell" id="shell">
+      <aside class="rail" id="rail" aria-label="GSV Bridge">
+        <a class="brand" href="#now" data-view-link="now" aria-label="GSV Bridge home">
+          <img src="/static/gsv-mark.svg" width="20" height="20" alt="">
+          <span>GSV Bridge</span>
+        </a>
+
+        <nav class="nav" aria-label="Bridge views">
+          <button class="nav-item is-active" type="button" data-view="now" aria-current="page">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <circle cx="12" cy="12" r="10"></circle><path d="M12 6v6h4"></path>
+            </svg>
+            <span class="nav-copy">Now</span>
+          </button>
+          <button class="nav-item" type="button" data-view="commitments">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M21 10.656V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h12.344"></path>
+              <path d="m9 11 3 3L22 4"></path>
+            </svg>
+            <span class="nav-copy">Commitments</span>
+            <span class="nav-count" id="task-count" hidden></span>
+          </button>
+          <button class="nav-item" type="button" data-view="storylines">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <circle cx="6" cy="19" r="3"></circle>
+              <path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"></path>
+              <circle cx="18" cy="5" r="3"></circle>
+            </svg>
+            <span class="nav-copy">Storylines</span>
+          </button>
+          <span class="nav-label">The vehicle</span>
+          <button class="nav-item" type="button" data-view="mind">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"></path>
+              <path d="M9 13a4.5 4.5 0 0 0 3-4M6.003 5.125A3 3 0 0 0 6.401 6.5M3.477 10.896a4 4 0 0 1 .585-.396M6 18a4 4 0 0 1-1.967-.516M12 13h4M12 18h6a2 2 0 0 1 2 2v1M12 8h8M16 8V5a2 2 0 0 1 2-2"></path>
+              <circle cx="16" cy="13" r=".5"></circle><circle cx="18" cy="3" r=".5"></circle><circle cx="20" cy="21" r=".5"></circle><circle cx="20" cy="8" r=".5"></circle>
+            </svg>
+            <span class="nav-copy">Mind</span>
+          </button>
+          <button class="nav-item" type="button" data-view="system">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M14 17H5M19 7h-9"></path><circle cx="17" cy="17" r="3"></circle><circle cx="7" cy="7" r="3"></circle>
+            </svg>
+            <span class="nav-copy">System</span>
+          </button>
+        </nav>
+
+        <div class="rail-foot">
+          <span class="private-dot" aria-hidden="true"></span>
+          <span>Private local session</span>
+        </div>
+      </aside>
+
+      <button class="rail-backdrop" id="rail-backdrop" type="button" aria-label="Close navigation" hidden></button>
+
+      <div class="workspace">
+        <header class="topbar">
+          <button class="menu-button" id="menu-button" type="button" aria-label="Open navigation" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M9 3v18"></path>
+            </svg>
+          </button>
+          <div class="local-status" id="local-status" role="status">
+            <canvas class="thinking-orb" id="connection-orb" width="20" height="20" data-orb-state="searching" role="img" aria-label="Reading local GSV"></canvas>
+            <span class="status-dot" aria-hidden="true" hidden></span>
+            <span id="local-status-copy">Reading local GSV</span>
+          </div>
+          <a class="codex-link" id="open-codex" hidden>
+            <span>New Codex hand</span>
+            <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            </svg>
+          </a>
+        </header>
+
+        <main class="main" id="main" tabindex="-1">
+          <header class="page-heading">
+            <p class="eyebrow">The agent is not the thread.</p>
+            <h1 id="page-title">Your Mind, between tasks.</h1>
+            <p class="page-intro" id="page-intro">Current orientation and the work that survives every hand.</p>
+          </header>
+
+          <div class="connection-notice" id="connection-notice" role="status" hidden>
+            <span id="connection-copy">The local vault could not be read.</span>
+            <button type="button" id="retry-button">Try again</button>
+          </div>
+
+          <section class="view" id="view" aria-busy="true">
+            <div class="loading-state">
+              <span class="loading-line is-wide"></span>
+              <span class="loading-line"></span>
+              <span class="loading-line is-short"></span>
+            </div>
+          </section>
+        </main>
+      </div>
+
+      <aside class="inspector" id="inspector" role="dialog" aria-modal="true" aria-label="Commitment details" aria-hidden="true">
+        <header class="inspector-head">
+          <div>
+            <p class="eyebrow" id="inspector-eyebrow">Commitment</p>
+            <h2 id="inspector-title">Nothing selected</h2>
+          </div>
+          <button class="close-button" id="close-inspector" type="button" aria-label="Close details">&#215;</button>
+        </header>
+        <div class="inspector-body" id="inspector-body"></div>
+        <footer class="inspector-foot" id="inspector-foot" hidden>
+          <a class="primary-action" id="continue-in-codex">
+            Open in new Codex hand <span aria-hidden="true">&#8599;</span>
+          </a>
+        </footer>
+      </aside>
+      <button class="inspector-backdrop" id="inspector-backdrop" type="button" aria-label="Close details" hidden></button>
+    </div>
+
+    <noscript>
+      <main class="noscript">
+        <h1>GSV Bridge needs JavaScript.</h1>
+        <p>Your local Markdown vault remains intact and available to Codex.</p>
+      </main>
+    </noscript>
+  </body>
+</html>

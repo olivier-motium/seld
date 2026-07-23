@@ -1,15 +1,10 @@
 #!/bin/sh
 set -eu
 
-VERSION="${GSV_VERSION:-0.1.0}"
+VERSION="${GSV_VERSION:-0.2.0}"
 RELEASE_BASE="${GSV_RELEASE_BASE_URL:-https://github.com/olivier-motium/gsv/releases/download/v${VERSION}}"
 INSTALL_DIR="${GSV_BIN_DIR:-${HOME}/.local/bin}"
 TARGET="${INSTALL_DIR}/gsv"
-
-if ! command -v codex >/dev/null 2>&1; then
-  printf '%s\n' "Codex CLI was not found on PATH. Install Codex Desktop or the Codex CLI first." >&2
-  exit 2
-fi
 
 case "$(uname -s)" in
   Darwin) platform="macos" ;;
@@ -25,7 +20,17 @@ esac
 
 asset="gsv-${platform}-${architecture}"
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/gsv-install.XXXXXX")"
-trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+staged=""
+backup=""
+preserve_backup=0
+cleanup() {
+  rm -rf "$temporary"
+  [ -z "$staged" ] || rm -f "$staged"
+  if [ "$preserve_backup" -eq 0 ] && [ -n "$backup" ]; then
+    rm -f "$backup"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
 download="${temporary}/${asset}"
 
 if [ -n "${GSV_BINARY:-}" ]; then
@@ -66,12 +71,39 @@ if [ -L "$TARGET" ]; then
 fi
 staged="$(mktemp "${INSTALL_DIR}/.gsv.new.XXXXXX")"
 install -m 0755 "$download" "$staged"
-backup=""
+if ! "$staged" --version >/dev/null; then
+  rm -f "$staged"
+  printf '%s\n' "The staged GSV executable did not pass its version preflight." >&2
+  exit 2
+fi
+prior_bridge_stopped=0
 if [ -e "$TARGET" ]; then
   backup="$(mktemp "${INSTALL_DIR}/.gsv.previous.XXXXXX")"
   cp -p "$TARGET" "$backup"
+  set +e
+  stop_output="$("$staged" --json bridge stop)"
+  stop_status=$?
+  set -e
+  if [ "$stop_status" -ne 0 ]; then
+    rm -f "$backup" "$staged"
+    printf '%s\n' "The existing Bridge could not be verified and stopped; the installed executable was left untouched." >&2
+    exit "$stop_status"
+  fi
+  case "$stop_output" in
+    *'"ok":true'*'"stopped":true'*) prior_bridge_stopped=1 ;;
+    *'"ok":true'*) ;;
+    *)
+      rm -f "$backup" "$staged"
+      printf '%s\n' "The staged GSV executable returned an invalid Bridge stop result." >&2
+      exit 2
+      ;;
+  esac
 fi
 if ! mv "$staged" "$TARGET"; then
+  if [ "$prior_bridge_stopped" -eq 1 ]; then
+    "$TARGET" --json bridge open --no-browser >/dev/null 2>&1 || \
+      printf '%s\n' "Warning: the previous Bridge could not be restarted after install replacement failed." >&2
+  fi
   [ -z "$backup" ] || rm -f "$backup"
   printf '%s\n' "Could not atomically install the GSV executable." >&2
   exit 2
@@ -82,12 +114,36 @@ set +e
 setup_status=$?
 set -e
 if [ "$setup_status" -ne 0 ]; then
+  set +e
+  cleanup_output="$("$TARGET" --json bridge stop 2>/dev/null)"
+  cleanup_status=$?
+  set -e
+  if [ "$cleanup_status" -eq 0 ]; then
+    case "$cleanup_output" in
+      *'"ok":true'*) ;;
+      *) cleanup_status=2 ;;
+    esac
+  fi
+  if [ "$cleanup_status" -ne 0 ]; then
+    if [ -n "$backup" ]; then
+      preserve_backup=1
+      printf '%s\n' "GSV setup failed and its Bridge stop could not be verified (exit $cleanup_status); the previous executable remains staged at $backup." >&2
+    else
+      printf '%s\n' "GSV setup failed and its Bridge stop could not be verified (exit $cleanup_status); the candidate executable was left in place." >&2
+    fi
+    exit "$setup_status"
+  fi
   if [ -n "$backup" ] && [ -e "$backup" ]; then
     mv "$backup" "$TARGET"
   else
     rm -f "$TARGET"
   fi
-  printf '%s\n' "GSV setup failed; the previous executable was restored." >&2
+  if [ "$prior_bridge_stopped" -eq 1 ]; then
+    if ! "$TARGET" --json bridge open --no-browser >/dev/null 2>&1; then
+      printf '%s\n' "Warning: the previous executable was restored, but its Bridge could not be restarted." >&2
+    fi
+  fi
+  printf '%s\n' "GSV setup failed; the previous executable was restored and its Bridge restart was attempted." >&2
   exit "$setup_status"
 fi
 if [ -n "$backup" ] && [ -e "$backup" ]; then
@@ -99,4 +155,5 @@ case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *) printf 'Add %s to PATH to run gsv directly in future shells.\n' "$INSTALL_DIR" ;;
 esac
+printf '%s\n' "The Bridge is ready. Run gsv anytime to reopen it."
 printf '%s\n' "Restart Codex, open a fresh task, and ask: What do you remember?"

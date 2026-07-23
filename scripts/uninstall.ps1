@@ -11,9 +11,33 @@ if (-not (Test-Path -LiteralPath $Target -PathType Leaf)) {
     throw "GSV executable not found at $Target"
 }
 
-& $Target codex uninstall @args
+& $Target bridge stop | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    throw "GSV integration uninstall failed with exit code $LASTEXITCODE."
+    throw "GSV Bridge stop failed with exit code $LASTEXITCODE."
+}
+$CleanupOutput = (& $Target --json codex uninstall @args | Out-String).Trim()
+$CleanupStatus = $LASTEXITCODE
+Write-Output $CleanupOutput
+try {
+    $CleanupPayload = $CleanupOutput | ConvertFrom-Json
+} catch {
+    throw "GSV cleanup output was not valid JSON. The executable was kept."
+}
+if (
+    $CleanupPayload.result.integration_removed -eq $true -and
+    $CleanupPayload.result.recovery_retained -eq $true
+) {
+    Write-Host "Active GSV integration was removed, but receipt-bound recovery evidence remains. The executable was kept. Inspect and delete only the exact retained_cleanup_paths printed above, then re-run this uninstaller to retire the catalog safely."
+    exit 3
+}
+if ($CleanupStatus -ne 0) {
+    throw "GSV cleanup is incomplete (exit $CleanupStatus). The executable was kept so you can run the printed retry command."
+}
+if (
+    $CleanupPayload.ok -ne $true -or
+    $CleanupPayload.result.cleanup_complete -ne $true
+) {
+    throw "GSV cleanup output did not verify ok:true and result.cleanup_complete:true. The executable was kept."
 }
 Remove-Item -LiteralPath $Target -Force
-Write-Host "Removed the GSV executable and Codex integration. Vault and config were preserved."
+Write-Host "Removed the GSV executable and verified GSV-owned integration. Vault and config were preserved."

@@ -19,5 +19,17 @@ class NotFoundError(ContinuityError):
     """A requested record does not exist."""
 
 
+class PersistenceError(ContinuityError):
+    """A mutation could not return an ordinary success after persistence work."""
+
+
+class MutationCommittedError(PersistenceError):
+    """A mutation committed, but a later persistence cleanup step failed."""
+
+
+class DegradedIntegrityError(PersistenceError):
+    """A persistence failure could not be rolled back to a known-good state."""
+
+
 class SetupError(ContinuityError):
     """Installation or integration could not be completed safely."""

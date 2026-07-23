@@ -4,19 +4,35 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
 from continuity_kernel import __version__
-from continuity_kernel.atomic import atomic_write
+from continuity_kernel.bridge import (
+    bridge_status,
+    open_bridge,
+    open_bridge_in_browser,
+    serve_bridge,
+    stop_bridge,
+)
 from continuity_kernel.codex_integration import (
     codex_status,
     install_codex,
+    install_codex_transaction,
     uninstall_codex,
 )
-from continuity_kernel.config import codex_home, config_path, resolve_vault, save_config
+from continuity_kernel.config import (
+    activate_config,
+    codex_home,
+    load_config,
+    resolve_vault,
+    restore_config,
+    save_config,
+)
 from continuity_kernel.demo import run_demo
 from continuity_kernel.errors import ContinuityError, SetupError
 from continuity_kernel.mcp_server import serve
@@ -27,14 +43,29 @@ from continuity_kernel.vault import Vault, doctor_dict
 def main(arguments: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(arguments)
-    if not getattr(args, "command", None):
-        parser.print_help()
-        return 0
     try:
+        if not getattr(args, "command", None):
+            if load_config(required=False) is None:
+                parser.print_help()
+                return 0
+            args.command = "bridge"
+            args.bridge_command = "open"
+            args.no_browser = False
         if args.command == "mcp":
-            return serve()
+            return serve(Vault(resolve_vault(getattr(args, "vault", None))))
         result = _dispatch(args)
-        _print(result, json_output=args.json, raw=getattr(args, "raw", False))
+        failure = _result_failure(args, result)
+        _print(
+            result,
+            json_output=args.json,
+            raw=getattr(args, "raw", False),
+            ok=failure is None,
+            error=failure[1] if failure is not None else None,
+        )
+        if failure is not None:
+            if not args.json:
+                print(f"Error: {failure[1]}", file=sys.stderr)
+            return failure[0]
         return 0
     except ContinuityError as exc:
         if getattr(args, "json", False):
@@ -50,32 +81,56 @@ def _dispatch(args: argparse.Namespace) -> Any:
         vault_path = resolve_vault(explicit_vault, require_config=False)
         vault = Vault(vault_path)
         initialized = vault.initialize(name=args.name, command="gsv")
-        configuration = config_path()
-        previous_config_exists = configuration.exists()
-        previous_config = configuration.read_bytes() if previous_config_exists else b""
-        save_config(vault_path)
-        installed_config = configuration.read_bytes()
-        integration = None
-        try:
-            if not args.no_codex:
-                integration = asdict(
-                    install_codex(vault=vault_path, codex_home=Path(args.codex_home))
-                )
-        except Exception as exc:
-            rollback_error = _restore_setup_config(
-                configuration,
-                previous_exists=previous_config_exists,
-                previous=previous_config,
-                installed=installed_config,
-            )
-            if rollback_error is not None:
-                raise SetupError(f"{exc}; {rollback_error}") from exc
-            raise
         doctor = doctor_dict(vault.doctor())
+        if not doctor["healthy"]:
+            return {
+                "bridge": None,
+                "codex": None,
+                "doctor": doctor,
+                "next": _doctor_next(vault_path, doctor),
+                "setup_complete": False,
+                "vault": initialized,
+            }
+        _, previous_config, installed_config = activate_config(vault_path)
+        integration = None
+        bridge = None
+        try:
+            if args.no_codex:
+                if not args.no_bridge:
+                    bridge = open_bridge(vault, open_browser=False)
+            else:
+                with install_codex_transaction(
+                    vault=vault_path, codex_home=Path(args.codex_home)
+                ) as staged:
+                    integration = asdict(staged)
+                    if not args.no_bridge:
+                        bridge = open_bridge(vault, open_browser=False)
+            if bridge is not None and not args.no_browser:
+                browser_opened = open_bridge_in_browser(vault)
+                bridge = {**bridge, "browser_opened": browser_opened}
+        except Exception as exc:
+            cleanup_error: Exception | None = None
+            if bridge is not None and bridge.get("started"):
+                try:
+                    stop_bridge()
+                except Exception as stop_exc:
+                    cleanup_error = stop_exc
+            rollback_error = restore_config(previous_config, expected=installed_config)
+            details = [str(item) for item in (cleanup_error, rollback_error) if item]
+            if details:
+                raise SetupError(f"{exc}; {'; '.join(details)}") from exc
+            raise
         return {
+            "bridge": bridge,
             "codex": integration,
             "doctor": doctor,
-            "next": "Restart Codex, then open a new task and ask: What do you remember?",
+            "next": _setup_next(
+                no_codex=args.no_codex,
+                no_bridge=args.no_bridge,
+                no_browser=args.no_browser,
+                bridge=bridge,
+            ),
+            "setup_complete": True,
             "vault": initialized,
         }
 
@@ -97,6 +152,60 @@ def _dispatch(args: argparse.Namespace) -> Any:
         if args.codex_command == "uninstall":
             return uninstall_codex(codex_home=home)
         raise AssertionError("unreachable Codex command")
+    if args.command == "bridge":
+        if args.bridge_command == "status":
+            return bridge_status()
+        if args.bridge_command == "stop":
+            return stop_bridge()
+        vault = Vault(resolve_vault(explicit_vault))
+        if args.bridge_command == "open":
+            return open_bridge(vault, open_browser=not args.no_browser)
+        if args.bridge_command == "serve":
+            return {
+                "port": serve_bridge(
+                    vault,
+                    port=args.port,
+                    instance_id=args.instance_id,
+                ),
+                "stopped": True,
+            }
+        raise AssertionError("unreachable Bridge command")
+    if args.command == "backup":
+        if args.backup_command == "verify":
+            return Vault.verify_backup(Path(args.path))
+        if args.backup_command == "restore":
+            restored = Vault.restore_backup(Path(args.path), Path(args.target))
+            restored_path = Path(restored["restored"])
+            configuration_matches = _configuration_matches_target(restored_path)
+            setup_command = f"gsv --vault {shlex.quote(str(restored_path))} setup"
+            status_command = f"gsv --vault {shlex.quote(str(restored_path))} status"
+            if configuration_matches is True:
+                availability = (
+                    "The restored vault is usable now with the explicit status command, and the "
+                    "existing configuration already points to it."
+                )
+            elif configuration_matches is False:
+                availability = (
+                    "The restored vault is usable now with the explicit status command; the "
+                    "existing configuration was not changed."
+                )
+            else:
+                availability = (
+                    "The restored vault is usable now with the explicit status command. The "
+                    "existing configuration could not be read safely and was not changed."
+                )
+            return {
+                **restored,
+                "activation_commands": ["gsv bridge stop", setup_command],
+                "activation_required": True,
+                "configuration_changed": False,
+                "configuration_matches_target": configuration_matches,
+                "next": (
+                    f"{availability} Run `{status_command}` to inspect it. To bind Codex plus The "
+                    "Bridge to this restored vault, first run `gsv bridge stop`; after it confirms "
+                    f"the old Bridge stopped, run `{setup_command}`."
+                ),
+            }
 
     vault = Vault(resolve_vault(explicit_vault))
     if args.command == "status":
@@ -127,27 +236,91 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "backup":
         if args.backup_command == "create":
             return vault.create_backup(Path(args.output) if args.output else None)
-        if args.backup_command == "verify":
-            return Vault.verify_backup(Path(args.path))
-        if args.backup_command == "restore":
-            return Vault.restore_backup(Path(args.path), Path(args.target))
+        raise AssertionError("unreachable backup command")
     raise AssertionError("unreachable command")
 
 
-def _restore_setup_config(
-    path: Path, *, previous_exists: bool, previous: bytes, installed: bytes
-) -> str | None:
-    try:
-        current = path.read_bytes() if path.exists() else b""
-        if current != installed:
-            return "GSV configuration changed concurrently and was left untouched"
-        if previous_exists:
-            atomic_write(path, previous)
-        elif path.exists():
-            path.unlink()
+def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | None:
+    if not isinstance(result, dict):
         return None
-    except OSError as exc:
-        return f"could not restore the previous GSV configuration: {exc}"
+    if args.command == "setup" and result.get("setup_complete") is False:
+        return 3, "GSV setup stopped because the vault is unhealthy; follow result.next."
+    if args.command == "doctor" and result.get("healthy") is False:
+        return 3, "GSV doctor found unresolved integrity issues; follow result.issues."
+    if (
+        args.command == "backup"
+        and args.backup_command == "verify"
+        and result.get("valid") is False
+    ):
+        return 3, "GSV backup verification failed; do not restore this archive."
+    if (
+        args.command == "backup"
+        and args.backup_command == "create"
+        and result.get("verified") is False
+    ):
+        return 3, "GSV backup creation did not verify; do not use the reported archive."
+    if (
+        args.command == "codex"
+        and args.codex_command == "uninstall"
+        and result.get("cleanup_complete") is False
+    ):
+        return 3, "GSV cleanup is incomplete; follow result.next and retry."
+    return None
+
+
+def _configuration_matches_target(target: Path) -> bool | str:
+    try:
+        configuration = load_config(required=False)
+        if configuration is None:
+            return False
+        configured = configuration.vault_path
+        if configured == target:
+            return True
+        return (
+            os.path.samefile(configured, target)
+            if configured.exists() and target.exists()
+            else False
+        )
+    except (ContinuityError, OSError, UnicodeError, ValueError, RuntimeError):
+        return "unknown"
+
+
+def _doctor_next(vault_path: Path, doctor: dict[str, Any]) -> str:
+    command = f"gsv --vault {shlex.quote(str(vault_path))} doctor"
+    issues = doctor.get("issues")
+    repairable = isinstance(issues, list) and any(
+        isinstance(issue, dict) and issue.get("repairable") is True for issue in issues
+    )
+    if repairable:
+        return f"Run `{command} --repair`, then run `{command}` and inspect any remaining issues."
+    return f"Inspect the reported issues, then run `{command}` again."
+
+
+def _setup_next(
+    *,
+    no_codex: bool,
+    no_bridge: bool,
+    no_browser: bool,
+    bridge: dict[str, Any] | None,
+) -> str:
+    steps: list[str] = []
+    if no_bridge:
+        steps.append("The Bridge was not started.")
+    elif no_browser:
+        steps.append("The Bridge is running locally; run `gsv` when you want to open it.")
+    elif bridge is not None and bridge.get("browser_opened") is True:
+        steps.append("The Bridge is open.")
+    else:
+        steps.append("The Bridge is running; run `gsv` to open it.")
+
+    if no_codex:
+        steps.append(
+            "Codex integration was skipped; run `gsv codex install` when you want a new "
+            "Codex hand to load this vault."
+        )
+    else:
+        steps.append("Restart Codex, then open a fresh task and ask: What do you remember?")
+    return " ".join(steps)
 
 
 def _task(vault: Vault, args: argparse.Namespace) -> Any:
@@ -270,6 +443,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     setup.add_argument("--name", default="My GSV")
     setup.add_argument("--codex-home", default=str(codex_home()))
+    setup.add_argument("--no-bridge", action="store_true")
+    setup.add_argument("--no-browser", action="store_true")
     setup.add_argument("--no-codex", action="store_true")
 
     init = commands.add_parser("init", help="Initialize a vault without changing Codex.")
@@ -376,6 +551,16 @@ def _parser() -> argparse.ArgumentParser:
     demo = commands.add_parser("demo", help="Run the complete synthetic GSV proof.")
     demo.add_argument("--output")
 
+    bridge = commands.add_parser("bridge", help="Open or inspect the local GSV Bridge.")
+    bridge_commands = bridge.add_subparsers(dest="bridge_command", required=True)
+    bridge_open = bridge_commands.add_parser("open", help="Open The Bridge in your browser.")
+    bridge_open.add_argument("--no-browser", action="store_true")
+    bridge_commands.add_parser("status", help="Show the verified Bridge process state.")
+    bridge_commands.add_parser("stop", help="Stop only the verified GSV Bridge process.")
+    bridge_serve = bridge_commands.add_parser("serve", help=argparse.SUPPRESS)
+    bridge_serve.add_argument("--port", type=int, default=0)
+    bridge_serve.add_argument("--instance-id")
+
     codex = commands.add_parser("codex", help="Manage the supported Codex integration.")
     codex_commands = codex.add_subparsers(dest="codex_command", required=True)
     for name in ("install", "status", "uninstall"):
@@ -411,14 +596,24 @@ def _thread_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ref", action="append", default=[])
 
 
-def _print(value: Any, *, json_output: bool, raw: bool) -> None:
+def _print(
+    value: Any,
+    *,
+    json_output: bool,
+    raw: bool,
+    ok: bool = True,
+    error: str | None = None,
+) -> None:
     if raw and isinstance(value, str) and not json_output:
         print(value, end="" if value.endswith("\n") else "\n")
         return
     if is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
     if json_output:
-        print(json.dumps({"ok": True, "result": value}, ensure_ascii=False, separators=(",", ":")))
+        payload = {"ok": ok, "result": value}
+        if error is not None:
+            payload["error"] = error
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     elif isinstance(value, str):
         print(value)
     else:
