@@ -10,6 +10,10 @@
   before starting or opening the local surface.
 - Add the killed-hand synthetic continuity proof and regenerable README
   visuals.
+- Make backup creation no-clobber, collision-resistant, traversal-complete,
+  and identity-checked across post-publication verification.
+- Keep backup verification and restore usable with missing or invalid UTF-8
+  configuration, with structured failures for ordinary configured commands.
 
 ## 0.1.0
 

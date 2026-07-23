@@ -136,6 +136,14 @@ gsv backup create
 gsv bridge stop
 ```
 
+`gsv backup create` chooses a collision-resistant name in the vault-owned
+`backups/` directory. An explicit output must not already exist; GSV never
+overwrites it. A destination elsewhere inside the vault is refused. Source
+traversal and unsupported file types fail closed instead of producing a
+partial archive. After no-clobber publication, GSV verifies the exact staged
+inode and SHA-256 before and after archive verification; a concurrently
+replaced destination is reported as degraded, never successful.
+
 Backup verification and restore do not depend on the configured vault, so they
 still work when configuration is missing or unreadable:
 

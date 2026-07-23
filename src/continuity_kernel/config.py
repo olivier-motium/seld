@@ -66,7 +66,7 @@ def load_config(*, required: bool = True) -> Config | None:
         raise ValidationError(f"configuration cannot be a symbolic link: {path}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValidationError(f"invalid GSV configuration: {path}") from exc
     if not isinstance(payload, dict) or payload.get("format_version") != 1:
         raise ValidationError("unsupported GSV configuration version")

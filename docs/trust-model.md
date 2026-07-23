@@ -8,6 +8,8 @@
   the mutation committed, or reports unknown integrity without guessing.
 - A malformed, oversized, encrypted, duplicate, or path-traversing backup does
   not escape the restore target.
+- Backup creation never replaces an existing destination and cannot report a
+  concurrently swapped published archive as the staged backup.
 - A failed install does not replace the last working executable or remove
   pre-existing Codex components.
 - Uninstall removes only expected GSV-owned integration and preserves vault,

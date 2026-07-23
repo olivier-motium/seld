@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from continuity_kernel import vault as vault_module
+from continuity_kernel.atomic import durable_publish_new as actual_durable_publish_new
 from continuity_kernel.atomic import durable_replace as actual_durable_replace
 from continuity_kernel.atomic import sha256_bytes
 from continuity_kernel.errors import (
     ConflictError,
+    DegradedIntegrityError,
     MutationCommittedError,
     NotFoundError,
     PersistenceError,
@@ -417,6 +421,29 @@ def test_backup_rejects_fifo_instead_of_silently_omitting_it(vault: Vault, tmp_p
         vault.create_backup(tmp_path / "backup.zip")
 
 
+def test_backup_propagates_directory_traversal_failure(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unreadable = vault.root / "unreadable"
+    unreadable.mkdir()
+    (unreadable / "must-not-be-omitted.txt").write_text("authoritative", encoding="utf-8")
+    original_scandir = os.scandir
+
+    def fail_unreadable(path: str | os.PathLike[str]) -> Any:
+        if Path(path) == unreadable:
+            raise PermissionError(errno.EACCES, "injected unreadable subtree")
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fail_unreadable)
+    destination = tmp_path / "backup.zip"
+
+    with pytest.raises(ValidationError, match="could not read vault backup directory"):
+        vault.create_backup(destination)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+
+
 @pytest.mark.parametrize("mode", [stat.S_IFLNK | 0o777, stat.S_IFIFO | 0o600])
 def test_backup_rejects_nonregular_unix_archive_entries(tmp_path: Path, mode: int) -> None:
     archive_path = tmp_path / "typed.zip"
@@ -449,6 +476,18 @@ def test_backup_rejects_nonportable_windows_aliases(tmp_path: Path, name: str) -
 
     assert not (tmp_path / "restored").exists()
     assert not (tmp_path / "escape.txt").exists()
+
+
+@pytest.mark.parametrize("code_point", range(1, 32), ids=lambda value: f"U+{value:04X}")
+def test_backup_rejects_every_windows_control_character(tmp_path: Path, code_point: int) -> None:
+    archive_path = tmp_path / "control-character.zip"
+    name = f"bad{chr(code_point)}name.txt"
+    _write_crafted_backup(archive_path, [(name, b"must never be extracted")])
+
+    with pytest.raises(ValidationError, match="non-portable backup entry"):
+        Vault.restore_backup(archive_path, tmp_path / "restored")
+
+    assert not (tmp_path / "restored").exists()
 
 
 def test_backup_rejects_unicode_normalization_aliases(tmp_path: Path) -> None:
@@ -534,7 +573,114 @@ def test_stage_publication_replace_then_fsync_failure_reports_committed_restore(
         Vault.restore_backup(backup, target)
 
     assert Vault(target).logical_digest() == vault.logical_digest()
-    assert list(tmp_path.glob(".restored.tmp-restore-*")) == []
+
+
+def test_backup_refuses_existing_destination_without_changing_its_bytes(
+    vault: Vault, tmp_path: Path
+) -> None:
+    destination = tmp_path / "existing.zip"
+    before = b"existing user bytes must survive\n"
+    destination.write_bytes(before)
+
+    with pytest.raises(ConflictError, match="already exists"):
+        vault.create_backup(destination)
+
+    assert destination.read_bytes() == before
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+
+
+def test_backup_refuses_authoritative_or_unowned_in_vault_destinations(vault: Vault) -> None:
+    mind = vault.root / "MIND.md"
+    mind_before = mind.read_bytes()
+
+    with pytest.raises(ValidationError, match="owned backups"):
+        vault.create_backup(mind)
+    with pytest.raises(ValidationError, match="owned backups"):
+        vault.create_backup(vault.root / "exports" / "archive.zip")
+
+    assert mind.read_bytes() == mind_before
+    assert not (vault.root / "exports").exists()
+
+
+def test_default_backup_names_are_unique_within_one_frozen_second(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frozen = datetime(2026, 7, 22, 23, 59, 59, tzinfo=UTC)
+
+    class FrozenDateTime:
+        @classmethod
+        def now(cls, timezone: object) -> datetime:
+            assert timezone is UTC
+            return frozen
+
+    monkeypatch.setattr(vault_module, "datetime", FrozenDateTime)
+    first = Path(vault.create_backup()["backup"])
+    second = Path(vault.create_backup()["backup"])
+
+    assert first != second
+    assert first.name.startswith("gsv-20260722T235959Z-")
+    assert second.name.startswith("gsv-20260722T235959Z-")
+    assert Vault.verify_backup(first)["valid"] is True
+    assert Vault.verify_backup(second)["valid"] is True
+
+
+def test_generated_backup_retries_only_a_generated_name_collision(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backups = vault.root / "backups"
+    collision = backups / "collision.zip"
+    destination = backups / "available.zip"
+    backups.mkdir(exist_ok=True)
+    collision.write_bytes(b"preserve collision bytes\n")
+    candidates = iter((collision, destination))
+    monkeypatch.setattr(
+        vault_module,
+        "_generated_backup_destination",
+        lambda _root: next(candidates),
+    )
+
+    result = vault.create_backup()
+
+    assert Path(result["backup"]) == destination
+    assert collision.read_bytes() == b"preserve collision bytes\n"
+    assert Vault.verify_backup(destination)["valid"] is True
+
+
+def test_backup_collision_created_during_publication_is_preserved(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "raced.zip"
+    sentinel = b"race-created user archive\n"
+
+    def race_publish(source: Path, target: Path) -> None:
+        target.write_bytes(sentinel)
+        actual_durable_publish_new(source, target)
+
+    monkeypatch.setattr(vault_module, "durable_publish_new", race_publish)
+
+    with pytest.raises(ConflictError, match="already exists"):
+        vault.create_backup(destination)
+
+    assert destination.read_bytes() == sentinel
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+
+
+def test_backup_fails_closed_when_hard_link_publication_is_unsupported(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "unsupported.zip"
+
+    def unsupported(source: Path, target: Path) -> None:
+        del source, target
+        raise OSError(errno.ENOTSUP, "injected unsupported hard links")
+
+    monkeypatch.setattr(vault_module, "durable_publish_new", unsupported)
+
+    with pytest.raises(PersistenceError, match="was not published"):
+        vault.create_backup(destination)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
 
 
 def test_backup_publication_replace_then_fsync_failure_reports_committed_archive(
@@ -543,17 +689,44 @@ def test_backup_publication_replace_then_fsync_failure_reports_committed_archive
     destination = tmp_path / "backup.zip"
 
     def publish_then_raise(source: Path, target: Path) -> None:
-        actual_durable_replace(source, target)
+        actual_durable_publish_new(source, target)
         if target == destination:
             raise OSError("injected backup parent fsync failure")
 
-    monkeypatch.setattr(vault_module, "durable_replace", publish_then_raise)
+    monkeypatch.setattr(vault_module, "durable_publish_new", publish_then_raise)
 
     with pytest.raises(MutationCommittedError, match=r"published.*durability"):
         vault.create_backup(destination)
 
     assert Vault.verify_backup(destination)["valid"] is True
     assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+
+
+def test_backup_target_swap_after_link_never_reports_success(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replacement_vault = Vault(tmp_path / "replacement-vault")
+    replacement_vault.initialize(name="Replacement")
+    replacement = Path(replacement_vault.create_backup(tmp_path / "replacement.zip")["backup"])
+    replacement_bytes = replacement.read_bytes()
+    destination = tmp_path / "backup.zip"
+    original_verify = Vault.verify_backup
+    swapped = False
+
+    def verify_after_swap(path: Path) -> dict[str, Any]:
+        nonlocal swapped
+        if Path(path) == destination and not swapped:
+            os.replace(replacement, destination)
+            swapped = True
+        return original_verify(path)
+
+    monkeypatch.setattr(Vault, "verify_backup", staticmethod(verify_after_swap))
+
+    with pytest.raises(DegradedIntegrityError, match="changed during verification"):
+        vault.create_backup(destination)
+
+    assert swapped is True
+    assert destination.read_bytes() == replacement_bytes
 
 
 def test_prior_target_move_replace_then_fsync_failure_can_finish_durably(

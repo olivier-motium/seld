@@ -13,7 +13,7 @@ from continuity_kernel import bridge as bridge_module
 from continuity_kernel import cli
 from continuity_kernel.codex_integration import CodexInstallResult
 from continuity_kernel.config import config_path, load_config, save_config
-from continuity_kernel.errors import SetupError
+from continuity_kernel.errors import SetupError, ValidationError
 from continuity_kernel.vault import Vault
 
 
@@ -477,6 +477,59 @@ def test_backup_verify_and_restore_do_not_require_readable_configuration(
     assert cli.main(["--json", "--vault", str(target), "status"]) == 0
     status = json.loads(capsys.readouterr().out)
     assert status["result"]["vault_id"] == source.identity()["vault_id"]
+
+
+def test_restore_keeps_published_result_when_configuration_is_invalid_utf8(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = Vault(tmp_path / "source")
+    source.initialize(name="Portable")
+    backup = Path(source.create_backup(tmp_path / "portable.zip")["backup"])
+    configuration = config_path()
+    configuration.parent.mkdir(parents=True)
+    before = b"\xff\xfeinvalid utf-8 configuration"
+    configuration.write_bytes(before)
+    target = tmp_path / "restored"
+
+    assert cli.main(["--json", "backup", "restore", str(backup), str(target)]) == 0
+    restored = json.loads(capsys.readouterr().out)
+
+    assert restored["ok"] is True
+    assert restored["result"]["published"] is True
+    assert restored["result"]["configuration_matches_target"] == "unknown"
+    assert configuration.read_bytes() == before
+    assert Vault(target).doctor().healthy is True
+
+
+def test_configuration_match_probe_treats_filesystem_failure_as_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unreadable_configuration(*, required: bool = False) -> None:
+        del required
+        raise PermissionError("injected unreadable configuration")
+
+    monkeypatch.setattr(cli, "load_config", unreadable_configuration)
+
+    assert cli._configuration_matches_target(tmp_path / "restored") == "unknown"
+
+
+def test_invalid_utf8_configuration_is_structured_for_loader_and_cli(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configuration = config_path()
+    configuration.parent.mkdir(parents=True)
+    configuration.write_bytes(b"\xff\xfeinvalid utf-8 configuration")
+
+    with pytest.raises(ValidationError, match="invalid GSV configuration"):
+        load_config()
+
+    assert cli.main(["--json", "status"]) == 2
+    output = capsys.readouterr()
+    payload = json.loads(output.err)
+    assert payload == {
+        "error": f"invalid GSV configuration: {configuration}",
+        "ok": False,
+    }
 
 
 def test_restore_keeps_existing_configured_vault_until_explicit_setup(

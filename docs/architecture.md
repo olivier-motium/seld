@@ -111,8 +111,13 @@ snapshot cannot mix record versions.
 
 Backup creation reads each included regular file once, hashes those captured
 bytes, and writes the same bytes into a staged ZIP. Symlinks and other special
-files fail closed. Verification rejects unsafe or non-portable member names,
-non-regular Unix entry types, case or Unicode aliases, and size-bound failures.
+files and traversal errors fail closed. Publication uses a same-directory
+no-replace hard link and never falls back to overwriting. Default names include
+a random suffix. The destination must match the staged inode and SHA-256 before
+and after archive verification, and the returned digest is the captured staged
+digest. Verification rejects unsafe or non-portable member names, non-regular
+Unix entry types, control characters, case or Unicode aliases, and size-bound
+failures.
 
 Restore keeps one archive descriptor open and reads each data member once into
 a sibling stage while computing the compared hash map. It then enumerates the

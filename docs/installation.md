@@ -133,10 +133,20 @@ gsv backup create
 gsv backup verify /path/to/backup.zip
 ```
 
+Default backup names include a random suffix and are published without
+replacing an existing path. Explicit output paths must be absent, and paths
+inside the vault are accepted only below its owned `backups/` directory. GSV
+fails closed when it cannot enumerate every source entry or encounters a
+symlink or other special file. It checks the published path against the staged
+inode and SHA-256 immediately before and after archive verification; a target
+swap is a degraded nonzero result rather than a successful backup.
+
 Verification and disaster-recovery restore are config-independent. This is
 intentional: both commands remain usable when `config.json` is absent or
-unreadable. A hash mismatch is reported as `valid: false`, `ok: false`, and a
-nonzero exit; restore never publishes that archive.
+unreadable, including invalid UTF-8. Other commands report invalid
+configuration as a structured validation error. A hash mismatch is reported
+as `valid: false`, `ok: false`, and a nonzero exit; restore never publishes
+that archive.
 
 ```bash
 gsv backup restore /path/to/backup.zip /path/to/restored-vault

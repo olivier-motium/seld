@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -23,6 +24,7 @@ from continuity_kernel.atomic import (
     DurableAppendError,
     append_durable,
     atomic_write,
+    durable_publish_new,
     durable_replace,
     durable_unlink,
     exclusive_lock,
@@ -708,14 +710,17 @@ class Vault:
 
     def create_backup(self, destination: Path | None = None) -> dict[str, Any]:
         self._manifest()
-        if destination is None:
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            destination = self.root / "backups" / f"gsv-{stamp}.zip"
+        generated_destination = destination is None
+        if generated_destination:
+            destination = _generated_backup_destination(self.root)
+        assert destination is not None
         destination = _leaf_path(destination)
+        _validate_backup_destination_policy(self.root, destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        _validate_backup_destination(destination)
+        if not generated_destination:
+            _validate_backup_destination(destination)
         with exclusive_lock(self.state / "locks/global.lock"):
-            files = self._backup_files(destination)
+            files = self._backup_files()
             descriptor, temp_name = tempfile.mkstemp(
                 prefix=".gsv-backup.tmp-", suffix=".zip", dir=destination.parent
             )
@@ -750,36 +755,62 @@ class Vault:
                     )
                 staged_identity = _path_identity(temp)
                 staged_hash = sha256_file(temp)
-                try:
-                    durable_replace(temp, destination)
-                except Exception as exc:
-                    if not temp.exists() and _regular_file_matches(
-                        destination, staged_identity, staged_hash
-                    ):
-                        raise MutationCommittedError(
-                            f"backup was published at {destination}, but directory durability "
-                            "could not be confirmed; run "
-                            f"`gsv backup verify {shlex.quote(str(destination))}` before using it"
+                collisions = 0
+                while True:
+                    try:
+                        durable_publish_new(temp, destination)
+                    except FileExistsError as exc:
+                        if not generated_destination:
+                            raise ConflictError(
+                                f"backup destination already exists and was not replaced: "
+                                f"{destination}"
+                            ) from exc
+                        collisions += 1
+                        if collisions >= 16:
+                            raise ConflictError(
+                                "could not allocate a new default backup name after 16 collisions"
+                            ) from exc
+                        destination = _generated_backup_destination(self.root)
+                        continue
+                    except Exception as exc:
+                        if _regular_file_matches(destination, staged_identity, staged_hash):
+                            raise MutationCommittedError(
+                                f"backup was published at {destination}, but directory durability "
+                                "could not be confirmed; run "
+                                "`gsv backup verify "
+                                f"{shlex.quote(str(destination))}` before using it"
+                            ) from exc
+                        if temp.exists():
+                            raise PersistenceError(
+                                f"backup was not published at {destination}; the staged archive "
+                                "was "
+                                "discarded"
+                            ) from exc
+                        raise DegradedIntegrityError(
+                            "could not determine whether backup publication changed "
+                            f"{destination}; "
+                            "inspect that path before retrying"
                         ) from exc
-                    if temp.exists():
-                        raise PersistenceError(
-                            f"backup was not published at {destination}; the staged archive was "
-                            "discarded"
-                        ) from exc
-                    raise DegradedIntegrityError(
-                        f"could not determine whether backup publication changed {destination}; "
-                        "inspect that path before retrying"
-                    ) from exc
+                    break
             finally:
                 if temp.exists():
                     temp.unlink()
         try:
+            if not _regular_file_matches(destination, staged_identity, staged_hash):
+                raise DegradedIntegrityError(
+                    f"backup destination changed before verification: {destination}"
+                )
             verification = self.verify_backup(destination)
         except ValidationError as exc:
             raise DegradedIntegrityError(
                 f"backup was published at {destination}, but post-publication verification failed; "
                 "do not use it until it passes `gsv backup verify`"
             ) from exc
+        if not _regular_file_matches(destination, staged_identity, staged_hash):
+            raise DegradedIntegrityError(
+                f"backup destination changed during verification: {destination}; inspect it before "
+                "retrying"
+            )
         if not verification["valid"]:
             raise DegradedIntegrityError(
                 f"backup was published at {destination}, but its hashes no longer verify; "
@@ -788,7 +819,7 @@ class Vault:
         return {
             "backup": str(destination),
             "files": len(files),
-            "sha256": sha256_file(destination),
+            "sha256": staged_hash,
             "verified": True,
             "vault_id": manifest["vault_id"],
         }
@@ -829,7 +860,7 @@ class Vault:
             if restored_stage.identity()["vault_id"] != inspection.manifest["vault_id"]:
                 raise ValidationError("restored vault identity does not match its backup manifest")
             digest = restored_stage.logical_digest()
-            staged_hashes = _hash_backup_files(restored_stage._backup_files(None))
+            staged_hashes = _hash_backup_files(restored_stage._backup_files())
             if staged_hashes != inspection.manifest["files"]:
                 raise ValidationError(
                     "staged vault files do not match the backup manifest before publication"
@@ -920,7 +951,7 @@ class Vault:
         if not self.root.exists():
             raise NotFoundError(f"vault does not exist: {self.root}")
         entries = []
-        for relative, path in self._backup_files(None):
+        for relative, path in self._backup_files():
             entries.append(f"{relative}\0{sha256_file(path)}\n")
         return sha256_bytes("".join(entries).encode("utf-8"))
 
@@ -1193,33 +1224,9 @@ class Vault:
         except ValueError as exc:
             raise ValidationError("path escapes the vault") from exc
 
-    def _backup_files(self, destination: Path | None) -> list[tuple[str, Path]]:
+    def _backup_files(self) -> list[tuple[str, Path]]:
         files: list[tuple[str, Path]] = []
-        for path in sorted(self.root.rglob("*")):
-            try:
-                metadata = os.lstat(path)
-            except OSError as exc:
-                raise ValidationError(
-                    f"could not inspect vault backup path: {path}: {exc}"
-                ) from exc
-            if stat.S_ISLNK(metadata.st_mode):
-                raise ValidationError(
-                    f"vault backup refuses symbolic link: {path.relative_to(self.root)}"
-                )
-            if stat.S_ISDIR(metadata.st_mode):
-                continue
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValidationError(
-                    f"vault backup refuses unsupported file type: {path.relative_to(self.root)}"
-                )
-            relative = path.relative_to(self.root).as_posix()
-            if relative.startswith(".gsv/locks/") or ".tmp-" in path.name:
-                continue
-            if relative.startswith("backups/"):
-                continue
-            if destination is not None and path == destination:
-                continue
-            files.append((relative, path))
+        _scan_backup_directory(self.root, self.root, files)
         return files
 
 
@@ -1261,17 +1268,61 @@ def _leaf_path(path: Path) -> Path:
     return expanded.parent.resolve() / expanded.name
 
 
+def _generated_backup_destination(root: Path) -> Path:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return root / "backups" / f"gsv-{stamp}-{uuid.uuid4().hex}.zip"
+
+
+def _validate_backup_destination_policy(root: Path, destination: Path) -> None:
+    try:
+        relative = destination.relative_to(root)
+    except ValueError:
+        return
+    if len(relative.parts) < 2 or relative.parts[0] != "backups":
+        raise ValidationError(
+            "a backup stored inside the vault must be within its owned backups/ directory"
+        )
+
+
 def _validate_backup_destination(path: Path) -> None:
     try:
-        metadata = os.lstat(path)
+        os.lstat(path)
     except FileNotFoundError:
         return
     except OSError as exc:
         raise ValidationError(f"could not inspect backup destination: {path}: {exc}") from exc
-    if stat.S_ISLNK(metadata.st_mode):
-        raise ValidationError(f"backup destination cannot be a symbolic link: {path}")
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ConflictError(f"backup destination must be absent or a regular file: {path}")
+    raise ConflictError(f"backup destination already exists and will not be replaced: {path}")
+
+
+def _scan_backup_directory(
+    root: Path,
+    directory: Path,
+    files: list[tuple[str, Path]],
+) -> None:
+    try:
+        with os.scandir(directory) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
+    except OSError as exc:
+        raise ValidationError(f"could not read vault backup directory: {directory}: {exc}") from exc
+    for entry in entries:
+        path = Path(entry.path)
+        try:
+            metadata = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise ValidationError(f"could not inspect vault backup path: {path}: {exc}") from exc
+        relative = path.relative_to(root).as_posix()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValidationError(f"vault backup refuses symbolic link: {relative}")
+        if stat.S_ISDIR(metadata.st_mode):
+            if relative in {"backups", ".gsv/locks"}:
+                continue
+            _scan_backup_directory(root, path, files)
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValidationError(f"vault backup refuses unsupported file type: {relative}")
+        if ".tmp-" in path.name:
+            continue
+        files.append((relative, path))
 
 
 def _path_identity(path: Path) -> tuple[int, int]:
@@ -1280,15 +1331,44 @@ def _path_identity(path: Path) -> tuple[int, int]:
 
 
 def _regular_file_matches(path: Path, identity: tuple[int, int], digest: str) -> bool:
+    descriptor = -1
     try:
-        metadata = os.lstat(path)
-        if not stat.S_ISREG(metadata.st_mode):
+        listed = os.lstat(path)
+        if not stat.S_ISREG(listed.st_mode):
             return False
-        if (metadata.st_dev, metadata.st_ino) != identity:
+        if (listed.st_dev, listed.st_ino) != identity:
             return False
-        return sha256_file(path) == digest
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            return False
+        if (opened.st_dev, opened.st_ino) != identity:
+            return False
+        captured = hashlib.sha256()
+        while block := os.read(descriptor, 1024 * 1024):
+            captured.update(block)
+        finished = os.fstat(descriptor)
+        if (
+            (finished.st_dev, finished.st_ino) != identity
+            or finished.st_size != opened.st_size
+            or finished.st_mtime_ns != opened.st_mtime_ns
+        ):
+            return False
+        final = os.lstat(path)
+        return (
+            stat.S_ISREG(final.st_mode)
+            and (final.st_dev, final.st_ino) == identity
+            and captured.hexdigest() == digest
+        )
     except OSError:
         return False
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 def _directory_matches(path: Path, identity: tuple[int, int] | None) -> bool:
@@ -1632,7 +1712,11 @@ def _portable_archive_path(name: str) -> tuple[tuple[str, ...], bool, tuple[str,
 
     normalized: list[str] = []
     for part in parts:
-        if ":" in part or any(character in '<>"|?*' for character in part):
+        if (
+            ":" in part
+            or any(character in '<>"|?*' for character in part)
+            or any(ord(character) < 32 for character in part)
+        ):
             raise ValidationError(f"non-portable backup entry: {name}")
         if part.endswith((" ", ".")):
             raise ValidationError(f"non-portable backup entry: {name}")

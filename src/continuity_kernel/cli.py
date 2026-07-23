@@ -291,7 +291,7 @@ def _configuration_matches_target(target: Path) -> bool | str:
     try:
         configuration = load_config(required=False)
         return configuration is not None and configuration.vault_path == target
-    except ContinuityError:
+    except (ContinuityError, OSError, UnicodeError):
         return "unknown"
 
 

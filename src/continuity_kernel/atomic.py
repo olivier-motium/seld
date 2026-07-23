@@ -108,6 +108,20 @@ def durable_replace(source: Path, target: Path) -> None:
     _fsync_directory(target.parent)
 
 
+def durable_publish_new(source: Path, target: Path) -> None:
+    """Publish one staged regular file without replacing any existing path."""
+
+    if source.parent.resolve() != target.parent.resolve():
+        raise OSError(errno.EXDEV, "no-clobber publication requires one directory")
+    os.link(source, target, follow_symlinks=False)
+    try:
+        source.unlink()
+    except Exception:
+        _fsync_directory(target.parent)
+        raise
+    _fsync_directory(target.parent)
+
+
 def append_durable(path: Path, content: bytes) -> None:
     """Append to an existing file or report restored, committed, or unknown state."""
 
