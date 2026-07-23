@@ -5,6 +5,7 @@ import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -1081,6 +1082,7 @@ def test_health_probe_treats_non_refusal_network_errors_as_unavailable(
         raise error
 
     monkeypatch.setattr(bridge, "_open_loopback", fail_request)
+    monkeypatch.setattr(bridge, "_loopback_connection_refused", lambda *_args, **_kwargs: False)
 
     probe = bridge._probe_health("http://127.0.0.1:43117/", token=ACCESS_TOKEN, timeout=0)
 
@@ -1138,6 +1140,50 @@ def test_health_probe_recognizes_windows_loopback_refusal(
     probe = bridge._probe_health(f"http://{bridge.LOOPBACK_HOST}:9/", token=ACCESS_TOKEN, timeout=0)
 
     assert probe == bridge._HealthProbe(bridge._HealthOutcome.REFUSED)
+
+
+def test_health_probe_confirms_opaque_loopback_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RefusedSocket:
+        def __enter__(self) -> RefusedSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def connect_ex(self, _address: tuple[str, int]) -> int:
+            return 10061
+
+    def fail_request(*_args: object, **_kwargs: object) -> None:
+        raise URLError(OSError(errno.EINVAL, "opaque transport failure"))
+
+    monkeypatch.setattr(bridge, "_open_loopback", fail_request)
+    monkeypatch.setattr("continuity_kernel.bridge.socket.socket", lambda *_args: RefusedSocket())
+
+    probe = bridge._probe_health(
+        f"http://{bridge.LOOPBACK_HOST}:43117/", token=ACCESS_TOKEN, timeout=0
+    )
+
+    assert probe == bridge._HealthProbe(bridge._HealthOutcome.REFUSED)
+
+
+def test_runtime_command_prefers_installed_sibling_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / ("python.exe" if os.name == "nt" else "python")
+    executable.write_bytes(b"")
+    launcher = tmp_path / ("gsv.exe" if os.name == "nt" else "gsv")
+    launcher.write_text("launcher", encoding="utf-8")
+    if os.name != "nt":
+        launcher.chmod(0o700)
+    monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.setattr(sys, "argv", ["pytest"])
+
+    assert bridge._runtime_command() == [str(launcher.resolve())]
 
 
 def test_stop_cleans_refused_receipt_without_signalling_unverified_pid(

@@ -8,6 +8,7 @@ import mimetypes
 import os
 import secrets
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -761,8 +762,12 @@ def _probe_health(url: str, *, token: str, timeout: float) -> _HealthProbe:
                 HTTPStatus.NOT_FOUND,
             }:
                 return _HealthProbe(_HealthOutcome.RESPONSE, {})
-        except (HTTPException, OSError, URLError) as exc:
-            if loopback and _is_connection_refused(exc):
+        except HTTPException:
+            pass
+        except (OSError, URLError) as exc:
+            if loopback and (
+                _is_connection_refused(exc) or _loopback_connection_refused(url, timeout=timeout)
+            ):
                 return _HealthProbe(_HealthOutcome.REFUSED)
         except (json.JSONDecodeError, ValueError):
             pass
@@ -791,6 +796,22 @@ def _is_connection_refused(error: BaseException) -> bool:
         if current is None:
             return False
     return False
+
+
+def _loopback_connection_refused(url: str, *, timeout: float) -> bool:
+    """Confirm an exact loopback TCP refusal when urllib hides the OS error."""
+
+    try:
+        parsed = urlsplit(url)
+        if parsed.hostname != LOOPBACK_HOST or parsed.port is None:
+            return False
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+            connection.settimeout(min(0.5, max(timeout, 0.05)))
+            result = connection.connect_ex((LOOPBACK_HOST, parsed.port))
+    except (OSError, ValueError):
+        return False
+    refused_codes = {errno.ECONNREFUSED, int(getattr(errno, "WSAECONNREFUSED", 10061))}
+    return result in refused_codes
 
 
 def _wait_for_state(
@@ -951,9 +972,19 @@ def _runtime_command() -> list[str]:
     if getattr(sys, "frozen", False):
         return [sys.executable]
     launcher = Path(sys.argv[0]).expanduser()
-    if launcher.name.lower() in {"gsv", "gsv.exe"} and launcher.exists():
+    if launcher.name.lower() in {"gsv", "gsv.exe"} and _usable_console_launcher(launcher):
         return [str(launcher.resolve())]
+    sibling = Path(sys.executable).with_name("gsv.exe" if _IS_WINDOWS else "gsv")
+    if _usable_console_launcher(sibling):
+        return [str(sibling.resolve())]
     return [sys.executable, "-m", "continuity_kernel"]
+
+
+def _usable_console_launcher(path: Path) -> bool:
+    try:
+        return path.is_file() and (_IS_WINDOWS or os.access(path, os.X_OK))
+    except OSError:
+        return False
 
 
 def _bridge_child_environment(vault: Vault) -> dict[str, str]:
