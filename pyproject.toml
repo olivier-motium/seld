@@ -65,6 +65,10 @@ python_version = "3.11"
 strict = true
 packages = ["continuity_kernel"]
 
+[[tool.mypy.overrides]]
+module = "playwright.*"
+ignore_missing_imports = true
+
 [tool.coverage.run]
 branch = true
 source = ["continuity_kernel"]
