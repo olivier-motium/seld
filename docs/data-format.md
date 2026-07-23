@@ -88,5 +88,7 @@ publishes the complete same-directory stage with a hard link or native atomic
 no-replace move, never a partial copy into the destination, and verifies the
 staged inode and digest around archive validation. Restore writes to a staging directory and
 publishes the completed vault only after every member passes validation.
+Failed unpublished restore stages remain named recovery evidence; they are not
+recursively removed by doctor repair.
 Checksums detect accidental corruption; they are not cryptographic
 authentication or encryption.

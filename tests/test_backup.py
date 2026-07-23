@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
 import stat
 import zipfile
 from datetime import UTC, datetime
@@ -13,9 +14,9 @@ import pytest
 
 from continuity_kernel import atomic as atomic_module
 from continuity_kernel import vault as vault_module
+from continuity_kernel.atomic import DurablePublishError, PublishOutcome, sha256_bytes
 from continuity_kernel.atomic import durable_publish_new as actual_durable_publish_new
 from continuity_kernel.atomic import durable_replace as actual_durable_replace
-from continuity_kernel.atomic import sha256_bytes
 from continuity_kernel.errors import (
     ConflictError,
     DegradedIntegrityError,
@@ -130,7 +131,9 @@ def test_self_consistent_invalid_backup_never_publishes_and_can_retry(
         Vault.restore_backup(invalid, target)
 
     assert not target.exists()
-    assert list(tmp_path.glob(".restored.tmp-restore-*")) == []
+    retained = list(tmp_path.glob(".restored.tmp-restore-*"))
+    assert len(retained) == 1
+    shutil.rmtree(retained[0])
 
     restored = Vault.restore_backup(original, target)
     assert restored["digest"] == vault.logical_digest()
@@ -153,7 +156,7 @@ def test_backup_manifest_identity_must_match_staged_vault(vault: Vault, tmp_path
         Vault.restore_backup(mismatched, target)
 
     assert not target.exists()
-    assert list(tmp_path.glob(".restored.tmp-restore-*")) == []
+    assert len(list(tmp_path.glob(".restored.tmp-restore-*"))) == 1
 
 
 def test_path_traversal_archive_is_rejected(tmp_path: Path) -> None:
@@ -296,7 +299,42 @@ def test_restore_rejects_same_inode_mutation_between_metadata_and_entry_read(
         Vault.restore_backup(source, target)
 
     assert not target.exists()
-    assert list(tmp_path.glob(".restored.tmp-restore-*")) == []
+    assert len(list(tmp_path.glob(".restored.tmp-restore-*"))) == 1
+
+
+def test_restore_stage_path_swap_preserves_replacement_and_displaced_stage(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backup = Path(vault.create_backup(tmp_path / "backup.zip")["backup"])
+    target = tmp_path / "restored"
+    displaced = tmp_path / ".restored.tmp-restore-displaced"
+    replacement: Path | None = None
+    original_extract = vault_module._extract_backup
+
+    def extract_then_swap(handle: Any, path: Path, stage: Path) -> Any:
+        nonlocal replacement
+        original_extract(handle, path, stage)
+        stage.replace(displaced)
+        stage.mkdir()
+        (stage / "replacement-user-data.txt").write_bytes(b"preserve replacement\n")
+        replacement = stage
+        raise ValidationError("injected post-extraction failure")
+
+    monkeypatch.setattr(vault_module, "_extract_backup", extract_then_swap)
+
+    with pytest.raises(DegradedIntegrityError, match="identity is changed"):
+        Vault.restore_backup(backup, target)
+
+    assert replacement is not None
+    assert (replacement / "replacement-user-data.txt").read_bytes() == b"preserve replacement\n"
+    assert (displaced / "MIND.md").is_file()
+    issues = Vault(target).doctor().issues
+    retained = [issue for issue in issues if issue.code == "orphan-temp"]
+    assert {issue.path for issue in retained} == {
+        f"../{replacement.name}",
+        f"../{displaced.name}",
+    }
+    assert all(issue.repairable is False for issue in retained)
 
 
 def test_failed_publication_restores_preexisting_empty_target(
@@ -320,7 +358,7 @@ def test_failed_publication_restores_preexisting_empty_target(
 
     assert target.is_dir()
     assert list(target.iterdir()) == []
-    assert list(tmp_path.glob(".restored.tmp-restore-*")) == []
+    assert len(list(tmp_path.glob(".restored.tmp-restore-*"))) == 1
 
 
 def test_concurrent_content_in_renamed_empty_target_is_restored_and_aborts(
@@ -343,9 +381,10 @@ def test_concurrent_content_in_renamed_empty_target_is_restored_and_aborts(
     with pytest.raises(PersistenceError, match="restore was not published") as failure:
         Vault.restore_backup(backup, target)
 
-    assert isinstance(failure.value.__cause__, ConflictError)
+    assert isinstance(failure.value.__cause__, PersistenceError)
+    assert isinstance(failure.value.__cause__.__cause__, ConflictError)
     assert (target / "concurrent.txt").read_bytes() == b"preserve\n"
-    assert list(tmp_path.glob(".restored.tmp-restore-*")) == []
+    assert len(list(tmp_path.glob(".restored.tmp-restore-*"))) == 1
 
 
 def test_prior_empty_cleanup_failure_reports_published_restore(
@@ -724,6 +763,39 @@ def test_backup_fails_closed_when_hard_link_publication_is_unsupported(
     monkeypatch.setattr(vault_module, "durable_publish_new", unsupported)
 
     with pytest.raises(PersistenceError, match="was not published"):
+        vault.create_backup(destination)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+
+
+@pytest.mark.parametrize("failure_kind", ["unpublished", "generic"])
+def test_backup_cleanup_after_unlink_failure_reports_actual_absent_stage(
+    failure_kind: str,
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "cleanup-state.zip"
+
+    def fail_publish(_: Path, __: Path) -> None:
+        if failure_kind == "unpublished":
+            raise DurablePublishError(
+                "injected unpublished failure", outcome=PublishOutcome.UNPUBLISHED
+            )
+        raise RuntimeError("injected generic publication failure")
+
+    def unlink_then_fail(path: Path) -> None:
+        path.unlink()
+        raise OSError("injected cleanup directory fsync failure")
+
+    monkeypatch.setattr(vault_module, "durable_publish_new", fail_publish)
+    monkeypatch.setattr(vault_module, "durable_unlink", unlink_then_fail)
+
+    with pytest.raises(
+        DegradedIntegrityError,
+        match="staged archive is no longer visible, but deletion durability is unconfirmed",
+    ):
         vault.create_backup(destination)
 
     assert not destination.exists()

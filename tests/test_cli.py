@@ -8,7 +8,7 @@ import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -421,7 +421,7 @@ def test_unhealthy_doctor_returns_nonzero_and_json_failure(
     assert payload["result"]["issues"][0]["path"] == "tasks/broken.md"
 
 
-def test_repaired_healthy_doctor_returns_success(
+def test_doctor_never_recursively_repairs_retained_restore_stage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     vault = Vault(tmp_path / "vault")
@@ -435,11 +435,13 @@ def test_repaired_healthy_doctor_returns_success(
     exit_code = cli.main(["--json", "doctor", "--repair"])
     payload = json.loads(capsys.readouterr().out)
 
-    assert exit_code == 0
-    assert payload["ok"] is True
-    assert payload["result"]["healthy"] is True
-    assert payload["result"]["repaired"] == [f"../{orphan.name}"]
-    assert not orphan.exists()
+    assert exit_code == 3
+    assert payload["ok"] is False
+    assert payload["result"]["healthy"] is False
+    assert payload["result"]["repaired"] == []
+    assert payload["result"]["issues"][0]["path"] == f"../{orphan.name}"
+    assert payload["result"]["issues"][0]["repairable"] is False
+    assert (orphan / "partial").read_text(encoding="utf-8") == "partial"
 
 
 def test_backup_verify_and_restore_do_not_require_readable_configuration(
@@ -834,6 +836,228 @@ def test_backup_staging_allocation_failure_is_structured_cli_json(
     assert "Traceback" not in captured.err
     assert captured.out == ""
     assert not destination.exists()
+
+
+@pytest.mark.parametrize("failure_point", ["descriptor-close", "zip-open", "temp-open", "fsync"])
+def test_backup_staging_io_failures_are_structured_and_cleaned(
+    failure_point: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Staging I/O")
+    destination = tmp_path / "backup.zip"
+    injected = f"injected {failure_point} failure"
+
+    if failure_point == "descriptor-close":
+        real_close = os.close
+        failed = False
+
+        def fail_close(descriptor: int) -> None:
+            nonlocal failed
+            real_close(descriptor)
+            if not failed:
+                failed = True
+                raise PermissionError(injected)
+
+        monkeypatch.setattr(os, "close", fail_close)
+    elif failure_point == "zip-open":
+
+        def fail_zip(*_: object, **__: object) -> zipfile.ZipFile:
+            raise PermissionError(injected)
+
+        monkeypatch.setattr(zipfile, "ZipFile", fail_zip)
+    elif failure_point == "temp-open":
+        real_open = Path.open
+
+        def fail_temp_open(path: Path, mode: str = "r", *args: object, **kwargs: object) -> Any:
+            if path.name.startswith(".gsv-backup.tmp-") and mode == "r+b":
+                raise PermissionError(injected)
+            return cast(Any, real_open)(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_temp_open)
+    else:
+        real_fsync = os.fsync
+        failed = False
+
+        def fail_first_fsync(descriptor: int) -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise PermissionError(injected)
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(os, "fsync", fail_first_fsync)
+
+    exit_code = cli.main(
+        [
+            "--json",
+            "--vault",
+            str(vault.root),
+            "backup",
+            "create",
+            "--output",
+            str(destination),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert injected in payload["error"]
+    assert "no backup was published" in payload["error"]
+    assert "durably discarded" in payload["error"]
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+
+
+def test_backup_staging_io_and_cleanup_failures_are_both_structured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Staging cleanup")
+    destination = tmp_path / "backup.zip"
+
+    def fail_zip(*_: object, **__: object) -> zipfile.ZipFile:
+        raise PermissionError("injected disk write failure")
+
+    def fail_cleanup(_: Path) -> None:
+        raise PermissionError("injected staged cleanup failure")
+
+    monkeypatch.setattr(zipfile, "ZipFile", fail_zip)
+    monkeypatch.setattr(vault_module, "durable_unlink", fail_cleanup)
+
+    exit_code = cli.main(
+        [
+            "--json",
+            "--vault",
+            str(vault.root),
+            "backup",
+            "create",
+            "--output",
+            str(destination),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert "injected disk write failure" in payload["error"]
+    assert "injected staged cleanup failure" in payload["error"]
+    assert "the staged archive remains" in payload["error"]
+    assert "Traceback" not in captured.err
+    assert not destination.exists()
+    assert len(list(tmp_path.glob(".gsv-backup.tmp-*.zip"))) == 1
+
+
+def test_backup_commands_report_symlink_loop_paths_as_structured_errors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Path validation")
+    valid_backup = Path(vault.create_backup(tmp_path / "valid.zip")["backup"])
+    loop = tmp_path / "loop"
+    try:
+        loop.symlink_to(loop, target_is_directory=True)
+    except OSError as exc:  # pragma: no cover - restricted Windows environments
+        pytest.skip(f"symbolic links unavailable: {exc}")
+
+    cases = (
+        (
+            [
+                "--json",
+                "--vault",
+                str(vault.root),
+                "backup",
+                "create",
+                "--output",
+                str(loop / "created.zip"),
+            ],
+            "invalid backup output path",
+        ),
+        (["--json", "backup", "verify", str(loop / "missing.zip")], "invalid backup path"),
+        (
+            [
+                "--json",
+                "backup",
+                "restore",
+                str(valid_backup),
+                str(loop / "restored"),
+            ],
+            "invalid restore target",
+        ),
+    )
+
+    for arguments, expected in cases:
+        exit_code = cli.main(arguments)
+        captured = capsys.readouterr()
+        payload = json.loads(captured.err)
+
+        assert exit_code == 2
+        assert payload["ok"] is False
+        assert expected in payload["error"]
+        assert str(loop) in payload["error"]
+        assert "Traceback" not in captured.err
+        assert captured.out == ""
+
+
+def test_restore_target_parent_failure_is_structured_cli_json(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Restore parent")
+    backup = Path(vault.create_backup(tmp_path / "backup.zip")["backup"])
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_bytes(b"preserve\n")
+    target = blocked_parent / "restored"
+
+    exit_code = cli.main(["--json", "backup", "restore", str(backup), str(target)])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"].startswith(f"could not prepare the restore target parent for {target}:")
+    assert "Traceback" not in captured.err
+    assert blocked_parent.read_bytes() == b"preserve\n"
+
+
+def test_restore_stage_allocation_failure_is_structured_cli_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Restore allocation")
+    backup = Path(vault.create_backup(tmp_path / "backup.zip")["backup"])
+    target = tmp_path / "restored"
+
+    def fail_stage(*_: object, **__: object) -> str:
+        raise PermissionError("injected restore stage allocation failure")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", fail_stage)
+
+    exit_code = cli.main(["--json", "backup", "restore", str(backup), str(target)])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"] == (
+        f"could not allocate a restore stage beside {target}: "
+        "injected restore stage allocation failure"
+    )
+    assert "Traceback" not in captured.err
+    assert not target.exists()
 
 
 def test_codex_status_and_uninstall_do_not_require_vault_configuration(

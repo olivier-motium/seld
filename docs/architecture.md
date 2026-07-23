@@ -129,6 +129,11 @@ directory and is restored if publication did not occur. Rename failures are
 classified by source and target identity plus logical digest: unpublished work
 is rolled back, while a visible committed restore with unconfirmed directory
 durability is reported as degraded and left intact for explicit doctor review.
+An unpublished failed stage is also retained and named instead of recursively
+deleted by a later pathname lookup. A changed stage pathname is an unknown
+recovery state: neither the replacement path nor a displaced original is
+removed. Doctor reports retained directories but never marks recursive deletion
+as repairable.
 Configuration and live Codex or Bridge state are outside this restore
 transaction and require the documented stop-plus-setup activation step.
 

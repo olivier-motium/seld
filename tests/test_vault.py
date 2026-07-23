@@ -512,7 +512,7 @@ def test_doctor_reports_oversized_authored_document(vault: Vault) -> None:
     )
 
 
-def test_doctor_repairs_interrupted_restore_sibling(vault: Vault) -> None:
+def test_doctor_preserves_interrupted_restore_sibling_for_manual_review(vault: Vault) -> None:
     orphan = vault.root.parent / f".{vault.root.name}.tmp-restore-synthetic"
     orphan.mkdir()
     (orphan / "partial").write_text("partial", encoding="utf-8")
@@ -520,6 +520,10 @@ def test_doctor_repairs_interrupted_restore_sibling(vault: Vault) -> None:
     before = vault.doctor()
     after = vault.doctor(repair=True)
 
-    assert any(issue.path == f"../{orphan.name}" for issue in before.issues)
-    assert after.healthy
-    assert not orphan.exists()
+    before_issue = next(issue for issue in before.issues if issue.path == f"../{orphan.name}")
+    after_issue = next(issue for issue in after.issues if issue.path == f"../{orphan.name}")
+    assert before_issue.repairable is False
+    assert after_issue.repairable is False
+    assert after.healthy is False
+    assert after.repaired == ()
+    assert (orphan / "partial").read_text(encoding="utf-8") == "partial"

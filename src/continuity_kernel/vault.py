@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import shlex
-import shutil
 import stat
 import sys
 import tempfile
@@ -626,15 +625,28 @@ class Vault:
                 relative = str(path.relative_to(self.root))
             except ValueError:
                 relative = f"../{path.name}"
-            issues.append(
-                DoctorIssue("orphan-temp", relative, "interrupted operation temporary path", True)
+            try:
+                metadata = os.lstat(path)
+            except OSError:
+                metadata = None
+            repairable_temp = metadata is not None and stat.S_ISREG(metadata.st_mode)
+            message = (
+                "interrupted operation temporary file"
+                if repairable_temp
+                else "retained recovery path; inspect it before removing that exact path"
             )
-            if repair and not path.is_symlink():
-                if path.is_file():
+            issues.append(DoctorIssue("orphan-temp", relative, message, repairable_temp))
+            if repair and repairable_temp:
+                try:
+                    current = os.lstat(path)
+                except OSError:
+                    continue
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and metadata is not None
+                    and (current.st_dev, current.st_ino) == (metadata.st_dev, metadata.st_ino)
+                ):
                     path.unlink()
-                    repaired.append(relative)
-                elif path.is_dir():
-                    shutil.rmtree(path)
                     repaired.append(relative)
 
         for name in ("MIND.md", "NOW.md"):
@@ -723,7 +735,7 @@ class Vault:
         if generated_destination:
             destination = _generated_backup_destination(self.root)
         assert destination is not None
-        destination = _leaf_path(destination)
+        destination = _leaf_path(destination, label="backup output path")
         _validate_backup_destination_policy(self.root, destination)
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -743,38 +755,51 @@ class Vault:
                 raise PersistenceError(
                     f"could not allocate a staged backup beside {destination}: {exc}"
                 ) from exc
-            os.close(descriptor)
             temp = Path(temp_name)
             preserve_staged = False
             try:
-                hashes: dict[str, str] = {}
-                total = 0
-                with zipfile.ZipFile(
-                    temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
-                ) as archive:
-                    for relative, path in files:
-                        content = _read_backup_source(path)
-                        total += len(content)
-                        if total > MAX_BACKUP_TOTAL_BYTES:
-                            raise ValidationError("vault backup exceeds its total size bound")
-                        hashes[relative] = sha256_bytes(content)
-                        archive.writestr(relative, content)
-                    manifest = {
-                        "created_at": format_time(datetime.now(UTC)),
-                        "files": hashes,
-                        "format_version": 1,
-                        "vault_id": self._manifest()["vault_id"],
-                    }
-                    archive.writestr(BACKUP_MANIFEST, _json_bytes(manifest))
-                with temp.open("r+b") as handle:
-                    os.fsync(handle.fileno())
-                staged_verification = self.verify_backup(temp)
-                if not staged_verification["valid"]:
-                    raise PersistenceError(
-                        "backup staging verification failed; no backup was published"
+                try:
+                    try:
+                        os.close(descriptor)
+                    finally:
+                        # A failed close has an ambiguous descriptor state. Never retry it and risk
+                        # closing a descriptor that the process has already reused.
+                        descriptor = -1
+                    hashes: dict[str, str] = {}
+                    total = 0
+                    with zipfile.ZipFile(
+                        temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+                    ) as archive:
+                        for relative, path in files:
+                            content = _read_backup_source(path)
+                            total += len(content)
+                            if total > MAX_BACKUP_TOTAL_BYTES:
+                                raise ValidationError("vault backup exceeds its total size bound")
+                            hashes[relative] = sha256_bytes(content)
+                            archive.writestr(relative, content)
+                        manifest = {
+                            "created_at": format_time(datetime.now(UTC)),
+                            "files": hashes,
+                            "format_version": 1,
+                            "vault_id": self._manifest()["vault_id"],
+                        }
+                        archive.writestr(BACKUP_MANIFEST, _json_bytes(manifest))
+                    with temp.open("r+b") as handle:
+                        os.fsync(handle.fileno())
+                    staged_verification = self.verify_backup(temp)
+                    if not staged_verification["valid"]:
+                        raise PersistenceError(
+                            "backup staging verification failed; no backup was published"
+                        )
+                    staged_identity = _path_identity(temp)
+                    staged_hash = sha256_file(temp)
+                except OSError as exc:
+                    preserve_staged = True
+                    _raise_backup_staging_io_error(
+                        temp=temp,
+                        destination=destination,
+                        primary=exc,
                     )
-                staged_identity = _path_identity(temp)
-                staged_hash = sha256_file(temp)
                 published_identity = staged_identity
                 collisions = 0
                 while True:
@@ -802,9 +827,10 @@ class Vault:
                                 durable_unlink(temp)
                             except OSError as cleanup_error:
                                 preserve_staged = True
+                                cleanup_state = _backup_staging_cleanup_state(temp)
                                 raise DegradedIntegrityError(
-                                    f"{exc}; the unpublished staged archive remains at {temp} "
-                                    f"because durable cleanup failed: {cleanup_error}"
+                                    f"{exc}; backup staging cleanup failed at {temp}; "
+                                    f"{cleanup_state}: {cleanup_error}"
                                 ) from exc
                             raise PersistenceError(str(exc)) from exc
                         preserve_staged = True
@@ -828,9 +854,11 @@ class Vault:
                                 durable_unlink(temp)
                             except OSError as cleanup_error:
                                 preserve_staged = True
+                                cleanup_state = _backup_staging_cleanup_state(temp)
                                 raise DegradedIntegrityError(
                                     f"backup was not published at {destination}, but staged "
-                                    f"archive cleanup failed at {temp}: {cleanup_error}"
+                                    f"archive cleanup failed at {temp}; {cleanup_state}: "
+                                    f"{cleanup_error}"
                                 ) from exc
                             raise PersistenceError(
                                 f"backup was not published at {destination}; the staged archive "
@@ -849,17 +877,7 @@ class Vault:
                     try:
                         durable_unlink(temp)
                     except OSError as cleanup_error:
-                        try:
-                            os.lstat(temp)
-                        except FileNotFoundError:
-                            cleanup_state = (
-                                "the staged archive is no longer visible, but deletion "
-                                "durability is unconfirmed"
-                            )
-                        except OSError:
-                            cleanup_state = "the staged archive path state is unknown"
-                        else:
-                            cleanup_state = "the staged archive remains"
+                        cleanup_state = _backup_staging_cleanup_state(temp)
                         if primary is None:
                             raise DegradedIntegrityError(
                                 f"backup staging cleanup failed at {temp}; {cleanup_state}: "
@@ -912,9 +930,26 @@ class Vault:
     @staticmethod
     def restore_backup(path: Path, target: Path) -> dict[str, Any]:
         target = _restore_target(target)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise PersistenceError(
+                f"could not prepare the restore target parent for {target}: {exc}"
+            ) from exc
         _validate_restore_target(target)
-        stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-restore-", dir=target.parent))
+        try:
+            stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-restore-", dir=target.parent))
+        except OSError as exc:
+            raise PersistenceError(
+                f"could not allocate a restore stage beside {target}: {exc}"
+            ) from exc
+        try:
+            stage_identity = _path_identity(stage)
+        except OSError as exc:
+            raise DegradedIntegrityError(
+                f"a restore stage was allocated at {stage}, but its identity could not be pinned; "
+                "inspect that path before retrying"
+            ) from exc
         prior_empty: Path | None = None
         cleanup_warning: str | None = None
         try:
@@ -939,15 +974,20 @@ class Vault:
                 raise ValidationError(
                     "staged vault files do not match the backup manifest before publication"
                 )
-            stage_identity = _path_identity(stage)
-
             target_existed = _validate_restore_target(target)
             prior_identity: tuple[int, int] | None = None
             if target_existed:
                 prior_identity = _path_identity(target)
-                prior_empty = Path(
-                    tempfile.mkdtemp(prefix=f".{target.name}.tmp-restore-prior-", dir=target.parent)
-                )
+                try:
+                    prior_empty = Path(
+                        tempfile.mkdtemp(
+                            prefix=f".{target.name}.tmp-restore-prior-", dir=target.parent
+                        )
+                    )
+                except OSError as exc:
+                    raise PersistenceError(
+                        f"could not allocate prior-target recovery beside {target}: {exc}"
+                    ) from exc
                 prior_empty.rmdir()
                 try:
                     durable_replace(target, prior_empty)
@@ -995,9 +1035,7 @@ class Vault:
                             identity=prior_identity,
                             cause=exc,
                         )
-                    raise PersistenceError(
-                        f"restore was not published at {target}; staged files were discarded"
-                    ) from exc
+                    raise PersistenceError(f"restore was not published at {target}") from exc
                 raise DegradedIntegrityError(
                     f"could not determine whether the restore was published at {target}; run "
                     f"`gsv --vault {shlex.quote(str(target))} doctor` if the target exists, and "
@@ -1008,8 +1046,14 @@ class Vault:
                 if cleanup_warning is None:
                     prior_empty = None
         finally:
-            if stage.exists():
-                shutil.rmtree(stage)
+            stage_state = _restore_stage_state(stage, stage_identity)
+            if stage_state != "absent":
+                primary = sys.exc_info()[1]
+                _raise_retained_restore_stage(
+                    stage=stage,
+                    state=stage_state,
+                    primary=primary,
+                )
         return {
             "backup": str(opened_path),
             "durability_confirmed": True,
@@ -1335,11 +1379,14 @@ def _json_line(payload: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
-def _leaf_path(path: Path) -> Path:
-    expanded = path.expanduser()
-    if not expanded.is_absolute():
-        expanded = Path.cwd() / expanded
-    return expanded.parent.resolve() / expanded.name
+def _leaf_path(path: Path, *, label: str) -> Path:
+    try:
+        expanded = path.expanduser()
+        if not expanded.is_absolute():
+            expanded = Path.cwd() / expanded
+        return expanded.parent.resolve() / expanded.name
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValidationError(f"invalid {label}: {path}: {exc}") from exc
 
 
 def _generated_backup_destination(root: Path) -> Path:
@@ -1365,6 +1412,37 @@ def _validate_backup_destination(path: Path) -> None:
     except OSError as exc:
         raise ValidationError(f"could not inspect backup destination: {path}: {exc}") from exc
     raise ConflictError(f"backup destination already exists and will not be replaced: {path}")
+
+
+def _raise_backup_staging_io_error(
+    *,
+    temp: Path,
+    destination: Path,
+    primary: OSError,
+) -> None:
+    prefix = f"could not create a staged backup beside {destination}: {primary}"
+    try:
+        durable_unlink(temp)
+    except OSError as cleanup_error:
+        cleanup_state = _backup_staging_cleanup_state(temp, include_path=True)
+        raise DegradedIntegrityError(
+            f"{prefix}; no backup was published; {cleanup_state}; durable cleanup failed: "
+            f"{cleanup_error}"
+        ) from primary
+    raise PersistenceError(
+        f"{prefix}; no backup was published and the staged archive was durably discarded"
+    ) from primary
+
+
+def _backup_staging_cleanup_state(path: Path, *, include_path: bool = False) -> str:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return "the staged archive is no longer visible, but deletion durability is unconfirmed"
+    except OSError:
+        return "the staged archive path state is unknown"
+    location = f" at {path}" if include_path else ""
+    return f"the staged archive remains{location}"
 
 
 def _scan_backup_directory(
@@ -1621,7 +1699,7 @@ def _hash_backup_files(files: list[tuple[str, Path]]) -> dict[str, str]:
 
 @contextmanager
 def _open_backup(path: Path) -> Iterator[tuple[Path, IO[bytes]]]:
-    opened_path = _leaf_path(path)
+    opened_path = _leaf_path(path, label="backup path")
     try:
         before = os.lstat(opened_path)
     except OSError as exc:
@@ -1774,7 +1852,47 @@ def _validate_backup_manifest(manifest: object) -> None:
 
 
 def _restore_target(path: Path) -> Path:
-    return _leaf_path(path)
+    return _leaf_path(path, label="restore target")
+
+
+def _restore_stage_state(path: Path, identity: tuple[int, int]) -> str:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    if stat.S_ISDIR(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == identity:
+        return "retained"
+    return "changed"
+
+
+def _raise_retained_restore_stage(
+    *,
+    stage: Path,
+    state: str,
+    primary: BaseException | None,
+) -> None:
+    if state == "retained":
+        detail = (
+            f"the unpublished restore stage is retained at {stage}; inspect it before removing "
+            "that exact directory"
+        )
+        if isinstance(primary, ValidationError):
+            raise ValidationError(f"{primary}; {detail}") from primary
+        if isinstance(primary, ConflictError):
+            raise ConflictError(f"{primary}; {detail}") from primary
+        if primary is None:
+            raise DegradedIntegrityError(f"restore did not consume its stage; {detail}")
+        raise DegradedIntegrityError(f"{primary}; {detail}") from primary
+
+    detail = (
+        f"restore stage identity is {state} at {stage}; the path may contain replacement data and "
+        "the original stage location is unknown. No recovery path was deleted"
+    )
+    if primary is None:
+        raise DegradedIntegrityError(detail)
+    raise DegradedIntegrityError(f"{primary}; {detail}") from primary
 
 
 def _validate_restore_target(target: Path) -> bool:

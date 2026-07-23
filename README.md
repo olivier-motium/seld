@@ -160,7 +160,9 @@ gsv --vault /path/to/restored-vault status
 An invalid archive returns a nonzero exit and is never published. Restore
 extracts to a private stage, verifies exact hashes and vault health, then
 publishes only to an absent or empty directory. It does not change the current
-configuration. To activate the restored vault, first run `gsv bridge stop`,
+configuration. A failed unpublished restore retains and names its exact private
+stage as recovery evidence; `gsv doctor` reports that directory but never
+recursively removes it with `--repair`. To activate the restored vault, first run `gsv bridge stop`,
 then `gsv --vault /path/to/restored-vault setup`; this deliberately rebinds
 Codex and The Bridge rather than silently switching a live installation.
 

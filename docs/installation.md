@@ -170,7 +170,9 @@ is visible but its directory sync fails, GSV returns a nonzero committed-state
 error naming the published target and the exact doctor command; it does not
 pretend the target stayed untouched or retry over it. A prior empty target that
 cannot be removed after publication is preserved and reported as a cleanup
-warning.
+warning. An unpublished failed restore retains its exact private stage and names
+that path in the nonzero result. Doctor reports retained stage directories for
+manual inspection; `doctor --repair` does not recursively delete them.
 
 Restore never rewrites configuration. It reports whether existing configuration
 already matches the target when that can be determined safely. Activation is a

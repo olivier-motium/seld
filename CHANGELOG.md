@@ -17,6 +17,9 @@
 - Keep backup verification and restore usable with missing or invalid UTF-8
   configuration, including symlink and special-file configuration paths, with
   structured failures for ordinary configured commands.
+- Keep failed unpublished restore stages as named recovery evidence, refuse
+  recursive doctor cleanup, and structure staging/path I/O failures without a
+  traceback.
 - Recheck receipt-owned marketplace bytes after atomic isolation during
   reinstall and uninstall, preserve destination races, and delete only exact
   manifest entries rather than recursively removing a mutable public path.
