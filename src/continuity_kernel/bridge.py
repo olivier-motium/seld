@@ -18,6 +18,7 @@ import time
 import uuid
 import webbrowser
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from hmac import compare_digest
@@ -189,7 +190,9 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         self.access_token = access_token
         self.instance_id = instance_id
         self.vault = vault
+        _worker_startup_marker("reading vault identity")
         self.vault_id = str(vault.identity()["vault_id"])
+        _worker_startup_marker("vault identity ready")
         self.static_root = static_root.resolve()
         self.integration_provider = integration_provider or _codex_metadata
         self._doctor: dict[str, Any] | None = None
@@ -203,7 +206,9 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         self._integration_at = 0.0
         self._integration_refreshing = False
         self._metadata_lock = threading.Lock()
+        _worker_startup_marker("binding loopback server")
         super().__init__(address, BridgeRequestHandler)
+        _worker_startup_marker("loopback server bound")
 
     def snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -466,6 +471,7 @@ def serve_bridge(
     if not _valid_access_token(token):
         raise ValidationError("Bridge access token must be 48 lowercase hexadecimal characters")
     static_resource = files("continuity_kernel") / "resources/bridge"
+    _worker_startup_marker("static resource ready")
     with as_file(static_resource) as static_root:
         server = BridgeHTTPServer(
             (LOOPBACK_HOST, port),
@@ -487,6 +493,7 @@ def serve_bridge(
         )
         if write_state:
             _write_state(state)
+            _worker_startup_marker("receipt written")
         try:
             server.serve_forever(poll_interval=0.25)
         except KeyboardInterrupt:
@@ -815,6 +822,7 @@ def _loopback_connection_refused(url: str, *, timeout: float) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
             connection.setblocking(False)
             result = connection.connect_ex((LOOPBACK_HOST, parsed.port))
+            _ci_probe_marker("initial", result)
             if _is_connection_refused(OSError(result, "loopback connection failed")):
                 return True
             pending = {
@@ -832,9 +840,24 @@ def _loopback_connection_refused(url: str, *, timeout: float) -> bool:
             if not writable and not exceptional:
                 return False
             final_error = connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            _ci_probe_marker("final", final_error)
             return _is_connection_refused(OSError(final_error, "loopback connection failed"))
     except (OSError, ValueError):
         return False
+
+
+def _ci_probe_marker(stage: str, code: int) -> None:
+    if not os.environ.get("CI"):
+        return
+    with suppress(OSError):
+        os.write(2, f"gsv loopback probe: {stage}={code}\n".encode("ascii"))
+
+
+def _worker_startup_marker(stage: str) -> None:
+    if os.environ.get("GSV_BRIDGE_WORKER") != "1":
+        return
+    with suppress(OSError):
+        os.write(2, f"gsv Bridge worker: {stage}\n".encode("ascii"))
 
 
 def _wait_for_state(
@@ -1012,6 +1035,7 @@ def _child_detaches_after_spawn() -> bool:
 def _bridge_child_environment(vault: Vault) -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("GSV_BRIDGE_DETACH_IN_CHILD", None)
+    environment["GSV_BRIDGE_WORKER"] = "1"
     environment["GSV_VAULT"] = str(vault.root)
     if getattr(sys, "frozen", False):
         environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
