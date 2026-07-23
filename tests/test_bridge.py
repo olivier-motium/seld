@@ -1145,24 +1145,16 @@ def test_health_probe_recognizes_windows_loopback_refusal(
 def test_health_probe_confirms_opaque_loopback_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class RefusedSocket:
-        def __enter__(self) -> RefusedSocket:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-        def settimeout(self, _timeout: float) -> None:
-            return None
-
-        def connect_ex(self, _address: tuple[str, int]) -> int:
-            return 10061
-
     def fail_request(*_args: object, **_kwargs: object) -> None:
         raise URLError(OSError(errno.EINVAL, "opaque transport failure"))
 
+    refusal = OSError(errno.EINVAL, "injected Windows refusal")
+    cast(Any, refusal).winerror = 10061
     monkeypatch.setattr(bridge, "_open_loopback", fail_request)
-    monkeypatch.setattr("continuity_kernel.bridge.socket.socket", lambda *_args: RefusedSocket())
+    monkeypatch.setattr(
+        "continuity_kernel.bridge.socket.create_connection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(refusal),
+    )
 
     probe = bridge._probe_health(
         f"http://{bridge.LOOPBACK_HOST}:43117/", token=ACCESS_TOKEN, timeout=0
@@ -1171,19 +1163,22 @@ def test_health_probe_confirms_opaque_loopback_refusal(
     assert probe == bridge._HealthProbe(bridge._HealthOutcome.REFUSED)
 
 
-def test_runtime_command_prefers_installed_sibling_launcher(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_source_bridge_command_uses_the_minimal_worker(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    executable = tmp_path / ("python.exe" if os.name == "nt" else "python")
-    executable.write_bytes(b"")
-    launcher = tmp_path / ("gsv.exe" if os.name == "nt" else "gsv")
-    launcher.write_text("launcher", encoding="utf-8")
-    if os.name != "nt":
-        launcher.chmod(0o700)
-    monkeypatch.setattr(sys, "executable", str(executable))
-    monkeypatch.setattr(sys, "argv", ["pytest"])
+    monkeypatch.setattr(sys, "executable", "/synthetic/python")
 
-    assert bridge._runtime_command() == [str(launcher.resolve())]
+    assert bridge._bridge_command(vault, instance_id=INSTANCE_ID) == [
+        "/synthetic/python",
+        "-m",
+        "continuity_kernel.bridge_worker",
+        "--vault",
+        str(vault.root),
+        "--port",
+        "0",
+        "--instance-id",
+        INSTANCE_ID,
+    ]
 
 
 def test_stop_cleans_refused_receipt_without_signalling_unverified_pid(

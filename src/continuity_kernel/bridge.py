@@ -42,7 +42,6 @@ from continuity_kernel.bridge_projection import (
 from continuity_kernel.bridge_projection import (
     codex_deep_link as codex_deep_link,
 )
-from continuity_kernel.codex_integration import codex_status
 from continuity_kernel.config import data_dir
 from continuity_kernel.errors import ContinuityError, SetupError, ValidationError
 from continuity_kernel.vault import Vault
@@ -160,6 +159,14 @@ def _codex_metadata() -> dict[str, Any]:
         return {"available": True, **codex_status()}
     except (ContinuityError, OSError) as exc:
         return {"available": False, "error": str(exc)}
+
+
+def codex_status() -> dict[str, Any]:
+    """Load the optional provider integration only when a snapshot needs it."""
+
+    from continuity_kernel.codex_integration import codex_status as read_status
+
+    return read_status()
 
 
 class BridgeHTTPServer(ThreadingHTTPServer):
@@ -513,13 +520,13 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
         else:
             _discard_state()
             instance_id = uuid.uuid4().hex
-            command = [*_runtime_command(), "--vault", str(vault.root), "bridge", "serve"]
-            command.extend(["--port", "0", "--instance-id", instance_id])
+            command = _bridge_command(vault, instance_id=instance_id)
             log_path = root / "bridge.log"
             environment = _bridge_child_environment(vault)
             with _open_private_log(log_path) as log:
+                child_detaches = _child_detaches_after_spawn()
                 options: dict[str, Any] = {
-                    "close_fds": True,
+                    "close_fds": not child_detaches,
                     "env": environment,
                     "stderr": log,
                     "stdin": subprocess.DEVNULL,
@@ -527,17 +534,16 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
                 }
                 if os.name == "nt":
                     options["creationflags"] = _CREATE_NEW_PROCESS_GROUP | _DETACHED_PROCESS
-                else:
+                elif not child_detaches:
                     options["start_new_session"] = True
                 process = subprocess.Popen(command, **options)
             state = _wait_for_state(
                 instance_id,
                 process.pid,
-                # Python and frozen launchers may hand off to a worker process on
-                # macOS and Windows. The random instance ID binds this receipt to
-                # the exact launch; the authenticated health check below binds its
-                # reported PID to the live server.
-                expected_pid=None,
+                # A frozen launcher may hand off to a worker process. Source and
+                # wheel installs launch the internal worker directly, so its PID
+                # must match the authenticated receipt.
+                expected_pid=None if getattr(sys, "frozen", False) else process.pid,
                 vault_id=str(vault.identity()["vault_id"]),
                 timeout=20.0,
             )
@@ -805,13 +811,16 @@ def _loopback_connection_refused(url: str, *, timeout: float) -> bool:
         parsed = urlsplit(url)
         if parsed.hostname != LOOPBACK_HOST or parsed.port is None:
             return False
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
-            connection.settimeout(min(0.5, max(timeout, 0.05)))
-            result = connection.connect_ex((LOOPBACK_HOST, parsed.port))
-    except (OSError, ValueError):
+        connection = socket.create_connection(
+            (LOOPBACK_HOST, parsed.port),
+            timeout=min(0.5, max(timeout, 0.05)),
+        )
+    except OSError as exc:
+        return _is_connection_refused(exc)
+    except ValueError:
         return False
-    refused_codes = {errno.ECONNREFUSED, int(getattr(errno, "WSAECONNREFUSED", 10061))}
-    return result in refused_codes
+    connection.close()
+    return False
 
 
 def _wait_for_state(
@@ -968,30 +977,32 @@ def _terminate_pid(pid: int) -> None:
         return
 
 
-def _runtime_command() -> list[str]:
+def _bridge_command(vault: Vault, *, instance_id: str) -> list[str]:
     if getattr(sys, "frozen", False):
-        return [sys.executable]
-    launcher = Path(sys.argv[0]).expanduser()
-    if launcher.name.lower() in {"gsv", "gsv.exe"} and _usable_console_launcher(launcher):
-        return [str(launcher.resolve())]
-    sibling = Path(sys.executable).with_name("gsv.exe" if _IS_WINDOWS else "gsv")
-    if _usable_console_launcher(sibling):
-        return [str(sibling.resolve())]
-    return [sys.executable, "-m", "continuity_kernel"]
+        command = [sys.executable, "--vault", str(vault.root), "bridge", "serve"]
+    else:
+        command = [
+            sys.executable,
+            "-m",
+            "continuity_kernel.bridge_worker",
+            "--vault",
+            str(vault.root),
+        ]
+    return [*command, "--port", "0", "--instance-id", instance_id]
 
 
-def _usable_console_launcher(path: Path) -> bool:
-    try:
-        return path.is_file() and (_IS_WINDOWS or os.access(path, os.X_OK))
-    except OSError:
-        return False
+def _child_detaches_after_spawn() -> bool:
+    return sys.platform == "darwin" and not getattr(sys, "frozen", False)
 
 
 def _bridge_child_environment(vault: Vault) -> dict[str, str]:
     environment = os.environ.copy()
+    environment.pop("GSV_BRIDGE_DETACH_IN_CHILD", None)
     environment["GSV_VAULT"] = str(vault.root)
     if getattr(sys, "frozen", False):
         environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    elif _child_detaches_after_spawn():
+        environment["GSV_BRIDGE_DETACH_IN_CHILD"] = "1"
     return environment
 
 
