@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import tempfile
 import zipfile
 from collections.abc import Iterator
@@ -543,6 +544,8 @@ def test_invalid_utf8_configuration_is_structured_for_loader_and_cli(
 def test_restore_publishes_without_opening_fifo_configuration(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    if sys.platform == "win32":
+        pytest.skip("FIFO creation is unavailable")
     source = Vault(tmp_path / "source")
     source.initialize(name="FIFO recovery")
     backup = Path(source.create_backup(tmp_path / "portable.zip")["backup"])

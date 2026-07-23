@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -207,6 +208,8 @@ def test_restore_rejects_symlink_target_without_touching_destination(
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
 def test_restore_rejects_special_target_without_blocking(vault: Vault, tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("FIFO creation is unavailable")
     backup = Path(vault.create_backup(tmp_path / "backup.zip")["backup"])
     target = tmp_path / "restored.fifo"
     os.mkfifo(target)
@@ -478,6 +481,8 @@ def test_backup_rejects_symlink_instead_of_silently_omitting_it(
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
 def test_backup_rejects_fifo_instead_of_silently_omitting_it(vault: Vault, tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("FIFO creation is unavailable")
     os.mkfifo(vault.root / "unrepresented.fifo")
 
     with pytest.raises(ValidationError, match="unsupported file type"):

@@ -23,14 +23,6 @@ Give any coding agent this instruction:
 is a convenience verified against Codex Desktop `26.715.72359`; the copyable
 instruction above remains the portable path.
 
-<picture>
-  <source srcset="docs/assets/gsv-handoff.gif" type="image/gif">
-  <img src="docs/assets/bridge-overview.png" alt="A synthetic GSV hand writes a commitment, ends, and a fresh hand resumes the exact revision in The Bridge.">
-</picture>
-
-[Static Bridge preview](docs/assets/bridge-overview.png) ·
-[How this proof is generated](docs/assets/README.md)
-
 > **Candidate status:** `0.2.0` is Unreleased and the repository is private. No
 > public `0.2.0` asset has been published. The exact candidate is validated
 > locally on macOS Apple Silicon through two independent MCP processes and the

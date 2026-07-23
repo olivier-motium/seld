@@ -1126,7 +1126,7 @@ def _pid_alive(pid: int) -> bool:
     if _IS_WINDOWS:
         return _windows_pid_alive(pid)
     try:
-        waited, _ = os.waitpid(pid, os.WNOHANG)
+        waited, _ = os.waitpid(pid, int(getattr(os, "WNOHANG", 0)))
         if waited == pid:
             return False
     except ChildProcessError:
@@ -1198,7 +1198,7 @@ def _private_runtime_dir() -> Path:
         root.mkdir(parents=True, exist_ok=True)
         if root.is_symlink() or not root.is_dir():
             raise SetupError(f"The Bridge data path is not a private directory: {root}")
-        if not _IS_WINDOWS:
+        if sys.platform != "win32":
             flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
             flags |= int(getattr(os, "O_NOFOLLOW", 0))
             descriptor = os.open(root, flags)
@@ -1226,7 +1226,7 @@ def _open_private_log(path: Path) -> BinaryIO:
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                 raise SetupError(f"Refusing unsafe Bridge log path: {path}")
-            if not _IS_WINDOWS:
+            if sys.platform != "win32":
                 os.fchmod(descriptor, 0o600)
             return os.fdopen(descriptor, "ab")
         except Exception:

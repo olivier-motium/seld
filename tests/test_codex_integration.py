@@ -3642,6 +3642,8 @@ def test_dangling_receipt_symlink_is_rejected_before_mutation(
 def test_receipt_fifo_is_rejected_without_opening_or_blocking(
     tmp_path: Path, fake_codex: FakeCodex
 ) -> None:
+    if sys.platform == "win32":
+        pytest.skip("FIFO creation is unavailable")
     home = tmp_path / "codex"
     home.mkdir()
     installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
@@ -3764,6 +3766,8 @@ def test_added_empty_marketplace_directory_is_preserved_as_changed(
 def test_special_marketplace_file_is_preserved_and_fails_closed(
     tmp_path: Path, fake_codex: FakeCodex
 ) -> None:
+    if sys.platform == "win32":
+        pytest.skip("FIFO creation is unavailable")
     home = tmp_path / "codex"
     home.mkdir()
     installed = integration.install_codex(vault=tmp_path / "vault", codex_home=home)
