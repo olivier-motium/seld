@@ -191,7 +191,9 @@ configures the restored vault and rebinds the Codex integration and Bridge.
 Source development is deliberately separate from the consumer promise:
 
 ```bash
-uv sync --extra dev --extra release --extra visual
+uv sync --extra dev --extra release --extra browser-test
+uv run playwright install chromium
+uv run python scripts/verify_bridge_browser.py
 uv run gsv setup
 ```
 

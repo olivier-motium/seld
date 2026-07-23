@@ -52,6 +52,17 @@ def test_vault_crud_context_and_same_name_entities(vault: Vault) -> None:
     assert vault.doctor().healthy
 
 
+@pytest.mark.parametrize("identifier", ["con", "nul", "com1", "lpt9"])
+def test_new_task_rejects_windows_reserved_identifier(vault: Vault, identifier: str) -> None:
+    with pytest.raises(ValidationError, match="reserved by Windows"):
+        vault.create_task(
+            identifier=identifier,
+            title="Portable task",
+            outcome="Remain restorable across supported platforms.",
+        )
+    assert vault.status()["counts"]["tasks"] == 0
+
+
 def test_stale_update_is_rejected_and_terminal_update_clears_future(vault: Vault) -> None:
     task = vault.create_task(
         identifier="cas-test",

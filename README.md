@@ -220,11 +220,13 @@ They remove the executable only after the cleanup output is verified to report
 Source development requires Python 3.11+ and `uv`:
 
 ```bash
-uv sync --extra dev --extra release --extra visual
+uv sync --extra dev --extra release --extra browser-test
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src tests scripts
 uv run pytest --cov=continuity_kernel --cov-report=term-missing
+uv run playwright install chromium
+uv run python scripts/verify_bridge_browser.py
 uv run python scripts/privacy_check.py .
 ```
 

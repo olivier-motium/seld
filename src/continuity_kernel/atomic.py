@@ -14,11 +14,12 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from ctypes import wintypes
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any, Protocol, cast
 
-from continuity_kernel.errors import ConflictError
+from continuity_kernel.errors import ConflictError, ValidationError
 
 
 class _PosixLock(Protocol):
@@ -66,6 +67,129 @@ class DurablePublishError(OSError):
     def __init__(self, message: str, *, outcome: PublishOutcome):
         super().__init__(message)
         self.outcome = outcome
+
+
+@dataclass(frozen=True)
+class RegularFileSnapshot:
+    """Stable metadata captured from an already-open regular file."""
+
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+
+
+def _snapshot(metadata: os.stat_result) -> RegularFileSnapshot:
+    return RegularFileSnapshot(
+        device=int(metadata.st_dev),
+        inode=int(metadata.st_ino),
+        size=int(metadata.st_size),
+        modified_ns=int(metadata.st_mtime_ns),
+    )
+
+
+def _same_file(left: RegularFileSnapshot, right: RegularFileSnapshot) -> bool:
+    if os.name != "nt":
+        return (left.device, left.inode) == (right.device, right.inode)
+    # CPython can expose different Windows file-index encodings for path and
+    # descriptor stat calls. Size and timestamp are checked here and again
+    # after the bounded read; lstat also rejects reparse-point swaps.
+    return (
+        left.device == right.device
+        and left.size == right.size
+        and left.modified_ns == right.modified_ns
+    )
+
+
+@contextmanager
+def open_regular_file(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int | None = None,
+) -> Iterator[tuple[int, RegularFileSnapshot]]:
+    """Open one stable regular file without following links or special files."""
+
+    try:
+        listed = os.lstat(path)
+    except OSError as exc:
+        raise ValidationError(f"could not inspect {label}: {path}: {exc}") from exc
+    if stat.S_ISLNK(listed.st_mode):
+        raise ValidationError(f"{label} cannot be a symbolic link: {path}")
+    if not stat.S_ISREG(listed.st_mode):
+        raise ValidationError(f"{label} must be a regular file: {path}")
+    if max_bytes is not None and listed.st_size > max_bytes:
+        raise ValidationError(f"{label} exceeds its size bound: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise ValidationError(f"could not open {label}: {path}: {exc}") from exc
+        opened = os.fstat(descriptor)
+        listed_snapshot = _snapshot(listed)
+        opened_snapshot = _snapshot(opened)
+        if not stat.S_ISREG(opened.st_mode) or not _same_file(listed_snapshot, opened_snapshot):
+            raise ValidationError(f"{label} changed while it was opened: {path}")
+        yield descriptor, opened_snapshot
+        finished = _snapshot(os.fstat(descriptor))
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or finished != opened_snapshot
+            or not _same_file(_snapshot(current), opened_snapshot)
+        ):
+            raise ValidationError(f"{label} changed while it was read: {path}")
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError(f"could not read {label}: {path}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def read_regular_file(path: Path, *, label: str, max_bytes: int) -> bytes:
+    """Read a stable regular file through the canonical bounded binary path."""
+
+    chunks: list[bytes] = []
+    remaining = max_bytes + 1
+    with open_regular_file(path, label=label, max_bytes=max_bytes) as (descriptor, _):
+        while remaining:
+            block = os.read(descriptor, min(64 * 1024, remaining))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+    content = b"".join(chunks)
+    if len(content) > max_bytes:
+        raise ValidationError(f"{label} exceeds its size bound: {path}")
+    return content
+
+
+def sha256_regular_file(path: Path, *, label: str, max_bytes: int | None = None) -> str:
+    """Hash one stable regular file through the same no-follow open boundary."""
+
+    digest = hashlib.sha256()
+    total = 0
+    with open_regular_file(path, label=label, max_bytes=max_bytes) as (descriptor, _):
+        while block := os.read(descriptor, 1024 * 1024):
+            total += len(block)
+            if max_bytes is not None and total > max_bytes:
+                raise ValidationError(f"{label} exceeds its size bound: {path}")
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def portable_relative(path: Path, root: Path) -> str:
+    """Serialize an API/archive path with stable POSIX separators on every OS."""
+
+    return path.relative_to(root).as_posix()
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -327,7 +451,7 @@ def append_durable(path: Path, content: bytes) -> None:
     """Append to an existing file or report restored, committed, or unknown state."""
 
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND)
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0))
     except Exception as exc:
         raise DurableAppendError(
             "could not open the existing append target", outcome=AppendOutcome.RESTORED

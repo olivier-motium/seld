@@ -66,8 +66,8 @@ does not ship an autonomous wake scheduler or a self-modifying daemon.
 - Now may show three cards per authored status lane only when every hidden card
   has an explicit remainder link to the complete Commitments view; bounded
   entity previews disclose their remainder too.
-- The published visual proof uses synthetic data and can be regenerated from
-  the repository.
+- The browser acceptance gate uses synthetic data, exercises the real packaged
+  Bridge, and commits no generated screenshots or GIFs.
 - Recovery, backup/restore, stale-write rejection, deliberate retirement of
   receipt-bound uninstall evidence, privacy scanning, and a fresh second Codex
   session must pass before release.

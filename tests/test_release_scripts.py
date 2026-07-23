@@ -85,6 +85,7 @@ def test_cli_json_keeps_the_posix_cleanup_gate_stable(
     assert output.startswith('{"ok":true,"result":{"cleanup_complete":true')
 
 
+@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX executable fixture")
 def test_e2e_helper_accepts_only_structured_exit_three_cleanup(
     tmp_path: Path,
 ) -> None:
@@ -581,7 +582,26 @@ def test_powershell_reinstall_failure_restores_previous_binary(tmp_path: Path) -
     target = install_dir / "gsv.exe"
     old = b"synthetic previous executable"
     target.write_bytes(old)
-    source = tmp_path / "Candidate.cs"
+    dotnet = shutil.which("dotnet")
+    if dotnet is None:
+        pytest.skip("the Windows runner has no .NET SDK for the executable fixture")
+    project = tmp_path / "candidate-src"
+    project.mkdir()
+    project_file = project / "candidate.csproj"
+    project_file.write_text(
+        """<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>candidate</AssemblyName>
+    <PublishSingleFile>true</PublishSingleFile>
+    <DebugType>None</DebugType>
+  </PropertyGroup>
+</Project>
+""",
+        encoding="utf-8",
+    )
+    source = project / "Program.cs"
     source.write_text(
         r"""
 using System;
@@ -605,29 +625,28 @@ public static class Candidate {
 """,
         encoding="utf-8",
     )
-    candidate = tmp_path / "candidate.exe"
-    compile_environment = os.environ.copy()
-    compile_environment.update(
-        {
-            "GSV_TEST_CANDIDATE": str(candidate),
-            "GSV_TEST_CSHARP": str(source),
-        }
-    )
+    publish = tmp_path / "candidate-publish"
     subprocess.run(
         [
-            powershell,
-            "-NoProfile",
-            "-Command",
-            "Add-Type -TypeDefinition (Get-Content -Raw -LiteralPath $env:GSV_TEST_CSHARP) "
-            "-Language CSharp -OutputAssembly $env:GSV_TEST_CANDIDATE "
-            "-OutputType ConsoleApplication",
+            dotnet,
+            "publish",
+            str(project_file),
+            "--configuration",
+            "Release",
+            "--runtime",
+            "win-x64",
+            "--self-contained",
+            "false",
+            "--output",
+            str(publish),
         ],
         check=True,
         capture_output=True,
         text=True,
-        env=compile_environment,
-        timeout=60,
+        timeout=180,
     )
+    candidate = publish / "candidate.exe"
+    assert candidate.is_file()
     fake_tools = tmp_path / "tools"
     fake_tools.mkdir()
     (fake_tools / "codex.cmd").write_text("@exit /b 0\n", encoding="ascii")

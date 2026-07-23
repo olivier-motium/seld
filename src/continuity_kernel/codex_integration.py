@@ -12,7 +12,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass
 from enum import StrEnum
@@ -20,13 +20,15 @@ from functools import lru_cache
 from hashlib import sha256
 from importlib.resources import as_file, files
 from pathlib import Path, PurePosixPath
-from typing import Any, Final
+from typing import Any, Final, TypedDict
 
 from continuity_kernel.atomic import (
     atomic_write,
     durable_unlink,
     exclusive_lock,
     move_no_replace,
+    read_regular_file,
+    sha256_regular_file,
 )
 from continuity_kernel.config import codex_home as default_codex_home
 from continuity_kernel.config import data_dir
@@ -104,7 +106,6 @@ class _MarketplaceCleanupState(StrEnum):
     VERIFIED_PRESENT = "verified_present"
     LEGACY_REPAIR_PRESENT = "legacy_repair_present"
     RETAINED = "retained"
-    REMOVED = "removed"
     ALREADY_MISSING = "already_missing"
     REMOVAL_FAILED = "removal_failed"
     CHANGED_OR_UNSAFE = "changed_or_unsafe"
@@ -129,7 +130,6 @@ class _MarketplaceCleanup:
     def complete(self) -> bool:
         return self.state in {
             _MarketplaceCleanupState.NOT_OWNED,
-            _MarketplaceCleanupState.REMOVED,
             _MarketplaceCleanupState.ALREADY_MISSING,
         }
 
@@ -145,6 +145,61 @@ class _ProviderCleanup:
 class _ReceiptSnapshot:
     payload: dict[str, Any]
     encoded: bytes | None
+
+
+class _ReceiptPhase(StrEnum):
+    MISSING = "missing"
+    INSTALLING = "installing"
+    ACTIVE = "active"
+    PROVIDER_VERIFIED = "provider_verified"
+    RECOVERY_ONLY = "recovery_only"
+
+
+@dataclass(frozen=True)
+class _ReceiptState:
+    phase: _ReceiptPhase
+    snapshot: _ReceiptSnapshot
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return self.snapshot.payload
+
+
+class UninstallResult(TypedDict, total=False):
+    cleanup_complete: bool
+    result_format_version: int
+    codex_available: bool | None
+    codex_home: str
+    deferred_registrations: list[str]
+    instructions_removed: bool
+    integration_removed: bool
+    local_cleanup_error: str | None
+    local_cleanup_verified: bool
+    manual_review_required: bool
+    marketplace_files_path: str | None
+    marketplace_files_removed: bool
+    marketplace_files_state: str
+    marketplace_removed: bool | None
+    next: str | None
+    plugin_removed: bool | None
+    preexisting_plugin_preserved: bool | None
+    receipt_missing: bool | None
+    receipt_state: str
+    retained_cleanup_paths: list[str]
+    recovery_retained: bool
+    recorded_marketplace_root: str | None
+    registered_marketplace_root: str | None
+    provider_cleanup_error: str | None
+    provider_checkpoint_error: str | None
+    provider_checkpoint_candidate_visible: bool
+    provider_checkpointed: bool
+    provider_cleanup_skipped: bool
+    provider_cleanup_verified: bool
+    receipt_cleanup_error: str | None
+    receipt_preserved_for_retry: bool | None
+    registration_cleanup_deferred: bool
+    uninstall_phase: object
+    user_data_preserved: bool
 
 
 @dataclass(frozen=True)
@@ -468,7 +523,6 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
             replacement=final_receipt,
             context="stable install receipt",
         )
-        _commit_marketplace(marketplace_change)
     except Exception as exc:
         rollback = _rollback_install(
             executable=executable,
@@ -507,6 +561,16 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
 def codex_status(*, codex_home: Path | None = None) -> dict[str, Any]:
     home = (codex_home or default_codex_home()).expanduser().resolve()
     executable = _codex_executable()
+    marketplaces = _run_json(executable, ["plugin", "marketplace", "list", "--json"], home)
+    marketplace = _unique_provider_item(
+        _marketplace_items(marketplaces, context="marketplace list during status"),
+        key="name",
+        identity=MARKETPLACE_NAME,
+        context="marketplace list during status",
+    )
+    marketplace_root_verified = marketplace is not None and _provider_root_matches(
+        marketplace.get("root"), _marketplace_root(home)
+    )
     plugins = _run_json(executable, ["plugin", "list", "--json"], home)
     plugin = _unique_provider_item(
         _plugin_items(plugins, context="plugin list", require_enabled=True),
@@ -514,10 +578,38 @@ def codex_status(*, codex_home: Path | None = None) -> dict[str, Any]:
         identity=PLUGIN_ID,
         context="plugin list",
     )
+    instructions_installed = _instructions_installed(home)
+    plugin_installed = plugin is not None and plugin.get("enabled") is True
+    receipt = _load_receipt(home)
+    receipt_active = bool(
+        receipt.get("format_version") == RECEIPT_FORMAT_VERSION
+        and receipt.get("integration_active") is True
+        and receipt.get("install_transition") is None
+        and receipt.get("uninstall_phase") is None
+    )
+    expected_manifest = receipt.get("marketplace_manifest") if receipt_active else None
+    manifest_verified = False
+    if isinstance(expected_manifest, dict) and _path_present(_marketplace_root(home)):
+        try:
+            manifest_verified = _tree_manifest(_marketplace_root(home)) == expected_manifest
+        except (OSError, ValidationError):
+            manifest_verified = False
+    ready = bool(
+        marketplace_root_verified
+        and plugin_installed
+        and instructions_installed
+        and receipt_active
+        and manifest_verified
+    )
     return {
         "codex_home": str(home),
-        "instructions_installed": _instructions_installed(home),
-        "plugin_installed": plugin is not None and plugin.get("enabled") is True,
+        "instructions_installed": instructions_installed,
+        "manifest_verified": manifest_verified,
+        "marketplace_registered": marketplace is not None,
+        "marketplace_root_verified": marketplace_root_verified,
+        "plugin_installed": plugin_installed,
+        "ready": ready,
+        "receipt_active": receipt_active,
     }
 
 
@@ -648,13 +740,28 @@ def _assert_idempotent_install_state(
     )
 
 
-def uninstall_codex(*, codex_home: Path | None = None) -> dict[str, Any]:
+def uninstall_codex(*, codex_home: Path | None = None) -> UninstallResult:
     home = (codex_home or default_codex_home()).expanduser().resolve()
     with exclusive_lock(_integration_lock_path(home)):
         return _uninstall_codex_locked(home)
 
 
-def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
+def _receipt_state(snapshot: _ReceiptSnapshot) -> _ReceiptState:
+    payload = snapshot.payload
+    if not payload:
+        phase = _ReceiptPhase.MISSING
+    elif payload.get("install_transition") is not None:
+        phase = _ReceiptPhase.INSTALLING
+    elif payload.get("integration_active") is not True:
+        phase = _ReceiptPhase.RECOVERY_ONLY
+    elif payload.get("uninstall_phase") == "provider_verified":
+        phase = _ReceiptPhase.PROVIDER_VERIFIED
+    else:
+        phase = _ReceiptPhase.ACTIVE
+    return _ReceiptState(phase, snapshot)
+
+
+def _uninstall_codex_locked(home: Path) -> UninstallResult:
     # Preserve the hard path/type boundary before translating later structural
     # cleanup findings into a retryable partial result. The cleanup plan below
     # takes a second exact-byte snapshot used for compare-before-delete.
@@ -664,13 +771,14 @@ def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
     if receipt.get("format_version") == 1 and receipt.get("uninstall_phase") == "provider_verified":
         receipt_snapshot = _migrate_v1_provider_checkpoint(home, receipt_snapshot)
         receipt = receipt_snapshot.payload
-    if not receipt:
+    state = _receipt_state(receipt_snapshot)
+    if state.phase is _ReceiptPhase.MISSING:
         evidence = _unowned_integration_evidence(home)
         if evidence.found:
             return _missing_receipt_result(home, evidence)
-    elif receipt.get("install_transition") is not None:
+    elif state.phase is _ReceiptPhase.INSTALLING:
         return _install_transition_uninstall_result(home, receipt_snapshot)
-    elif not receipt.get("integration_active", True):
+    elif state.phase is _ReceiptPhase.RECOVERY_ONLY:
         return _recovery_only_uninstall(home, receipt_snapshot)
     plugin_owned = bool(receipt.get("plugin_owned"))
     marketplace_owned = bool(receipt.get("marketplace_owned"))
@@ -870,7 +978,6 @@ def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
             _MarketplaceCleanupState.NOT_OWNED,
             _MarketplaceCleanupState.RETAINED,
             _MarketplaceCleanupState.ALREADY_MISSING,
-            _MarketplaceCleanupState.REMOVED,
         }
     )
     receipt_error: str | None = None
@@ -1026,7 +1133,6 @@ def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
         "marketplace_files_removed": not retained_paths
         and marketplace_files.state
         in {
-            _MarketplaceCleanupState.REMOVED,
             _MarketplaceCleanupState.ALREADY_MISSING,
         },
         "marketplace_files_state": marketplace_files.state,
@@ -1073,7 +1179,7 @@ def _uninstall_codex_locked(home: Path) -> dict[str, Any]:
 def _install_transition_uninstall_result(
     home: Path,
     snapshot: _ReceiptSnapshot,
-) -> dict[str, Any]:
+) -> UninstallResult:
     """Resolve an interrupted install into an inactive, immutable recovery catalog."""
 
     receipt = snapshot.payload
@@ -1353,7 +1459,7 @@ def _transition_uninstall_failure(
     codex_available: bool | None = None,
     provider_attempted: bool = False,
     repair_capacity_refused: bool = False,
-) -> dict[str, Any]:
+) -> UninstallResult:
     root = _marketplace_root(home)
     receipt = snapshot.payload
     transition = receipt.get("install_transition")
@@ -1436,7 +1542,7 @@ def _transition_uninstall_failure(
     }
 
 
-def _recovery_only_uninstall(home: Path, snapshot: _ReceiptSnapshot) -> dict[str, Any]:
+def _recovery_only_uninstall(home: Path, snapshot: _ReceiptSnapshot) -> UninstallResult:
     """Finish an already removed integration without touching retained recovery trees."""
 
     root = _marketplace_root(home)
@@ -1538,7 +1644,7 @@ def _recovery_only_uninstall(home: Path, snapshot: _ReceiptSnapshot) -> dict[str
     }
 
 
-def _missing_receipt_result(home: Path, evidence: _UnownedIntegrationEvidence) -> dict[str, Any]:
+def _missing_receipt_result(home: Path, evidence: _UnownedIntegrationEvidence) -> UninstallResult:
     detected_registrations = [
         name
         for name, present in (
@@ -1940,10 +2046,6 @@ def _integration_lock_path(home: Path) -> Path:
     return data_dir() / "locks" / f"codex-integration-{identity}.lock"
 
 
-def _commit_marketplace(change: _MarketplaceChange) -> None:
-    del change
-
-
 def _planned_instruction_install(home: Path) -> tuple[bytes | None, bytes]:
     existing = _read_regular_bytes(home / "AGENTS.md", label="Codex AGENTS.md")
     try:
@@ -2127,51 +2229,13 @@ def _read_regular_bytes(
 ) -> bytes | None:
     """Read one regular file without following links or opening special files."""
 
-    try:
-        before = os.lstat(path)
-    except FileNotFoundError:
+    if not os.path.lexists(path):
         return None
-    except OSError as exc:
-        raise ValidationError(f"could not inspect {label}: {path}: {exc}") from exc
-    if stat.S_ISLNK(before.st_mode):
-        raise ValidationError(f"{label} cannot be a symbolic link: {path}")
-    if not stat.S_ISREG(before.st_mode):
-        raise ValidationError(f"{label} must be a regular file: {path}")
-    if max_bytes is not None and before.st_size > max_bytes:
-        raise ValidationError(f"{label} is too large: {path}")
-
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise ValidationError(f"could not open {label}: {path}: {exc}") from exc
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise ValidationError(f"{label} must remain a regular file: {path}")
-        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
-            raise ValidationError(f"{label} changed while it was being opened: {path}")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(descriptor, 64 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if max_bytes is not None and total > max_bytes:
-                raise ValidationError(f"{label} is too large: {path}")
-        return b"".join(chunks)
-    except ValidationError:
-        raise
-    except OSError as exc:
-        raise ValidationError(f"could not read {label}: {path}: {exc}") from exc
-    finally:
-        with suppress(OSError):
-            os.close(descriptor)
+    return read_regular_file(
+        path,
+        label=label,
+        max_bytes=max_bytes if max_bytes is not None else sys.maxsize,
+    )
 
 
 def _read_agents_text(home: Path) -> str | None:
@@ -2993,47 +3057,6 @@ def _dedupe_cleanup_pending(records: list[dict[str, Any]]) -> list[dict[str, Any
     return [by_basename[name] for name in sorted(by_basename)]
 
 
-def _restore_receipt_after_failed_install(
-    home: Path,
-    *,
-    prior: bytes | None,
-    attempted: bytes | None,
-) -> None:
-    path = _receipt_path(home)
-    current = _read_regular_bytes(
-        path,
-        label="Codex integration receipt",
-        max_bytes=RECEIPT_MAX_BYTES,
-    )
-    if current == prior:
-        return
-    if attempted is None or current != attempted:
-        raise ConflictError("ownership receipt changed during install rollback")
-    if prior is None:
-        durable_unlink(path)
-        if (
-            _read_regular_bytes(
-                path,
-                label="Codex integration receipt",
-                max_bytes=RECEIPT_MAX_BYTES,
-            )
-            is not None
-        ):
-            raise ConflictError("new ownership receipt remained after install rollback")
-        return
-    try:
-        atomic_write(path, prior)
-    except Exception as exc:
-        restored = _read_regular_bytes(
-            path,
-            label="Codex integration receipt",
-            max_bytes=RECEIPT_MAX_BYTES,
-        )
-        if restored != prior:
-            raise SetupError("previous ownership receipt could not be restored") from exc
-    _confirm_receipt_durable(path, prior)
-
-
 def _checkpoint_provider_verified(
     home: Path,
     snapshot: _ReceiptSnapshot,
@@ -3157,7 +3180,7 @@ def _migrate_v1_provider_checkpoint(
 def _missing_marketplace_uninstall(
     home: Path,
     snapshot: _ReceiptSnapshot,
-) -> dict[str, Any]:
+) -> UninstallResult:
     """Recover any owned missing marketplace with a receipt-first repair transition."""
 
     if snapshot.encoded is None:  # pragma: no cover - owned receipt invariant
@@ -3170,7 +3193,7 @@ def _missing_marketplace_uninstall(
 def _upgrade_transition_with_repair(
     home: Path,
     snapshot: _ReceiptSnapshot,
-) -> dict[str, Any]:
+) -> UninstallResult:
     if snapshot.encoded is None:
         raise ConflictError("install transition receipt is missing before repair upgrade")
     receipt = snapshot.payload
@@ -3228,7 +3251,7 @@ def _start_provider_repair_transition(
     snapshot: _ReceiptSnapshot,
     *,
     cleanup_pending: list[dict[str, Any]],
-) -> dict[str, Any]:
+) -> UninstallResult:
     if snapshot.encoded is None:
         raise ConflictError("ownership receipt is missing before provider repair")
     # A failed scaffold write can retain one partial repair tree, and the
@@ -3581,13 +3604,6 @@ def _inspect_checkpointed_marketplace(
     )
 
 
-def _populate_legacy_repair_tree(target: Path) -> None:
-    source = files("continuity_kernel") / "resources/marketplace"
-    with as_file(source) as source_path:
-        _copy_tree_exclusive(source_path, target)
-    _write_exclusive(target / LEGACY_REPAIR_MARKER_NAME, LEGACY_REPAIR_MARKER)
-
-
 def _resume_provider_repair_tree(root: Path, transition: dict[str, Any]) -> None:
     record = transition.get("repair")
     if not isinstance(record, dict):
@@ -3650,35 +3666,6 @@ def _legacy_repair_contents() -> dict[str, bytes | None]:
         _read_marketplace_contents(source_path, source_path, contents)
     contents[LEGACY_REPAIR_MARKER_NAME] = LEGACY_REPAIR_MARKER
     return contents
-
-
-def _copy_tree_exclusive(source: Path, target: Path) -> None:
-    try:
-        with os.scandir(source) as iterator:
-            entries = sorted(iterator, key=lambda entry: entry.name)
-    except OSError as exc:
-        raise ValidationError(f"could not read packaged marketplace directory: {source}") from exc
-    for entry in entries:
-        source_path = Path(entry.path)
-        target_path = target / entry.name
-        try:
-            if entry.is_symlink():
-                raise ValidationError(
-                    f"packaged marketplace contains a symbolic link: {source_path}"
-                )
-            if entry.is_dir(follow_symlinks=False):
-                target_path.mkdir()
-                _copy_tree_exclusive(source_path, target_path)
-            elif entry.is_file(follow_symlinks=False):
-                _write_exclusive(target_path, source_path.read_bytes())
-            else:
-                raise ValidationError(
-                    f"packaged marketplace contains a special file: {source_path}"
-                )
-        except OSError as exc:
-            raise ValidationError(
-                f"could not create legacy marketplace scaffold entry: {target_path}"
-            ) from exc
 
 
 def _write_exclusive(path: Path, content: bytes) -> None:
@@ -3882,45 +3869,6 @@ def _path_present(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
 
-def _restore_quarantined_marketplace(
-    root: Path,
-    quarantine: Path,
-    *,
-    state: _MarketplaceCleanupState,
-    detail: str,
-) -> _MarketplaceCleanup:
-    if not _path_present(quarantine):
-        return _MarketplaceCleanup(
-            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
-            path=str(root),
-            error=f"{detail}; the isolated cleanup path disappeared before recovery",
-        )
-    if _path_present(root):
-        return _MarketplaceCleanup(
-            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
-            path=str(root),
-            error=(
-                f"{detail}; a destination race was preserved at {root}, and the isolated tree "
-                f"remains at {quarantine}"
-            ),
-        )
-    try:
-        _publish_directory_new(quarantine, root)
-    except OSError as exc:
-        if _path_present(root) and not _path_present(quarantine):
-            return _MarketplaceCleanup(
-                state,
-                path=str(root),
-                error=f"{detail}; recovery is visible but durability is unconfirmed: {exc}",
-            )
-        return _MarketplaceCleanup(
-            _MarketplaceCleanupState.CHANGED_OR_UNSAFE,
-            path=str(root),
-            error=(f"{detail}; recovery failed: {exc}. Preserved paths: {root} and {quarantine}"),
-        )
-    return _MarketplaceCleanup(state, path=str(root), error=detail)
-
-
 def _codex_executable() -> str:
     override = os.environ.get("GSV_CODEX")
     if override:
@@ -4100,37 +4048,9 @@ def _scan_marketplace_directory(
             entries[relative] = "directory"
             _scan_marketplace_directory(root, path, entries)
         elif stat.S_ISREG(metadata.st_mode):
-            entries[relative] = f"file:{_sha256_regular_file(path, metadata)}"
+            entries[relative] = f"file:{sha256_regular_file(path, label='marketplace file')}"
         else:
             raise ValidationError(f"generated marketplace contains a special file: {path}")
-
-
-def _sha256_regular_file(path: Path, expected: os.stat_result) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise ValidationError(f"could not open generated marketplace file: {path}") from exc
-    digest = sha256()
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_dev != expected.st_dev
-            or opened.st_ino != expected.st_ino
-        ):
-            raise ValidationError(f"generated marketplace file changed during inspection: {path}")
-        while True:
-            block = os.read(descriptor, 1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-        after = os.fstat(descriptor)
-        if after.st_size != opened.st_size or after.st_mtime_ns != opened.st_mtime_ns:
-            raise ValidationError(f"generated marketplace file changed during inspection: {path}")
-    finally:
-        os.close(descriptor)
-    return digest.hexdigest()
 
 
 def _tree_digest_from_manifest(manifest: dict[str, str]) -> str:

@@ -7,9 +7,9 @@ the same build and acceptance matrix without publishing, so every target can be
 proved before the first tag. The workflow installs the locked development and
 release environments, runs lint, formatting, strict typing, tests, coverage,
 the privacy gate, and package builds before producing native executables.
-The quality job also installs an isolated Chromium runtime, drives the real
+The quality job also installs an isolated Chromium runtime and drives the real
 bearer-gated Bridge through healthy, inspector, mobile, stale, and unavailable
-states, and privacy-scans the generated visual proof.
+states. The gate persists no screenshots, GIFs, or other generated media.
 
 ## Assets
 

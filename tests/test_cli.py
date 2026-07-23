@@ -4,7 +4,6 @@ import json
 import os
 import stat
 import sys
-import tempfile
 import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -15,7 +14,7 @@ import pytest
 
 from continuity_kernel import bridge as bridge_module
 from continuity_kernel import cli
-from continuity_kernel import vault as vault_module
+from continuity_kernel import vault_backup as vault_backup_module
 from continuity_kernel.atomic import durable_replace as actual_durable_replace
 from continuity_kernel.codex_integration import CodexInstallResult
 from continuity_kernel.config import config_path, load_config, save_config
@@ -108,6 +107,83 @@ def test_setup_codex_failure_removes_new_configuration(
     assert "injected Codex failure" in capsys.readouterr().err
     assert not config_path().exists()
     assert requested.exists()
+
+
+def test_setup_failure_preserves_a_concurrent_configuration_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    requested = tmp_path / "requested-vault"
+    concurrent = tmp_path / "concurrent-vault"
+
+    @contextmanager
+    def fail_after_concurrent_change(**_: object) -> Iterator[CodexInstallResult]:
+        save_config(concurrent)
+        raise SetupError("injected Codex failure")
+        yield cast(CodexInstallResult, None)  # pragma: no cover
+
+    monkeypatch.setattr(cli, "install_codex_transaction", fail_after_concurrent_change)
+
+    result = cli.main(
+        [
+            "--vault",
+            str(requested),
+            "setup",
+            "--no-bridge",
+            "--codex-home",
+            str(tmp_path / "codex"),
+        ]
+    )
+
+    assert result == 2
+    assert "changed concurrently and was left untouched" in capsys.readouterr().err
+    configured = load_config()
+    assert configured is not None
+    assert configured.vault_path == concurrent.resolve()
+
+
+def test_setup_restores_configuration_even_when_bridge_cleanup_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    existing = tmp_path / "existing-vault"
+    requested = tmp_path / "requested-vault"
+    Vault(existing).initialize(name="Existing")
+    save_config(existing)
+
+    monkeypatch.setattr(
+        cli,
+        "open_bridge",
+        lambda *_args, **_kwargs: {"running": True, "started": True},
+    )
+    monkeypatch.setattr(
+        cli,
+        "open_bridge_in_browser",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SetupError("browser stage failed")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "stop_bridge",
+        lambda: (_ for _ in ()).throw(SetupError("bridge cleanup failed")),
+    )
+
+    result = cli.main(["--vault", str(requested), "setup", "--no-codex"])
+
+    assert result == 2
+    assert "browser stage failed; bridge cleanup failed" in capsys.readouterr().err
+    restored = load_config()
+    assert restored is not None
+    assert restored.vault_path == existing.resolve()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
+def test_setup_refuses_fifo_configuration_without_blocking(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("FIFO creation is unavailable")
+    configuration = config_path()
+    configuration.parent.mkdir(parents=True)
+    os.mkfifo(configuration)
+
+    assert cli.main(["--vault", str(tmp_path / "vault"), "setup", "--no-codex"]) == 2
+    assert stat.S_ISFIFO(os.lstat(configuration).st_mode)
 
 
 def test_setup_reuses_configured_vault_when_no_override(
@@ -286,7 +362,7 @@ def test_setup_keeps_committed_install_when_browser_open_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     events: list[str] = []
-    current_state: dict[str, object] = {}
+    current_state: bridge_module.BridgeState | None = None
 
     @contextmanager
     def staged_install(**_: object) -> Iterator[CodexInstallResult]:
@@ -303,18 +379,18 @@ def test_setup_keeps_committed_install_when_browser_open_raises(
         events.append("codex-committed")
 
     def started(vault: Vault, **_: object) -> dict[str, object]:
-        current_state.update(
-            {
-                "instance_id": "a" * 32,
-                "pid": 4242,
-                "port": 43117,
-                "token": "b" * 48,
-                "url": "http://127.0.0.1:43117/",
-                "vault": str(vault.root),
-                "vault_id": vault.status()["vault_id"],
-            }
+        nonlocal current_state
+        current_state = bridge_module.BridgeState(
+            format_version=bridge_module.STATE_VERSION,
+            instance_id="a" * 32,
+            pid=4242,
+            port=43117,
+            token="b" * 48,
+            url="http://127.0.0.1:43117/",
+            vault=str(vault.root),
+            vault_id=str(vault.status()["vault_id"]),
         )
-        return {"running": True, "started": True, "url": current_state["url"]}
+        return {"running": True, "started": True, "url": current_state.url}
 
     monkeypatch.setattr(cli, "install_codex_transaction", staged_install)
     monkeypatch.setattr(cli, "open_bridge", started)
@@ -341,15 +417,16 @@ def test_direct_bridge_open_survives_browser_exception(
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Browser failure proof")
     save_config(vault.root)
-    state = {
-        "instance_id": "a" * 32,
-        "pid": 4242,
-        "port": 43117,
-        "token": "b" * 48,
-        "url": "http://127.0.0.1:43117/",
-        "vault": str(vault.root),
-        "vault_id": vault.status()["vault_id"],
-    }
+    state = bridge_module.BridgeState(
+        format_version=bridge_module.STATE_VERSION,
+        instance_id="a" * 32,
+        pid=4242,
+        port=43117,
+        token="b" * 48,
+        url="http://127.0.0.1:43117/",
+        vault=str(vault.root),
+        vault_id=str(vault.status()["vault_id"]),
+    )
     monkeypatch.setattr(bridge_module, "_current_state", lambda: (state, True, False))
 
     def browser_failure(*_: object, **__: object) -> bool:
@@ -776,8 +853,8 @@ def test_backup_cleanup_failure_is_visible_in_cli_json(
             path.unlink()
         raise OSError("injected cleanup durability failure")
 
-    monkeypatch.setattr(vault_module, "_read_backup_source", fail_source_capture)
-    monkeypatch.setattr(vault_module, "durable_unlink", fail_cleanup)
+    monkeypatch.setattr(vault_backup_module, "_read_backup_source", fail_source_capture)
+    monkeypatch.setattr(vault_backup_module, "durable_unlink", fail_cleanup)
 
     exit_code = cli.main(
         [
@@ -815,7 +892,7 @@ def test_backup_staging_allocation_failure_is_structured_cli_json(
     def fail_staging(*_: object, **__: object) -> tuple[int, str]:
         raise PermissionError("injected unwritable output directory")
 
-    monkeypatch.setattr(tempfile, "mkstemp", fail_staging)
+    monkeypatch.setattr(vault_backup_module, "_mkstemp", fail_staging)
 
     exit_code = cli.main(
         [
@@ -856,15 +933,24 @@ def test_backup_staging_io_failures_are_structured_and_cleaned(
 
     if failure_point == "descriptor-close":
         real_close = os.close
+        real_mkstemp = vault_backup_module._mkstemp
+        staged_descriptor: int | None = None
         failed = False
+
+        def capture_staged_descriptor(*args: Any, **kwargs: Any) -> tuple[int, str]:
+            nonlocal staged_descriptor
+            descriptor, path = real_mkstemp(*args, **kwargs)
+            staged_descriptor = descriptor
+            return descriptor, path
 
         def fail_close(descriptor: int) -> None:
             nonlocal failed
             real_close(descriptor)
-            if not failed:
+            if descriptor == staged_descriptor and not failed:
                 failed = True
                 raise PermissionError(injected)
 
+        monkeypatch.setattr(vault_backup_module, "_mkstemp", capture_staged_descriptor)
         monkeypatch.setattr(os, "close", fail_close)
     elif failure_point == "zip-open":
 
@@ -935,7 +1021,7 @@ def test_backup_staging_io_and_cleanup_failures_are_both_structured(
         raise PermissionError("injected staged cleanup failure")
 
     monkeypatch.setattr(zipfile, "ZipFile", fail_zip)
-    monkeypatch.setattr(vault_module, "durable_unlink", fail_cleanup)
+    monkeypatch.setattr(vault_backup_module, "durable_unlink", fail_cleanup)
 
     exit_code = cli.main(
         [
@@ -1048,7 +1134,7 @@ def test_restore_stage_allocation_failure_is_structured_cli_json(
     def fail_stage(*_: object, **__: object) -> str:
         raise PermissionError("injected restore stage allocation failure")
 
-    monkeypatch.setattr(tempfile, "mkdtemp", fail_stage)
+    monkeypatch.setattr(vault_backup_module, "_mkdtemp", fail_stage)
 
     exit_code = cli.main(["--json", "backup", "restore", str(backup), str(target)])
     captured = capsys.readouterr()
@@ -1082,7 +1168,7 @@ def test_restore_target_swap_is_a_structured_degraded_cli_result(
             destination.mkdir()
             (destination / "replacement.txt").write_bytes(b"preserve\n")
 
-    monkeypatch.setattr(vault_module, "durable_replace", publish_then_swap)
+    monkeypatch.setattr(vault_backup_module, "durable_replace", publish_then_swap)
 
     exit_code = cli.main(["--json", "backup", "restore", str(backup), str(target)])
     captured = capsys.readouterr()

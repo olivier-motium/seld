@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from continuity_kernel import atomic as atomic_module
-from continuity_kernel import vault as vault_module
+from continuity_kernel import vault_backup as vault_backup_module
 from continuity_kernel.atomic import DurablePublishError, PublishOutcome, sha256_bytes
 from continuity_kernel.atomic import durable_publish_new as actual_durable_publish_new
 from continuity_kernel.atomic import durable_replace as actual_durable_replace
@@ -240,7 +240,7 @@ def test_restore_uses_same_open_archive_after_source_path_is_replaced(
     )
     source = Path(original_vault.create_backup(tmp_path / "source.zip")["backup"])
     replacement = Path(replacement_vault.create_backup(tmp_path / "replacement.zip")["backup"])
-    metadata = vault_module._backup_metadata
+    metadata = vault_backup_module._backup_metadata
     swapped = False
 
     def metadata_and_replace(
@@ -253,7 +253,7 @@ def test_restore_uses_same_open_archive_after_source_path_is_replaced(
             swapped = True
         return infos, manifest
 
-    monkeypatch.setattr(vault_module, "_backup_metadata", metadata_and_replace)
+    monkeypatch.setattr(vault_backup_module, "_backup_metadata", metadata_and_replace)
     target = tmp_path / "restored"
     restored = Vault.restore_backup(source, target)
 
@@ -277,7 +277,7 @@ def test_restore_rejects_same_inode_mutation_between_metadata_and_entry_read(
     replacement_vault.initialize(name="Replacement")
     replacement = Path(replacement_vault.create_backup(tmp_path / "replacement.zip")["backup"])
     replacement_bytes = replacement.read_bytes()
-    metadata = vault_module._backup_metadata
+    metadata = vault_backup_module._backup_metadata
     mutated = False
 
     def metadata_and_mutate(
@@ -295,7 +295,7 @@ def test_restore_rejects_same_inode_mutation_between_metadata_and_entry_read(
             mutated = True
         return infos, manifest
 
-    monkeypatch.setattr(vault_module, "_backup_metadata", metadata_and_mutate)
+    monkeypatch.setattr(vault_backup_module, "_backup_metadata", metadata_and_mutate)
     target = tmp_path / "restored"
 
     with pytest.raises(ValidationError, match="invalid backup"):
@@ -312,7 +312,7 @@ def test_restore_stage_path_swap_preserves_replacement_and_displaced_stage(
     target = tmp_path / "restored"
     displaced = tmp_path / ".restored.tmp-restore-displaced"
     replacement: Path | None = None
-    original_extract = vault_module._extract_backup
+    original_extract = vault_backup_module._extract_backup
 
     def extract_then_swap(handle: Any, path: Path, stage: Path) -> Any:
         nonlocal replacement
@@ -323,7 +323,7 @@ def test_restore_stage_path_swap_preserves_replacement_and_displaced_stage(
         replacement = stage
         raise ValidationError("injected post-extraction failure")
 
-    monkeypatch.setattr(vault_module, "_extract_backup", extract_then_swap)
+    monkeypatch.setattr(vault_backup_module, "_extract_backup", extract_then_swap)
 
     with pytest.raises(DegradedIntegrityError, match="identity is changed"):
         Vault.restore_backup(backup, target)
@@ -354,7 +354,7 @@ def test_restore_rejects_target_swap_immediately_after_publication(
             destination.mkdir()
             (destination / "replacement-user-data.txt").write_bytes(b"preserve replacement\n")
 
-    monkeypatch.setattr(vault_module, "durable_replace", publish_then_swap)
+    monkeypatch.setattr(vault_backup_module, "durable_replace", publish_then_swap)
 
     with pytest.raises(DegradedIntegrityError, match="post-publication verification"):
         Vault.restore_backup(backup, target)
@@ -378,7 +378,7 @@ def test_failed_publication_restores_preexisting_empty_target(
             raise OSError("injected publication failure")
         actual_durable_replace(source, destination)
 
-    monkeypatch.setattr(vault_module, "durable_replace", fail_stage_publish)
+    monkeypatch.setattr(vault_backup_module, "durable_replace", fail_stage_publish)
     with pytest.raises(PersistenceError, match="was not published"):
         Vault.restore_backup(backup, target)
 
@@ -402,7 +402,7 @@ def test_concurrent_content_in_renamed_empty_target_is_restored_and_aborts(
             (destination / "concurrent.txt").write_bytes(b"preserve\n")
             moved = True
 
-    monkeypatch.setattr(vault_module, "durable_replace", add_content_after_move)
+    monkeypatch.setattr(vault_backup_module, "durable_replace", add_content_after_move)
 
     with pytest.raises(PersistenceError, match="restore was not published") as failure:
         Vault.restore_backup(backup, target)
@@ -423,7 +423,7 @@ def test_prior_empty_cleanup_failure_reports_published_restore(
     def fail_cleanup(path: Path) -> str:
         return f"injected cleanup failure at {path}"
 
-    monkeypatch.setattr(vault_module, "_remove_prior_empty", fail_cleanup)
+    monkeypatch.setattr(vault_backup_module, "_remove_prior_empty", fail_cleanup)
     restored = Vault.restore_backup(backup, target)
 
     assert Vault(target).doctor().healthy is False
@@ -595,7 +595,7 @@ def test_backup_creation_hashes_and_writes_one_captured_source_read(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     before = (vault.root / "MIND.md").read_bytes()
-    read_source = vault_module._read_backup_source
+    read_source = vault_backup_module._read_backup_source
     reads = 0
 
     def read_then_mutate(path: Path) -> bytes:
@@ -606,7 +606,7 @@ def test_backup_creation_hashes_and_writes_one_captured_source_read(
             path.write_bytes(content + b"\nchanged after capture\n")
         return content
 
-    monkeypatch.setattr(vault_module, "_read_backup_source", read_then_mutate)
+    monkeypatch.setattr(vault_backup_module, "_read_backup_source", read_then_mutate)
     result = vault.create_backup(tmp_path / "snapshot.zip")
 
     assert reads == 1
@@ -661,7 +661,7 @@ def test_restore_rechecks_staged_files_against_manifest(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backup = Path(vault.create_backup(tmp_path / "backup.zip")["backup"])
-    monkeypatch.setattr(vault_module, "_hash_backup_files", lambda _files: {})
+    monkeypatch.setattr(vault_backup_module, "_hash_backup_files", lambda _files: {})
     target = tmp_path / "restored"
 
     with pytest.raises(ValidationError, match="staged vault files"):
@@ -681,7 +681,7 @@ def test_stage_publication_replace_then_fsync_failure_reports_committed_restore(
         if destination == target:
             raise OSError("injected parent fsync failure")
 
-    monkeypatch.setattr(vault_module, "durable_replace", publish_then_raise)
+    monkeypatch.setattr(vault_backup_module, "durable_replace", publish_then_raise)
 
     with pytest.raises(MutationCommittedError, match=r"published.*durability"):
         Vault.restore_backup(backup, target)
@@ -727,7 +727,7 @@ def test_default_backup_names_are_unique_within_one_frozen_second(
             assert timezone is UTC
             return frozen
 
-    monkeypatch.setattr(vault_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(vault_backup_module, "datetime", FrozenDateTime)
     first = Path(vault.create_backup()["backup"])
     second = Path(vault.create_backup()["backup"])
 
@@ -748,7 +748,7 @@ def test_generated_backup_retries_only_a_generated_name_collision(
     collision.write_bytes(b"preserve collision bytes\n")
     candidates = iter((collision, destination))
     monkeypatch.setattr(
-        vault_module,
+        vault_backup_module,
         "_generated_backup_destination",
         lambda _root: next(candidates),
     )
@@ -770,7 +770,7 @@ def test_backup_collision_created_during_publication_is_preserved(
         target.write_bytes(sentinel)
         actual_durable_publish_new(source, target)
 
-    monkeypatch.setattr(vault_module, "durable_publish_new", race_publish)
+    monkeypatch.setattr(vault_backup_module, "durable_publish_new", race_publish)
 
     with pytest.raises(ConflictError, match="already exists"):
         vault.create_backup(destination)
@@ -788,7 +788,7 @@ def test_backup_fails_closed_when_hard_link_publication_is_unsupported(
         del source, target
         raise OSError(errno.ENOTSUP, "injected unsupported hard links")
 
-    monkeypatch.setattr(vault_module, "durable_publish_new", unsupported)
+    monkeypatch.setattr(vault_backup_module, "durable_publish_new", unsupported)
 
     with pytest.raises(PersistenceError, match="was not published"):
         vault.create_backup(destination)
@@ -817,8 +817,8 @@ def test_backup_cleanup_after_unlink_failure_reports_actual_absent_stage(
         path.unlink()
         raise OSError("injected cleanup directory fsync failure")
 
-    monkeypatch.setattr(vault_module, "durable_publish_new", fail_publish)
-    monkeypatch.setattr(vault_module, "durable_unlink", unlink_then_fail)
+    monkeypatch.setattr(vault_backup_module, "durable_publish_new", fail_publish)
+    monkeypatch.setattr(vault_backup_module, "durable_unlink", unlink_then_fail)
 
     with pytest.raises(
         DegradedIntegrityError,
@@ -1029,7 +1029,7 @@ def test_backup_publication_replace_then_fsync_failure_reports_committed_archive
         if target == destination:
             raise OSError("injected backup parent fsync failure")
 
-    monkeypatch.setattr(vault_module, "durable_publish_new", publish_then_raise)
+    monkeypatch.setattr(vault_backup_module, "durable_publish_new", publish_then_raise)
 
     with pytest.raises(MutationCommittedError, match=r"published.*durability"):
         vault.create_backup(destination)
@@ -1134,7 +1134,7 @@ def test_prior_target_move_replace_then_fsync_failure_can_finish_durably(
             raised = True
             raise OSError("injected prior-target fsync failure")
 
-    monkeypatch.setattr(vault_module, "durable_replace", move_then_raise_once)
+    monkeypatch.setattr(vault_backup_module, "durable_replace", move_then_raise_once)
     restored = Vault.restore_backup(backup, target)
 
     assert raised is True

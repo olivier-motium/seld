@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from continuity_kernel import __version__
-from continuity_kernel.atomic import atomic_write
 from continuity_kernel.bridge import (
     bridge_status,
     open_bridge,
@@ -27,10 +26,11 @@ from continuity_kernel.codex_integration import (
     uninstall_codex,
 )
 from continuity_kernel.config import (
+    activate_config,
     codex_home,
-    config_path,
     load_config,
     resolve_vault,
+    restore_config,
     save_config,
 )
 from continuity_kernel.demo import run_demo
@@ -91,11 +91,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 "setup_complete": False,
                 "vault": initialized,
             }
-        configuration = config_path()
-        previous_config_exists = configuration.exists()
-        previous_config = configuration.read_bytes() if previous_config_exists else b""
-        save_config(vault_path)
-        installed_config = configuration.read_bytes()
+        _, previous_config, installed_config = activate_config(vault_path)
         integration = None
         bridge = None
         try:
@@ -113,16 +109,16 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 browser_opened = open_bridge_in_browser(vault)
                 bridge = {**bridge, "browser_opened": browser_opened}
         except Exception as exc:
+            cleanup_error: Exception | None = None
             if bridge is not None and bridge.get("started"):
-                stop_bridge()
-            rollback_error = _restore_setup_config(
-                configuration,
-                previous_exists=previous_config_exists,
-                previous=previous_config,
-                installed=installed_config,
-            )
-            if rollback_error is not None:
-                raise SetupError(f"{exc}; {rollback_error}") from exc
+                try:
+                    stop_bridge()
+                except Exception as stop_exc:
+                    cleanup_error = stop_exc
+            rollback_error = restore_config(previous_config, expected=installed_config)
+            details = [str(item) for item in (cleanup_error, rollback_error) if item]
+            if details:
+                raise SetupError(f"{exc}; {'; '.join(details)}") from exc
             raise
         return {
             "bridge": bridge,
@@ -242,22 +238,6 @@ def _dispatch(args: argparse.Namespace) -> Any:
             return vault.create_backup(Path(args.output) if args.output else None)
         raise AssertionError("unreachable backup command")
     raise AssertionError("unreachable command")
-
-
-def _restore_setup_config(
-    path: Path, *, previous_exists: bool, previous: bytes, installed: bytes
-) -> str | None:
-    try:
-        current = path.read_bytes() if path.exists() else b""
-        if current != installed:
-            return "GSV configuration changed concurrently and was left untouched"
-        if previous_exists:
-            atomic_write(path, previous)
-        elif path.exists():
-            path.unlink()
-        return None
-    except OSError as exc:
-        return f"could not restore the previous GSV configuration: {exc}"
 
 
 def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | None:

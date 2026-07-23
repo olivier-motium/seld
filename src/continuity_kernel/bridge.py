@@ -20,39 +20,40 @@ from dataclasses import dataclass
 from enum import StrEnum
 from hmac import compare_digest
 from http import HTTPStatus
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import as_file, files
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Final, cast
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import unquote, urlsplit
+from urllib.request import ProxyHandler, Request, build_opener
 
 from continuity_kernel import __version__
-from continuity_kernel.atomic import atomic_write, exclusive_lock
+from continuity_kernel.atomic import atomic_write, exclusive_lock, read_regular_file
+from continuity_kernel.bridge_projection import (
+    REPOSITORY_URL as REPOSITORY_URL,
+)
+from continuity_kernel.bridge_projection import (
+    _bridge_doctor,
+    project_snapshot,
+)
+from continuity_kernel.bridge_projection import (
+    codex_deep_link as codex_deep_link,
+)
 from continuity_kernel.codex_integration import codex_status
 from continuity_kernel.config import data_dir
 from continuity_kernel.errors import ContinuityError, SetupError, ValidationError
-from continuity_kernel.records import (
-    MAX_RECORD_BYTES,
-    Entity,
-    Record,
-    Task,
-    WorkThread,
-    parse_entity,
-    parse_task,
-    parse_thread,
-    record_dict,
-)
-from continuity_kernel.vault import Vault, doctor_dict
+from continuity_kernel.vault import Vault
 
 LOOPBACK_HOST: Final = "127.0.0.1"
 DEFAULT_PORT: Final = 0
 MAX_TARGET_LENGTH: Final = 4_096
 MAX_STATIC_BYTES: Final = 4 * 1024 * 1024
+MAX_STATE_BYTES: Final = 64 * 1024
 STATE_VERSION: Final = 1
-REPOSITORY_URL: Final = "https://github.com/olivier-motium/gsv"
 METADATA_CACHE_SECONDS: Final = 30.0
+BRIDGE_LOCK_TIMEOUT: Final = 25.0
 _CREATE_NEW_PROCESS_GROUP: Final = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
 _DETACHED_PROCESS: Final = int(getattr(subprocess, "DETACHED_PROCESS", 0))
 _IS_WINDOWS = os.name == "nt"
@@ -86,48 +87,56 @@ class _HealthProbe:
 
 
 @dataclass(frozen=True)
-class _RecordProjection:
-    records: tuple[Record, ...]
-    state: str
-    issues: tuple[dict[str, Any], ...]
+class BridgeState:
+    """Validated owner-only receipt for one detached Bridge process."""
 
-    def payload(self) -> dict[str, Any]:
-        return {
-            "issues": [dict(issue) for issue in self.issues],
-            "readable": len(self.records),
-            "state": self.state,
-            "unreadable": len(self.issues),
-        }
+    format_version: int
+    instance_id: str
+    pid: int
+    port: int
+    token: str
+    url: str
+    vault: str
+    vault_id: str
 
-
-@dataclass(frozen=True)
-class _ObservedRecordFile:
-    metadata: os.stat_result | None
-    error: str | None = None
-
-    def fingerprint(self) -> tuple[object, ...]:
-        if self.metadata is None:
-            return ("unreadable",)
-        return (
-            "observed",
-            self.metadata.st_dev,
-            self.metadata.st_ino,
-            self.metadata.st_mode,
-            self.metadata.st_size,
-            self.metadata.st_mtime_ns,
-            self.metadata.st_ctime_ns,
+    @classmethod
+    def from_payload(cls, payload: object) -> BridgeState:
+        if not isinstance(payload, dict) or payload.get("format_version") != STATE_VERSION:
+            raise ValidationError("unsupported Bridge state version")
+        if type(payload.get("pid")) is not int or type(payload.get("port")) is not int:
+            raise ValidationError("Bridge state is incomplete")
+        required_strings = ("instance_id", "token", "url", "vault", "vault_id")
+        if any(not isinstance(payload.get(key), str) for key in required_strings):
+            raise ValidationError("Bridge state is incomplete")
+        state = cls(
+            format_version=STATE_VERSION,
+            instance_id=cast(str, payload["instance_id"]),
+            pid=cast(int, payload["pid"]),
+            port=cast(int, payload["port"]),
+            token=cast(str, payload["token"]),
+            url=cast(str, payload["url"]),
+            vault=cast(str, payload["vault"]),
+            vault_id=cast(str, payload["vault_id"]),
         )
+        if not _valid_instance_id(state.instance_id) or not _valid_access_token(state.token):
+            raise ValidationError("Bridge state has no valid local session")
+        if not _state_url_matches(state):
+            raise ValidationError("Bridge state has no valid local session")
+        return state
 
-
-_NEW_MIND_PROMPT: Final = (
-    "Help me shape my GSV Mind. Read the installed GSV context first, then ask only the few "
-    "questions needed to make MIND.md and NOW.md useful."
-)
-_NEW_HAND_PROMPT: Final = (
-    "Start a new GSV hand. Read the installed GSV context and exact current records before "
-    "deciding what deserves attention."
-)
-_TERMINAL_TASK_STATUSES: Final = frozenset({"done", "dropped"})
+    def payload(self, *, include_token: bool = True) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "format_version": self.format_version,
+            "instance_id": self.instance_id,
+            "pid": self.pid,
+            "port": self.port,
+            "url": self.url,
+            "vault": self.vault,
+            "vault_id": self.vault_id,
+        }
+        if include_token:
+            result["token"] = self.token
+        return result
 
 
 def bridge_snapshot(
@@ -138,293 +147,17 @@ def bridge_snapshot(
 ) -> dict[str, Any]:
     """Return the exact authored records needed by the read-only Bridge."""
 
-    resolved_doctor = doctor if doctor is not None else _bridge_doctor(vault)
-    resolved_integration = _codex_metadata() if integration is None else integration
-    codex_ready = bool(
-        resolved_integration.get("available") is True
-        and resolved_integration.get("plugin_installed") is True
-        and resolved_integration.get("instructions_installed") is True
-    )
-    task_projection = _project_record_section(
+    return project_snapshot(
         vault,
-        directory="tasks",
-        parser=parse_task,
-        sort_key=lambda item: (
-            cast(Task, item).status,
-            cast(Task, item).updated_at,
-            cast(Task, item).identifier,
-        ),
+        doctor=doctor if doctor is not None else _bridge_doctor(vault),
+        integration=integration if integration is not None else _codex_metadata(),
     )
-    entity_projection = _project_record_section(
-        vault,
-        directory="entities",
-        parser=parse_entity,
-        sort_key=lambda item: (
-            cast(Entity, item).entity_type,
-            cast(Entity, item).title.casefold(),
-            cast(Entity, item).identifier,
-        ),
-    )
-    thread_projection = _project_record_section(
-        vault,
-        directory="threads",
-        parser=parse_thread,
-        sort_key=lambda item: (
-            cast(WorkThread, item).status,
-            cast(WorkThread, item).updated_at,
-            cast(WorkThread, item).identifier,
-        ),
-    )
-    projections = {
-        "tasks": task_projection,
-        "entities": entity_projection,
-        "threads": thread_projection,
-    }
-    resolved_doctor = _merge_projection_doctor(resolved_doctor, projections)
-    task_records = tuple(cast(Task, item) for item in task_projection.records)
-    thread_records = tuple(cast(WorkThread, item) for item in thread_projection.records)
-    entity_records = tuple(cast(Entity, item) for item in entity_projection.records)
-    tasks = []
-    for item in task_records:
-        task = record_dict(item)
-        if codex_ready and item.status not in _TERMINAL_TASK_STATUSES:
-            task["codex_url"] = codex_deep_link(
-                vault.root,
-                f"Resume the GSV commitment `{item.identifier}`. Load its exact current record "
-                "and revision before deciding or changing anything.",
-            )
-        tasks.append(task)
-    threads = [record_dict(item) for item in thread_records]
-    entities = [record_dict(item) for item in entity_records]
-    mind = vault.read_document("MIND.md")
-    now = vault.read_document("NOW.md")
-    status = {
-        **vault.identity(),
-        "counts": {
-            "tasks": len(task_records),
-            "entities": len(entity_records),
-            "threads": len(thread_records),
-        },
-    }
-    return {
-        "bridge": {
-            "local": True,
-            "read_only": True,
-            "version": __version__,
-        },
-        "codex": {
-            **resolved_integration,
-            "ready": codex_ready,
-            **(
-                {
-                    "new_hand_url": codex_deep_link(vault.root, _NEW_HAND_PROMPT),
-                    **(
-                        {"new_mind_url": codex_deep_link(vault.root, _NEW_MIND_PROMPT)}
-                        if task_projection.state == "complete" and not task_records
-                        else {}
-                    ),
-                }
-                if codex_ready
-                else {}
-            ),
-        },
-        "doctor": resolved_doctor,
-        "entities": entities,
-        "mind": mind,
-        "now": now,
-        "projection": {
-            "sections": {name: section.payload() for name, section in projections.items()}
-        },
-        "status": status,
-        "tasks": tasks,
-        "threads": threads,
-    }
-
-
-def _project_record_section(
-    vault: Vault,
-    *,
-    directory: str,
-    parser: Callable[[str], Record],
-    sort_key: Callable[[Record], tuple[Any, ...]],
-) -> _RecordProjection:
-    root = vault.root / directory
-    unavailable = _section_directory_issue(root, vault.root, directory)
-    if unavailable is not None:
-        return _RecordProjection((), "unavailable", (unavailable,))
-
-    try:
-        before = os.lstat(root)
-        listed = _record_directory_snapshot(root)
-    except OSError as exc:
-        issue = _projection_issue(
-            "unavailable-record-section",
-            directory,
-            f"could not enumerate the {directory} record section: {exc}",
-        )
-        return _RecordProjection((), "unavailable", (issue,))
-
-    records: list[Record] = []
-    issues: list[dict[str, Any]] = []
-    for name, observed in listed.items():
-        relative = f"{directory}/{name}"
-        path = root / name
-        try:
-            metadata = observed.metadata
-            if metadata is None:
-                raise ValidationError(
-                    f"could not inspect record: {observed.error or 'unknown error'}"
-                )
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValidationError("record must be a regular file and cannot be a symbolic link")
-            if metadata.st_size > MAX_RECORD_BYTES:
-                raise ValidationError("record exceeds its size bound")
-            record = parser(vault._read_text(path, max_bytes=MAX_RECORD_BYTES))
-            vault._assert_record_identity(path, record)
-        except (ContinuityError, OSError, UnicodeError) as exc:
-            issues.append(_projection_issue("invalid-record", relative, str(exc)))
-            continue
-        records.append(record)
-
-    try:
-        confirmed = _record_directory_snapshot(root)
-        after = os.lstat(root)
-    except OSError as exc:
-        issue = _projection_issue(
-            "unavailable-record-section",
-            directory,
-            f"the {directory} record section changed during inspection: {exc}",
-        )
-        return _RecordProjection((), "unavailable", (issue,))
-    directory_changed = not stat.S_ISDIR(before.st_mode) or not stat.S_ISDIR(after.st_mode)
-    directory_changed = directory_changed or (before.st_dev, before.st_ino) != (
-        after.st_dev,
-        after.st_ino,
-    )
-    initial_fingerprints = {name: item.fingerprint() for name, item in listed.items()}
-    confirmed_fingerprints = {name: item.fingerprint() for name, item in confirmed.items()}
-    if directory_changed or initial_fingerprints != confirmed_fingerprints:
-        issue = _projection_issue(
-            "unavailable-record-section",
-            directory,
-            f"the {directory} record section changed during inspection; "
-            "reload to use a stable view",
-        )
-        return _RecordProjection((), "unavailable", (issue,))
-
-    return _RecordProjection(
-        tuple(sorted(records, key=sort_key)),
-        "partial" if issues else "complete",
-        tuple(issues),
-    )
-
-
-def _record_directory_snapshot(root: Path) -> dict[str, _ObservedRecordFile]:
-    with os.scandir(root) as entries:
-        names = sorted(entry.name for entry in entries if entry.name.endswith(".md"))
-
-    observed: dict[str, _ObservedRecordFile] = {}
-    for name in names:
-        try:
-            observed[name] = _ObservedRecordFile(os.lstat(root / name))
-        except OSError as exc:
-            observed[name] = _ObservedRecordFile(None, str(exc))
-    return observed
-
-
-def _section_directory_issue(path: Path, vault_root: Path, directory: str) -> dict[str, Any] | None:
-    try:
-        metadata = os.lstat(path)
-    except FileNotFoundError:
-        return _projection_issue(
-            "unavailable-record-section",
-            directory,
-            f"the {directory} record section is missing",
-        )
-    except OSError as exc:
-        return _projection_issue(
-            "unavailable-record-section",
-            directory,
-            f"could not inspect the {directory} record section: {exc}",
-        )
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        return _projection_issue(
-            "unavailable-record-section",
-            str(path.relative_to(vault_root)),
-            f"the {directory} record section must be a real directory, not a link or other file",
-        )
-    return None
-
-
-def _projection_issue(code: str, path: str, message: str) -> dict[str, Any]:
-    return {"code": code, "message": message, "path": path, "repairable": False}
-
-
-def _bridge_doctor(vault: Vault) -> dict[str, Any]:
-    try:
-        return doctor_dict(vault.doctor())
-    except (ContinuityError, OSError, UnicodeError) as exc:
-        identity = vault.identity()
-        return {
-            "counts": {"entities": 0, "tasks": 0, "threads": 0},
-            "healthy": False,
-            "issues": [
-                _projection_issue(
-                    "doctor-unavailable",
-                    ".",
-                    f"the full vault integrity check could not finish: {exc}",
-                )
-            ],
-            "repaired": [],
-            "vault": str(vault.root),
-            "vault_id": identity["vault_id"],
-        }
-
-
-def _merge_projection_doctor(
-    doctor: dict[str, Any], projections: dict[str, _RecordProjection]
-) -> dict[str, Any]:
-    merged = dict(doctor)
-    prior_issues = doctor.get("issues")
-    issues = [dict(issue) for issue in prior_issues] if isinstance(prior_issues, list) else []
-    seen = {
-        (issue.get("code"), issue.get("path"), issue.get("message"))
-        for issue in issues
-        if isinstance(issue, dict)
-    }
-    for projection in projections.values():
-        for issue in projection.issues:
-            identity = (issue.get("code"), issue.get("path"), issue.get("message"))
-            if identity not in seen:
-                issues.append(dict(issue))
-                seen.add(identity)
-    prior_counts = doctor.get("counts")
-    counts = dict(prior_counts) if isinstance(prior_counts, dict) else {}
-    counts.update({name: len(projection.records) for name, projection in projections.items()})
-    merged["counts"] = counts
-    merged["issues"] = issues
-    if any(projection.state != "complete" for projection in projections.values()):
-        merged["healthy"] = False
-    return merged
-
-
-def codex_deep_link(vault: Path, prompt: str) -> str:
-    """Build the installed Codex app's verified new-task deep-link shape."""
-
-    query = urlencode(
-        {
-            "originUrl": REPOSITORY_URL,
-            "path": str(vault.expanduser().resolve()),
-            "prompt": prompt,
-        }
-    )
-    return f"codex://new?{query}"
 
 
 def _codex_metadata() -> dict[str, Any]:
     try:
         return {"available": True, **codex_status()}
-    except ContinuityError as exc:
+    except (ContinuityError, OSError) as exc:
         return {"available": False, "error": str(exc)}
 
 
@@ -639,10 +372,15 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._error(HTTPStatus.NOT_FOUND, "That Bridge asset does not exist")
             return
-        if not target.is_file() or target.is_symlink() or target.stat().st_size > MAX_STATIC_BYTES:
+        try:
+            payload = read_regular_file(
+                target,
+                label="Bridge static asset",
+                max_bytes=MAX_STATIC_BYTES,
+            )
+        except ValidationError:
             self._error(HTTPStatus.NOT_FOUND, "That Bridge asset does not exist")
             return
-        payload = target.read_bytes()
         content_type = _MIME_TYPES.get(
             target.suffix.lower(),
             mimetypes.guess_type(target.name)[0] or "application/octet-stream",
@@ -728,16 +466,16 @@ def serve_bridge(
             instance_id=identity,
         )
         bound_port = int(server.server_address[1])
-        state = {
-            "format_version": STATE_VERSION,
-            "instance_id": identity,
-            "pid": os.getpid(),
-            "port": bound_port,
-            "token": token,
-            "url": f"http://{LOOPBACK_HOST}:{bound_port}/",
-            "vault": str(vault.root),
-            "vault_id": server.vault_id,
-        }
+        state = BridgeState(
+            format_version=STATE_VERSION,
+            instance_id=identity,
+            pid=os.getpid(),
+            port=bound_port,
+            token=token,
+            url=f"http://{LOOPBACK_HOST}:{bound_port}/",
+            vault=str(vault.root),
+            vault_id=server.vault_id,
+        )
         if write_state:
             _write_state(state)
         try:
@@ -755,7 +493,7 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
     """Reuse or start the detached Bridge, then optionally open its local URL."""
 
     root = _private_runtime_dir()
-    with exclusive_lock(root / "bridge.lock"):
+    with exclusive_lock(root / "bridge.lock", timeout=BRIDGE_LOCK_TIMEOUT):
         current, current_running, health_unavailable = _current_state()
         if health_unavailable:
             raise SetupError(
@@ -764,12 +502,12 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
                 "`gsv bridge stop`."
             )
         if current_running and current is not None:
-            if Path(str(current["vault"])).resolve() != vault.root:
+            if Path(current.vault).resolve() != vault.root:
                 raise SetupError(
                     "The Bridge is already running for another GSV vault. "
                     "Run `gsv bridge stop` before switching vaults."
                 )
-            url = str(current["url"])
+            url = current.url
             started = False
         else:
             _discard_state()
@@ -796,17 +534,17 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
                 process.pid,
                 expected_pid=None if getattr(sys, "frozen", False) else process.pid,
                 vault_id=str(vault.identity()["vault_id"]),
-                timeout=8.0,
+                timeout=20.0,
             )
             if state is None:
                 _terminate_pid(process.pid)
-                raise SetupError(f"The Bridge did not become healthy. See {log_path}")
-            health = _health_payload(str(state["url"]), token=str(state["token"]), timeout=2.0)
+                raise SetupError(_bridge_start_failure(process, log_path))
+            health = _health_payload(state.url, token=state.token, timeout=2.0)
             if not _state_matches_health(state, health):
                 _terminate_pid(process.pid)
-                _remove_state_if_owned(int(state["pid"]), instance_id)
+                _remove_state_if_owned(state.pid, instance_id)
                 raise SetupError(f"The Bridge reported an unexpected identity. See {log_path}")
-            url = str(state["url"])
+            url = state.url
             started = True
     opened = open_bridge_in_browser(vault) if open_browser else False
     result = {
@@ -826,11 +564,11 @@ def open_bridge_in_browser(vault: Vault) -> bool:
     """Open only a live Bridge session that is verified for this exact vault."""
 
     root = _private_runtime_dir()
-    with exclusive_lock(root / "bridge.lock"):
+    with exclusive_lock(root / "bridge.lock", timeout=BRIDGE_LOCK_TIMEOUT):
         state, running, _ = _current_state()
         if not running or state is None:
             return False
-        if Path(str(state["vault"])).resolve() != vault.root:
+        if Path(state.vault).resolve() != vault.root:
             return False
         try:
             return _launch_browser(_open_url(state))
@@ -845,6 +583,12 @@ def _launch_browser(url: str) -> bool:
 def bridge_status() -> dict[str, Any]:
     """Return current detached Bridge state without starting anything."""
 
+    root = _private_runtime_dir()
+    with exclusive_lock(root / "bridge.lock", timeout=BRIDGE_LOCK_TIMEOUT):
+        return _bridge_status_locked()
+
+
+def _bridge_status_locked() -> dict[str, Any]:
     state, running, health_unavailable = _current_state()
     if state is None:
         return {"running": False}
@@ -859,6 +603,12 @@ def bridge_status() -> dict[str, Any]:
 def stop_bridge() -> dict[str, Any]:
     """Stop only the process named by the GSV-owned Bridge receipt."""
 
+    root = _private_runtime_dir()
+    with exclusive_lock(root / "bridge.lock", timeout=BRIDGE_LOCK_TIMEOUT):
+        return _stop_bridge_locked()
+
+
+def _stop_bridge_locked() -> dict[str, Any]:
     state, invalid_removed = _load_state_safely()
     if state is None:
         return {
@@ -866,23 +616,23 @@ def stop_bridge() -> dict[str, Any]:
             "stale_receipt_removed": invalid_removed,
             "stopped": False,
         }
-    pid = int(state["pid"])
+    pid = state.pid
     if not _pid_alive(pid):
-        _remove_state_if_owned(pid, str(state["instance_id"]))
+        _remove_state_if_owned(pid, state.instance_id)
         return {
             "running": False,
             "stale_reason": "process_not_running",
             "stale_receipt_removed": True,
             "stopped": False,
         }
-    probe = _probe_health(str(state["url"]), token=str(state["token"]), timeout=0.75)
+    probe = _probe_health(state.url, token=state.token, timeout=0.75)
     if probe.outcome is _HealthOutcome.UNAVAILABLE:
         raise SetupError(
             "The Bridge process is still alive, but its private health check did not answer. "
             "No process was signalled and the receipt was preserved; retry `gsv bridge stop`."
         )
     if probe.outcome is _HealthOutcome.REFUSED:
-        _remove_state_if_owned(pid, str(state["instance_id"]))
+        _remove_state_if_owned(pid, state.instance_id)
         return {
             "running": False,
             "stale_reason": "connection_refused",
@@ -890,7 +640,7 @@ def stop_bridge() -> dict[str, Any]:
             "stopped": False,
         }
     if not _state_matches_health(state, probe.payload):
-        _remove_state_if_owned(pid, str(state["instance_id"]))
+        _remove_state_if_owned(pid, state.instance_id)
         return {
             "running": False,
             "stale_reason": "identity_mismatch",
@@ -908,73 +658,65 @@ def stop_bridge() -> dict[str, Any]:
             "The verified Bridge process did not stop. Its receipt was preserved; retry "
             "`gsv bridge stop` before installing or uninstalling."
         )
-    _remove_state_if_owned(pid, str(state["instance_id"]))
-    return {"running": not stopped, "stopped": stopped, "url": state["url"]}
+    _remove_state_if_owned(pid, state.instance_id)
+    return {"running": not stopped, "stopped": stopped, "url": state.url}
 
 
 def _state_path() -> Path:
     return data_dir() / "bridge-state.json"
 
 
-def _write_state(payload: dict[str, Any]) -> None:
+def _write_state(state: BridgeState | dict[str, Any]) -> None:
     path = _state_path()
     _private_runtime_dir()
-    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    validated = state if isinstance(state, BridgeState) else BridgeState.from_payload(state)
+    encoded = (json.dumps(validated.payload(), indent=2, sort_keys=True) + "\n").encode("utf-8")
     atomic_write(path, encoded)
 
 
-def _load_state() -> dict[str, Any] | None:
+def _load_state() -> BridgeState | None:
     path = _state_path()
-    if not path.exists():
+    if not os.path.lexists(path):
         return None
-    if path.is_symlink() or not path.is_file():
-        raise ValidationError(f"invalid Bridge state path: {path}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        encoded = read_regular_file(
+            path,
+            label="Bridge state",
+            max_bytes=MAX_STATE_BYTES,
+        )
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValidationError(f"invalid Bridge state: {path}") from exc
-    if not isinstance(payload, dict) or payload.get("format_version") != STATE_VERSION:
-        raise ValidationError("unsupported Bridge state version")
-    if not isinstance(payload.get("pid"), int) or not isinstance(payload.get("port"), int):
-        raise ValidationError("Bridge state is incomplete")
-    if not isinstance(payload.get("url"), str) or not isinstance(payload.get("vault"), str):
-        raise ValidationError("Bridge state is incomplete")
-    if not isinstance(payload.get("vault_id"), str) or not _valid_instance_id(
-        payload.get("instance_id")
-    ):
-        raise ValidationError("Bridge state has no valid instance identity")
-    if not _valid_access_token(payload.get("token")) or not _state_url_matches(payload):
-        raise ValidationError("Bridge state has no valid local session")
-    return payload
+    return BridgeState.from_payload(payload)
 
 
-def _load_state_safely() -> tuple[dict[str, Any] | None, bool]:
+def _load_state_safely() -> tuple[BridgeState | None, bool]:
     try:
         return _load_state(), False
     except (OSError, ValidationError):
         return None, _discard_state()
 
 
-def _current_state() -> tuple[dict[str, Any] | None, bool, bool]:
+def _current_state() -> tuple[BridgeState | None, bool, bool]:
     state, _ = _load_state_safely()
     if state is None:
         return None, False, False
-    pid = int(state["pid"])
+    pid = state.pid
     if not _pid_alive(pid):
-        _remove_state_if_owned(pid, str(state["instance_id"]))
+        _remove_state_if_owned(pid, state.instance_id)
         return None, False, False
-    probe = _probe_health(str(state["url"]), token=str(state["token"]), timeout=0.5)
+    probe = _probe_health(state.url, token=state.token, timeout=0.5)
     if probe.outcome is _HealthOutcome.UNAVAILABLE:
         return state, False, True
     if probe.outcome is _HealthOutcome.REFUSED or not _state_matches_health(state, probe.payload):
-        _remove_state_if_owned(pid, str(state["instance_id"]))
+        _remove_state_if_owned(pid, state.instance_id)
         return None, False, False
     return state, True, False
 
 
 def _remove_state_if_owned(pid: int, instance_id: str) -> None:
     state, _ = _load_state_safely()
-    if state is not None and state["pid"] == pid and state["instance_id"] == instance_id:
+    if state is not None and state.pid == pid and state.instance_id == instance_id:
         _state_path().unlink(missing_ok=True)
 
 
@@ -1004,7 +746,7 @@ def _probe_health(url: str, *, token: str, timeout: float) -> _HealthProbe:
                 health,
                 headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
             )
-            with urlopen(request, timeout=min(0.5, max(timeout, 0.1))) as response:
+            with _open_loopback(request, timeout=min(0.5, max(timeout, 0.1))) as response:
                 payload = json.loads(response.read())
                 if response.status == HTTPStatus.OK and isinstance(payload, dict):
                     return _HealthProbe(_HealthOutcome.RESPONSE, payload)
@@ -1015,7 +757,7 @@ def _probe_health(url: str, *, token: str, timeout: float) -> _HealthProbe:
                 HTTPStatus.NOT_FOUND,
             }:
                 return _HealthProbe(_HealthOutcome.RESPONSE, {})
-        except (OSError, URLError) as exc:
+        except (HTTPException, OSError, URLError) as exc:
             if loopback and _is_connection_refused(exc):
                 return _HealthProbe(_HealthOutcome.REFUSED)
         except (json.JSONDecodeError, ValueError):
@@ -1023,6 +765,12 @@ def _probe_health(url: str, *, token: str, timeout: float) -> _HealthProbe:
         if time.monotonic() >= deadline:
             return _HealthProbe(_HealthOutcome.UNAVAILABLE)
         time.sleep(0.05)
+
+
+def _open_loopback(request: Request, *, timeout: float) -> Any:
+    """Open a local health request without inheriting ambient proxy settings."""
+
+    return build_opener(ProxyHandler({})).open(request, timeout=timeout)
 
 
 def _is_connection_refused(error: BaseException) -> bool:
@@ -1046,7 +794,7 @@ def _wait_for_state(
     expected_pid: int | None,
     vault_id: str,
     timeout: float,
-) -> dict[str, Any] | None:
+) -> BridgeState | None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -1055,9 +803,9 @@ def _wait_for_state(
             state = None
         if (
             state is not None
-            and state["instance_id"] == instance_id
-            and (expected_pid is None or state["pid"] == expected_pid)
-            and state["vault_id"] == vault_id
+            and state.instance_id == instance_id
+            and (expected_pid is None or state.pid == expected_pid)
+            and state.vault_id == vault_id
         ):
             return state
         if expected_pid is not None and not _pid_alive(launcher_pid):
@@ -1066,26 +814,44 @@ def _wait_for_state(
     return None
 
 
-def _state_matches_health(state: dict[str, Any], health: dict[str, Any] | None) -> bool:
+def _bridge_start_failure(process: subprocess.Popen[bytes], log_path: Path) -> str:
+    """Return a bounded startup diagnostic without treating an ephemeral log as evidence."""
+
+    status = process.poll()
+    prefix = (
+        f"The Bridge process exited with status {status} before becoming healthy."
+        if status is not None
+        else "The Bridge did not become healthy within 20 seconds."
+    )
+    try:
+        raw = read_regular_file(log_path, label="Bridge startup log", max_bytes=64 * 1024)
+        tail = raw.decode("utf-8", errors="replace")[-2_000:]
+        safe = " ".join(tail.split())
+    except ValidationError:
+        safe = ""
+    return f"{prefix} Startup output: {safe}" if safe else f"{prefix} See {log_path}"
+
+
+def _state_matches_health(state: BridgeState, health: dict[str, Any] | None) -> bool:
     if health is None:
         return False
     return (
         health.get("service") == "gsv-bridge"
-        and health.get("instance_id") == state.get("instance_id")
-        and health.get("pid") == state.get("pid")
-        and health.get("port") == state.get("port")
-        and health.get("vault_id") == state.get("vault_id")
+        and health.get("instance_id") == state.instance_id
+        and health.get("pid") == state.pid
+        and health.get("port") == state.port
+        and health.get("vault_id") == state.vault_id
         and _state_url_matches(state)
     )
 
 
-def _state_url_matches(state: dict[str, Any]) -> bool:
+def _state_url_matches(state: BridgeState) -> bool:
     try:
-        parsed = urlsplit(str(state.get("url", "")))
+        parsed = urlsplit(state.url)
         return (
             parsed.scheme == "http"
             and parsed.hostname == LOOPBACK_HOST
-            and parsed.port == state.get("port")
+            and parsed.port == state.port
             and parsed.path == "/"
             and not parsed.username
             and not parsed.password
@@ -1096,12 +862,12 @@ def _state_url_matches(state: dict[str, Any]) -> bool:
         return False
 
 
-def _open_url(state: dict[str, Any]) -> str:
-    return f"{state['url']}#token={state['token']}"
+def _open_url(state: BridgeState) -> str:
+    return f"{state.url}#token={state.token}"
 
 
-def _public_state(state: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in state.items() if key != "token"}
+def _public_state(state: BridgeState) -> dict[str, Any]:
+    return state.payload(include_token=False)
 
 
 def _valid_instance_id(value: object) -> bool:

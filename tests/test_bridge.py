@@ -9,12 +9,13 @@ import threading
 import time
 from collections.abc import Iterator
 from http import HTTPStatus
+from http.client import BadStatusLine
 from importlib.resources import as_file, files
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, urlopen
 
 import pytest
 
@@ -25,6 +26,19 @@ from continuity_kernel.vault import Vault, doctor_dict
 
 INSTANCE_ID = "a" * 32
 ACCESS_TOKEN = "b" * 48
+
+
+def test_codex_metadata_degrades_when_provider_process_cannot_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_status() -> dict[str, Any]:
+        raise FileNotFoundError("missing Codex executable")
+
+    monkeypatch.setattr(bridge, "codex_status", fail_status)
+
+    result = bridge._codex_metadata()
+
+    assert result == {"available": False, "error": "missing Codex executable"}
 
 
 @pytest.fixture
@@ -38,6 +52,7 @@ def running_bridge(
             "available": True,
             "instructions_installed": True,
             "plugin_installed": True,
+            "ready": True,
         },
     )
     resource = files("continuity_kernel") / "resources/bridge"
@@ -107,6 +122,7 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
             "available": True,
             "instructions_installed": True,
             "plugin_installed": True,
+            "ready": True,
         },
     )
 
@@ -150,6 +166,7 @@ def test_snapshot_exposes_mind_shaping_only_for_a_proven_empty_ledger(vault: Vau
             "available": True,
             "instructions_installed": True,
             "plugin_installed": True,
+            "ready": True,
         },
     )
 
@@ -180,6 +197,7 @@ def test_terminal_history_gets_new_hand_but_never_resume_or_first_run(
             "available": True,
             "instructions_installed": True,
             "plugin_installed": True,
+            "ready": True,
         },
     )
 
@@ -214,6 +232,7 @@ def test_only_nonterminal_tasks_receive_resume_links(vault: Vault) -> None:
             "available": True,
             "instructions_installed": True,
             "plugin_installed": True,
+            "ready": True,
         },
     )
     by_id = {task["identifier"]: task for task in snapshot["tasks"]}
@@ -325,6 +344,46 @@ def test_authenticated_snapshot_keeps_valid_tasks_when_one_record_is_malformed(
     }
 
 
+def test_health_probe_turns_malformed_http_response_into_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        bridge,
+        "_open_loopback",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(BadStatusLine("broken")),
+    )
+
+    probe = bridge._probe_health("http://127.0.0.1:43117/", token=ACCESS_TOKEN, timeout=0)
+
+    assert probe.outcome is bridge._HealthOutcome.UNAVAILABLE
+
+
+def test_loopback_health_requests_disable_ambient_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = object()
+    observed: list[object] = []
+
+    class ProxyFreeOpener:
+        def open(self, request: Request, *, timeout: float) -> object:
+            observed.extend((request, timeout))
+            return response
+
+    def build_proxy_free_opener(handler: object) -> ProxyFreeOpener:
+        observed.append(handler)
+        return ProxyFreeOpener()
+
+    monkeypatch.setattr(bridge, "build_opener", build_proxy_free_opener)
+    request = Request("http://127.0.0.1:43117/api/v1/health")
+
+    result = bridge._open_loopback(request, timeout=0.5)
+
+    assert result is response
+    assert isinstance(observed[0], ProxyHandler)
+    assert cast(Any, observed[0]).proxies == {}
+    assert observed[1:] == [request, 0.5]
+
+
 def test_only_bad_tasks_return_http_200_but_never_become_a_first_run(
     running_bridge: tuple[bridge.BridgeHTTPServer, str],
 ) -> None:
@@ -342,6 +401,7 @@ def test_only_bad_tasks_return_http_200_but_never_become_a_first_run(
             "available": True,
             "instructions_installed": True,
             "plugin_installed": True,
+            "ready": True,
         },
     )
 
@@ -538,9 +598,15 @@ def test_packaged_bridge_bundle_contains_ui_assets_and_licenses() -> None:
 def test_bridge_ui_tokens_and_dependency_free_orb_contract() -> None:
     resource = files("continuity_kernel") / "resources/bridge"
     with as_file(resource) as root:
-        css = (Path(root) / "bridge.css").read_text(encoding="utf-8")
+        css = "\n".join(
+            (Path(root) / name).read_text(encoding="utf-8")
+            for name in ("bridge.css", "bridge-components.css", "bridge-responsive.css")
+        )
         html = (Path(root) / "index.html").read_text(encoding="utf-8")
-        javascript = (Path(root) / "bridge.js").read_text(encoding="utf-8")
+        javascript = "\n".join(
+            (Path(root) / name).read_text(encoding="utf-8")
+            for name in ("bridge.js", "thinking-orbs.js")
+        )
 
     for token in (
         "--text-xs: 12px",
@@ -669,6 +735,7 @@ def test_snapshot_does_not_wait_for_slow_codex_status_and_refreshes_once(
             "available": True,
             "instructions_installed": True,
             "plugin_installed": True,
+            "ready": True,
         }
 
     resource = files("continuity_kernel") / "resources/bridge"
@@ -807,7 +874,7 @@ def test_stop_failure_preserves_verified_receipt(
 ) -> None:
     bridge._write_state(_state(vault))
     signaled: list[int] = []
-    clock = iter((0.0, 4.0))
+    clock = iter((0.0, 0.0, 4.0))
     monkeypatch.setattr(bridge, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr("continuity_kernel.bridge.time.monotonic", lambda: next(clock))
     monkeypatch.setattr(
@@ -837,7 +904,8 @@ def test_forged_or_invalid_receipt_is_removed_without_signaling(
 ) -> None:
     state = _state(vault)
     state["url"] = "http://127.0.0.1:9/"
-    bridge._write_state(state)
+    bridge._state_path().parent.mkdir(parents=True, exist_ok=True)
+    bridge._state_path().write_text(json.dumps(state), encoding="utf-8")
     signaled: list[int] = []
     monkeypatch.setattr(bridge, "_terminate_pid", signaled.append)
 
@@ -873,7 +941,7 @@ def test_state_receipt_is_private_and_open_token_stays_in_fragment(vault: Vault)
 
     if os.name != "nt":
         assert bridge._state_path().stat().st_mode & 0o777 == 0o600
-    open_url = bridge._open_url(state)
+    open_url = bridge._open_url(bridge.BridgeState.from_payload(state))
     before_fragment, fragment = open_url.split("#", 1)
     assert ACCESS_TOKEN not in before_fragment
     assert fragment == f"token={ACCESS_TOKEN}"
@@ -896,7 +964,7 @@ def test_frozen_start_accepts_worker_pid_after_exact_launch_identity(
     vault: Vault, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = _state(vault, pid=5252)
-    monkeypatch.setattr(bridge, "_load_state", lambda: state)
+    monkeypatch.setattr(bridge, "_load_state", lambda: bridge.BridgeState.from_payload(state))
 
     observed = bridge._wait_for_state(
         INSTANCE_ID,
@@ -906,14 +974,15 @@ def test_frozen_start_accepts_worker_pid_after_exact_launch_identity(
         timeout=0.1,
     )
 
-    assert observed == state
+    assert observed is not None
+    assert observed.payload() == state
 
 
 def test_source_start_requires_receipt_to_match_launcher_pid(
     vault: Vault, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = _state(vault, pid=5252)
-    monkeypatch.setattr(bridge, "_load_state", lambda: state)
+    monkeypatch.setattr(bridge, "_load_state", lambda: bridge.BridgeState.from_payload(state))
     monkeypatch.setattr(bridge, "_pid_alive", lambda _pid: False)
 
     observed = bridge._wait_for_state(
@@ -1009,7 +1078,7 @@ def test_health_probe_treats_non_refusal_network_errors_as_unavailable(
     def fail_request(*_args: object, **_kwargs: object) -> None:
         raise error
 
-    monkeypatch.setattr(bridge, "urlopen", fail_request)
+    monkeypatch.setattr(bridge, "_open_loopback", fail_request)
 
     probe = bridge._probe_health("http://127.0.0.1:43117/", token=ACCESS_TOKEN, timeout=0)
 
@@ -1031,7 +1100,7 @@ def test_health_probe_treats_malformed_response_as_unavailable(
         def read(self) -> bytes:
             return b"not-json"
 
-    monkeypatch.setattr(bridge, "urlopen", lambda *_args, **_kwargs: MalformedResponse())
+    monkeypatch.setattr(bridge, "_open_loopback", lambda *_args, **_kwargs: MalformedResponse())
 
     probe = bridge._probe_health("http://127.0.0.1:43117/", token=ACCESS_TOKEN, timeout=0)
 
@@ -1046,7 +1115,7 @@ def test_health_probe_never_classifies_remote_refusal_as_local_stale_state(
     def fail_request(*_args: object, **_kwargs: object) -> None:
         raise refused
 
-    monkeypatch.setattr(bridge, "urlopen", fail_request)
+    monkeypatch.setattr(bridge, "_open_loopback", fail_request)
 
     probe = bridge._probe_health("http://example.invalid:9/", token=ACCESS_TOKEN, timeout=0)
 
@@ -1092,8 +1161,8 @@ def test_open_replaces_refused_receipt_without_signalling_unverified_pid(
         assert opened["started"] is True
         assert signaled == []
         assert replacement is not None
-        assert replacement["pid"] != os.getpid()
-        assert replacement["instance_id"] != INSTANCE_ID
+        assert replacement.pid != os.getpid()
+        assert replacement.instance_id != INSTANCE_ID
     finally:
         stopped = bridge.stop_bridge()
     assert stopped["stopped"] is True
@@ -1135,7 +1204,7 @@ def test_real_detached_bridge_child_binds_reports_and_stops(vault: Vault) -> Non
         assert status["identity_verified"] is True
         assert status["port"] > 0
         assert state is not None
-        health = bridge._health_payload(str(state["url"]), token=str(state["token"]), timeout=2)
+        health = bridge._health_payload(state.url, token=state.token, timeout=2)
         assert bridge._state_matches_health(state, health)
     finally:
         stopped = bridge.stop_bridge()

@@ -42,6 +42,13 @@ are typed IDs such as `company:atlas` and `thread:atlas-release`. Filenames must
 agree with record identity. Relationships are explicit ID lists; names, text
 similarity, aliases, and timestamps never create edges automatically.
 
+New task IDs also reject Windows-reserved basenames such as `con`, `nul`,
+`com1`, and `lpt1`. A pre-0.2 vault that already contains one of those task IDs
+remains readable on its source platform, but its backup is intentionally not
+portable. Rename that task and update explicit references on the source
+platform before creating a cross-platform backup; GSV never silently rewrites
+an existing record identity.
+
 ## Bounds
 
 Records, text fields, references, relationships, context output, archive
