@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import secrets
+import select
 import signal
 import socket
 import stat
@@ -811,16 +812,29 @@ def _loopback_connection_refused(url: str, *, timeout: float) -> bool:
         parsed = urlsplit(url)
         if parsed.hostname != LOOPBACK_HOST or parsed.port is None:
             return False
-        connection = socket.create_connection(
-            (LOOPBACK_HOST, parsed.port),
-            timeout=min(0.5, max(timeout, 0.05)),
-        )
-    except OSError as exc:
-        return _is_connection_refused(exc)
-    except ValueError:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+            connection.setblocking(False)
+            result = connection.connect_ex((LOOPBACK_HOST, parsed.port))
+            if _is_connection_refused(OSError(result, "loopback connection failed")):
+                return True
+            pending = {
+                errno.EINPROGRESS,
+                errno.EWOULDBLOCK,
+                errno.EALREADY,
+                int(getattr(errno, "WSAEWOULDBLOCK", 10035)),
+                int(getattr(errno, "WSAEINPROGRESS", 10036)),
+                int(getattr(errno, "WSAEALREADY", 10037)),
+            }
+            if result not in pending:
+                return False
+            wait = min(0.5, max(timeout, 0.05))
+            _, writable, exceptional = select.select([], [connection], [connection], wait)
+            if not writable and not exceptional:
+                return False
+            final_error = connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            return _is_connection_refused(OSError(final_error, "loopback connection failed"))
+    except (OSError, ValueError):
         return False
-    connection.close()
-    return False
 
 
 def _wait_for_state(

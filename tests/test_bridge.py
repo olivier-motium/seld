@@ -1145,15 +1145,31 @@ def test_health_probe_recognizes_windows_loopback_refusal(
 def test_health_probe_confirms_opaque_loopback_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class PendingSocket:
+        def __enter__(self) -> PendingSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def setblocking(self, _blocking: bool) -> None:
+            return None
+
+        def connect_ex(self, _address: tuple[str, int]) -> int:
+            return 10035
+
+        def getsockopt(self, _level: int, _option: int) -> int:
+            return 10061
+
     def fail_request(*_args: object, **_kwargs: object) -> None:
         raise URLError(OSError(errno.EINVAL, "opaque transport failure"))
 
-    refusal = OSError(errno.EINVAL, "injected Windows refusal")
-    cast(Any, refusal).winerror = 10061
+    connection = PendingSocket()
     monkeypatch.setattr(bridge, "_open_loopback", fail_request)
+    monkeypatch.setattr("continuity_kernel.bridge.socket.socket", lambda *_args: connection)
     monkeypatch.setattr(
-        "continuity_kernel.bridge.socket.create_connection",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(refusal),
+        "continuity_kernel.bridge.select.select",
+        lambda *_args: ([], [connection], []),
     )
 
     probe = bridge._probe_health(
