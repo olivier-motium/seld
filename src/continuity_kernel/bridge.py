@@ -18,7 +18,6 @@ import time
 import uuid
 import webbrowser
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from hmac import compare_digest
@@ -175,12 +174,14 @@ def codex_status() -> dict[str, Any]:
 class BridgeHTTPServer(ThreadingHTTPServer):
     """Loopback server carrying one vault and one immutable static root."""
 
-    allow_reuse_address = True
+    allow_reuse_address = not _IS_WINDOWS
     daemon_threads = True
+    request_queue_size = 16
 
     def server_bind(self) -> None:
         """Bind the numeric loopback address without a reverse-DNS lookup."""
 
+        _set_windows_exclusive_address_use(self.socket)
         TCPServer.server_bind(self)
         self.server_name = LOOPBACK_HOST
         self.server_port = int(self.server_address[1])
@@ -198,9 +199,7 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         self.access_token = access_token
         self.instance_id = instance_id
         self.vault = vault
-        _worker_startup_marker("reading vault identity")
         self.vault_id = str(vault.identity()["vault_id"])
-        _worker_startup_marker("vault identity ready")
         self.static_root = static_root.resolve()
         self.integration_provider = integration_provider or _codex_metadata
         self._doctor: dict[str, Any] | None = None
@@ -214,9 +213,7 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         self._integration_at = 0.0
         self._integration_refreshing = False
         self._metadata_lock = threading.Lock()
-        _worker_startup_marker("binding loopback server")
         super().__init__(address, BridgeRequestHandler)
-        _worker_startup_marker("loopback server bound")
 
     def snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -479,7 +476,6 @@ def serve_bridge(
     if not _valid_access_token(token):
         raise ValidationError("Bridge access token must be 48 lowercase hexadecimal characters")
     static_resource = files("continuity_kernel") / "resources/bridge"
-    _worker_startup_marker("static resource ready")
     with as_file(static_resource) as static_root:
         server = BridgeHTTPServer(
             (LOOPBACK_HOST, port),
@@ -501,7 +497,6 @@ def serve_bridge(
         )
         if write_state:
             _write_state(state)
-            _worker_startup_marker("receipt written")
         try:
             server.serve_forever(poll_interval=0.25)
         except KeyboardInterrupt:
@@ -555,7 +550,7 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
                 process = subprocess.Popen(command, **options)
             state = _wait_for_state(
                 instance_id,
-                process.pid,
+                process,
                 # A frozen launcher may hand off to a worker process. Source and
                 # wheel installs launch the internal worker directly, so its PID
                 # must match the authenticated receipt.
@@ -832,7 +827,6 @@ def _loopback_connection_refused(url: str, *, timeout: float) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
             connection.setblocking(False)
             result = connection.connect_ex((LOOPBACK_HOST, parsed.port))
-            _ci_probe_marker("initial", result)
             if _is_connection_refused(OSError(result, "loopback connection failed")):
                 return True
             pending = {
@@ -848,31 +842,34 @@ def _loopback_connection_refused(url: str, *, timeout: float) -> bool:
             wait = min(0.5, max(timeout, 0.05))
             _, writable, exceptional = select.select([], [connection], [connection], wait)
             final_error = connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-            _ci_probe_marker("final", final_error)
             if not writable and not exceptional and final_error == 0:
-                return False
+                return _IS_WINDOWS and _loopback_port_is_unbound(parsed.port)
             return _is_connection_refused(OSError(final_error, "loopback connection failed"))
     except (OSError, ValueError):
         return False
 
 
-def _ci_probe_marker(stage: str, code: int) -> None:
-    if not os.environ.get("CI"):
-        return
-    with suppress(OSError):
-        os.write(2, f"gsv loopback probe: {stage}={code}\n".encode("ascii"))
+def _loopback_port_is_unbound(port: int) -> bool:
+    """Confirm on Windows that no socket owns the exact recorded loopback port."""
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            _set_windows_exclusive_address_use(probe)
+            probe.bind((LOOPBACK_HOST, port))
+    except OSError:
+        return False
+    return True
 
 
-def _worker_startup_marker(stage: str) -> None:
-    if os.environ.get("GSV_BRIDGE_WORKER") != "1":
-        return
-    with suppress(OSError):
-        os.write(2, f"gsv Bridge worker: {stage}\n".encode("ascii"))
+def _set_windows_exclusive_address_use(target: socket.socket) -> None:
+    option = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if _IS_WINDOWS and option is not None:
+        target.setsockopt(socket.SOL_SOCKET, option, 1)
 
 
 def _wait_for_state(
     instance_id: str,
-    launcher_pid: int,
+    process: subprocess.Popen[bytes],
     *,
     expected_pid: int | None,
     vault_id: str,
@@ -891,7 +888,7 @@ def _wait_for_state(
             and state.vault_id == vault_id
         ):
             return state
-        if expected_pid is not None and not _pid_alive(launcher_pid):
+        if expected_pid is not None and process.poll() is not None:
             return None
         time.sleep(0.05)
     return None
@@ -1045,7 +1042,6 @@ def _child_detaches_after_spawn() -> bool:
 def _bridge_child_environment(vault: Vault) -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("GSV_BRIDGE_DETACH_IN_CHILD", None)
-    environment["GSV_BRIDGE_WORKER"] = "1"
     environment["GSV_VAULT"] = str(vault.root)
     if getattr(sys, "frozen", False):
         environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"

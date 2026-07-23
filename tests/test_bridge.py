@@ -989,12 +989,16 @@ def test_frozen_bridge_child_requests_an_independent_pyinstaller_runtime(
 def test_frozen_start_accepts_worker_pid_after_exact_launch_identity(
     vault: Vault, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    class LiveLauncher:
+        def poll(self) -> None:
+            return None
+
     state = _state(vault, pid=5252)
     monkeypatch.setattr(bridge, "_load_state", lambda: bridge.BridgeState.from_payload(state))
 
     observed = bridge._wait_for_state(
         INSTANCE_ID,
-        4242,
+        cast(Any, LiveLauncher()),
         expected_pid=None,
         vault_id=str(vault.identity()["vault_id"]),
         timeout=0.1,
@@ -1007,13 +1011,16 @@ def test_frozen_start_accepts_worker_pid_after_exact_launch_identity(
 def test_source_start_requires_receipt_to_match_launcher_pid(
     vault: Vault, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    class ExitedLauncher:
+        def poll(self) -> int:
+            return 1
+
     state = _state(vault, pid=5252)
     monkeypatch.setattr(bridge, "_load_state", lambda: bridge.BridgeState.from_payload(state))
-    monkeypatch.setattr(bridge, "_pid_alive", lambda _pid: False)
 
     observed = bridge._wait_for_state(
         INSTANCE_ID,
-        4242,
+        cast(Any, ExitedLauncher()),
         expected_pid=4242,
         vault_id=str(vault.identity()["vault_id"]),
         timeout=0.1,
@@ -1182,13 +1189,20 @@ def test_health_probe_confirms_opaque_loopback_refusal(
             return 10035
 
         def getsockopt(self, _level: int, _option: int) -> int:
-            return 10061
+            return 0
+
+        def setsockopt(self, _level: int, _option: int, _value: int) -> None:
+            return None
+
+        def bind(self, _address: tuple[str, int]) -> None:
+            return None
 
     def fail_request(*_args: object, **_kwargs: object) -> None:
         raise URLError(OSError(errno.EINVAL, "opaque transport failure"))
 
     connection = PendingSocket()
     monkeypatch.setattr(bridge, "_open_loopback", fail_request)
+    monkeypatch.setattr(bridge, "_IS_WINDOWS", True)
     monkeypatch.setattr("continuity_kernel.bridge.socket.socket", lambda *_args: connection)
     monkeypatch.setattr(
         "continuity_kernel.bridge.select.select",
@@ -1200,6 +1214,26 @@ def test_health_probe_confirms_opaque_loopback_refusal(
     )
 
     assert probe == bridge._HealthProbe(bridge._HealthOutcome.REFUSED)
+
+
+def test_windows_refusal_fallback_preserves_a_bound_loopback_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with socket.socket() as listener:
+        listener.bind((bridge.LOOPBACK_HOST, 0))
+        listener.listen()
+        port = int(listener.getsockname()[1])
+        monkeypatch.setattr(bridge, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            "continuity_kernel.bridge.select.select",
+            lambda *_args: ([], [], []),
+        )
+
+        refused = bridge._loopback_connection_refused(
+            f"http://{bridge.LOOPBACK_HOST}:{port}/", timeout=0
+        )
+
+    assert refused is False
 
 
 def test_source_bridge_command_uses_the_minimal_worker(
