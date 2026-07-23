@@ -60,7 +60,7 @@ def test_doctor_recovers_orphan_from_hard_crash(vault: Vault) -> None:
     assert not unhealthy.healthy
     assert any(issue.code == "orphan-temp" for issue in unhealthy.issues)
     assert repaired.healthy
-    assert str(orphan.relative_to(vault.root)) in repaired.repaired
+    assert orphan.relative_to(vault.root).as_posix() in repaired.repaired
     assert canonical.read_bytes() == before
     assert Vault(vault.root).get_task(task.identifier).revision == task.revision
 

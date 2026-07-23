@@ -532,7 +532,11 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
             state = _wait_for_state(
                 instance_id,
                 process.pid,
-                expected_pid=None if getattr(sys, "frozen", False) else process.pid,
+                # Python and frozen launchers may hand off to a worker process on
+                # macOS and Windows. The random instance ID binds this receipt to
+                # the exact launch; the authenticated health check below binds its
+                # reported PID to the live server.
+                expected_pid=None,
                 vault_id=str(vault.identity()["vault_id"]),
                 timeout=20.0,
             )
@@ -779,7 +783,9 @@ def _is_connection_refused(error: BaseException) -> bool:
     for _ in range(4):
         if isinstance(current, ConnectionRefusedError):
             return True
-        if isinstance(current, OSError) and current.errno in refused_codes:
+        if isinstance(current, OSError) and (
+            current.errno in refused_codes or getattr(current, "winerror", None) in refused_codes
+        ):
             return True
         current = getattr(current, "reason", None)
         if current is None:
@@ -985,7 +991,7 @@ def _open_private_log(path: Path) -> BinaryIO:
             metadata = path.lstat()
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
                 raise SetupError(f"Refusing unsafe Bridge log path: {path}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | int(getattr(os, "O_BINARY", 0))
         flags |= int(getattr(os, "O_CLOEXEC", 0))
         flags |= int(getattr(os, "O_NOFOLLOW", 0))
         descriptor = os.open(path, flags, 0o600)

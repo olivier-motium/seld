@@ -973,6 +973,7 @@ def test_committed_source_cleanup_failure_is_not_masked_or_retried(
     assert Vault.verify_backup(destination)["valid"] is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="directory fsync is unavailable on Windows")
 def test_committed_move_fsync_failure_reports_consumed_stage(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

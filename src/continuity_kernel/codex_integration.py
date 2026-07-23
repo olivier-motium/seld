@@ -3342,7 +3342,8 @@ def _confirm_receipt_durable(path: Path, expected: bytes) -> None:
     )
     if before != expected:
         raise ConflictError("ownership receipt bytes changed before durability confirmation")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (os.O_RDWR if os.name == "nt" else os.O_RDONLY) | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
         metadata = os.fstat(descriptor)
@@ -3669,7 +3670,7 @@ def _legacy_repair_contents() -> dict[str, bytes | None]:
 
 
 def _write_exclusive(path: Path, content: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, 0o600)
     try:

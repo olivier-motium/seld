@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 import sys
 import zipfile
@@ -242,7 +243,7 @@ def test_unhealthy_setup_preserves_config_and_never_calls_provider_or_bridge(
     assert payload["result"]["doctor"]["issues"][0]["path"] == "tasks/broken.md"
     assert payload["result"]["codex"] is None
     assert payload["result"]["bridge"] is None
-    assert f"gsv --vault {corrupt.resolve()} doctor" in payload["result"]["next"]
+    assert f"gsv --vault {shlex.quote(str(corrupt.resolve()))} doctor" in payload["result"]["next"]
     assert events == []
     config = load_config()
     assert config is not None
@@ -554,7 +555,7 @@ def test_backup_verify_and_restore_do_not_require_readable_configuration(
     assert restored["result"]["activation_required"] is True
     assert restored["result"]["activation_commands"] == [
         "gsv bridge stop",
-        f"gsv --vault {target.resolve()} setup",
+        f"gsv --vault {shlex.quote(str(target.resolve()))} setup",
     ]
     assert "Codex plus The Bridge" in restored["result"]["next"]
     assert configuration.read_bytes() == before

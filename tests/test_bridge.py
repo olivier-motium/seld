@@ -590,7 +590,9 @@ def test_packaged_bridge_bundle_contains_ui_assets_and_licenses() -> None:
     }
 
     with as_file(resource) as root:
-        present = {str(path.relative_to(root)) for path in Path(root).rglob("*") if path.is_file()}
+        present = {
+            path.relative_to(root).as_posix() for path in Path(root).rglob("*") if path.is_file()
+        }
 
     assert expected <= present
 
@@ -1120,6 +1122,22 @@ def test_health_probe_never_classifies_remote_refusal_as_local_stale_state(
     probe = bridge._probe_health("http://example.invalid:9/", token=ACCESS_TOKEN, timeout=0)
 
     assert probe == bridge._HealthProbe(bridge._HealthOutcome.UNAVAILABLE)
+
+
+def test_health_probe_recognizes_windows_loopback_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = OSError(errno.EINVAL, "injected Windows refusal")
+    cast(Any, error).winerror = 10061
+
+    def fail_request(*_args: object, **_kwargs: object) -> None:
+        raise URLError(error)
+
+    monkeypatch.setattr(bridge, "_open_loopback", fail_request)
+
+    probe = bridge._probe_health(f"http://{bridge.LOOPBACK_HOST}:9/", token=ACCESS_TOKEN, timeout=0)
+
+    assert probe == bridge._HealthProbe(bridge._HealthOutcome.REFUSED)
 
 
 def test_stop_cleans_refused_receipt_without_signalling_unverified_pid(
