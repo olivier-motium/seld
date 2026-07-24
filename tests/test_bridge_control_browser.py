@@ -83,10 +83,16 @@ def test_browser_guided_review_queues_exact_intent_and_preserves_stale_draft(
                 browser = playwright.chromium.launch(headless=True)
                 page = browser.new_page(viewport={"height": 844, "width": 390})
                 page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
-                page.locator('[data-view="commitments"]').click()
+                commitments = page.locator('[data-view="commitments"]')
+                commitments.focus()
+                commitments.press("Enter")
 
                 page.get_by_role("heading", name="Work through every open outcome").wait_for()
-                assert page.get_by_role("heading", name="Exact outcome").is_visible()
+                assert (
+                    page.locator("article.guided-review-subject")
+                    .get_by_role("heading", name="Exact outcome")
+                    .is_visible()
+                )
                 assert page.get_by_text("Rank 7", exact=True).is_visible()
                 assert page.get_by_text("Checked never means resolved.", exact=False).is_visible()
                 assert page.locator("body").evaluate(
@@ -113,15 +119,29 @@ def test_browser_guided_review_queues_exact_intent_and_preserves_stale_draft(
                     result_ref="task:review-session",
                 )
                 page.reload(wait_until="networkidle")
-                page.locator('[data-view="commitments"]').click()
+                commitments = page.locator('[data-view="commitments"]')
+                commitments.focus()
+                commitments.press("Enter")
 
                 answer = page.get_by_label("Tell the Mind what you want")
+                failed_answer = "Keep this exact wording through a network failure."
+                answer.fill(failed_answer)
+                page.route("**/api/v1/control", lambda route: route.abort())
+                page.get_by_role("button", name="Send and keep going").click()
+                page.wait_for_function(
+                    """value => document.querySelector('#guided-review-answer')?.value === value""",
+                    arg=failed_answer,
+                )
+                assert answer.input_value() == failed_answer
+                assert len(ledger.snapshot().pending) == 0
+                page.unroute("**/api/v1/control")
+
                 answer.fill("Move this below the maintenance outcome, but keep it open.")
                 ledger.queue.append(
                     kind="correction",
                     subject="record:task/review-session",
                     choice="A concurrent exact answer won the queue CAS.",
-                    expected_revision=queued.queue_revision,
+                    expected_revision=ledger.snapshot().queue_revision,
                     target_revision=session.revision,
                 )
                 page.get_by_role("button", name="Send and keep going").click()

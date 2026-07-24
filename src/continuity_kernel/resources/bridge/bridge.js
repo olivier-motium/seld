@@ -449,6 +449,7 @@ function renderGuidedReview(snapshot) {
       });
       await loadSnapshot({ quiet: true });
       status.textContent = "Queued for the review agent to read. No task meaning changed in the browser.";
+      return true;
     } catch (error) {
       if (error.status === 409) {
         await loadSnapshot({ quiet: true });
@@ -456,6 +457,7 @@ function renderGuidedReview(snapshot) {
       } else {
         status.textContent = error.message || "The review answer could not be queued.";
       }
+      return false;
     } finally {
       trigger.disabled = false;
     }
@@ -502,11 +504,11 @@ function renderGuidedReview(snapshot) {
     event.preventDefault();
     const answer = input.value.trim();
     if (!answer) return;
-    await send(
+    const queued = await send(
       `For task:${task.identifier}, my verbatim guided-review answer is:\n${answer}`,
       submit,
     );
-    if (!status.textContent.startsWith("The queue or review changed")) {
+    if (queued) {
       guidedReviewDraft = "";
       input.value = "";
     }
