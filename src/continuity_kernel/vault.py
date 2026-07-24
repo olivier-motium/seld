@@ -31,6 +31,15 @@ from continuity_kernel.errors import (
     PersistenceError,
     ValidationError,
 )
+from continuity_kernel.portfolio import (
+    ABSENT_PORTFOLIO_REVISION,
+    Portfolio,
+    PortfolioItem,
+    new_portfolio,
+    parse_portfolio,
+    portfolio_items,
+    render_portfolio,
+)
 from continuity_kernel.records import (
     Entity,
     Record,
@@ -40,6 +49,7 @@ from continuity_kernel.records import (
     canonical_id,
     entity_ids_value,
     format_time,
+    hand_id,
     new_entity,
     new_task,
     new_thread,
@@ -48,12 +58,14 @@ from continuity_kernel.records import (
     parse_entity,
     parse_task,
     parse_thread,
+    parse_time,
     references,
     render_entity,
     render_task,
     render_thread,
     task_id,
     task_ids_value,
+    task_rank,
     task_status,
     thread_status,
     title_text,
@@ -269,9 +281,13 @@ class Vault:
         next_actor: str | None = None,
         next_action: str | None = None,
         waiting_on: str | None = None,
+        rank: int | None = None,
+        active_thread_id: str | None = None,
         clear_next_actor: bool = False,
         clear_next_action: bool = False,
         clear_waiting_on: bool = False,
+        clear_rank: bool = False,
+        clear_active_thread_id: bool = False,
         add_refs: tuple[str, ...] = (),
         remove_refs: tuple[str, ...] = (),
         observed_at: datetime | None = None,
@@ -296,20 +312,34 @@ class Vault:
                 if waiting_on is not None
                 else before.waiting_on
             )
+            target_rank = task_rank(rank) if rank is not None else before.rank
+            target_active_thread_id = (
+                hand_id(active_thread_id)
+                if active_thread_id is not None
+                else before.active_thread_id
+            )
             if target_status in {"done", "dropped"} and any(
-                value is not None for value in (next_actor, next_action, waiting_on)
+                value is not None
+                for value in (next_actor, next_action, waiting_on, active_thread_id)
             ):
-                raise ValidationError("terminal task updates cannot also set future-work fields")
+                raise ValidationError(
+                    "terminal task updates cannot also set future-work fields or an active hand"
+                )
             if clear_next_actor:
                 target_actor = None
             if clear_next_action:
                 target_next = None
             if clear_waiting_on:
                 target_waiting = None
+            if clear_rank:
+                target_rank = None
+            if clear_active_thread_id:
+                target_active_thread_id = None
             if target_status in {"done", "dropped"}:
                 target_actor = None
                 target_next = None
                 target_waiting = None
+                target_active_thread_id = None
             refs = tuple(item for item in before.refs if item not in set(remove_refs))
             refs = references((*refs, *add_refs))
             candidate = replace(
@@ -320,6 +350,8 @@ class Vault:
                 next_actor=target_actor,
                 next_action=target_next,
                 waiting_on=target_waiting,
+                rank=target_rank,
+                active_thread_id=target_active_thread_id,
                 refs=refs,
                 updated_at=next_timestamp(before.updated_at, observed_at),
                 revision="",
@@ -460,6 +492,57 @@ class Vault:
             self._replace_record(path, "thread", before, after, render_thread(after))
             return after
 
+    def get_portfolio(self) -> Portfolio:
+        return parse_portfolio(self._read_text(self.root / "PORTFOLIO.md"))
+
+    def set_portfolio(
+        self,
+        *,
+        expected_revision: str,
+        summary: str,
+        items: tuple[PortfolioItem, ...],
+        observed_at: datetime | None = None,
+    ) -> Portfolio:
+        """Author the complete open Portfolio with one exact CAS write."""
+
+        path = self.root / "PORTFOLIO.md"
+        clean_items = portfolio_items(items)
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self.state / "locks/portfolio.lock"),
+        ):
+            before: Portfolio | None
+            previous: bytes | None
+            if os.path.lexists(path):
+                previous = self._read_bytes(path)
+                before = parse_portfolio(previous.decode("utf-8"))
+                self._expect(before.revision, expected_revision)
+                timestamp = next_timestamp(before.updated_at, observed_at)
+            else:
+                previous = None
+                before = None
+                if expected_revision != ABSENT_PORTFOLIO_REVISION:
+                    raise ConflictError(
+                        "Portfolio changed; reload it before authoring the complete set"
+                    )
+                timestamp = format_time(observed_at or datetime.now(UTC))
+            self._validate_portfolio_items(clean_items)
+            after = new_portfolio(
+                summary=summary,
+                items=clean_items,
+                observed_at=parse_time(timestamp),
+            )
+            self._persist_with_event(
+                path=path,
+                content=render_portfolio(after).encode("utf-8"),
+                previous=previous,
+                operation="portfolio.set",
+                identifier="portfolio:current",
+                before_revision=before.revision if before is not None else None,
+                after_revision=after.revision,
+            )
+            return after
+
     def read_document(self, name: str) -> dict[str, str]:
         path = self._document_path(name)
         stored = self._read_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
@@ -570,6 +653,13 @@ class Vault:
                 self._read_text(self.root / name, max_bytes=MAX_DOCUMENT_BYTES)
             except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
                 issues.append(DoctorIssue("invalid-document", name, str(exc)))
+
+        portfolio_path = self.root / "PORTFOLIO.md"
+        if os.path.lexists(portfolio_path):
+            try:
+                parse_portfolio(self._read_text(portfolio_path))
+            except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
+                issues.append(DoctorIssue("invalid-portfolio", "PORTFOLIO.md", str(exc)))
 
         records: dict[str, Record] = {}
         for kind, directory, parser in (
@@ -910,6 +1000,44 @@ class Vault:
             self.get_task(identifier)
         for identifier in entity_ids:
             self.get_entity(identifier)
+
+    def _validate_portfolio_items(self, items: tuple[PortfolioItem, ...]) -> None:
+        tasks = self.list_tasks()
+        open_tasks = {
+            task.identifier: task
+            for task in tasks
+            if task.status not in {"done", "dropped"} and "review-scope:all-open" not in task.refs
+        }
+        item_ids = {item.task_id for item in items}
+        if item_ids != set(open_tasks):
+            missing = sorted(set(open_tasks) - item_ids)
+            extra = sorted(item_ids - set(open_tasks))
+            details = []
+            if missing:
+                details.append(f"missing open tasks: {', '.join(missing)}")
+            if extra:
+                details.append(f"not current open tasks: {', '.join(extra)}")
+            raise ValidationError(
+                "Portfolio must cover the complete open task set; " + "; ".join(details)
+            )
+        for item in items:
+            task = open_tasks[item.task_id]
+            if item.task_revision != task.revision:
+                raise ConflictError(
+                    f"Portfolio task anchor changed for {item.task_id}; reload before writing"
+                )
+            if item.work_thread_id is None:
+                continue
+            thread = self.get_thread(item.work_thread_id)
+            if item.work_thread_revision != thread.revision:
+                raise ConflictError(
+                    f"Portfolio work-thread anchor changed for {item.task_id}; "
+                    "reload before writing"
+                )
+            if item.task_id not in thread.task_ids:
+                raise ValidationError(
+                    f"Portfolio work thread {thread.identifier} does not contain {item.task_id}"
+                )
 
     def _assert_inside(self, path: Path) -> None:
         try:

@@ -17,6 +17,10 @@ the resolved local vault as `path`. The Bridge distinguishes three actions:
   task identifier, resume language, or first-run language.
 - a task `codex_url` resumes one exact commitment and therefore exists only for
   nonterminal tasks. Done and dropped records never receive one.
+- the guided Portfolio review start link opens a new Codex hand with the finite
+  review contract. Once the agent authors that hand ID on the review-session
+  Task, Bridge renders the exact hand link. This public integration does not
+  claim a supported API for injecting later turns into that existing hand.
 
 The top bar, all-clear state, and terminal-task inspector use `new_hand_url`;
 only the true first-run panel uses `new_mind_url`. The Bridge emits none of

@@ -33,6 +33,7 @@ from continuity_kernel.control_queue import (
 )
 from continuity_kernel.errors import MutationCommittedError, SetupError, ValidationError
 from continuity_kernel.operations import OperationLedger
+from continuity_kernel.portfolio import ABSENT_PORTFOLIO_REVISION, portfolio_item
 from continuity_kernel.vault import Vault, doctor_dict
 
 INSTANCE_ID = "a" * 32
@@ -207,6 +208,111 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
             "review_url": review_url,
             "state": "ready",
         }
+
+
+def test_snapshot_projects_one_exact_guided_review_subject_without_inference(
+    vault: Vault,
+) -> None:
+    first = vault.create_task(
+        identifier="first-outcome",
+        title="First exact outcome",
+        outcome="Decide whether this still earns its place.",
+        status="ready",
+        next_actor="human",
+        rank=10,
+    )
+    second = vault.create_task(
+        identifier="second-outcome",
+        title="Second exact outcome",
+        outcome="Choose its real horizon.",
+        status="ready",
+        next_actor="human",
+        rank=20,
+    )
+    session = vault.create_task(
+        identifier="review-session",
+        title="Review every open outcome",
+        outcome="Check each outcome without equating checked with resolved.",
+        status="waiting",
+        next_actor="human",
+        next_action="Keep this current and advance.",
+        waiting_on="Should I keep it unchanged?",
+        active_thread_id="exact-review-hand",
+        refs=("review-scope:all-open", "review-subject:task:first-outcome"),
+    )
+    portfolio = vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="This is the complete authored outcome set.",
+        items=(
+            portfolio_item(
+                task_id_value=first.identifier,
+                task_revision=first.revision,
+                stance="needs-human",
+                reason="Check whether it is current.",
+            ),
+            portfolio_item(
+                task_id_value=second.identifier,
+                task_revision=second.revision,
+                stance="needs-human",
+                reason="Check its horizon after the first outcome.",
+            ),
+        ),
+    )
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )
+    review = snapshot["portfolio"]["review"]
+    assert snapshot["portfolio"]["revision"] == portfolio.revision
+    assert review["state"] == "active"
+    assert review["actionable"] is True
+    assert review["subject_task_id"] == first.identifier
+    assert review["subject"]["position"] == 1
+    assert review["recommendation"] == "Keep this current and advance."
+    assert review["question"] == "Should I keep it unchanged?"
+    assert review["checked_count"] == 0
+    assert review["uncovered_count"] == 2
+
+    changed_second = vault.update_task(
+        second.identifier,
+        expected_revision=second.revision,
+        next_action="An unrelated newer action.",
+    )
+    assert changed_second.revision != second.revision
+    drifted = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )
+    assert drifted["portfolio"]["state"] == "stale"
+    assert drifted["portfolio"]["stale_count"] == 1
+    assert drifted["portfolio"]["review"]["actionable"] is True
+
+    advanced = vault.update_task(
+        session.identifier,
+        expected_revision=session.revision,
+        remove_refs=("review-subject:task:first-outcome",),
+        add_refs=(
+            "review-covered:task:first-outcome",
+            "review-subject:task:second-outcome",
+        ),
+        next_action="Reauthor the stale anchor before asking about the second outcome.",
+        waiting_on="Should its horizon change?",
+    )
+    assert advanced.revision != session.revision
+    checked = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )["portfolio"]["review"]
+    assert checked["checked_count"] == 1
+    assert checked["checked_open_count"] == 1
+    assert vault.get_task(first.identifier).status == "ready"
+    assert checked["state"] == "conflict"
+    assert checked["actionable"] is False
+    assert "stale" in checked["issue"].casefold()
 
 
 def test_snapshot_exposes_mind_shaping_only_for_a_proven_empty_ledger(vault: Vault) -> None:

@@ -17,8 +17,9 @@
 ## Kernel
 
 `continuity_kernel.records` defines bounded task, entity, and work-thread
-records. `continuity_kernel.vault` owns validation, locking, atomic persistence,
-context rendering, backup, restore, and health checks. The CLI and
+records. `continuity_kernel.portfolio` defines one typed complete authored
+Portfolio. `continuity_kernel.vault` owns validation, locking, atomic
+persistence, context rendering, backup, restore, and health checks. The CLI and
 dependency-free stdio MCP server are adapters over that same vault.
 
 The Culture-Grade branch also contains onboarding storage, source recipes and
@@ -150,6 +151,36 @@ Snapshot, Bridge GET, CLI list, and MCP list are observational: they never
 anchor or repair disposition state. An explicit accept, reject, or archive
 mutation validates the vault binding and revisions from that observation
 before performing any deterministic recovery it needs.
+
+### Guided Portfolio review
+
+The guided review is a thin composition of existing primitives:
+
+1. An agent authors the complete `PORTFOLIO.md` through `portfolio set`, with
+   exact Task and optional WorkThread anchors.
+2. One ordinary nonterminal review-session Task carries the all-open scope,
+   exact current subject, covered Task references, current recommendation and
+   question, and one exact active Codex hand.
+3. Bridge projects those declarations. It never chooses a next Task or derives
+   meaning from an answer. A stale current-subject anchor disables semantic
+   controls; unrelated Portfolio drift stays visible but does not make the
+   exact current subject unsafe.
+4. A button or freeform answer appends one authenticated correction intent
+   bound to the review-session revision. A queue conflict preserves the typed
+   draft.
+5. The review agent reloads the operation, Task, WorkThread, and Portfolio
+   revisions; interprets the answer; applies only justified native CAS writes;
+   reads canonical truth back; then accepts or rejects the intent. Acceptance
+   acknowledges the receipt only.
+6. Advancing adds `review-covered:task:<id>` only after the user answered or
+   explicitly skipped that subject, and replaces the exact subject in the same
+   Task CAS write. It does not reorder Portfolio or complete the reviewed Task.
+
+There is no transcript store, semantic queue executor, review database, or
+browser-side task policy. Public Codex integration currently exposes new-task
+deep links, not a supported API for waking an existing Codex turn; therefore an
+active hand is rendered exactly when authored, but automatic same-hand turn
+delivery remains outside this public slice.
 
 This control write flow currently depends on POSIX directory descriptors,
 `O_NOFOLLOW`, and directory-root locking. It is enabled on macOS and Linux. The

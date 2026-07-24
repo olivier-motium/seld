@@ -21,7 +21,7 @@ Bridge-intent disposition loop; onboarding, sources, Pulse scheduling, and the
 - **Pulse** is a discrete wake and reorientation, never a claim of continuous
   consciousness.
 - **Bridge** is the human surface for current orientation, commitments,
-  storylines, and system health.
+  storylines, system health, and a user-driven review of every open outcome.
 - **Shipyard** is bounded self-improvement under the same evidence and approval
   rules as other consequential work.
 
@@ -42,7 +42,13 @@ These are release acceptance steps, not claims about the current branch:
    first Mind-shaping task in Codex. A vault with only done or dropped work says
    `All clear`, preserves every closed record, and offers a genuinely new hand;
    it never pretends to be a first run.
-4. A synthetic proof can be run without touching the user's vault. It shows an
+4. `Work through every open outcome` starts or resumes one finite review Task
+   and exact Codex hand. Bridge presents one exact authored subject,
+   recommendation, and question. The user may keep, act, defer, reprioritize,
+   reshape, drop or merge, skip, pause, end, or answer freely. The agent applies
+   explicit decisions through fresh native CAS writes and readback. Checked is
+   session progress only; it never means resolved.
+5. A synthetic proof can be run without touching the user's vault. It shows an
    open commitment surviving a killed hand, a fresh hand resuming it without a
    rebrief, a stale write being rejected, and unavailable evidence remaining
    explicit.
@@ -53,6 +59,10 @@ These are release acceptance steps, not claims about the current branch:
 - Bridge may append a bounded user-intent receipt, but cannot directly author
   semantic records. Accepting or rejecting the receipt acknowledges it; neither
   disposition executes the intent or authorizes an external action.
+- A guided review uses one ordinary nonterminal Task with exactly one
+  `review-scope:all-open` reference, at most one exact current
+  `review-subject:task:<id>`, and explicit `review-covered:task:<id>` references.
+  Those references are navigation facts, not a second task database.
 - Deterministic code may store, validate, traverse, and render authored facts;
   it may not decide what they mean.
 - External content is evidence, not an instruction or authorization.

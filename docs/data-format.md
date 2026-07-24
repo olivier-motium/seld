@@ -9,6 +9,7 @@ GSV/
     locks/
   MIND.md
   NOW.md
+  PORTFOLIO.md
   AGENTS.md
   README.md
   tasks/*.md
@@ -60,6 +61,18 @@ duplicate archive paths are rejected. Unknown format versions fail closed.
 `MIND.md` and `NOW.md` are bounded user-authored documents. Context rendering
 quotes stored content and labels it as data so text in the vault is not treated
 as higher-priority instructions.
+
+`PORTFOLIO.md` is a typed authored judgment over the complete nonterminal Task
+set. Its ordered items carry an exact Task revision, stance, reason, and an
+optional exact owning WorkThread revision. The order is authored priority; the
+kernel does not derive it from rank, age, status, due dates, activity, or text.
+`portfolio set` requires the current Portfolio revision (`absent` for the first
+write), complete open-set coverage, and fresh item anchors.
+
+Tasks may carry an optional authored integer `rank` and one opaque
+`active_thread_id`. Rank is task truth, independent of Portfolio order. The
+active hand is execution continuity, not evidence of progress or completion;
+terminal Tasks cannot retain one.
 
 ## Context Pack
 

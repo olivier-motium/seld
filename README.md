@@ -5,8 +5,9 @@
 GSV 1.0 is being built to bring your email, messages, calendars, files, GitHub
 work, and Codex activity into one current picture of your life. It is meant to
 keep track of people, projects, promises, decisions, waiting-fors, and what
-needs attention next. You keep talking and working in Codex. The local Bridge
-shows durable GSV records and the exact work Codex can continue.
+needs attention next. Codex remains the reasoning engine. The local Bridge
+shows durable GSV records, the exact work Codex can continue, and a guided
+one-outcome-at-a-time Portfolio review driven by your explicit answers.
 
 Your canonical GSV records are readable files on your computer. There is no GSV
 account, hosted database, telemetry service, or second chat app.
@@ -33,14 +34,16 @@ life you choose to share:
 - **What happens next:** the next actor, exact continuation, approval boundary,
   and one active Codex hand for each real outcome.
 
-Bridge follows one simple contract: **read here, talk in Codex**. In this
-foundation slice, its authenticated control route can queue an explicit setup
-choice, approval, correction, or undo request. A separate CLI or MCP process
-can accept or reject that queued intent durably. Disposition does not execute
-the request, authorize an external action, change semantic records, or mark
-work complete. This control lane currently requires secure directory-pinned
-storage available on macOS and Linux; Windows fails closed and remains an open
-cross-platform gate while canonical Bridge reads stay available.
+Bridge follows one simple authority contract: **the browser presents and
+captures; the agent judges; native records remain truth**. Its authenticated
+control route can queue an explicit guided-review answer, setup choice,
+approval, correction, or undo request. A CLI or MCP agent reads that receipt,
+authors any justified Task, WorkThread, and complete Portfolio changes through
+fresh compare-and-swap writes, reads them back, and only then accepts or rejects
+the receipt. Disposition itself does not execute the request, authorize an
+external action, change semantic records, or mark work complete. This control
+lane currently requires secure directory-pinned storage available on macOS and
+Linux; Windows fails closed while canonical Bridge reads stay available.
 
 ## Why cross-source context matters
 
@@ -86,16 +89,21 @@ proven OpenClaw or Hermes replacement.
 
 ## What is proven, and what is only foundation code
 
-- Durable local Tasks, Entities, WorkThreads, Mind, and current orientation.
+- Durable local Tasks, Entities, WorkThreads, Mind, current orientation, and an
+  authored complete Portfolio with exact Task and optional WorkThread anchors.
 - Compare-and-swap writes, crash recovery, verified backup/restore, and
   reversible Codex integration.
 - A private loopback Bridge with exact continuation links.
 
-This foundation branch adds an authenticated, compare-and-swap Bridge control
-queue plus durable accept/reject dispositions readable from a fresh CLI or MCP
-process on macOS and Linux. Windows has no secure pinned-store backend in this
-foundation and fails the control lane closed. That bounded loop is not a
-semantic mutation or action executor.
+This foundation branch adds a guided all-open Portfolio review over that same
+authenticated, compare-and-swap Bridge control queue. It presents one exact
+authored subject, recommendation, and question; quick directions and freeform
+answers enter the existing queue. The agent—not browser code—applies exact
+semantic changes through Task, WorkThread, and Portfolio CAS commands. Checked
+means only reviewed in that finite session, never completed. Durable
+accept/reject dispositions remain readable from a fresh CLI or MCP process on
+macOS and Linux. Windows has no secure pinned-store backend in this foundation
+and fails the control lane closed.
 
 The branch also contains context-first onboarding state, host readiness
 receipts, source-attestation validators, Pulse admission, and scheduler-canary

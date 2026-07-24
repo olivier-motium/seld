@@ -90,7 +90,7 @@ export function renderControlPanel(snapshot, { bridgeToken, currentControls, ref
     submit.disabled = true;
     status.textContent = "Saving locally…";
     try {
-      await appendControl(snapshot, bridgeToken, {
+      await appendControlIntent(snapshot, bridgeToken, {
         choice,
         kind: "correction",
         subject: "mind:user-correction",
@@ -197,7 +197,7 @@ export function controlSystemStatus(snapshot) {
   return snapshot.controls.pending ? "Review needed" : "Ready";
 }
 
-async function appendControl(snapshot, bridgeToken, intent) {
+export async function appendControlIntent(snapshot, bridgeToken, intent) {
   if (!bridgeToken || !snapshot.controls?.available || !snapshot.controls.queue_revision) {
     throw new Error("The local Bridge intent queue is not ready.");
   }

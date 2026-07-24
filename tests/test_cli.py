@@ -50,6 +50,73 @@ def test_cli_json_task_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert created["result"]["identifier"] == "cli-proof"
 
 
+def test_cli_authors_rank_hand_and_complete_portfolio(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault_path = tmp_path / "portfolio-vault"
+    assert cli.main(["--json", "--vault", str(vault_path), "init"]) == 0
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault_path),
+                "task",
+                "create",
+                "--id",
+                "ranked-outcome",
+                "--title",
+                "Ranked outcome",
+                "--outcome",
+                "Keep exact authored order.",
+                "--rank",
+                "3",
+                "--active-thread-id",
+                "exact-hand",
+            ]
+        )
+        == 0
+    )
+    task = json.loads(capsys.readouterr().out)["result"]
+
+    item = json.dumps(
+        {
+            "reason": "The user should decide deliberately.",
+            "stance": "needs-human",
+            "task_id": task["identifier"],
+            "task_revision": task["revision"],
+        }
+    )
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault_path),
+                "portfolio",
+                "set",
+                "--expected-revision",
+                "absent",
+                "--summary",
+                "One complete open outcome.",
+                "--item-json",
+                item,
+            ]
+        )
+        == 0
+    )
+    portfolio = json.loads(capsys.readouterr().out)["result"]
+    assert portfolio["items"][0]["task_id"] == "ranked-outcome"
+
+    assert cli.main(["--json", "--vault", str(vault_path), "portfolio", "show"]) == 0
+    shown = json.loads(capsys.readouterr().out)["result"]
+    assert shown == portfolio
+    assert task["rank"] == 3
+    assert task["active_thread_id"] == "exact-hand"
+
+
 def test_cli_does_not_advertise_unsupported_control_lane(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

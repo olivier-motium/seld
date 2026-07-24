@@ -1,5 +1,6 @@
 import { startThinkingOrb, stopThinkingOrb } from "./thinking-orbs.js";
 import {
+  appendControlIntent,
   controlSystemCopy,
   controlSystemStatus,
   renderControlPanel,
@@ -53,6 +54,7 @@ const state = {
   snapshot: null,
   snapshotSignature: null,
 };
+let guidedReviewDraft = "";
 
 for (const button of document.querySelectorAll("[data-view]")) {
   button.addEventListener("click", () => navigate(button.dataset.view));
@@ -315,6 +317,7 @@ function renderCommitments(snapshot) {
   if (taskProjection.state !== "complete") {
     container.append(renderProjectionWarning(taskProjection, "work"));
   }
+  container.append(renderGuidedReview(snapshot));
   if (taskProjection.state === "complete" && snapshot.tasks.length === 0) {
     container.append(renderFirstRun(snapshot));
     return container;
@@ -326,6 +329,191 @@ function renderCommitments(snapshot) {
   }
   appendClosedHistory(container, completed);
   return container;
+}
+
+function renderGuidedReview(snapshot) {
+  const portfolio = snapshot.portfolio || {};
+  const review = portfolio.review || {};
+  const section = element("section", "guided-review");
+  const head = element("div", "guided-review-head");
+  const copy = element("div");
+  copy.append(
+    textElement("p", "section-label", "Guided all-open review"),
+    textElement("h2", "", "Work through every open outcome"),
+    textElement(
+      "p",
+      "guided-review-progress",
+      review.state === "active"
+        ? `${review.checked_count || 0} checked this session · ${review.uncovered_count || 0} still to check. Checked never means resolved.`
+        : "One exact outcome at a time, with authored priority and native compare-and-swap changes.",
+    ),
+  );
+  head.append(copy);
+  section.append(head);
+
+  if (!portfolio.available || review.state === "available" || review.state === "unavailable") {
+    const empty = element("div", "guided-review-empty");
+    empty.append(
+      textElement(
+        "p",
+        "",
+        portfolio.available
+          ? "No finite review session is open. Start one Codex review hand; answers then travel through the authenticated Bridge intent queue."
+          : "The complete authored Portfolio is not available yet. Codex must author it from the full open task set before review can begin.",
+      ),
+    );
+    if (review.start_url) {
+      const start = textElement("a", "primary-action", "Start the review hand");
+      start.href = review.start_url;
+      empty.append(start);
+    }
+    section.append(empty);
+    return section;
+  }
+
+  if (review.issue) {
+    const warning = element("div", "guided-review-warning", { role: "alert" });
+    warning.append(
+      textElement("strong", "", "Review state needs repair"),
+      textElement("p", "", review.issue),
+    );
+    section.append(warning);
+  }
+
+  const subject = review.subject;
+  const task = subject?.task;
+  if (subject && task) {
+    const card = element("article", "guided-review-subject");
+    const facts = element("div", "guided-review-facts");
+    facts.append(
+      textElement("span", "status-pill", statusLabel(task)),
+      textElement("span", "", `Portfolio ${subject.position} of ${review.open_count}`),
+      textElement("span", "", task.rank === null ? "No authored rank" : `Rank ${task.rank}`),
+    );
+    card.append(
+      facts,
+      textElement("h3", "", task.title),
+      textElement("p", "", task.outcome),
+      textElement("strong", "guided-review-label", "The Mind recommends"),
+      textElement("p", "", review.recommendation || "No recommendation has been authored yet."),
+      textElement("strong", "guided-review-label", "One question"),
+      textElement("p", "", review.question || "The current question has not been authored yet."),
+    );
+    section.append(card);
+  }
+
+  if (!review.active_thread_id) {
+    const resume = element("div", "guided-review-empty");
+    resume.append(
+      textElement("p", "", "The session is durable, but no exact Codex hand is currently claimed."),
+    );
+    if (review.start_url) {
+      const link = textElement("a", "primary-action", "Resume the review hand");
+      link.href = review.start_url;
+      resume.append(link);
+    }
+    section.append(resume);
+    return section;
+  }
+
+  if (review.pending_intent) {
+    const pending = element("div", "guided-review-empty", { role: "status" });
+    pending.append(
+      textElement("strong", "", "Your answer is queued"),
+      textElement(
+        "p",
+        "",
+        "The review agent must read current truth, apply any justified native CAS changes, and acknowledge this exact receipt before another answer is accepted.",
+      ),
+    );
+    section.append(pending);
+    return section;
+  }
+
+  if (!review.actionable || !subject || !task) return section;
+  const form = element("form", "guided-review-form");
+  const intentList = element("div", "guided-review-intents", {
+    "aria-label": "Direction for the current exact outcome",
+    role: "group",
+  });
+  const status = element("p", "control-status", { "aria-live": "polite", role: "status" });
+  const send = async (choice, trigger) => {
+    trigger.disabled = true;
+    status.textContent = "Saving your exact wording locally…";
+    try {
+      await appendControlIntent(snapshot, bridgeToken, {
+        choice,
+        kind: "correction",
+        subject: `record:task/${review.session.identifier}`,
+        target_revision: review.session_revision,
+      });
+      await loadSnapshot({ quiet: true });
+      status.textContent = "Queued for the review agent to read. No task meaning changed in the browser.";
+    } catch (error) {
+      if (error.status === 409) {
+        await loadSnapshot({ quiet: true });
+        status.textContent = "The queue or review changed. Your draft is still here; review current truth and retry.";
+      } else {
+        status.textContent = error.message || "The review answer could not be queued.";
+      }
+    } finally {
+      trigger.disabled = false;
+    }
+  };
+  for (const [label, intent] of [
+    ["Keep current", "keep"],
+    ["Do / next", "act-next"],
+    ["Defer", "defer"],
+    ["Reprioritize", "reprioritize"],
+    ["Edit", "reshape"],
+    ["Drop / merge", "drop-or-merge"],
+    ["Skip for now", "skip"],
+  ]) {
+    const button = textElement("button", "command-copy", label);
+    button.type = "button";
+    button.addEventListener("click", () => send(
+      `For task:${task.identifier}, my explicit guided-review answer is: ${intent}. Interpret this in the exact current context; do not infer completion or broader authority.`,
+      button,
+    ));
+    intentList.append(button);
+  }
+  const label = textElement("label", "guided-review-label", "Tell the Mind what you want");
+  const input = element("textarea", "control-input", {
+    maxlength: "4096",
+    rows: "3",
+  });
+  input.id = "guided-review-answer";
+  label.htmlFor = input.id;
+  input.value = guidedReviewDraft;
+  input.addEventListener("input", () => { guidedReviewDraft = input.value; });
+  const submit = textElement("button", "primary-action", "Send and keep going");
+  submit.type = "submit";
+  const sessionActions = element("div", "guided-review-session-actions");
+  for (const [labelText, intent] of [["Pause here", "pause"], ["End review", "end-review"]]) {
+    const button = textElement("button", "quiet-action", labelText);
+    button.type = "button";
+    button.addEventListener("click", () => send(
+      `For review session task:${review.session.identifier}, my explicit session instruction is: ${intent}. Preserve checked-versus-resolved semantics.`,
+      button,
+    ));
+    sessionActions.append(button);
+  }
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const answer = input.value.trim();
+    if (!answer) return;
+    await send(
+      `For task:${task.identifier}, my verbatim guided-review answer is:\n${answer}`,
+      submit,
+    );
+    if (!status.textContent.startsWith("The queue or review changed")) {
+      guidedReviewDraft = "";
+      input.value = "";
+    }
+  });
+  form.append(intentList, label, input, submit, sessionActions, status);
+  section.append(form);
+  return section;
 }
 
 function appendClosedHistory(container, tasks) {

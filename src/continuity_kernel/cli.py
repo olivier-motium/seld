@@ -38,6 +38,7 @@ from continuity_kernel.demo import run_demo
 from continuity_kernel.errors import ContinuityError, SetupError
 from continuity_kernel.mcp_server import serve
 from continuity_kernel.operations import OperationLedger, capture_operation_binding
+from continuity_kernel.portfolio import portfolio_dict, portfolio_item
 from continuity_kernel.records import record_dict
 from continuity_kernel.vault import Vault, doctor_dict
 
@@ -224,6 +225,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return context if args.format == "markdown" else {"context": context}
     if args.command == "task":
         return _task(vault, args)
+    if args.command == "portfolio":
+        return _portfolio(vault, args)
     if args.command == "entity":
         return _entity(vault, args)
     if args.command == "thread":
@@ -342,6 +345,8 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
                 next_actor=args.next_actor,
                 next_action=args.next_action,
                 waiting_on=args.waiting_on,
+                rank=args.rank,
+                active_thread_id=args.active_thread_id,
                 refs=tuple(args.ref),
             )
         )
@@ -355,9 +360,13 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
             next_actor=args.next_actor,
             next_action=args.next_action,
             waiting_on=args.waiting_on,
+            rank=args.rank,
+            active_thread_id=args.active_thread_id,
             clear_next_actor=args.clear_next_actor,
             clear_next_action=args.clear_next_action,
             clear_waiting_on=args.clear_waiting_on,
+            clear_rank=args.clear_rank,
+            clear_active_thread_id=args.clear_active_thread_id,
             add_refs=tuple(args.add_ref),
             remove_refs=tuple(args.remove_ref),
         )
@@ -389,6 +398,33 @@ def _entity(vault: Vault, args: argparse.Namespace) -> Any:
             aliases=tuple(args.alias) if args.alias is not None else None,
             add_refs=tuple(args.add_ref),
             remove_refs=tuple(args.remove_ref),
+        )
+    )
+
+
+def _portfolio(vault: Vault, args: argparse.Namespace) -> Any:
+    if args.portfolio_command == "show":
+        return portfolio_dict(vault.get_portfolio())
+    parsed = []
+    for encoded in args.item_json:
+        value = json.loads(encoded)
+        if not isinstance(value, dict):
+            raise ValueError("each --item-json value must be a JSON object")
+        parsed.append(
+            portfolio_item(
+                task_id_value=value.get("task_id"),
+                task_revision=value.get("task_revision"),
+                stance=value.get("stance"),
+                reason=value.get("reason"),
+                work_thread_id=value.get("work_thread_id"),
+                work_thread_revision=value.get("work_thread_revision"),
+            )
+        )
+    return portfolio_dict(
+        vault.set_portfolio(
+            expected_revision=args.expected_revision,
+            summary=args.summary,
+            items=tuple(parsed),
         )
     )
 
@@ -514,11 +550,25 @@ def _parser() -> argparse.ArgumentParser:
     task_update.add_argument("--next-actor", choices=("agent", "human", "external"))
     task_update.add_argument("--next-action")
     task_update.add_argument("--waiting-on")
+    task_update.add_argument("--rank", type=int)
+    task_update.add_argument("--active-thread-id")
     task_update.add_argument("--clear-next-actor", action="store_true")
     task_update.add_argument("--clear-next-action", action="store_true")
     task_update.add_argument("--clear-waiting-on", action="store_true")
+    task_update.add_argument("--clear-rank", action="store_true")
+    task_update.add_argument("--clear-active-thread-id", action="store_true")
     task_update.add_argument("--add-ref", action="append", default=[])
     task_update.add_argument("--remove-ref", action="append", default=[])
+
+    portfolio = commands.add_parser(
+        "portfolio", help="Show or author the complete open Portfolio judgment."
+    )
+    portfolio_commands = portfolio.add_subparsers(dest="portfolio_command", required=True)
+    portfolio_commands.add_parser("show")
+    portfolio_set = portfolio_commands.add_parser("set")
+    portfolio_set.add_argument("--expected-revision", required=True)
+    portfolio_set.add_argument("--summary", required=True)
+    portfolio_set.add_argument("--item-json", action="append", default=[])
 
     entity = commands.add_parser("entity", help="Create and inspect canonical entities.")
     entity_commands = entity.add_subparsers(dest="entity_command", required=True)
@@ -650,6 +700,8 @@ def _task_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--next-actor", choices=("agent", "human", "external"))
     parser.add_argument("--next-action")
     parser.add_argument("--waiting-on")
+    parser.add_argument("--rank", type=int)
+    parser.add_argument("--active-thread-id")
     parser.add_argument("--ref", action="append", default=[])
 
 

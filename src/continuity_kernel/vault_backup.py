@@ -334,7 +334,7 @@ def _is_owned_vault_temp(relative: str) -> bool:
         return False
     parent = path.parent.as_posix()
     if parent == ".":
-        return target_name in {"AGENTS.md", "MIND.md", "NOW.md", "README.md"}
+        return target_name in {"AGENTS.md", "MIND.md", "NOW.md", "PORTFOLIO.md", "README.md"}
     if parent in {"tasks", "entities", "threads"}:
         return target_name.endswith(".md")
     if parent == "onboarding":

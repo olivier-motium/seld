@@ -93,6 +93,64 @@ def test_two_independent_mcp_sessions_share_durable_state(tmp_path: Path) -> Non
     assert resumed["result"]["structuredContent"]["next_action"] == ("Read from a second process.")
 
 
+def test_mcp_authors_and_reads_complete_portfolio(tmp_path: Path) -> None:
+    vault_path = tmp_path / "portfolio-vault"
+    Vault(vault_path).initialize(name="MCP Portfolio")
+    process = _start(vault_path)
+    try:
+        _exchange(process, "initialize", 1)
+        tools = _exchange(process, "tools/list", 2)["result"]["tools"]
+        created = _exchange(
+            process,
+            "tools/call",
+            3,
+            {
+                "name": "gsv_task_create",
+                "arguments": {
+                    "active_thread_id": "exact-hand",
+                    "id": "mcp-ranked-outcome",
+                    "outcome": "Remain exact across processes.",
+                    "rank": 5,
+                    "title": "MCP ranked outcome",
+                },
+            },
+        )["result"]["structuredContent"]
+        authored = _exchange(
+            process,
+            "tools/call",
+            4,
+            {
+                "name": "gsv_portfolio_set",
+                "arguments": {
+                    "expected_revision": "absent",
+                    "items": [
+                        {
+                            "reason": "Keep exact authored order.",
+                            "stance": "keep-in-view",
+                            "task_id": created["identifier"],
+                            "task_revision": created["revision"],
+                        }
+                    ],
+                    "summary": "One complete outcome.",
+                },
+            },
+        )["result"]["structuredContent"]
+        shown = _exchange(
+            process,
+            "tools/call",
+            5,
+            {"name": "gsv_portfolio_show", "arguments": {}},
+        )["result"]["structuredContent"]
+    finally:
+        _close(process)
+
+    names = {tool["name"] for tool in tools}
+    assert {"gsv_portfolio_show", "gsv_portfolio_set"} <= names
+    assert authored == shown
+    assert created["rank"] == 5
+    assert created["active_thread_id"] == "exact-hand"
+
+
 def test_cli_explicit_vault_overrides_mcp_environment_for_process_lifetime(
     tmp_path: Path,
 ) -> None:

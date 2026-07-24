@@ -17,6 +17,7 @@ from continuity_kernel.operations import (
     OperationLedger,
     capture_operation_binding,
 )
+from continuity_kernel.portfolio import portfolio_dict, portfolio_item
 from continuity_kernel.records import record_dict
 from continuity_kernel.vault import Vault, doctor_dict
 
@@ -200,6 +201,8 @@ def _call(
                 next_actor=_optional_string(values, "next_actor"),
                 next_action=_optional_string(values, "next_action"),
                 waiting_on=_optional_string(values, "waiting_on"),
+                rank=_optional_integer(values, "rank"),
+                active_thread_id=_optional_string(values, "active_thread_id"),
                 refs=_strings(values, "refs"),
             )
         )
@@ -214,11 +217,42 @@ def _call(
                 next_actor=_optional_string(values, "next_actor"),
                 next_action=_optional_string(values, "next_action"),
                 waiting_on=_optional_string(values, "waiting_on"),
+                rank=_optional_integer(values, "rank"),
+                active_thread_id=_optional_string(values, "active_thread_id"),
                 clear_next_actor=_boolean(values, "clear_next_actor"),
                 clear_next_action=_boolean(values, "clear_next_action"),
                 clear_waiting_on=_boolean(values, "clear_waiting_on"),
+                clear_rank=_boolean(values, "clear_rank"),
+                clear_active_thread_id=_boolean(values, "clear_active_thread_id"),
                 add_refs=_strings(values, "add_refs"),
                 remove_refs=_strings(values, "remove_refs"),
+            )
+        )
+    if name == "gsv_portfolio_show":
+        return portfolio_dict(vault.get_portfolio())
+    if name == "gsv_portfolio_set":
+        raw_items = values.get("items")
+        if not isinstance(raw_items, list):
+            raise ValidationError("items must be an array")
+        items = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                raise ValidationError("each Portfolio item must be an object")
+            items.append(
+                portfolio_item(
+                    task_id_value=_string(raw, "task_id"),
+                    task_revision=_string(raw, "task_revision"),
+                    stance=_string(raw, "stance"),
+                    reason=_string(raw, "reason"),
+                    work_thread_id=_optional_string(raw, "work_thread_id"),
+                    work_thread_revision=_optional_string(raw, "work_thread_revision"),
+                )
+            )
+        return portfolio_dict(
+            vault.set_portfolio(
+                expected_revision=_string(values, "expected_revision"),
+                summary=_string(values, "summary"),
+                items=tuple(items),
             )
         )
     if name == "gsv_entity_list":
@@ -405,10 +439,12 @@ TOOLS: Final = [
         "Create one explicit durable outcome. Do not infer task meaning from source text.",
         {
             "id": TEXT,
+            "active_thread_id": TEXT,
             "next_action": TEXT,
             "next_actor": {"enum": ["agent", "human", "external"], "type": "string"},
             "outcome": TEXT,
             "refs": TEXTS,
+            "rank": {"minimum": 0, "type": "integer"},
             "status": TEXT,
             "title": TEXT,
             "waiting_on": TEXT,
@@ -421,20 +457,67 @@ TOOLS: Final = [
         "Update an exact task using its latest compare-and-swap revision.",
         {
             "add_refs": TEXTS,
+            "active_thread_id": TEXT,
+            "clear_active_thread_id": BOOLEAN,
             "clear_next_action": BOOLEAN,
             "clear_next_actor": BOOLEAN,
             "clear_waiting_on": BOOLEAN,
+            "clear_rank": BOOLEAN,
             "expected_revision": TEXT,
             "id": TEXT,
             "next_action": TEXT,
             "next_actor": {"enum": ["agent", "human", "external"], "type": "string"},
             "outcome": TEXT,
             "remove_refs": TEXTS,
+            "rank": {"minimum": 0, "type": "integer"},
             "status": TEXT,
             "title": TEXT,
             "waiting_on": TEXT,
         },
         ("id", "expected_revision"),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_portfolio_show",
+        "Read the complete authored Portfolio and its exact revision.",
+        {},
+        read_only=True,
+    ),
+    _tool(
+        "gsv_portfolio_set",
+        (
+            "Author the complete open Portfolio against exact task and optional WorkThread "
+            "revisions. Order and stances are authored judgment, never inferred."
+        ),
+        {
+            "expected_revision": TEXT,
+            "items": {
+                "items": {
+                    "additionalProperties": False,
+                    "properties": {
+                        "reason": TEXT,
+                        "stance": {
+                            "enum": [
+                                "needs-human",
+                                "agent-can-carry",
+                                "keep-in-view",
+                                "reconsider",
+                            ],
+                            "type": "string",
+                        },
+                        "task_id": TEXT,
+                        "task_revision": TEXT,
+                        "work_thread_id": TEXT,
+                        "work_thread_revision": TEXT,
+                    },
+                    "required": ["task_id", "task_revision", "stance", "reason"],
+                    "type": "object",
+                },
+                "type": "array",
+            },
+            "summary": TEXT,
+        },
+        ("expected_revision", "summary", "items"),
         read_only=False,
     ),
     _tool("gsv_entity_list", "List canonical entities.", {}, read_only=True),
@@ -672,6 +755,15 @@ def _boolean(values: dict[str, Any], name: str) -> bool:
 
 def _integer(values: dict[str, Any], name: str, default: int) -> int:
     value = values.get(name, default)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError(f"{name} must be an integer")
+    return value
+
+
+def _optional_integer(values: dict[str, Any], name: str) -> int | None:
+    if name not in values:
+        return None
+    value = values[name]
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValidationError(f"{name} must be an integer")
     return value

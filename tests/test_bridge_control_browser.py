@@ -9,6 +9,7 @@ import pytest
 
 from continuity_kernel.bridge import BridgeHTTPServer
 from continuity_kernel.operations import OperationLedger
+from continuity_kernel.portfolio import ABSENT_PORTFOLIO_REVISION, portfolio_item
 from continuity_kernel.vault import Vault
 
 sync_playwright = pytest.importorskip("playwright.sync_api").sync_playwright
@@ -19,6 +20,125 @@ pytestmark = pytest.mark.skipif(
 
 ACCESS_TOKEN = "e" * 48
 INSTANCE_ID = "f" * 32
+
+
+def test_browser_guided_review_queues_exact_intent_and_preserves_stale_draft(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Guided review proof")
+    outcome = vault.create_task(
+        identifier="exact-outcome",
+        title="Exact outcome",
+        outcome="Decide its current place without inventing completion.",
+        status="ready",
+        next_actor="human",
+        rank=7,
+    )
+    session = vault.create_task(
+        identifier="review-session",
+        title="Review every open outcome",
+        outcome="Check every exact outcome.",
+        status="waiting",
+        next_actor="human",
+        next_action="Keep it current if the evidence still holds.",
+        waiting_on="Does this outcome still earn its place?",
+        active_thread_id="exact-review-hand",
+        refs=("review-scope:all-open", "review-subject:task:exact-outcome"),
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="One exact open outcome.",
+        items=(
+            portfolio_item(
+                task_id_value=outcome.identifier,
+                task_revision=outcome.revision,
+                stance="needs-human",
+                reason="The user should decide deliberately.",
+            ),
+        ),
+    )
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    ledger = OperationLedger(vault.root)
+
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"height": 844, "width": 390})
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
+                page.locator('[data-view="commitments"]').click()
+
+                page.get_by_role("heading", name="Work through every open outcome").wait_for()
+                assert page.get_by_role("heading", name="Exact outcome").is_visible()
+                assert page.get_by_text("Rank 7", exact=True).is_visible()
+                assert page.get_by_text("Checked never means resolved.", exact=False).is_visible()
+                assert page.locator("body").evaluate(
+                    "element => element.scrollWidth <= document.documentElement.clientWidth"
+                )
+
+                page.get_by_role("button", name="Keep current").click()
+                page.wait_for_timeout(300)
+                queued = ledger.snapshot()
+                assert len(queued.pending) == 1
+                assert queued.pending[0].subject == "record:task/review-session"
+                assert queued.pending[0].target_revision == session.revision
+                assert "task:exact-outcome" in queued.pending[0].choice
+                assert vault.get_task(outcome.identifier).revision == outcome.revision
+                page.get_by_text("Your answer is queued", exact=True).wait_for()
+
+                ledger.decide(
+                    event_id=queued.pending[0].event_id,
+                    decision="accepted",
+                    actor_ref="core:review-agent",
+                    reason_code="semantic-readback-complete",
+                    expected_queue_revision=queued.queue_revision,
+                    expected_disposition_revision=queued.disposition_revision,
+                    result_ref="task:review-session",
+                )
+                page.reload(wait_until="networkidle")
+                page.locator('[data-view="commitments"]').click()
+
+                answer = page.get_by_label("Tell the Mind what you want")
+                answer.fill("Move this below the maintenance outcome, but keep it open.")
+                ledger.queue.append(
+                    kind="correction",
+                    subject="record:task/review-session",
+                    choice="A concurrent exact answer won the queue CAS.",
+                    expected_revision=queued.queue_revision,
+                    target_revision=session.revision,
+                )
+                page.get_by_role("button", name="Send and keep going").click()
+                page.wait_for_function(
+                    """value => document.querySelector('#guided-review-answer')?.value === value""",
+                    arg="Move this below the maintenance outcome, but keep it open.",
+                )
+                assert page.get_by_label("Tell the Mind what you want").input_value() == (
+                    "Move this below the maintenance outcome, but keep it open."
+                )
+                assert vault.get_task(outcome.identifier).revision == outcome.revision
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
 
 
 def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Path) -> None:

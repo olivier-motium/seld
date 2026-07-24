@@ -14,6 +14,7 @@ from continuity_kernel import __version__
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED, event_dict
 from continuity_kernel.errors import ContinuityError, ValidationError
 from continuity_kernel.operations import OperationLedger, disposition_dict
+from continuity_kernel.portfolio import portfolio_dict
 from continuity_kernel.records import (
     MAX_RECORD_BYTES,
     TERMINAL_TASK_STATUSES,
@@ -79,6 +80,18 @@ _CONTROL_REVIEW_PROMPT: Final = (
     "`gsv operation list` surface. Acknowledge or reject each intent against its current queue "
     "and disposition revisions. This is review only: do not apply the requested change, edit "
     "canonical records, use provider tools, or take external action. If nothing is pending, say so."
+)
+_GUIDED_REVIEW_PROMPT: Final = (
+    "Start or resume one finite all-open GSV Portfolio review. Use one ordinary review-session "
+    "Task with exactly one review-scope:all-open ref, at most one current "
+    "review-subject:task:<id> ref, and review-covered:task:<id> refs only for outcomes the user "
+    "explicitly checked. Covered never means resolved. Keep one exact active Codex hand on the "
+    "session Task. Read pending Bridge correction intents through gsv operation list; interpret "
+    "each answer yourself, apply only explicit semantic decisions through fresh native Task, "
+    "WorkThread, and complete Portfolio CAS writes plus readback, then acknowledge or reject the "
+    "intent with a result ref. Accepting an intent is only acknowledgement and never performs the "
+    "semantic write. Present one exact current outcome, recommendation, and useful question. Do "
+    "not infer meaning, end because of time or energy, or create a transcript store."
 )
 
 
@@ -162,6 +175,13 @@ def project_snapshot(
         expected_vault_id=expected_vault_id,
         expected_root_identity=expected_root_identity,
     )
+    portfolio = _project_portfolio(
+        vault,
+        tasks=task_records,
+        threads=thread_records,
+        codex_ready=codex_ready,
+        controls=controls,
+    )
     return {
         "bridge": {
             "control_queue": CONTROL_STORE_SUPPORTED,
@@ -190,12 +210,168 @@ def project_snapshot(
         "entities": entities,
         "mind": mind,
         "now": now,
+        "portfolio": portfolio,
         "projection": {
             "sections": {name: section.payload() for name, section in projections.items()}
         },
         "status": status,
         "tasks": tasks,
         "threads": threads,
+    }
+
+
+def _project_portfolio(
+    vault: Vault,
+    *,
+    tasks: tuple[Task, ...],
+    threads: tuple[WorkThread, ...],
+    codex_ready: bool,
+    controls: dict[str, Any],
+) -> dict[str, Any]:
+    """Project authored Portfolio and finite-review navigation without choosing meaning."""
+
+    start_url = codex_deep_link(vault.root, _GUIDED_REVIEW_PROMPT) if codex_ready else None
+    try:
+        portfolio = vault.get_portfolio()
+    except (ContinuityError, OSError, UnicodeError, ValueError):
+        return {
+            "available": False,
+            "items": [],
+            "review": {"state": "unavailable", "start_url": start_url},
+            "state": "missing",
+        }
+
+    task_by_id = {task.identifier: task for task in tasks}
+    thread_by_id = {thread.identifier: thread for thread in threads}
+    projected_items = []
+    stale_count = 0
+    for position, item in enumerate(portfolio.items, 1):
+        task = task_by_id.get(item.task_id)
+        thread = thread_by_id.get(item.work_thread_id) if item.work_thread_id else None
+        task_stale = task is None or task.revision != item.task_revision
+        thread_stale = bool(
+            item.work_thread_id and (thread is None or thread.revision != item.work_thread_revision)
+        )
+        stale = task_stale or thread_stale
+        stale_count += int(stale)
+        projected_items.append(
+            {
+                **item.__dict__,
+                "position": position,
+                "stale": stale,
+                "task": record_dict(task) if task is not None else None,
+                "work_thread": record_dict(thread) if thread is not None else None,
+            }
+        )
+
+    review_candidates = [
+        task
+        for task in tasks
+        if task.status not in TERMINAL_TASK_STATUSES
+        and any(ref.startswith("review-scope:") for ref in task.refs)
+    ]
+    review: dict[str, Any]
+    if len(review_candidates) > 1:
+        review = {
+            "issue": "More than one nonterminal Task claims the guided-review scope.",
+            "start_url": start_url,
+            "state": "conflict",
+        }
+    elif not review_candidates:
+        review = {"start_url": start_url, "state": "available"}
+    else:
+        session = review_candidates[0]
+        scope_refs = [ref for ref in session.refs if ref.startswith("review-scope:")]
+        subject_refs = [ref for ref in session.refs if ref.startswith("review-subject:")]
+        covered_refs = [ref for ref in session.refs if ref.startswith("review-covered:")]
+        issue = ""
+        if scope_refs != ["review-scope:all-open"]:
+            issue = "The review session must carry exactly one review-scope:all-open ref."
+        subject_ids = [
+            ref.removeprefix("review-subject:task:")
+            for ref in subject_refs
+            if ref.startswith("review-subject:task:")
+        ]
+        covered_ids = [
+            ref.removeprefix("review-covered:task:")
+            for ref in covered_refs
+            if ref.startswith("review-covered:task:")
+        ]
+        if not issue and (len(subject_ids) != len(subject_refs) or len(subject_ids) > 1):
+            issue = "The review session has malformed or conflicting subject refs."
+        if not issue and (
+            len(covered_ids) != len(covered_refs) or len(set(covered_ids)) != len(covered_ids)
+        ):
+            issue = "The review session has malformed or duplicate covered refs."
+        if not issue and any(identifier not in task_by_id for identifier in covered_ids):
+            issue = "The review session references a covered Task that is not present."
+        pending_intents = [
+            item["event"]
+            for item in controls.get("items", [])
+            if isinstance(item, dict)
+            and item.get("status") == "pending"
+            and isinstance(item.get("event"), dict)
+            and item["event"].get("subject") == f"record:task/{session.identifier}"
+        ]
+        if not issue and len(pending_intents) > 1:
+            issue = "More than one pending answer targets this exact review session."
+        if (
+            not issue
+            and len(pending_intents) == 1
+            and pending_intents[0].get("target_revision") != session.revision
+        ):
+            issue = "The pending review answer targets an older session revision."
+        open_outcome_ids = {
+            task.identifier
+            for task in tasks
+            if task.status not in TERMINAL_TASK_STATUSES
+            and "review-scope:all-open" not in task.refs
+        }
+        subject_id = subject_ids[0] if subject_ids else None
+        subject_matches = [item for item in projected_items if item["task_id"] == subject_id]
+        subject = subject_matches[0] if len(subject_matches) == 1 else None
+        subject_safe = bool(
+            subject is not None
+            and subject_id in open_outcome_ids
+            and subject["stale"] is False
+            and subject_id not in set(covered_ids)
+        )
+        if not issue and subject_id and not subject_safe:
+            issue = (
+                "The exact authored review subject is stale, closed, absent, or already covered."
+            )
+        checked_open = len(open_outcome_ids & set(covered_ids))
+        review = {
+            "active_thread_id": session.active_thread_id,
+            "actionable": bool(
+                subject_safe and session.active_thread_id and not issue and not pending_intents
+            ),
+            "checked_count": len(covered_ids),
+            "checked_open_count": checked_open,
+            "covered_task_ids": covered_ids,
+            "hand_url": (
+                f"codex://threads/{session.active_thread_id}" if session.active_thread_id else None
+            ),
+            "issue": issue or None,
+            "open_count": len(open_outcome_ids),
+            "pending_intent": pending_intents[0] if len(pending_intents) == 1 else None,
+            "question": session.waiting_on,
+            "recommendation": session.next_action,
+            "session": record_dict(session),
+            "session_revision": session.revision,
+            "start_url": start_url,
+            "state": "active" if not issue else "conflict",
+            "subject": subject,
+            "subject_task_id": subject_id,
+            "uncovered_count": max(0, len(open_outcome_ids) - checked_open),
+        }
+    return {
+        **portfolio_dict(portfolio),
+        "available": True,
+        "items": projected_items,
+        "review": review,
+        "stale_count": stale_count,
+        "state": "stale" if stale_count else "current",
     }
 
 

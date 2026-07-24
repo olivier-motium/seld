@@ -15,10 +15,12 @@ FORMAT_VERSION: Final = 1
 MAX_RECORD_BYTES: Final = 256 * 1024
 MAX_TEXT_BYTES: Final = 64 * 1024
 MAX_TITLE_LENGTH: Final = 180
-MAX_REFERENCES: Final = 50
+MAX_REFERENCES: Final = 2_000
 MAX_RELATIONS: Final = 100
+MAX_TASK_RANK: Final = 2_147_483_647
 SAFE_ID = re.compile(r"^[a-z][a-z0-9]*(?::[a-z0-9][a-z0-9-]{0,95})$")
 SAFE_TASK_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
+SAFE_HAND_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 META = re.compile(r"^<!-- gsv:(\{.*\}) -->$")
 
@@ -61,6 +63,8 @@ class Task:
     outcome: str
     next_action: str | None
     waiting_on: str | None
+    rank: int | None
+    active_thread_id: str | None
     refs: tuple[str, ...]
     created_at: str
     updated_at: str
@@ -109,6 +113,8 @@ def new_task(
     next_actor: str | None = None,
     next_action: str | None = None,
     waiting_on: str | None = None,
+    rank: int | None = None,
+    active_thread_id: str | None = None,
     refs: tuple[str, ...] = (),
     observed_at: datetime | None = None,
 ) -> Task:
@@ -126,6 +132,8 @@ def new_task(
         outcome=body_text(outcome, "outcome", required=True),
         next_action=optional_body(next_action, "next action"),
         waiting_on=optional_body(waiting_on, "waiting on"),
+        rank=task_rank(rank),
+        active_thread_id=hand_id(active_thread_id),
         refs=references(refs),
         created_at=now,
         updated_at=now,
@@ -200,6 +208,8 @@ def render_task(task: Task) -> str:
         "kind": "task",
         "next_actor": actor(task.next_actor),
         "next_action_present": task.next_action is not None,
+        "rank": task_rank(task.rank),
+        "active_thread_id": hand_id(task.active_thread_id),
         "refs": list(references(task.refs)),
         "status": task_status(task.status),
         "updated_at": stored_time(task.updated_at, "updated_at"),
@@ -268,6 +278,8 @@ def parse_task(markdown: str) -> Task:
         outcome=body_text(sections["Outcome"], "outcome", required=True),
         next_action=_optional_section(meta, "next_action_present", sections["Next action"]),
         waiting_on=_optional_section(meta, "waiting_on_present", sections["Waiting on"]),
+        rank=task_rank(_optional_integer(meta, "rank")),
+        active_thread_id=hand_id(_optional_string(meta, "active_thread_id")),
         refs=references(_string_tuple(meta, "refs")),
         created_at=stored_time(_string(meta, "created_at"), "created_at"),
         updated_at=stored_time(_string(meta, "updated_at"), "updated_at"),
@@ -398,6 +410,23 @@ def actor(value: str | None) -> Actor | None:
     return value  # type: ignore[return-value]
 
 
+def task_rank(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_TASK_RANK:
+        raise ValidationError(f"task rank must be an integer from 0 to {MAX_TASK_RANK}")
+    return value
+
+
+def hand_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    clean = str(value).strip()
+    if not SAFE_HAND_ID.fullmatch(clean):
+        raise ValidationError("active thread ID must be one bounded opaque identifier")
+    return clean
+
+
 def safe_token(value: str, label: str) -> str:
     clean = str(value).strip().lower()
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", clean):
@@ -468,6 +497,8 @@ def _validate_task_state(task: Task) -> None:
         (task.next_actor, task.next_action, task.waiting_on)
     ):
         raise ValidationError("terminal tasks cannot contain future-work fields")
+    if task.status in TERMINAL_TASK_STATUSES and task.active_thread_id is not None:
+        raise ValidationError("terminal tasks cannot claim an active Codex hand")
     if task.status == "waiting" and task.next_actor is None:
         raise ValidationError("waiting tasks require a next actor")
 
@@ -539,6 +570,15 @@ def _optional_string(metadata: dict[str, Any], key: str) -> str | None:
         return None
     if not isinstance(value, str):
         raise ValidationError(f"record metadata field {key} must be a string or null")
+    return value
+
+
+def _optional_integer(metadata: dict[str, Any], key: str) -> int | None:
+    value = metadata.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"record metadata field {key} must be an integer or null")
     return value
 
 
