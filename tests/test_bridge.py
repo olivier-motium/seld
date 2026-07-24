@@ -643,9 +643,9 @@ def test_bridge_ui_tokens_and_dependency_free_orb_contract() -> None:
     assert "snapshotSignature" in javascript
     assert "snapshot.codex.new_hand_url" in javascript
     assert '"new_mind_url"' in javascript
-    assert "No commitments are open." in javascript
-    assert "more · View Commitments" in javascript
-    assert "more entities not shown." in javascript
+    assert "Nothing is open right now." in javascript
+    assert "more · View all work" in javascript
+    assert "more not shown." in javascript
     assert 'taskProjection.state !== "complete"' in javascript
     assert 'readable: fallback, state: "unavailable", unreadable: 0' in javascript
     assert 'from "react"' not in javascript
@@ -659,7 +659,7 @@ def test_http_surface_requires_per_launch_bearer_for_private_data(
     server, base = running_bridge
     with urlopen(f"{base}/", timeout=2) as response:
         assert response.status == HTTPStatus.OK
-        assert b"The agent is not the thread" in response.read()
+        assert b"Your work in Codex, in one place." in response.read()
 
     with pytest.raises(HTTPError) as missing:
         urlopen(_request(f"{base}/api/v1/snapshot"), timeout=2)

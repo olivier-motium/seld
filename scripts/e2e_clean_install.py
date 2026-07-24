@@ -654,7 +654,7 @@ def _verify_bridge_http(
         raise RuntimeError("Bridge snapshot did not match the expected vault path")
     with urlopen(url, timeout=5) as response:
         static = response.read()
-    if b"The agent is not the thread" not in static:
+    if b"Your work in Codex, in one place." not in static:
         raise RuntimeError("Bridge static product surface was not bundled")
 
 

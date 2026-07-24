@@ -175,7 +175,7 @@ def _bridge_static_smoke(binary: Path) -> dict[str, bool]:
             )
             with urlopen(snapshot_request, timeout=5) as response:
                 snapshot = json.loads(response.read())
-            if b"The agent is not the thread" not in root_page:
+            if b"Your work in Codex, in one place." not in root_page:
                 raise RuntimeError("frozen Bridge root page was not bundled")
             if b".connection-notice" not in stylesheet:
                 raise RuntimeError("frozen Bridge stylesheet was not bundled")
