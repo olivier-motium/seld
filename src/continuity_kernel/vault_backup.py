@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import stat
 import sys
@@ -21,7 +22,9 @@ from tempfile import mkstemp as _tempfile_mkstemp
 from typing import IO, Any, Final
 
 from continuity_kernel.atomic import (
+    PINNED_PATH_ROOT_SUPPORTED,
     DurablePublishError,
+    PinnedPathRoot,
     PublishOutcome,
     atomic_write,
     durable_publish_new,
@@ -41,12 +44,28 @@ from continuity_kernel.errors import (
     PersistenceError,
     ValidationError,
 )
-from continuity_kernel.records import WINDOWS_RESERVED_NAMES, format_time
+from continuity_kernel.records import WINDOWS_RESERVED_NAMES, format_time, stored_time
+from continuity_kernel.vault_identity import (
+    REQUIRED_VAULT_DIRECTORIES,
+    canonical_vault_id,
+    parse_vault_manifest,
+)
 
 MAX_BACKUP_ENTRIES: Final = 10_000
 MAX_BACKUP_ENTRY_BYTES: Final = 16 * 1024 * 1024
 MAX_BACKUP_TOTAL_BYTES: Final = 512 * 1024 * 1024
 BACKUP_MANIFEST: Final = "GSV_BACKUP.json"
+_MIGRATION_TOMBSTONE_MARKER: Final = re.compile(
+    r"^\.(?P<name>onboarding|control|migrations)\.gsv-remove-"
+    r"(?P<token>[0-9a-f]{24})\.marker$"
+)
+_MIGRATION_TOMBSTONE_RELATIVE: Final = {
+    (".", "onboarding"): "onboarding",
+    (".gsv", "control"): ".gsv/control",
+    (".gsv", "migrations"): ".gsv/migrations",
+}
+_MIGRATION_TOMBSTONE_ID: Final = "culture-grade-foundation-v1"
+_MIGRATION_TOMBSTONE_MARKER_MAX_BYTES: Final = 1024
 
 
 def _mkstemp(*, prefix: str, suffix: str, dir: Path) -> tuple[int, str]:
@@ -171,9 +190,87 @@ def _scan_backup_directory(
             continue
         if not stat.S_ISREG(metadata.st_mode):
             raise ValidationError(f"vault backup refuses unsupported file type: {relative}")
+        # Rollback ownership is inode-bound to this host. A restored vault must
+        # plan and establish fresh local ownership instead of inheriting a
+        # receipt that could authorize deletion of replacement directories.
+        if relative == ".gsv/migration-culture-grade-foundation-v1.json":
+            continue
+        if _is_owned_migration_tombstone_marker(path, relative):
+            continue
         if _is_owned_vault_temp(relative):
             continue
         files.append((relative, path))
+
+
+def _is_owned_migration_tombstone_marker(path: Path, relative: str) -> bool:
+    """Recognize only the exact host-local marker emitted by foundation rollback."""
+
+    portable = PurePosixPath(relative)
+    matched = _MIGRATION_TOMBSTONE_MARKER.fullmatch(portable.name)
+    if matched is None:
+        return False
+    parent = portable.parent.as_posix()
+    expected_relative = _MIGRATION_TOMBSTONE_RELATIVE.get((parent, matched.group("name")))
+    if expected_relative is None:
+        return False
+    try:
+        encoded = read_regular_file(
+            path,
+            label="migration removal marker",
+            max_bytes=_MIGRATION_TOMBSTONE_MARKER_MAX_BYTES,
+        )
+        payload = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValidationError):
+        return False
+    if not isinstance(payload, dict) or set(payload) != {
+        "device",
+        "inode",
+        "migration_id",
+        "relative_path",
+    }:
+        return False
+    device = payload.get("device")
+    inode = payload.get("inode")
+    if (
+        payload.get("migration_id") != _MIGRATION_TOMBSTONE_ID
+        or payload.get("relative_path") != expected_relative
+        or not isinstance(device, int)
+        or isinstance(device, bool)
+        or device < 0
+        or not isinstance(inode, int)
+        or isinstance(inode, bool)
+        or inode < 0
+    ):
+        return False
+    token = sha256_bytes(
+        f"{_MIGRATION_TOMBSTONE_ID}\0{expected_relative}\0{device}\0{inode}".encode()
+    )[:24]
+    expected = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if matched.group("token") != token or encoded != expected:
+        return False
+
+    quarantine = path.with_suffix(".quarantine")
+    try:
+        before = os.lstat(quarantine)
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISDIR(before.st_mode)
+            or (int(before.st_dev), int(before.st_ino)) != (device, inode)
+        ):
+            return False
+        with os.scandir(quarantine) as entries:
+            if next(entries, None) is not None:
+                return False
+        after = os.lstat(quarantine)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(after.st_mode)
+        and (int(after.st_dev), int(after.st_ino)) == (device, inode)
+        and (int(after.st_dev), int(after.st_ino)) == (int(before.st_dev), int(before.st_ino))
+    )
 
 
 def _relative_to_directory_identity(root: Path, path: Path) -> tuple[str, ...] | None:
@@ -240,9 +337,18 @@ def _is_owned_vault_temp(relative: str) -> bool:
         return target_name in {"AGENTS.md", "MIND.md", "NOW.md", "README.md"}
     if parent in {"tasks", "entities", "threads"}:
         return target_name.endswith(".md")
-    return (parent == ".gsv" and target_name == "manifest.json") or (
-        parent == "journal" and target_name == "events.jsonl"
-    )
+    if parent == "onboarding":
+        return target_name == "session.md"
+    if parent == ".gsv/control":
+        return target_name in {"initialized", "queue.jsonl"} or (
+            target_name.startswith("dispositions-") and target_name.endswith(".jsonl")
+        )
+    if parent == ".gsv/control/archive":
+        return target_name.startswith("queue-") and target_name.endswith(".jsonl")
+    return (
+        parent == ".gsv"
+        and target_name in {"manifest.json", "migration-culture-grade-foundation-v1.json"}
+    ) or (parent == "journal" and target_name == "events.jsonl")
 
 
 def _path_identity(path: Path) -> tuple[int, int]:
@@ -327,19 +433,110 @@ def _restore_prior_target(
         ) from cause
 
 
-def _read_backup_source(path: Path) -> bytes:
-    return read_regular_file(
+@dataclass(frozen=True)
+class _BackupAncestry:
+    directories: tuple[tuple[Path, tuple[int, int]], ...]
+
+
+def _capture_backup_ancestry(root: Path, path: Path) -> _BackupAncestry:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValidationError("vault backup source escaped its canonical root") from exc
+    directories: list[tuple[Path, tuple[int, int]]] = []
+    current = root
+    for component in (None, *relative.parts[:-1]):
+        if component is not None:
+            current /= component
+        try:
+            metadata = os.lstat(current)
+        except OSError as exc:
+            raise ValidationError(
+                f"vault backup source ancestry is unavailable: {current}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValidationError(
+                f"vault backup source ancestry is not a real directory: {current}"
+            )
+        directories.append((current, (int(metadata.st_dev), int(metadata.st_ino))))
+    return _BackupAncestry(tuple(directories))
+
+
+def _validate_backup_ancestry(ancestry: _BackupAncestry) -> None:
+    for path, identity in ancestry.directories:
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            raise ValidationError(
+                f"vault backup source ancestry changed while it was read: {path}: {exc}"
+            ) from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (int(metadata.st_dev), int(metadata.st_ino)) != identity
+        ):
+            raise ValidationError(f"vault backup source ancestry changed while it was read: {path}")
+
+
+_BackupSourceStore = PinnedPathRoot | _BackupAncestry
+
+
+@contextmanager
+def _backup_source_store(root: Path) -> Iterator[_BackupSourceStore]:
+    if not PINNED_PATH_ROOT_SUPPORTED:
+        ancestry = _capture_backup_ancestry(root, root / ".gsv/manifest.json")
+        try:
+            yield ancestry
+        finally:
+            _validate_backup_ancestry(ancestry)
+        return
+    store = PinnedPathRoot(root)
+    try:
+        yield store
+    finally:
+        store.close()
+
+
+def _read_backup_source(
+    path: Path,
+    *,
+    root: Path,
+    store: _BackupSourceStore,
+) -> bytes:
+    if isinstance(store, PinnedPathRoot):
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise ValidationError("vault backup source escaped its pinned root") from exc
+        content = store.read_regular_file(
+            relative,
+            label="vault backup file",
+            max_bytes=MAX_BACKUP_ENTRY_BYTES,
+        )
+        assert content is not None
+        return content
+    _validate_backup_ancestry(store)
+    ancestry = _capture_backup_ancestry(root, path)
+    content = read_regular_file(
         path,
         label="vault backup file",
         max_bytes=MAX_BACKUP_ENTRY_BYTES,
     )
+    _validate_backup_ancestry(ancestry)
+    _validate_backup_ancestry(store)
+    return content
 
 
-def _hash_backup_files(files: list[tuple[str, Path]]) -> dict[str, str]:
+def _hash_backup_files(
+    files: list[tuple[str, Path]],
+    *,
+    root: Path,
+    store: _BackupSourceStore,
+) -> dict[str, str]:
     hashes: dict[str, str] = {}
     total = 0
     for relative, path in files:
-        content = _read_backup_source(path)
+        content = _read_backup_source(path, root=root, store=store)
         total += len(content)
         if total > MAX_BACKUP_TOTAL_BYTES:
             raise ValidationError("vault backup exceeds its total size bound")
@@ -480,13 +677,27 @@ def _read_archive_entry(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> byte
 
 
 def _validate_backup_manifest(manifest: object) -> None:
-    if not isinstance(manifest, dict) or type(manifest.get("format_version")) is not int:
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "created_at",
+        "files",
+        "format_version",
+        "vault_id",
+    }:
+        raise ValidationError("backup manifest has an unsupported shape")
+    if type(manifest.get("format_version")) is not int:
         raise ValidationError("unsupported backup manifest version")
     if manifest["format_version"] != 1:
         raise ValidationError("unsupported backup manifest version")
-    vault_id = manifest.get("vault_id")
-    if not isinstance(vault_id, str) or not vault_id.strip():
-        raise ValidationError("backup manifest has no vault identity")
+    canonical_vault_id(manifest.get("vault_id"))
+    created_at = manifest.get("created_at")
+    if not isinstance(created_at, str):
+        raise ValidationError("backup manifest has an invalid creation time")
+    try:
+        clean_created_at = stored_time(created_at, "backup creation time")
+    except ValidationError as exc:
+        raise ValidationError("backup manifest has an invalid creation time") from exc
+    if clean_created_at != created_at:
+        raise ValidationError("backup manifest creation time is not canonical")
     expected = manifest.get("files")
     if not isinstance(expected, dict):
         raise ValidationError("backup manifest has no file map")
@@ -563,6 +774,27 @@ def _validate_restore_target(target: Path) -> bool:
     except OSError as exc:
         raise ValidationError(f"could not inspect restore target: {target}: {exc}") from exc
     raise ConflictError(f"restore target is not empty: {target}")
+
+
+def _restore_required_directories(stage: Path) -> None:
+    for relative in REQUIRED_VAULT_DIRECTORIES:
+        path = stage / relative
+        try:
+            metadata = os.lstat(path)
+        except FileNotFoundError:
+            try:
+                path.mkdir(parents=True)
+            except OSError as exc:
+                raise ValidationError(
+                    f"could not restore required vault directory: {relative}: {exc}"
+                ) from exc
+            continue
+        except OSError as exc:
+            raise ValidationError(
+                f"could not inspect restored vault directory: {relative}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValidationError(f"restored required vault path is not a directory: {relative}")
 
 
 def _remove_prior_empty(path: Path) -> str | None:
@@ -657,7 +889,6 @@ def create_backup(vault: Any, destination: Path | None = None) -> dict[str, Any]
     if not generated_destination:
         _validate_backup_destination(destination)
     with exclusive_lock(vault.state / "locks/global.lock"):
-        files = vault._backup_files()
         try:
             descriptor, temp_name = _mkstemp(
                 prefix=".gsv-backup.tmp-", suffix=".zip", dir=destination.parent
@@ -676,25 +907,47 @@ def create_backup(vault: Any, destination: Path | None = None) -> dict[str, Any]
                     # A failed close has an ambiguous descriptor state. Never retry it and risk
                     # closing a descriptor that the process has already reused.
                     descriptor = -1
-                hashes: dict[str, str] = {}
-                total = 0
-                with zipfile.ZipFile(
-                    temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
-                ) as archive:
-                    for relative, path in files:
-                        content = _read_backup_source(path)
-                        total += len(content)
-                        if total > MAX_BACKUP_TOTAL_BYTES:
-                            raise ValidationError("vault backup exceeds its total size bound")
-                        hashes[relative] = sha256_bytes(content)
-                        archive.writestr(relative, content)
-                    manifest = {
-                        "created_at": format_time(datetime.now(UTC)),
-                        "files": hashes,
-                        "format_version": 1,
-                        "vault_id": vault._manifest()["vault_id"],
-                    }
-                    archive.writestr(BACKUP_MANIFEST, _json_bytes(manifest))
+                with _backup_source_store(vault.root) as source_store:
+                    manifest_path = vault.root / ".gsv/manifest.json"
+                    manifest_before = _read_backup_source(
+                        manifest_path,
+                        root=vault.root,
+                        store=source_store,
+                    )
+                    vault_manifest = parse_vault_manifest(manifest_before)
+                    files = vault._backup_files()
+                    hashes: dict[str, str] = {}
+                    total = 0
+                    with zipfile.ZipFile(
+                        temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+                    ) as archive:
+                        for relative, path in files:
+                            content = _read_backup_source(
+                                path,
+                                root=vault.root,
+                                store=source_store,
+                            )
+                            total += len(content)
+                            if total > MAX_BACKUP_TOTAL_BYTES:
+                                raise ValidationError("vault backup exceeds its total size bound")
+                            hashes[relative] = sha256_bytes(content)
+                            archive.writestr(relative, content)
+                        manifest_after = _read_backup_source(
+                            manifest_path,
+                            root=vault.root,
+                            store=source_store,
+                        )
+                        if manifest_after != manifest_before:
+                            raise ValidationError(
+                                "vault identity changed while its backup was created"
+                            )
+                        manifest = {
+                            "created_at": format_time(datetime.now(UTC)),
+                            "files": hashes,
+                            "format_version": 1,
+                            "vault_id": vault_manifest["vault_id"],
+                        }
+                        archive.writestr(BACKUP_MANIFEST, _json_bytes(manifest))
                 with temp.open("r+b") as handle:
                     os.fsync(handle.fileno())
                 staged_verification = vault.verify_backup(temp)
@@ -871,6 +1124,7 @@ def restore_backup(path: Path, target: Path) -> dict[str, Any]:
             inspection = _extract_backup(handle, opened_path, stage)
             if not inspection.valid:
                 raise ValidationError("backup file hashes do not match its manifest")
+        _restore_required_directories(stage)
         restored_stage = Vault(stage)
         doctor = restored_stage.doctor()
         if not doctor.healthy:
@@ -883,7 +1137,12 @@ def restore_backup(path: Path, target: Path) -> dict[str, Any]:
         if restored_stage.identity()["vault_id"] != inspection.manifest["vault_id"]:
             raise ValidationError("restored vault identity does not match its backup manifest")
         digest = restored_stage.logical_digest()
-        staged_hashes = _hash_backup_files(restored_stage._backup_files())
+        with _backup_source_store(stage) as source_store:
+            staged_hashes = _hash_backup_files(
+                restored_stage._backup_files(),
+                root=stage,
+                store=source_store,
+            )
         if staged_hashes != inspection.manifest["files"]:
             raise ValidationError(
                 "staged vault files do not match the backup manifest before publication"

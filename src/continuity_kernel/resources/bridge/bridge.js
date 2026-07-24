@@ -1,4 +1,9 @@
 import { startThinkingOrb, stopThinkingOrb } from "./thinking-orbs.js";
+import {
+  controlSystemCopy,
+  controlSystemStatus,
+  renderControlPanel,
+} from "./bridge-controls.js";
 
 const bridgeToken = captureBridgeToken();
 
@@ -108,6 +113,7 @@ async function loadSnapshot({ quiet = false } = {}) {
     setConnectionState(state.snapshot.doctor.healthy ? "healthy" : "partial");
     if (snapshotChanged) render();
     scheduleIntegrationRefresh(snapshot);
+    return true;
   } catch (error) {
     const message = connectionMessage(error);
     if (state.snapshot) {
@@ -116,6 +122,7 @@ async function loadSnapshot({ quiet = false } = {}) {
       setConnectionState("unavailable", message);
       renderUnavailable();
     }
+    return false;
   } finally {
     ui.view.setAttribute("aria-busy", "false");
   }
@@ -552,9 +559,17 @@ function renderSystem(snapshot) {
     ),
     systemRow(
       "Local dashboard",
-      "Available only on this computer and read-only.",
+      "Local canonical views plus a bounded queue for your explicit choices and corrections.",
       "Local",
       "",
+    ),
+    systemRow(
+      "Bridge intent queue",
+      controlSystemCopy(snapshot),
+      controlSystemStatus(snapshot),
+      snapshot.controls?.available || snapshot.bridge?.control_queue === false
+        ? ""
+        : "is-error",
     ),
     systemRow(
       "Automatic task updates",
@@ -563,7 +578,18 @@ function renderSystem(snapshot) {
       "",
     ),
   );
-  container.append(list);
+  container.append(
+    list,
+    renderControlPanel(snapshot, {
+      bridgeToken,
+      currentControls: () => state.snapshot?.controls,
+      refresh: async () => {
+        if (!(await loadSnapshot({ quiet: true }))) {
+          throw new Error("Bridge snapshot refresh failed");
+        }
+      },
+    }),
+  );
   if (!snapshot.doctor.healthy) container.append(renderDoctorRecovery(snapshot.doctor));
   if (!codexReady(snapshot) && !snapshot.codex.checking) {
     container.append(renderRecoveryCommand("Connect Codex", "gsv codex install"));

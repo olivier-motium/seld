@@ -67,3 +67,4 @@ jobs:
       - run: uv sync --frozen --extra dev --extra browser-test
       - run: uv run playwright install --with-deps chromium
       - run: uv run python scripts/verify_bridge_browser.py
+      - run: uv run pytest tests/test_bridge_control_browser.py

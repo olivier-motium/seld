@@ -16,9 +16,53 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 _IS_WINDOWS = os.name == "nt"
+_EMPTY_REVISION = hashlib.sha256(b"").hexdigest()
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> Request | None:
+        del message, new_url
+        raise HTTPError(
+            request.full_url,
+            code,
+            "GSV refuses redirects during the clean-install proof",
+            headers,
+            file_pointer,
+        )
+
+
+def _open_loopback(request: str | Request, *, timeout: float) -> Any:
+    """Open one exact IPv4 loopback URL without consulting ambient proxies."""
+
+    url = request.full_url if isinstance(request, Request) else request
+    target = urlsplit(url)
+    try:
+        port = target.port
+    except ValueError as exc:
+        raise RuntimeError("clean-install proof received an invalid Bridge URL") from exc
+    if (
+        target.scheme != "http"
+        or target.hostname != "127.0.0.1"
+        or port is None
+        or port < 1
+        or target.username is not None
+        or target.password is not None
+        or target.fragment
+    ):
+        raise RuntimeError("clean-install proof accepts only http://127.0.0.1:<port> URLs")
+    return build_opener(ProxyHandler({}), _RejectRedirects()).open(request, timeout=timeout)
 
 
 def main() -> int:
@@ -129,6 +173,15 @@ def run_e2e(
         status["vault_id"],
         vault_path=vault,
     )
+    control_event_ids: tuple[str, str] | None = None
+    if not _IS_WINDOWS:
+        control_event_ids = _verify_installed_control_round_trip(
+            installed,
+            environment,
+            bridge_status["url"],
+            bridge_state["token"],
+        )
+        status = _cli(installed, environment, ["status"])
     initial_bridge_pid = int(bridge_state["pid"])
     initial_instance_id = str(bridge_state["instance_id"])
     digest_before_upgrade = str(status["digest"])
@@ -153,6 +206,12 @@ def run_e2e(
         upgraded_status["vault_id"],
         vault_path=vault,
     )
+    if control_event_ids is not None:
+        _verify_archived_control_bridge(
+            upgraded_bridge["url"],
+            upgraded_state["token"],
+            control_event_ids,
+        )
     status = upgraded_status
     bridge_status = upgraded_bridge
     bridge_state = upgraded_state
@@ -487,6 +546,7 @@ def run_e2e(
         "backup_restore_without_readable_config": True,
         "backup_restore_preserved_both_vaults": True,
         "bridge_authenticated_loopback": True,
+        "bridge_control_archive_visible_after_restart": control_event_ids is not None,
         "bridge_direct_stop": True,
         "binary_sha256": binary_sha256,
         "binary_version": installed_version,
@@ -497,6 +557,8 @@ def run_e2e(
         "full_uninstall_removed_binary": True,
         "installer_without_python_uv_make": True,
         "installer_upgrade_restarted_bridge": True,
+        "installed_control_round_trip": control_event_ids is not None,
+        "installed_control_round_trip_skipped": _IS_WINDOWS,
         "native_codex_two_session": native_result,
         "native_auth_bridge_used": False,
         "real_codex_legacy_missing_manifest_uninstall": True,
@@ -633,7 +695,7 @@ def _verify_bridge_http(
 ) -> None:
     snapshot_url = f"{url.rstrip('/')}/api/v1/snapshot"
     try:
-        urlopen(Request(snapshot_url, headers={"Accept": "application/json"}), timeout=5)
+        _open_loopback(Request(snapshot_url, headers={"Accept": "application/json"}), timeout=5)
     except HTTPError as exc:
         if exc.code != 403:
             raise RuntimeError(f"unauthenticated Bridge returned {exc.code}, expected 403") from exc
@@ -643,7 +705,7 @@ def _verify_bridge_http(
         snapshot_url,
         headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
     )
-    with urlopen(request, timeout=5) as response:
+    with _open_loopback(request, timeout=5) as response:
         snapshot = json.loads(response.read())
     if snapshot["status"]["vault_id"] != vault_id:
         raise RuntimeError("Bridge snapshot did not match the installed vault")
@@ -652,10 +714,168 @@ def _verify_bridge_http(
         and Path(snapshot["status"]["vault"]).resolve() != vault_path.resolve()
     ):
         raise RuntimeError("Bridge snapshot did not match the expected vault path")
-    with urlopen(url, timeout=5) as response:
+    with _open_loopback(url, timeout=5) as response:
         static = response.read()
     if b"Your work in Codex, in one place." not in static:
         raise RuntimeError("Bridge static product surface was not bundled")
+
+
+def _post_bridge_control(
+    url: str,
+    token: str,
+    *,
+    expected_revision: str,
+    choice: str,
+) -> dict[str, Any]:
+    base = url.rstrip("/")
+    request = Request(
+        f"{base}/api/v1/control",
+        data=json.dumps(
+            {
+                "choice": choice,
+                "expected_revision": expected_revision,
+                "kind": "correction",
+                "subject": "mind:installed-round-trip",
+            }
+        ).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method="POST",
+    )
+    with _open_loopback(request, timeout=5) as response:
+        payload = json.loads(response.read())
+        if response.status != 201 or payload.get("ok") is not True:
+            raise RuntimeError("authenticated Bridge control intent was not durably queued")
+    return cast(dict[str, Any], payload)
+
+
+def _verify_installed_control_round_trip(
+    binary: Path,
+    environment: dict[str, str],
+    bridge_url: str,
+    token: str,
+) -> tuple[str, str]:
+    """Prove the installed POSIX control lane across independent processes."""
+
+    server = {"args": ["mcp", "serve"], "command": str(binary)}
+    accepted_intent = _post_bridge_control(
+        bridge_url,
+        token,
+        expected_revision=_EMPTY_REVISION,
+        choice="Friday evening is protected.",
+    )
+    accepted_event_id = str(accepted_intent["event"]["event_id"])
+    first_cli = _cli(binary, environment, ["operation", "list"])
+    if [item["event_id"] for item in first_cli["pending"]] != [accepted_event_id]:
+        raise RuntimeError("installed CLI did not read the authenticated Bridge intent")
+
+    accepted = _mcp_call(
+        server,
+        environment,
+        "gsv_operation_accept",
+        {
+            "actor_ref": "core:doctor",
+            "event_id": accepted_event_id,
+            "expected_disposition_revision": first_cli["disposition_revision"],
+            "expected_queue_revision": first_cli["queue_revision"],
+            "expected_vault_id": first_cli["vault_id"],
+            "reason_code": "supported-correction",
+            "result_ref": "control:acknowledged",
+        },
+    )
+    if accepted["pending"] or accepted["decided"][0]["disposition"]["decision"] != "accepted":
+        raise RuntimeError("installed MCP did not durably accept the Bridge intent")
+
+    rejected_intent = _post_bridge_control(
+        bridge_url,
+        token,
+        expected_revision=accepted["queue_revision"],
+        choice="Send this provider instruction without review.",
+    )
+    rejected_event_id = str(rejected_intent["event"]["event_id"])
+    before_reject = _cli(binary, environment, ["operation", "list"])
+    rejected = _cli(
+        binary,
+        environment,
+        [
+            "operation",
+            "reject",
+            rejected_event_id,
+            "--expected-queue-revision",
+            before_reject["queue_revision"],
+            "--expected-disposition-revision",
+            before_reject["disposition_revision"],
+            "--expected-vault-id",
+            before_reject["vault_id"],
+            "--actor-ref",
+            "core:doctor",
+            "--reason-code",
+            "unsupported-request",
+        ],
+    )
+    if rejected["pending"]:
+        raise RuntimeError("installed CLI did not durably reject the second Bridge intent")
+
+    fresh_cli = _cli(binary, environment, ["operation", "list"])
+    fresh_mcp = _mcp_call(server, environment, "gsv_operation_list", {})
+    if fresh_mcp != fresh_cli:
+        raise RuntimeError("fresh installed CLI and MCP processes disagree on control state")
+    decided = {
+        item["event"]["event_id"]: item["disposition"]["decision"] for item in fresh_cli["decided"]
+    }
+    if decided != {accepted_event_id: "accepted", rejected_event_id: "rejected"}:
+        raise RuntimeError("fresh installed processes did not recover both durable dispositions")
+
+    archived = _cli(
+        binary,
+        environment,
+        [
+            "operation",
+            "archive-closed",
+            "--expected-queue-revision",
+            fresh_cli["queue_revision"],
+            "--expected-disposition-revision",
+            fresh_cli["disposition_revision"],
+            "--expected-vault-id",
+            fresh_cli["vault_id"],
+        ],
+    )
+    if archived.get("archived_events") != 2:
+        raise RuntimeError("installed CLI did not archive both closed Bridge intents")
+    archived_cli = _cli(binary, environment, ["operation", "list"])
+    archived_mcp = _mcp_call(server, environment, "gsv_operation_list", {})
+    if archived_mcp != archived_cli or archived_cli["pending"] or archived_cli["decided"]:
+        raise RuntimeError("fresh installed processes did not recover the archived control state")
+    return accepted_event_id, rejected_event_id
+
+
+def _verify_archived_control_bridge(
+    url: str,
+    token: str,
+    event_ids: tuple[str, str],
+) -> None:
+    request = Request(
+        f"{url.rstrip('/')}/api/v1/snapshot",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    with _open_loopback(request, timeout=5) as response:
+        snapshot = json.loads(response.read())
+    controls = snapshot["controls"]
+    history = {
+        item["event"]["event_id"]: (item["status"], item["archived"])
+        for item in controls["history"]
+    }
+    expected = {event_ids[0]: ("accepted", True), event_ids[1]: ("rejected", True)}
+    if (
+        controls.get("pending") != 0
+        or controls.get("decided") != 0
+        or controls.get("archived_decided") != 2
+        or history != expected
+    ):
+        raise RuntimeError("restarted Bridge did not recover both archived dispositions")
 
 
 def _native_codex_sessions(

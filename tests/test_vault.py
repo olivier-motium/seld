@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,7 @@ import pytest
 from continuity_kernel.atomic import sha256_bytes
 from continuity_kernel.errors import ConflictError, NotFoundError, ValidationError
 from continuity_kernel.vault import MAX_DOCUMENT_BYTES, Vault
+from continuity_kernel.vault_identity import REQUIRED_VAULT_DIRECTORIES
 
 
 def test_vault_crud_context_and_same_name_entities(vault: Vault) -> None:
@@ -216,6 +219,46 @@ def test_initialize_is_idempotent_and_preserves_authored_documents(vault: Vault)
     assert second["created"] == []
     assert "Keep this handoff" in vault.read_document("NOW.md")["content"]
     assert second["name"] == "Test GSV"
+
+
+@pytest.mark.parametrize("relative", REQUIRED_VAULT_DIRECTORIES)
+def test_doctor_requires_every_canonical_directory(vault: Vault, relative: str) -> None:
+    path = vault.root / relative
+    if relative == ".gsv":
+        pytest.skip("the manifest lives inside .gsv and gives a more specific failure")
+    shutil.rmtree(path)
+
+    result = vault.doctor()
+
+    assert result.healthy is False
+    assert any(
+        issue.code == "missing-directory" and issue.path == relative for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {"format_version": True},
+        {"vault_id": "not-a-canonical-uuid"},
+        {"created_at": " 2026-07-24T00:00:00Z "},
+        {"name": " Test GSV "},
+        {"unexpected": "field"},
+    ],
+)
+def test_doctor_rejects_noncanonical_vault_manifest(
+    vault: Vault,
+    replacement: dict[str, object],
+) -> None:
+    path = vault.root / ".gsv/manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest.update(replacement)
+    path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+
+    result = vault.doctor()
+
+    assert result.healthy is False
+    assert any(issue.code == "manifest" for issue in result.issues)
 
 
 def test_thread_requires_existing_relationships(vault: Vault) -> None:

@@ -4,13 +4,15 @@ import errno
 import json
 import os
 import re
+import shutil
 import socket
 import sys
 import threading
 import time
 from collections.abc import Iterator
 from http import HTTPStatus
-from http.client import BadStatusLine
+from http.client import BadStatusLine, HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any, cast
@@ -21,8 +23,16 @@ from urllib.request import ProxyHandler, Request, urlopen
 import pytest
 
 from continuity_kernel import __version__, bridge, mcp_server
+from continuity_kernel import control_queue as control_queue_module
 from continuity_kernel.config import data_dir
-from continuity_kernel.errors import SetupError, ValidationError
+from continuity_kernel.control_queue import (
+    CONTROL_STORE_SUPPORTED,
+    EMPTY_REVISION,
+    ControlQueue,
+    ControlStorageError,
+)
+from continuity_kernel.errors import MutationCommittedError, SetupError, ValidationError
+from continuity_kernel.operations import OperationLedger
 from continuity_kernel.vault import Vault, doctor_dict
 
 INSTANCE_ID = "a" * 32
@@ -156,7 +166,47 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
         "state": "complete",
         "unreadable": 0,
     }
-    assert snapshot["bridge"] == {"local": True, "read_only": True, "version": __version__}
+    assert snapshot["bridge"] == {
+        "control_queue": CONTROL_STORE_SUPPORTED,
+        "local": True,
+        "semantic_write": False,
+        "version": __version__,
+    }
+    if os.name == "nt":
+        assert snapshot["controls"] == {
+            "archived_decided": None,
+            "available": False,
+            "decided": None,
+            "disposition_revision": None,
+            "generation": None,
+            "history": [],
+            "items": [],
+            "pending": None,
+            "queue_revision": None,
+            "review_prompt": None,
+            "review_url": None,
+            "state": "unavailable",
+        }
+    else:
+        review_prompt = snapshot["controls"]["review_prompt"]
+        review_url = snapshot["controls"]["review_url"]
+        assert "This is review only" in review_prompt
+        assert "do not apply the requested change" in review_prompt
+        assert parse_qs(urlsplit(review_url).query)["prompt"] == [review_prompt]
+        assert snapshot["controls"] == {
+            "archived_decided": 0,
+            "available": True,
+            "decided": 0,
+            "disposition_revision": EMPTY_REVISION,
+            "generation": 0,
+            "history": [],
+            "items": [],
+            "pending": 0,
+            "queue_revision": EMPTY_REVISION,
+            "review_prompt": review_prompt,
+            "review_url": review_url,
+            "state": "ready",
+        }
 
 
 def test_snapshot_exposes_mind_shaping_only_for_a_proven_empty_ledger(vault: Vault) -> None:
@@ -176,8 +226,55 @@ def test_snapshot_exposes_mind_shaping_only_for_a_proven_empty_ledger(vault: Vau
     assert (mind_link.scheme, mind_link.netloc) == ("codex", "new")
     assert (hand_link.scheme, hand_link.netloc) == ("codex", "new")
     assert parse_qs(mind_link.query)["path"] == [str(vault.root)]
-    assert "shape my GSV Mind" in parse_qs(mind_link.query)["prompt"][0]
+    assert "$gsv-onboard" in parse_qs(mind_link.query)["prompt"][0]
     assert parse_qs(hand_link.query)["originUrl"] == [bridge.REPOSITORY_URL]
+
+
+def test_missing_secure_pinned_storage_degrades_only_the_control_lane(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, base = running_bridge
+    task = server.vault.create_task(
+        identifier="canonical-survives-control-platform-gap",
+        title="Keep canonical records readable",
+        outcome="A missing secure control-store backend cannot hide canonical work.",
+    )
+
+    def unavailable_store(_root: Path) -> None:
+        raise ValidationError("secure directory-pinned storage is unavailable on this platform")
+
+    monkeypatch.setattr(control_queue_module, "PinnedPathRoot", unavailable_store)
+
+    with urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2) as response:
+        snapshot = json.loads(response.read())
+
+    assert any(item["identifier"] == task.identifier for item in snapshot["tasks"])
+    assert snapshot["controls"]["state"] == "unavailable"
+    assert not (server.vault.root / ".gsv/control").exists()
+
+    request = Request(
+        f"{base}/api/v1/control",
+        data=json.dumps(
+            {
+                "choice": "Do not create an insecure fallback.",
+                "expected_revision": EMPTY_REVISION,
+                "kind": "correction",
+                "subject": "mind:user-correction",
+            }
+        ).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method="POST",
+    )
+    with pytest.raises(HTTPError) as rejected:
+        urlopen(request, timeout=2)
+
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert not (server.vault.root / ".gsv/control").exists()
 
 
 @pytest.mark.parametrize("status", ["done", "dropped"])
@@ -370,8 +467,8 @@ def test_loopback_health_requests_disable_ambient_proxies(
             observed.extend((request, timeout))
             return response
 
-    def build_proxy_free_opener(handler: object) -> ProxyFreeOpener:
-        observed.append(handler)
+    def build_proxy_free_opener(*handlers: object) -> ProxyFreeOpener:
+        observed.extend(handlers)
         return ProxyFreeOpener()
 
     monkeypatch.setattr(bridge, "build_opener", build_proxy_free_opener)
@@ -382,7 +479,79 @@ def test_loopback_health_requests_disable_ambient_proxies(
     assert result is response
     assert isinstance(observed[0], ProxyHandler)
     assert cast(Any, observed[0]).proxies == {}
-    assert observed[1:] == [request, 0.5]
+    assert isinstance(observed[1], bridge._RejectRedirects)
+    assert observed[2:] == [request, 0.5]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://attacker.example:43117/api/v1/health",
+        "http://localhost:43117/api/v1/health",
+        "https://127.0.0.1:43117/api/v1/health",
+        "http://127.0.0.1/api/v1/health",
+        "http://127.0.0.1:0/api/v1/health",
+    ],
+)
+def test_loopback_health_requests_reject_non_exact_loopback_before_opening(
+    url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden_build_opener(*_handlers: object) -> object:
+        raise AssertionError("an invalid health URL must not reach the network")
+
+    monkeypatch.setattr(bridge, "build_opener", forbidden_build_opener)
+
+    with pytest.raises(ValueError, match=r"only http://127\.0\.0\.1:<port>"):
+        bridge._open_loopback(Request(url), timeout=0.5)
+
+
+def test_loopback_health_request_refuses_redirect_before_sink_request() -> None:
+    sink_requests: list[str | None] = []
+
+    class SinkHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            sink_requests.append(self.headers.get("Authorization"))
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    sink = ThreadingHTTPServer((bridge.LOOPBACK_HOST, 0), SinkHandler)
+    sink_thread = threading.Thread(target=sink.serve_forever, daemon=True)
+    sink_thread.start()
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header(
+                "Location", f"http://{bridge.LOOPBACK_HOST}:{sink.server_address[1]}/sink"
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    redirect = ThreadingHTTPServer((bridge.LOOPBACK_HOST, 0), RedirectHandler)
+    redirect_thread = threading.Thread(target=redirect.serve_forever, daemon=True)
+    redirect_thread.start()
+    original = f"http://{bridge.LOOPBACK_HOST}:{redirect.server_address[1]}/health"
+    try:
+        request = Request(original, headers={"Authorization": "Bearer synthetic-token"})
+        with pytest.raises(HTTPError) as rejected:
+            bridge._open_loopback(request, timeout=2)
+
+        assert rejected.value.code == HTTPStatus.FOUND
+        assert rejected.value.url == original
+        assert sink_requests == []
+    finally:
+        redirect.shutdown()
+        redirect_thread.join(timeout=3)
+        redirect.server_close()
+        sink.shutdown()
+        sink_thread.join(timeout=3)
+        sink.server_close()
 
 
 def test_only_bad_tasks_return_http_200_but_never_become_a_first_run(
@@ -703,6 +872,59 @@ def test_health_endpoint_uses_only_cached_manifest_identity(
 
     assert health["vault_id"] == server.vault_id
     assert health["instance_id"] == INSTANCE_ID
+    assert health["vault_root_device"] == server.vault_root_identity[0]
+    assert health["vault_root_inode"] == server.vault_root_identity[1]
+
+
+def test_erroneous_head_response_has_no_body_and_keeps_connection_usable(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+) -> None:
+    _, base = running_bridge
+    target = urlsplit(base)
+    assert target.port is not None
+    connection = HTTPConnection(bridge.LOOPBACK_HOST, target.port, timeout=2)
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        connection.request("HEAD", "/missing", headers=headers)
+        missing = connection.getresponse()
+        assert missing.status == HTTPStatus.NOT_FOUND
+        assert missing.read() == b""
+
+        connection.request("GET", "/api/v1/health", headers=headers)
+        healthy = connection.getresponse()
+        assert healthy.status == HTTPStatus.OK
+        assert json.loads(healthy.read())["service"] == "gsv-bridge"
+    finally:
+        connection.close()
+
+
+def test_static_route_rejects_an_in_tree_symlink(vault: Vault, tmp_path: Path) -> None:
+    static = tmp_path / "static"
+    static.mkdir()
+    (static / "real.js").write_text("console.log('real');\n", encoding="utf-8")
+    try:
+        (static / "alias.js").symlink_to(static / "real.js")
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this platform")
+    server = bridge.BridgeHTTPServer(
+        (bridge.LOOPBACK_HOST, 0),
+        vault,
+        static,
+        access_token=ACCESS_TOKEN,
+        instance_id=INSTANCE_ID,
+        integration_provider=lambda: {"available": False, "ready": False},
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://{bridge.LOOPBACK_HOST}:{server.server_address[1]}"
+    try:
+        with pytest.raises(HTTPError) as rejected:
+            urlopen(_request(f"{base}/static/alias.js"), timeout=2)
+        assert rejected.value.code == HTTPStatus.NOT_FOUND
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
 
 
 def test_snapshot_endpoint_never_calls_full_status_or_logical_digest(
@@ -799,12 +1021,576 @@ def test_http_surface_rejects_cross_origin_and_writes(
     request = Request(
         f"{base}/api/v1/snapshot",
         data=b"{}",
-        headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+        headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Origin": base},
         method="POST",
     )
     with pytest.raises(HTTPError) as write:
         urlopen(request, timeout=2)
     assert write.value.code == HTTPStatus.METHOD_NOT_ALLOWED
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="secure directory-pinned control storage is POSIX-only foundation"
+)
+def test_bridge_accepts_only_authenticated_cas_control_events(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+) -> None:
+    server, base = running_bridge
+    body = json.dumps(
+        {
+            "choice": "selected",
+            "expected_revision": EMPTY_REVISION,
+            "kind": "setup_choice",
+            "subject": "source:gmail",
+        }
+    ).encode("utf-8")
+    request = Request(
+        f"{base}/api/v1/control",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=2) as response:
+        assert response.status == HTTPStatus.CREATED
+        appended = json.loads(response.read())
+
+    stored = ControlQueue(server.vault.root).snapshot()
+    assert appended["event"]["kind"] == "setup_choice"
+    assert appended["revision"] == stored.revision
+    assert stored.events[0].subject == "source:gmail"
+    assert server.vault.list_tasks() == []
+
+    with pytest.raises(HTTPError) as stale:
+        urlopen(request, timeout=2)
+    assert stale.value.code == HTTPStatus.CONFLICT
+
+    with urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2) as response:
+        snapshot = json.loads(response.read())
+    assert snapshot["controls"] == {
+        "archived_decided": 0,
+        "available": True,
+        "decided": 0,
+        "disposition_revision": EMPTY_REVISION,
+        "generation": 0,
+        "history": [],
+        "items": [
+            {
+                "event": {
+                    "choice": "selected",
+                    "created_at": stored.events[0].created_at,
+                    "event_id": stored.events[0].event_id,
+                    "kind": "setup_choice",
+                    "schema_version": 1,
+                    "source": "bridge",
+                    "subject": "source:gmail",
+                    "target_revision": None,
+                },
+                "status": "pending",
+            }
+        ],
+        "pending": 1,
+        "queue_revision": stored.revision,
+        "review_prompt": snapshot["controls"]["review_prompt"],
+        "review_url": snapshot["controls"]["review_url"],
+        "state": "ready",
+    }
+    assert "do not apply the requested change" in snapshot["controls"]["review_prompt"]
+    if snapshot["controls"]["review_url"] is not None:
+        assert snapshot["controls"]["review_url"].startswith("codex://new?")
+    assert snapshot["bridge"]["semantic_write"] is False
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="secure directory-pinned control storage is POSIX-only foundation"
+)
+def test_live_bridge_refuses_reads_and_writes_after_vault_path_replacement(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+    tmp_path: Path,
+) -> None:
+    server, base = running_bridge
+    original_vault_id = server.vault_id
+    parked = tmp_path / "original-vault"
+    server.vault.root.rename(parked)
+    replacement = Vault(server.vault.root)
+    replacement.initialize(name="Replacement vault")
+    assert replacement.identity()["vault_id"] != original_vault_id
+
+    with pytest.raises(HTTPError) as stale_snapshot:
+        urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2)
+    assert stale_snapshot.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+
+    body = json.dumps(
+        {
+            "choice": "This bearer must not cross the vault boundary.",
+            "expected_revision": EMPTY_REVISION,
+            "kind": "correction",
+            "subject": "mind:user-correction",
+        }
+    ).encode("utf-8")
+    request = Request(
+        f"{base}/api/v1/control",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method="POST",
+    )
+    with pytest.raises(HTTPError) as stale_control:
+        urlopen(request, timeout=2)
+    assert stale_control.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert not (replacement.root / ".gsv/control").exists()
+
+    # Health continues to identify the authenticated process receipt; it is
+    # deliberately not a claim that the vault pathname is still writable.
+    with urlopen(_request(f"{base}/api/v1/health", token=ACCESS_TOKEN), timeout=2) as response:
+        health = json.loads(response.read())
+    assert health["vault_id"] == original_vault_id
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="secure directory-pinned control storage is POSIX-only foundation"
+)
+def test_bridge_post_never_repairs_a_replacement_vault_after_mid_request_swap(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, base = running_bridge
+    replacement_root = tmp_path / "prepared-replacement"
+    replacement = Vault(replacement_root)
+    replacement.initialize(name="Prepared replacement")
+    replacement_queue = ControlQueue(replacement.root).append(
+        kind="correction",
+        subject="mind:user-correction",
+        choice="Keep the replacement queue byte-for-byte unchanged.",
+        expected_revision=EMPTY_REVISION,
+    )
+    replacement_queue_path = replacement.root / ".gsv/control/queue.jsonl"
+    replacement_before = replacement_queue_path.read_bytes()
+    assert replacement_queue.revision != EMPTY_REVISION
+    assert not tuple((replacement.root / ".gsv/control").glob("dispositions-*.head.jsonl"))
+
+    parked = tmp_path / "post-swap-original"
+    actual_append = ControlQueue.append
+    swapped = False
+
+    def append_then_swap(queue: ControlQueue, **kwargs: Any) -> Any:
+        nonlocal swapped
+        result = actual_append(queue, **kwargs)
+        if queue.vault_root == server.vault.root and not swapped:
+            swapped = True
+            server.vault.root.rename(parked)
+            replacement_root.rename(server.vault.root)
+        return result
+
+    monkeypatch.setattr(ControlQueue, "append", append_then_swap)
+    request = Request(
+        f"{base}/api/v1/control",
+        data=json.dumps(
+            {
+                "choice": "Append only to the startup vault.",
+                "expected_revision": EMPTY_REVISION,
+                "kind": "correction",
+                "subject": "mind:user-correction",
+            }
+        ).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method="POST",
+    )
+
+    with pytest.raises(HTTPError) as rejected:
+        urlopen(request, timeout=2)
+
+    assert swapped is True
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    current_control = server.vault.root / ".gsv/control"
+    assert (current_control / "queue.jsonl").read_bytes() == replacement_before
+    assert not tuple(current_control.glob("dispositions-*.head.jsonl"))
+    assert (parked / ".gsv/control/queue.jsonl").is_file()
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="secure directory-pinned control storage is POSIX-only foundation"
+)
+def test_bridge_get_never_repairs_same_id_replacement_after_precheck_swap(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, base = running_bridge
+    replacement_root = tmp_path / "same-id-replacement"
+    replacement = Vault(replacement_root)
+    replacement.initialize(name="Same logical ID replacement")
+    manifest_path = replacement.root / ".gsv/manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["vault_id"] = server.vault_id
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    ControlQueue(replacement.root).append(
+        kind="correction",
+        subject="mind:user-correction",
+        choice="Do not initialize a head in this same-ID replacement.",
+        expected_revision=EMPTY_REVISION,
+    )
+    replacement_queue_path = replacement.root / ".gsv/control/queue.jsonl"
+    replacement_before = replacement_queue_path.read_bytes()
+    parked = tmp_path / "get-swap-original"
+    actual_require = server._require_current_vault_identity
+    swapped = False
+
+    def verify_then_swap() -> None:
+        nonlocal swapped
+        actual_require()
+        if not swapped:
+            swapped = True
+            server.vault.root.rename(parked)
+            replacement_root.rename(server.vault.root)
+
+    monkeypatch.setattr(server, "_require_current_vault_identity", verify_then_swap)
+
+    with pytest.raises(HTTPError) as rejected:
+        urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2)
+
+    assert swapped is True
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    current_control = server.vault.root / ".gsv/control"
+    assert (current_control / "queue.jsonl").read_bytes() == replacement_before
+    assert not tuple(current_control.glob("dispositions-*.head.jsonl"))
+
+
+def test_bridge_control_endpoint_rejects_missing_auth_cross_origin_and_unknown_shape(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+) -> None:
+    _, base = running_bridge
+    body = json.dumps(
+        {
+            "choice": "approve",
+            "expected_revision": EMPTY_REVISION,
+            "kind": "approval",
+            "subject": "operation:test",
+        }
+    ).encode("utf-8")
+
+    for headers, expected in (
+        ({"Content-Type": "application/json"}, HTTPStatus.FORBIDDEN),
+        (
+            {
+                "Authorization": f"Bearer {ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            HTTPStatus.FORBIDDEN,
+        ),
+        (
+            {
+                "Authorization": f"Bearer {ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+                "Origin": "http://127.0.0.1:9",
+            },
+            HTTPStatus.FORBIDDEN,
+        ),
+        (
+            {
+                "Authorization": f"Bearer {ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+                "Origin": f"{base}/not-an-origin",
+            },
+            HTTPStatus.FORBIDDEN,
+        ),
+        (
+            {
+                "Authorization": f"Bearer {'c' * 48}",
+                "Content-Type": "application/json",
+                "Origin": base,
+            },
+            HTTPStatus.FORBIDDEN,
+        ),
+    ):
+        request = Request(f"{base}/api/v1/control", data=body, headers=headers, method="POST")
+        with pytest.raises(HTTPError) as rejected:
+            urlopen(request, timeout=2)
+        assert rejected.value.code == expected
+
+    unsupported = json.dumps(
+        {
+            "choice": "approve",
+            "expected_revision": EMPTY_REVISION,
+            "kind": "approval",
+            "provider_body": "untrusted content",
+            "subject": "operation:test",
+        }
+    ).encode("utf-8")
+    request = Request(
+        f"{base}/api/v1/control",
+        data=unsupported,
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method="POST",
+    )
+    with pytest.raises(HTTPError) as rejected:
+        urlopen(request, timeout=2)
+    assert rejected.value.code == HTTPStatus.BAD_REQUEST
+
+
+def test_bridge_control_endpoint_rejects_forged_host_without_creating_control_store(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+) -> None:
+    server, base = running_bridge
+    target = urlsplit(base)
+    assert target.port is not None
+    body = json.dumps(
+        {
+            "choice": "Do not trust a forged Host header.",
+            "expected_revision": EMPTY_REVISION,
+            "kind": "correction",
+            "subject": "mind:user-correction",
+        }
+    ).encode("utf-8")
+    connection = HTTPConnection(bridge.LOOPBACK_HOST, target.port, timeout=2)
+    try:
+        connection.putrequest("POST", "/api/v1/control", skip_host=True)
+        connection.putheader("Host", f"attacker.example:{target.port}")
+        connection.putheader("Authorization", f"Bearer {ACCESS_TOKEN}")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(len(body)))
+        connection.putheader("Origin", base)
+        connection.endheaders(body)
+        response = connection.getresponse()
+        response.read()
+    finally:
+        connection.close()
+
+    assert response.status == HTTPStatus.FORBIDDEN
+    assert not (server.vault.root / ".gsv/control").exists()
+
+
+def test_bridge_reports_an_unconfirmed_control_commit_without_claiming_no_change(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, base = running_bridge
+
+    def unconfirmed(*_args: object, **_kwargs: object) -> None:
+        raise MutationCommittedError("injected post-publication durability failure")
+
+    monkeypatch.setattr(ControlQueue, "append", unconfirmed)
+    request = Request(
+        f"{base}/api/v1/control",
+        data=json.dumps(
+            {
+                "choice": "Keep this correction visible until its outcome is known.",
+                "expected_revision": EMPTY_REVISION,
+                "kind": "correction",
+                "subject": "mind:user-correction",
+            }
+        ).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method="POST",
+    )
+
+    with pytest.raises(HTTPError) as rejected:
+        urlopen(request, timeout=2)
+
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    payload = json.loads(rejected.value.read())
+    assert "could not confirm its durable result" in payload["error"]
+    assert "Reload the queue before retrying" in payload["error"]
+    assert "not changed" not in payload["error"]
+
+
+def test_bridge_preflights_dispositions_before_committing_a_new_intent(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+) -> None:
+    server, base = running_bridge
+    first_body = json.dumps(
+        {
+            "choice": "First correction.",
+            "expected_revision": EMPTY_REVISION,
+            "kind": "correction",
+            "subject": "mind:user-correction",
+        }
+    ).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "Origin": base,
+    }
+    with urlopen(
+        Request(f"{base}/api/v1/control", data=first_body, headers=headers, method="POST"),
+        timeout=2,
+    ) as response:
+        first = json.loads(response.read())
+
+    queue_path = server.vault.root / ".gsv/control/queue.jsonl"
+    queue_before = queue_path.read_bytes()
+    disposition_path = server.vault.root / ".gsv/control/dispositions-0000000000000000.jsonl"
+    disposition_path.write_bytes(b"{}\n")
+    second_body = json.dumps(
+        {
+            "choice": "This must not append after failed disposition preflight.",
+            "expected_revision": first["revision"],
+            "kind": "correction",
+            "subject": "mind:user-correction",
+        }
+    ).encode("utf-8")
+
+    with pytest.raises(HTTPError) as rejected:
+        urlopen(
+            Request(f"{base}/api/v1/control", data=second_body, headers=headers, method="POST"),
+            timeout=2,
+        )
+
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert queue_path.read_bytes() == queue_before
+    assert len(ControlQueue(server.vault.root).snapshot().events) == 1
+
+
+def test_bridge_returns_the_committed_queue_revision_without_a_post_commit_ledger_read(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, base = running_bridge
+    actual_snapshot = OperationLedger.snapshot
+    calls = 0
+
+    def preflight_once(ledger: OperationLedger, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise ControlStorageError("injected post-commit ledger failure")
+        return actual_snapshot(ledger, **kwargs)
+
+    monkeypatch.setattr(OperationLedger, "snapshot", preflight_once)
+    body = json.dumps(
+        {
+            "choice": "Return the committed queue revision.",
+            "expected_revision": EMPTY_REVISION,
+            "kind": "correction",
+            "subject": "mind:user-correction",
+        }
+    ).encode("utf-8")
+    request = Request(
+        f"{base}/api/v1/control",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method="POST",
+    )
+
+    with urlopen(request, timeout=2) as response:
+        result = json.loads(response.read())
+
+    assert response.status == HTTPStatus.CREATED
+    assert calls == 1
+    assert result["revision"] == ControlQueue(server.vault.root).snapshot().revision
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_bridge_non_post_methods_never_append_control_events(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str], method: str
+) -> None:
+    server, base = running_bridge
+    request = Request(
+        f"{base}/api/v1/control",
+        data=json.dumps(
+            {
+                "choice": "approve",
+                "expected_revision": EMPTY_REVISION,
+                "kind": "approval",
+                "subject": "operation:test",
+            }
+        ).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method=method,
+    )
+
+    with pytest.raises(HTTPError) as rejected:
+        urlopen(request, timeout=2)
+
+    assert rejected.value.code == HTTPStatus.METHOD_NOT_ALLOWED
+    assert not (server.vault.root / ".gsv/control").exists()
+
+
+def test_corrupt_control_queue_does_not_hide_canonical_bridge_reads(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+) -> None:
+    server, base = running_bridge
+    task = server.vault.create_task(
+        identifier="canonical-stays-visible",
+        title="Canonical stays visible",
+        outcome="The Bridge degrades only its noncanonical control lane.",
+    )
+    queue = ControlQueue(server.vault.root)
+    queue.path.parent.mkdir(parents=True, exist_ok=True)
+    queue.path.write_bytes(b"{}")
+
+    with urlopen(_request(f"{base}/api/v1/snapshot", token=ACCESS_TOKEN), timeout=2) as response:
+        snapshot = json.loads(response.read())
+
+    assert response.status == HTTPStatus.OK
+    assert any(item["identifier"] == task.identifier for item in snapshot["tasks"])
+    assert snapshot["controls"] == {
+        "archived_decided": None,
+        "available": False,
+        "decided": None,
+        "disposition_revision": None,
+        "generation": None,
+        "history": [],
+        "items": [],
+        "pending": None,
+        "queue_revision": None,
+        "review_prompt": None,
+        "review_url": None,
+        "state": "unavailable",
+    }
+
+    request = Request(
+        f"{base}/api/v1/control",
+        data=json.dumps(
+            {
+                "choice": "Keep the stored corruption untouched.",
+                "expected_revision": EMPTY_REVISION,
+                "kind": "correction",
+                "subject": "mind:user-correction",
+            }
+        ).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method="POST",
+    )
+    with pytest.raises(HTTPError) as rejected:
+        urlopen(request, timeout=2)
+
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert queue.path.read_bytes() == b"{}"
 
 
 def test_stop_never_signals_reused_pid_when_health_identity_mismatches(
@@ -1342,3 +2128,23 @@ def test_real_detached_bridge_child_binds_reports_and_stops(vault: Vault) -> Non
         stopped = bridge.stop_bridge()
     assert stopped["stopped"] is True
     assert not bridge._state_path().exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="same-path inode replacement proof is POSIX-only")
+def test_open_refuses_to_reuse_a_bridge_after_same_id_vault_replacement(vault: Vault) -> None:
+    original_vault_id = vault.identity()["vault_id"]
+    opened = bridge.open_bridge(vault, open_browser=False)
+    parked = vault.root.with_name(f"{vault.root.name}-parked")
+    try:
+        vault.root.rename(parked)
+        shutil.copytree(parked, vault.root)
+        replacement = Vault(vault.root)
+        assert replacement.identity()["vault_id"] == original_vault_id
+
+        with pytest.raises(SetupError, match="earlier vault directory"):
+            bridge.open_bridge(replacement, open_browser=False)
+        assert bridge.open_bridge_in_browser(replacement) is False
+        assert opened["started"] is True
+    finally:
+        stopped = bridge.stop_bridge()
+    assert stopped["stopped"] is True

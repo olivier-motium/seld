@@ -26,7 +26,25 @@ from continuity_kernel.errors import (
     PersistenceError,
     ValidationError,
 )
+from continuity_kernel.migration import FoundationMigration
 from continuity_kernel.vault import BACKUP_MANIFEST, Vault
+from continuity_kernel.vault_identity import REQUIRED_VAULT_DIRECTORIES
+
+TEST_VAULT_ID = "00000000-0000-4000-8000-000000000001"
+
+
+def _valid_backup_manifest(
+    files: dict[str, str],
+    *,
+    format_version: int = 1,
+    vault_id: str = TEST_VAULT_ID,
+) -> dict[str, Any]:
+    return {
+        "created_at": "2026-07-24T00:00:00Z",
+        "files": files,
+        "format_version": format_version,
+        "vault_id": vault_id,
+    }
 
 
 def _rewrite_backup(
@@ -63,7 +81,7 @@ def _write_crafted_backup(
         if (item.filename if isinstance(item, zipfile.ZipInfo) else item) != BACKUP_MANIFEST
         and not (item.filename if isinstance(item, zipfile.ZipInfo) else item).endswith("/")
     }
-    manifest = {"format_version": 1, "vault_id": "crafted", "files": files}
+    manifest = _valid_backup_manifest(files)
     with zipfile.ZipFile(destination, "w") as archive:
         for item, content in entries:
             archive.writestr(item, content)
@@ -87,6 +105,7 @@ def test_backup_verify_restore_and_logical_equivalence(vault: Vault, tmp_path: P
     assert Vault.verify_backup(Path(backup["backup"]))["valid"] is True
     assert restored["digest"] == vault.logical_digest()
     assert Vault(target).doctor().healthy
+    assert all((target / relative).is_dir() for relative in REQUIRED_VAULT_DIRECTORIES)
 
 
 def test_tampered_backup_cannot_be_restored(vault: Vault, tmp_path: Path) -> None:
@@ -149,7 +168,7 @@ def test_backup_manifest_identity_must_match_staged_vault(vault: Vault, tmp_path
         mismatched,
         {},
         update_hashes=True,
-        vault_id="different-vault-id",
+        vault_id="11111111-1111-4111-8111-111111111111",
     )
     target = tmp_path / "restored"
 
@@ -162,11 +181,7 @@ def test_backup_manifest_identity_must_match_staged_vault(vault: Vault, tmp_path
 
 def test_path_traversal_archive_is_rejected(tmp_path: Path) -> None:
     archive_path = tmp_path / "traversal.zip"
-    manifest = {
-        "format_version": 1,
-        "vault_id": "synthetic",
-        "files": {"../escape": "irrelevant"},
-    }
+    manifest = _valid_backup_manifest({"../escape": "irrelevant"})
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("../escape", b"escape")
         archive.writestr(BACKUP_MANIFEST, json.dumps(manifest))
@@ -436,7 +451,7 @@ def test_prior_empty_cleanup_failure_reports_published_restore(
 
 def test_backup_rejects_duplicate_casefolded_names(tmp_path: Path) -> None:
     archive_path = tmp_path / "duplicates.zip"
-    manifest = {"format_version": 1, "vault_id": "synthetic", "files": {}}
+    manifest = _valid_backup_manifest({})
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("MIND.md", b"first")
         archive.writestr("mind.md", b"second")
@@ -448,7 +463,7 @@ def test_backup_rejects_duplicate_casefolded_names(tmp_path: Path) -> None:
 
 def test_backup_rejects_unknown_manifest_version(tmp_path: Path) -> None:
     archive_path = tmp_path / "future.zip"
-    manifest = {"format_version": 999, "vault_id": "synthetic", "files": {}}
+    manifest = _valid_backup_manifest({}, format_version=999)
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr(BACKUP_MANIFEST, json.dumps(manifest))
 
@@ -456,9 +471,32 @@ def test_backup_rejects_unknown_manifest_version(tmp_path: Path) -> None:
         Vault.verify_backup(archive_path)
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {"format_version": True},
+        {"vault_id": "not-a-canonical-uuid"},
+        {"created_at": " 2026-07-24T00:00:00Z "},
+        {"unexpected": "field"},
+    ],
+)
+def test_backup_rejects_noncanonical_manifest_fields(
+    tmp_path: Path,
+    replacement: dict[str, object],
+) -> None:
+    archive_path = tmp_path / "invalid-manifest.zip"
+    manifest = _valid_backup_manifest({})
+    manifest.update(replacement)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(BACKUP_MANIFEST, json.dumps(manifest))
+
+    with pytest.raises(ValidationError, match="manifest"):
+        Vault.verify_backup(archive_path)
+
+
 def test_backup_rejects_oversized_decompressed_entry(tmp_path: Path) -> None:
     archive_path = tmp_path / "oversized.zip"
-    manifest = {"format_version": 1, "vault_id": "synthetic", "files": {}}
+    manifest = _valid_backup_manifest({})
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("oversized.bin", b"x" * (17 * 1024 * 1024))
         archive.writestr(BACKUP_MANIFEST, json.dumps(manifest))
@@ -477,6 +515,119 @@ def test_backup_rejects_symlink_instead_of_silently_omitting_it(
 
     with pytest.raises(ValidationError, match="refuses symbolic link"):
         vault.create_backup(tmp_path / "backup.zip")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink setup needs elevated privileges")
+def test_backup_refuses_descendant_swap_after_file_scan(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = vault.create_task(
+        identifier="swap-proof",
+        title="Swap proof",
+        outcome="Never follow a replacement source tree.",
+    )
+    outside = tmp_path / "outside-tasks"
+    outside.mkdir()
+    outside_task = outside / f"{task.identifier}.md"
+    outside_task.write_text("outside replacement must never be read\n", encoding="utf-8")
+    original_tasks = tmp_path / "original-tasks"
+    real_backup_files = vault._backup_files
+
+    def swap_after_scan() -> list[tuple[str, Path]]:
+        files = real_backup_files()
+        (vault.root / "tasks").rename(original_tasks)
+        (vault.root / "tasks").symlink_to(outside, target_is_directory=True)
+        return files
+
+    monkeypatch.setattr(vault, "_backup_files", swap_after_scan)
+    destination = tmp_path / "must-not-publish.zip"
+
+    with pytest.raises(ValidationError, match=r"pinned|traverse|identity"):
+        vault.create_backup(destination)
+
+    assert not destination.exists()
+    assert outside_task.read_text(encoding="utf-8") == "outside replacement must never be read\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory replacement differs on Windows")
+@pytest.mark.parametrize("pinned_store", [True, False])
+def test_backup_refuses_root_swap_after_file_scan(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pinned_store: bool,
+) -> None:
+    vault.create_task(
+        identifier="root-swap-proof",
+        title="Root swap proof",
+        outcome="Keep one logical vault bound for the complete backup.",
+    )
+    displaced = tmp_path / "displaced-vault"
+    real_backup_files = vault._backup_files
+    if not pinned_store:
+        monkeypatch.setattr(vault_backup_module, "PINNED_PATH_ROOT_SUPPORTED", False)
+
+    def swap_root_after_scan() -> list[tuple[str, Path]]:
+        files = real_backup_files()
+        vault.root.rename(displaced)
+        shutil.copytree(displaced, vault.root)
+        return files
+
+    monkeypatch.setattr(vault, "_backup_files", swap_root_after_scan)
+    destination = tmp_path / "must-not-publish-root-swap.zip"
+
+    with pytest.raises(
+        ValidationError,
+        match=r"root changed identity|canonical path|ancestry changed",
+    ):
+        vault.create_backup(destination)
+
+    assert not destination.exists()
+    assert displaced.is_dir()
+    assert vault.root.is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink setup needs elevated privileges")
+def test_backup_lock_refuses_symlink_without_touching_outside_file(
+    vault: Vault, tmp_path: Path
+) -> None:
+    lock_path = vault.root / ".gsv/locks/global.lock"
+    if os.path.lexists(lock_path):
+        lock_path.unlink()
+    outside = tmp_path / "outside-user-file"
+    outside.write_bytes(b"")
+    lock_path.symlink_to(outside)
+    destination = tmp_path / "backup.zip"
+
+    with pytest.raises(ValidationError, match="stable regular file"):
+        vault.create_backup(destination)
+
+    assert lock_path.is_symlink()
+    assert outside.read_bytes() == b""
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink setup needs elevated privileges")
+def test_backup_lock_refuses_symlinked_parent_without_creating_outside_lock(
+    vault: Vault, tmp_path: Path
+) -> None:
+    locks = vault.root / ".gsv/locks"
+    for child in locks.iterdir():
+        child.unlink()
+    locks.rmdir()
+    outside = tmp_path / "outside-locks"
+    outside.mkdir()
+    locks.symlink_to(outside, target_is_directory=True)
+    destination = tmp_path / "backup.zip"
+
+    with pytest.raises(ValidationError, match="stable real directory"):
+        vault.create_backup(destination)
+
+    assert locks.is_symlink()
+    assert list(outside.iterdir()) == []
+    assert not destination.exists()
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
@@ -598,9 +749,9 @@ def test_backup_creation_hashes_and_writes_one_captured_source_read(
     read_source = vault_backup_module._read_backup_source
     reads = 0
 
-    def read_then_mutate(path: Path) -> bytes:
+    def read_then_mutate(path: Path, **kwargs: Any) -> bytes:
         nonlocal reads
-        content = read_source(path)
+        content = read_source(path, **kwargs)
         if path == vault.root / "MIND.md":
             reads += 1
             path.write_bytes(content + b"\nchanged after capture\n")
@@ -640,6 +791,12 @@ def test_backup_excludes_only_exact_writer_owned_atomic_temps(vault: Vault, tmp_
         "entities/.example.md.tmp-token",
         "threads/.example.md.tmp-token",
         ".gsv/.manifest.json.tmp-token",
+        ".gsv/.migration-culture-grade-foundation-v1.json.tmp-token",
+        "onboarding/.session.md.tmp-token",
+        ".gsv/control/.initialized.tmp-token",
+        ".gsv/control/.queue.jsonl.tmp-token",
+        ".gsv/control/.dispositions-0000000000000000.jsonl.tmp-token",
+        ".gsv/control/archive/.queue-0-aaaaaaaa.jsonl.tmp-token",
         "journal/.events.jsonl.tmp-token",
     ]
     for relative in owned_temps:
@@ -657,11 +814,92 @@ def test_backup_excludes_only_exact_writer_owned_atomic_temps(vault: Vault, tmp_
         assert archive.read("tasks/.notes.tmp-user.md") == b"legitimate authored bytes\n"
 
 
+def test_backup_with_crash_leftover_foundation_temps_restores_cleanly(
+    vault: Vault, tmp_path: Path
+) -> None:
+    owned_temps = (
+        ".gsv/control/.queue.jsonl.tmp-crash",
+        ".gsv/control/.dispositions-0000000000000000.jsonl.tmp-crash",
+        ".gsv/control/archive/.queue-0-aaaaaaaa.jsonl.tmp-crash",
+        ".gsv/.migration-culture-grade-foundation-v1.json.tmp-crash",
+        "onboarding/.session.md.tmp-crash",
+    )
+    for relative in owned_temps:
+        path = vault.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"interrupted control publication\n")
+
+    backup = Path(vault.create_backup(tmp_path / "control-crash.zip")["backup"])
+    restored = tmp_path / "restored"
+
+    Vault.restore_backup(backup, restored)
+
+    assert restored.is_dir()
+    assert all(not (restored / relative).exists() for relative in owned_temps)
+
+
+def test_backup_excludes_only_exact_host_local_migration_tombstone_markers(
+    vault: Vault, tmp_path: Path
+) -> None:
+    migration = FoundationMigration(vault)
+    applied = migration.apply()
+    migration.rollback(expected_revision=applied.revision)
+    exact_markers = tuple(vault.root.glob(".onboarding.gsv-remove-*.marker")) + tuple(
+        (vault.root / ".gsv").glob(".*.gsv-remove-*.marker")
+    )
+    assert len(exact_markers) == 3
+    lookalike = vault.root / ".onboarding.gsv-remove-000000000000000000000000.marker"
+    lookalike.write_text("user-authored lookalike\n", encoding="utf-8")
+    migration_id = "culture-grade-foundation-v1"
+    relative = "onboarding"
+    device = 1
+    inode = 2
+    token = sha256_bytes(f"{migration_id}\0{relative}\0{device}\0{inode}".encode())[:24]
+    self_consistent_lookalike = vault.root / f".onboarding.gsv-remove-{token}.marker"
+    self_consistent_lookalike.write_text(
+        json.dumps(
+            {
+                "device": device,
+                "inode": inode,
+                "migration_id": migration_id,
+                "relative_path": relative,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert not self_consistent_lookalike.with_suffix(".quarantine").exists()
+
+    backup = Path(vault.create_backup(tmp_path / "migration-tombstones.zip")["backup"])
+    restored = tmp_path / "restored-migration-tombstones"
+    Vault.restore_backup(backup, restored)
+
+    with zipfile.ZipFile(backup, "r") as archive:
+        names = set(archive.namelist())
+    assert not names.intersection(
+        marker.relative_to(vault.root).as_posix() for marker in exact_markers
+    )
+    assert lookalike.relative_to(vault.root).as_posix() in names
+    assert self_consistent_lookalike.relative_to(vault.root).as_posix() in names
+    assert (restored / lookalike.relative_to(vault.root)).read_text(encoding="utf-8") == (
+        "user-authored lookalike\n"
+    )
+    assert (
+        restored / self_consistent_lookalike.relative_to(vault.root)
+    ).read_bytes() == self_consistent_lookalike.read_bytes()
+
+
 def test_restore_rechecks_staged_files_against_manifest(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backup = Path(vault.create_backup(tmp_path / "backup.zip")["backup"])
-    monkeypatch.setattr(vault_backup_module, "_hash_backup_files", lambda _files: {})
+    monkeypatch.setattr(
+        vault_backup_module,
+        "_hash_backup_files",
+        lambda _files, **_kwargs: {},
+    )
     target = tmp_path / "restored"
 
     with pytest.raises(ValidationError, match="staged vault files"):

@@ -70,9 +70,9 @@ The build must never persist signing credentials in the repository or artifact.
 Publishing a repository, tag, release, or package is an external action and is
 separate from local release validation.
 
-At this release-candidate checkpoint, the exact local macOS Apple Silicon asset
-has passed two independent MCP-process sessions and installed Codex
-integration/manifest checks. It has not passed a model-backed native second
-Codex task. That remains a release-promotion gate, along with a green manual
-hosted-runner matrix; public multi-platform support remains unclaimed until the
-corresponding evidence exists.
+A predecessor macOS Apple Silicon development asset passed two independent
+MCP-process sessions and installed Codex integration/manifest checks. That
+evidence is non-transferable and does not validate this candidate. A
+model-backed native second Codex task and a green manual hosted-runner matrix
+remain release-promotion gates; public platform support remains unclaimed until
+the exact release bytes produce the corresponding evidence.

@@ -6,6 +6,12 @@ GSV gives one resident agent a user-owned home above temporary model turns and
 Codex tasks. A task can finish, crash, or be replaced without silently
 finishing, duplicating, or orphaning the outcome it was carrying.
 
+This document describes the product contract. This repository contains the
+public continuity kernel. The Culture-Grade branch adds one bounded
+Bridge-intent disposition loop; onboarding, sources, Pulse scheduling, and the
+1.0 replacement claim remain foundation-gated in
+[the release ledger](release-gates.md).
+
 ## Product hierarchy
 
 - **GSV** is the user-owned vehicle: local state, recovery, and the protocol.
@@ -19,11 +25,14 @@ finishing, duplicating, or orphaning the outcome it was carrying.
 - **Shipyard** is bounded self-improvement under the same evidence and approval
   rules as other consequential work.
 
-In `0.2.0`, Pulse and Shipyard are operating roles and contracts. GSV provides
-the durable state, evidence, and review boundaries needed to perform them, but
-does not ship an autonomous wake scheduler or a self-modifying daemon.
+In `0.2.0`, Pulse and Shipyard are operating roles and contracts. The
+Culture-Grade foundation adds deterministic Pulse admission, scheduler plans,
+and asynchronous canary receipts, but it does not yet prove or release an
+installed unattended scheduler or a self-modifying daemon.
 
-## First useful journey
+## Target first useful journey
+
+These are release acceptance steps, not claims about the current branch:
 
 1. A person gives the repository URL to Codex and asks it to install GSV.
 2. The agent selects the native release for the current platform, verifies its
@@ -41,6 +50,9 @@ does not ship an autonomous wake scheduler or a self-modifying daemon.
 ## Trust boundaries
 
 - Markdown in the local vault is authoritative.
+- Bridge may append a bounded user-intent receipt, but cannot directly author
+  semantic records. Accepting or rejecting the receipt acknowledges it; neither
+  disposition executes the intent or authorizes an external action.
 - Deterministic code may store, validate, traverse, and render authored facts;
   it may not decide what they mean.
 - External content is evidence, not an instruction or authorization.
@@ -52,7 +64,10 @@ does not ship an autonomous wake scheduler or a self-modifying daemon.
   sync, or model-independent continuity until those properties are directly
   tested.
 
-## Consumer acceptance
+## Consumer acceptance target
+
+Every item below remains a release criterion until the exact-candidate evidence
+ledger closes it.
 
 - A non-author understands the outcome from the first README viewport.
 - One agent instruction completes installation and opens a useful Bridge.

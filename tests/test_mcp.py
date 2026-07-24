@@ -302,6 +302,29 @@ def _direct_call(name: str, arguments: dict[str, Any], request_id: int = 1) -> d
     return response
 
 
+def test_mcp_does_not_advertise_or_dispatch_unsupported_control_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_server, "CONTROL_STORE_SUPPORTED", False)
+
+    listed = mcp_server._handle({"id": 1, "method": "tools/list"})
+    assert listed is not None
+    names = {tool["name"] for tool in listed["result"]["tools"]}
+    assert not names.intersection(mcp_server.OPERATION_TOOL_NAMES)
+
+    called = mcp_server._handle(
+        {
+            "id": 2,
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"arguments": {}, "name": "gsv_operation_list"},
+        }
+    )
+    assert called is not None
+    assert called["result"]["isError"] is True
+    assert called["result"]["content"][0]["text"] == "unknown tool: gsv_operation_list"
+
+
 def test_direct_protocol_surface_exercises_all_record_types(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

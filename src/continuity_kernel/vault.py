@@ -79,8 +79,14 @@ from continuity_kernel.vault_context import (
 from continuity_kernel.vault_context import (
     build_context_pack as _build_context_pack,
 )
+from continuity_kernel.vault_identity import (
+    REQUIRED_VAULT_DIRECTORIES,
+    parse_vault_manifest,
+)
+from continuity_kernel.vault_identity import (
+    VAULT_FORMAT_VERSION as VAULT_VERSION,
+)
 
-VAULT_VERSION: Final = 1
 MAX_DOCUMENT_BYTES: Final = 512 * 1024
 MAX_JOURNAL_LINE_BYTES: Final = 64 * 1024
 RecordKind = Literal["task", "entity", "thread"]
@@ -171,14 +177,9 @@ class Vault:
             self.root.chmod(0o700)
         created: list[str] = []
         with exclusive_lock(self.state / "locks/setup.lock"):
-            for relative in (
-                ".gsv/locks",
-                "tasks",
-                "entities",
-                "threads",
-                "journal",
-                "backups",
-            ):
+            for relative in REQUIRED_VAULT_DIRECTORIES:
+                if relative == ".gsv":
+                    continue
                 target = self.root / relative
                 if not target.exists():
                     target.mkdir(parents=True)
@@ -501,6 +502,32 @@ class Vault:
         issues: list[DoctorIssue] = []
         repaired: list[str] = []
         manifest: dict[str, Any] | None = None
+        for relative in REQUIRED_VAULT_DIRECTORIES:
+            path = self.root / relative
+            try:
+                directory_metadata = os.lstat(path)
+            except FileNotFoundError:
+                issues.append(
+                    DoctorIssue(
+                        "missing-directory",
+                        relative,
+                        "required vault directory is missing",
+                    )
+                )
+                continue
+            except OSError as exc:
+                issues.append(DoctorIssue("invalid-directory", relative, str(exc)))
+                continue
+            if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(
+                directory_metadata.st_mode
+            ):
+                issues.append(
+                    DoctorIssue(
+                        "invalid-directory",
+                        relative,
+                        "required vault path is not a real directory",
+                    )
+                )
         try:
             manifest = self._manifest()
         except (ValidationError, NotFoundError) as exc:
@@ -759,15 +786,7 @@ class Vault:
 
     def _manifest(self) -> dict[str, Any]:
         path = self.state / "manifest.json"
-        try:
-            payload = json.loads(self._read_text(path, max_bytes=64 * 1024))
-        except json.JSONDecodeError as exc:
-            raise ValidationError("vault manifest is invalid JSON") from exc
-        if not isinstance(payload, dict) or payload.get("format_version") != VAULT_VERSION:
-            raise ValidationError("unsupported or invalid vault manifest")
-        if not isinstance(payload.get("vault_id"), str) or not isinstance(payload.get("name"), str):
-            raise ValidationError("vault manifest is incomplete")
-        return payload
+        return parse_vault_manifest(self._read_bytes(path, max_bytes=64 * 1024))
 
     def _event(self, operation: str, identifier: str, before: str | None, after: str) -> None:
         event = {

@@ -9,10 +9,55 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, cast
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> Request | None:
+        del message, new_url
+        raise HTTPError(
+            request.full_url,
+            code,
+            "GSV refuses redirects during the frozen Bridge smoke test",
+            headers,
+            file_pointer,
+        )
+
+
+def _open_loopback(request: str | Request, *, timeout: float) -> Any:
+    """Open one exact IPv4 loopback URL without consulting ambient proxies."""
+
+    url = request.full_url if isinstance(request, Request) else request
+    target = urlsplit(url)
+    try:
+        port = target.port
+    except ValueError as exc:
+        raise RuntimeError("Bridge smoke test received an invalid loopback URL") from exc
+    if (
+        target.scheme != "http"
+        or target.hostname != "127.0.0.1"
+        or port is None
+        or port < 1
+        or target.username is not None
+        or target.password is not None
+        or target.fragment
+    ):
+        raise RuntimeError("Bridge smoke test accepts only http://127.0.0.1:<port> URLs")
+    return build_opener(ProxyHandler({}), _RejectRedirects()).open(request, timeout=timeout)
 
 
 def main() -> int:
@@ -63,6 +108,24 @@ def main() -> int:
     if os.name != "nt":
         target.chmod(0o755)
 
+    privacy = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts/privacy_check.py"),
+            str(root),
+            "--no-history",
+            "--artifact",
+            str(target),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if privacy.returncode != 0:
+        raise RuntimeError(f"frozen artifact privacy scan failed: {privacy.stdout[:2000]}")
+    privacy_report = json.loads(privacy.stdout.splitlines()[-1])
+
     version = subprocess.run(
         [str(target), "--version"],
         check=True,
@@ -82,6 +145,7 @@ def main() -> int:
         json.dumps(
             {
                 "artifact": str(target),
+                "artifact_privacy_scanned": privacy_report["scanned"],
                 **bridge_smoke,
                 "mcp_server": server_info["name"],
                 "size": target.stat().st_size,
@@ -165,15 +229,15 @@ def _bridge_static_smoke(binary: Path) -> dict[str, bool]:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         url = str(state["url"])
         try:
-            with urlopen(url, timeout=5) as response:
+            with _open_loopback(url, timeout=5) as response:
                 root_page = response.read()
-            with urlopen(f"{url.rstrip('/')}/static/bridge.css", timeout=5) as response:
+            with _open_loopback(f"{url.rstrip('/')}/static/bridge.css", timeout=5) as response:
                 stylesheet = response.read()
             snapshot_request = Request(
                 f"{url.rstrip('/')}/api/v1/snapshot",
                 headers={"Authorization": f"Bearer {state['token']}"},
             )
-            with urlopen(snapshot_request, timeout=5) as response:
+            with _open_loopback(snapshot_request, timeout=5) as response:
                 snapshot = json.loads(response.read())
             if b"Your work in Codex, in one place." not in root_page:
                 raise RuntimeError("frozen Bridge root page was not bundled")

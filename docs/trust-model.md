@@ -24,6 +24,13 @@
   Bridge snapshot or health identity.
 - A stale, forged, or PID-reused Bridge receipt cannot cause GSV to signal an
   unrelated process.
+- A stale Bridge control writer cannot append against a newer queue revision,
+  and a Bridge control event cannot directly author or replace semantic canon.
+- A Bridge control event receives at most one durable accept/reject disposition;
+  stale queue or disposition revisions are rejected, and a fresh process reads
+  the same result.
+- Bridge, CLI, and MCP operation reads leave the canonical control store
+  byte-for-byte unchanged; crash recovery belongs to an explicit mutation.
 
 ## Bridge boundary
 
@@ -43,9 +50,27 @@ dead PID or a concrete authenticated identity mismatch also clears the stale
 receipt; only a complete identity match permits signalling.
 
 The server binds only to `127.0.0.1`, validates the exact Host and Origin for
-its bound port, exposes no write API, and serves only bounded regular files
-inside its packaged static root. The browser writes authored content using
-`textContent`, not HTML interpolation.
+its bound port, and serves only bounded regular files inside its packaged
+static root. Its only write route is `POST /api/v1/control`: an authenticated,
+size-bounded, compare-and-swap append to a local queue. The route accepts only
+setup choices, approvals, corrections, and undo requests. These are user-intent
+receipts. The CLI and MCP operation surfaces may durably accept or reject a
+receipt, but disposition does not execute it or grant external-action authority.
+Each mutation requires the logical vault ID and both CAS revisions returned by
+the preceding operation snapshot. A live MCP process additionally binds to the
+physical vault root it opened, so copied tokens and same-path replacement
+cannot cross a vault boundary.
+Neither the receipt nor its disposition can directly write Tasks, Entities,
+WorkThreads, `MIND.md`, `NOW.md`, onboarding, source readiness, grants, or
+action policy. Every other HTTP write method and path remains denied. The
+browser renders authored content using `textContent`, not HTML interpolation.
+
+The control queue and its CLI/MCP disposition surfaces currently require the
+secure directory-pinned storage primitive available on macOS and Linux. On
+Windows the CLI commands and MCP tools are not advertised, the Bridge control
+endpoint returns unavailable and writes nothing, and canonical Bridge reads
+remain available. This is a foundation limit, not cross-platform release
+evidence.
 
 The bearer restores the intended same-user local-file boundary against casual
 loopback reads. It is not a security boundary against hostile code already
@@ -79,7 +104,10 @@ does not roll back Codex integration or configuration.
 - Secret storage or credential management.
 - Automatic task prioritization, semantic identity merging, or autonomous
   background action.
-- An autonomous Pulse scheduler or self-modifying Shipyard daemon.
+- A released autonomous Pulse scheduler or self-modifying Shipyard daemon. The
+  Culture-Grade foundation contains inert local-only admission and
+  scheduler-canary contracts, but has no public scheduler mutation surface;
+  installed unattended operation remains a release gate.
 - Protection after the host, user account, Codex installation, or release
   signing identity is compromised.
 

@@ -1,6 +1,6 @@
 {
   "name": "gsv",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Durable local context, tasks, entities, and work threads for Codex.",
   "author": {
     "name": "GSV contributors"
@@ -26,4 +26,3 @@
     "screenshots": []
   }
 }
-

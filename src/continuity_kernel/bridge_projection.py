@@ -11,7 +11,9 @@ from typing import Any, Final, cast
 from urllib.parse import urlencode
 
 from continuity_kernel import __version__
+from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED, event_dict
 from continuity_kernel.errors import ContinuityError, ValidationError
+from continuity_kernel.operations import OperationLedger, disposition_dict
 from continuity_kernel.records import (
     MAX_RECORD_BYTES,
     TERMINAL_TASK_STATUSES,
@@ -64,12 +66,19 @@ class _ObservedRecordFile:
 
 
 _NEW_MIND_PROMPT: Final = (
-    "Help me shape my GSV Mind. Read the installed GSV context first, then ask only the few "
-    "questions needed to make MIND.md and NOW.md useful."
+    "Use $gsv-onboard to help me describe the context GSV should eventually use. First inspect "
+    "the installed GSV help and state clearly whether a durable onboarding surface exists. In "
+    "this foundation it does not: capture a proposal only, and do not claim sources are ready."
 )
 _NEW_HAND_PROMPT: Final = (
     "Start a new GSV hand. Read the installed GSV context and exact current records before "
     "deciding what deserves attention."
+)
+_CONTROL_REVIEW_PROMPT: Final = (
+    "Review the pending Bridge intents for this GSV vault through the supported "
+    "`gsv operation list` surface. Acknowledge or reject each intent against its current queue "
+    "and disposition revisions. This is review only: do not apply the requested change, edit "
+    "canonical records, use provider tools, or take external action. If nothing is pending, say so."
 )
 
 
@@ -78,6 +87,8 @@ def project_snapshot(
     *,
     doctor: dict[str, Any],
     integration: dict[str, Any],
+    expected_vault_id: str | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """Return the exact authored records needed by the read-only Bridge."""
 
@@ -145,10 +156,17 @@ def project_snapshot(
             "threads": len(thread_records),
         },
     }
+    controls = _project_controls(
+        vault,
+        codex_ready=codex_ready,
+        expected_vault_id=expected_vault_id,
+        expected_root_identity=expected_root_identity,
+    )
     return {
         "bridge": {
+            "control_queue": CONTROL_STORE_SUPPORTED,
             "local": True,
-            "read_only": True,
+            "semantic_write": False,
             "version": __version__,
         },
         "codex": {
@@ -167,6 +185,7 @@ def project_snapshot(
                 else {}
             ),
         },
+        "controls": controls,
         "doctor": resolved_doctor,
         "entities": entities,
         "mind": mind,
@@ -177,6 +196,77 @@ def project_snapshot(
         "status": status,
         "tasks": tasks,
         "threads": threads,
+    }
+
+
+def _project_controls(
+    vault: Vault,
+    *,
+    codex_ready: bool,
+    expected_vault_id: str | None,
+    expected_root_identity: tuple[int, int] | None,
+) -> dict[str, Any]:
+    """Degrade the noncanonical control lane without hiding canonical records."""
+
+    try:
+        snapshot = OperationLedger(vault.root).snapshot(
+            expected_vault_id=expected_vault_id,
+            expected_root_identity=expected_root_identity,
+        )
+    except (ContinuityError, OSError, UnicodeError, ValueError):
+        return {
+            "archived_decided": None,
+            "available": False,
+            "decided": None,
+            "disposition_revision": None,
+            "generation": None,
+            "history": [],
+            "items": [],
+            "pending": None,
+            "queue_revision": None,
+            "review_prompt": None,
+            "review_url": None,
+            "state": "unavailable",
+        }
+    items: list[dict[str, Any]] = [
+        {"event": event_dict(event), "status": "pending"} for event in snapshot.pending
+    ]
+    items.extend(
+        {
+            "disposition": disposition_dict(disposition),
+            "event": event_dict(event),
+            "status": disposition.decision.value,
+        }
+        for event, disposition in snapshot.decided
+    )
+    items.sort(key=lambda item: (str(item["event"]["created_at"]), str(item["event"]["event_id"])))
+    history: list[dict[str, Any]] = [
+        {
+            "archived": True,
+            "disposition": disposition_dict(disposition),
+            "event": event_dict(event),
+            "generation": generation.queue_generation,
+            "status": disposition.decision.value,
+        }
+        for generation in snapshot.archived
+        for event, disposition in generation.decided
+    ]
+    history.sort(
+        key=lambda item: (str(item["event"]["created_at"]), str(item["event"]["event_id"]))
+    )
+    return {
+        "archived_decided": len(history),
+        "available": True,
+        "decided": len(snapshot.decided),
+        "disposition_revision": snapshot.disposition_revision,
+        "generation": snapshot.queue_generation,
+        "history": history[-20:],
+        "items": items[-20:],
+        "pending": len(snapshot.pending),
+        "queue_revision": snapshot.queue_revision,
+        "review_prompt": _CONTROL_REVIEW_PROMPT,
+        "review_url": codex_deep_link(vault.root, _CONTROL_REVIEW_PROMPT) if codex_ready else None,
+        "state": "ready",
     }
 
 

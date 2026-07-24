@@ -16,6 +16,7 @@
   }
 
   .recovery-panel,
+  .control-panel,
   .recovery-panel.is-compact {
     grid-template-columns: 1fr;
     gap: 16px;

@@ -50,6 +50,18 @@ def test_cli_json_task_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert created["result"]["identifier"] == "cli-proof"
 
 
+def test_cli_does_not_advertise_unsupported_control_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "CONTROL_STORE_SUPPORTED", False)
+
+    parser = cli._parser()
+    with pytest.raises(SystemExit) as stopped:
+        parser.parse_args(["operation", "list"])
+
+    assert stopped.value.code == 2
+
+
 def test_setup_codex_failure_does_not_replace_existing_configuration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -395,7 +407,27 @@ def test_setup_keeps_committed_install_when_browser_open_raises(
 
     monkeypatch.setattr(cli, "install_codex_transaction", staged_install)
     monkeypatch.setattr(cli, "open_bridge", started)
-    monkeypatch.setattr(bridge_module, "_current_state", lambda: (current_state, True, False))
+
+    def current() -> tuple[
+        bridge_module.BridgeState | None,
+        bool,
+        bool,
+        dict[str, object],
+    ]:
+        assert current_state is not None
+        metadata = os.lstat(current_state.vault)
+        return (
+            current_state,
+            True,
+            False,
+            {
+                "vault_id": current_state.vault_id,
+                "vault_root_device": int(metadata.st_dev),
+                "vault_root_inode": int(metadata.st_ino),
+            },
+        )
+
+    monkeypatch.setattr(bridge_module, "_current_state", current)
 
     def browser_failure(*_: object, **__: object) -> bool:
         raise OSError("injected browser failure")
@@ -428,7 +460,17 @@ def test_direct_bridge_open_survives_browser_exception(
         vault=str(vault.root),
         vault_id=str(vault.status()["vault_id"]),
     )
-    monkeypatch.setattr(bridge_module, "_current_state", lambda: (state, True, False))
+    metadata = os.lstat(vault.root)
+    health = {
+        "vault_id": state.vault_id,
+        "vault_root_device": int(metadata.st_dev),
+        "vault_root_inode": int(metadata.st_ino),
+    }
+    monkeypatch.setattr(
+        bridge_module,
+        "_current_state",
+        lambda: (state, True, False, health),
+    )
 
     def browser_failure(*_: object, **__: object) -> bool:
         raise OSError("injected browser failure")
@@ -846,7 +888,7 @@ def test_backup_cleanup_failure_is_visible_in_cli_json(
     vault.initialize(name="Cleanup truth")
     destination = tmp_path / "backup.zip"
 
-    def fail_source_capture(_: Path) -> bytes:
+    def fail_source_capture(_: Path, **_kwargs: Any) -> bytes:
         raise ValidationError("injected source capture failure")
 
     def fail_cleanup(path: Path) -> None:

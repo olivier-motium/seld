@@ -23,6 +23,7 @@ e2e:
 
 browser:
 	uv run python scripts/verify_bridge_browser.py
+	uv run pytest tests/test_bridge_control_browser.py
 
 check: lint typecheck test privacy
 

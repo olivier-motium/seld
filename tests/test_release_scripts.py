@@ -1,21 +1,145 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
+import threading
 import tomllib
+import zipfile
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, cast
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, ProxyHandler
 
 import pytest
 
 import continuity_kernel.cli as cli_module
 from continuity_kernel import __version__
-from scripts import e2e_clean_install, privacy_check
+from scripts import build_standalone, e2e_clean_install, privacy_check
 from scripts.e2e_clean_install import _require_native_codex
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("module", [build_standalone, e2e_clean_install])
+def test_release_bridge_http_disables_proxies_for_exact_loopback(
+    module: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: dict[str, object] = {}
+
+    class FakeOpener:
+        def open(self, request: object, *, timeout: float) -> object:
+            observed["request"] = request
+            observed["timeout"] = timeout
+            return object()
+
+    def fake_build_opener(*handlers: object) -> FakeOpener:
+        observed["handlers"] = handlers
+        return FakeOpener()
+
+    monkeypatch.setattr(module, "build_opener", fake_build_opener)
+    request = module.Request(
+        "http://127.0.0.1:43117/api/v1/snapshot",
+        headers={"Authorization": "Bearer synthetic-token"},
+    )
+
+    result = module._open_loopback(request, timeout=5)
+
+    handlers = observed["handlers"]
+    assert isinstance(handlers, tuple)
+    assert len(handlers) == 2
+    assert isinstance(handlers[0], ProxyHandler)
+    assert cast(Any, handlers[0]).proxies == {}
+    assert isinstance(handlers[1], HTTPRedirectHandler)
+    assert observed["request"] is request
+    assert observed["timeout"] == 5
+    assert type(result) is object
+
+
+@pytest.mark.parametrize("module", [build_standalone, e2e_clean_install])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://attacker.example:43117/api/v1/snapshot",
+        "http://localhost:43117/api/v1/snapshot",
+        "https://127.0.0.1:43117/api/v1/snapshot",
+        "http://127.0.0.1/api/v1/snapshot",
+    ],
+)
+def test_release_bridge_http_rejects_non_exact_loopback_before_opening(
+    module: Any, url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = False
+
+    def forbidden_build_opener(*_handlers: object) -> object:
+        nonlocal opened
+        opened = True
+        raise AssertionError("an invalid Bridge URL must not reach the network")
+
+    monkeypatch.setattr(module, "build_opener", forbidden_build_opener)
+    request = module.Request(url, headers={"Authorization": "Bearer synthetic-token"})
+
+    with pytest.raises(RuntimeError, match=r"only http://127\.0\.0\.1:<port>"):
+        module._open_loopback(request, timeout=5)
+
+    assert opened is False
+
+
+@pytest.mark.parametrize("module", [build_standalone, e2e_clean_install])
+def test_release_bridge_http_refuses_redirect_before_sink_request(module: Any) -> None:
+    sink_requests: list[str | None] = []
+
+    class SinkHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            sink_requests.append(self.headers.get("Authorization"))
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), SinkHandler)
+    sink_thread = threading.Thread(target=sink.serve_forever, daemon=True)
+    sink_thread.start()
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", f"http://127.0.0.1:{sink.server_address[1]}/sink")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    redirect = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    redirect_thread = threading.Thread(target=redirect.serve_forever, daemon=True)
+    redirect_thread.start()
+    original = f"http://127.0.0.1:{redirect.server_address[1]}/source"
+    try:
+        request = module.Request(
+            original,
+            headers={"Authorization": "Bearer synthetic-token"},
+        )
+        with pytest.raises(HTTPError) as rejected:
+            module._open_loopback(request, timeout=2)
+
+        assert rejected.value.code == HTTPStatus.FOUND
+        assert rejected.value.url == original
+        assert sink_requests == []
+    finally:
+        redirect.shutdown()
+        redirect_thread.join(timeout=3)
+        redirect.server_close()
+        sink.shutdown()
+        sink_thread.join(timeout=3)
+        sink.server_close()
 
 
 def _write_uninstall_fixture(path: Path) -> None:
@@ -707,6 +831,80 @@ def test_artifact_directory_scan_is_recursive(tmp_path: Path) -> None:
 
     assert scanned == 1
     assert findings == [privacy_check.Finding("platform/gsv", "working-tree")]
+
+
+def test_artifact_scan_reads_deflated_wheel_members(tmp_path: Path) -> None:
+    artifact = tmp_path / "gsv-test.whl"
+    canary = b"-----BEGIN " + b"PRIVATE KEY-----"
+    with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("continuity_kernel/hidden.py", canary * 8)
+    assert canary not in artifact.read_bytes()
+
+    findings, scanned = privacy_check.scan_artifact_path(
+        artifact,
+        privacy_check.PATTERNS,
+        root=tmp_path,
+    )
+
+    assert scanned == 2
+    assert (
+        privacy_check.Finding(
+            "gsv-test.whl!continuity_kernel/hidden.py",
+            "artifact-member",
+        )
+        in findings
+    )
+
+
+def test_artifact_scan_reads_compressed_sdist_members(tmp_path: Path) -> None:
+    artifact = tmp_path / "gsv-test.tar.gz"
+    canary = b"-----BEGIN " + b"PRIVATE KEY-----"
+    content = canary * 8
+    info = tarfile.TarInfo("gsv-test/hidden.py")
+    info.size = len(content)
+    with tarfile.open(artifact, "w:gz") as archive:
+        archive.addfile(info, io.BytesIO(content))
+    assert canary not in artifact.read_bytes()
+
+    findings, scanned = privacy_check.scan_artifact_path(
+        artifact,
+        privacy_check.PATTERNS,
+        root=tmp_path,
+    )
+
+    assert scanned == 2
+    assert (
+        privacy_check.Finding(
+            "gsv-test.tar.gz!gsv-test/hidden.py",
+            "artifact-member",
+        )
+        in findings
+    )
+
+
+def test_artifact_scan_fails_closed_on_oversized_compressed_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "oversized.whl"
+    with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("continuity_kernel/large.py", b"x" * 512)
+    assert artifact.stat().st_size < 256
+    monkeypatch.setattr(privacy_check, "MAX_SCAN_BYTES", 256)
+
+    findings, scanned = privacy_check.scan_artifact_path(
+        artifact,
+        privacy_check.PATTERNS,
+        root=tmp_path,
+    )
+
+    assert scanned == 1
+    assert findings == [
+        privacy_check.Finding(
+            "oversized.whl!continuity_kernel/large.py",
+            "artifact-member-oversized",
+        )
+    ]
 
 
 def test_privacy_scan_detects_json_escaped_windows_home(tmp_path: Path) -> None:

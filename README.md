@@ -1,73 +1,120 @@
 # GSV
 
-## Keep your work with Codex in one place.
+## Turn Codex into the AI that manages your life.
 
-GSV keeps a local record of what you are trying to get done, what already
-happened, and what should happen next. You keep using Codex Desktop. Open the
-private GSV dashboard to see your work and create a Codex task for any
-unfinished item.
+GSV 1.0 is being built to bring your email, messages, calendars, files, GitHub
+work, and Codex activity into one current picture of your life. It is meant to
+keep track of people, projects, promises, decisions, waiting-fors, and what
+needs attention next. You keep talking and working in Codex. The local Bridge
+shows durable GSV records and the exact work Codex can continue.
 
-When a Codex task ends, fails, or gets replaced, the work record stays. GSV
-stores those records as readable files on your computer. There is no GSV
-account, hosted database, or cloud service.
+Your canonical GSV records are readable files on your computer. There is no GSV
+account, hosted database, telemetry service, or second chat app.
 
-> **`0.2.0` is private and unreleased.** The public install path is not live
-> yet. [See what remains to validate](#release-status).
+> **This repository contains the public continuity kernel, not the 1.0
+> replacement product.** The current foundation branch implements one bounded
+> Bridge-intent round trip for local verification. Its onboarding and source
+> models, Pulse admission, and scheduler planners are foundation code, not
+> installed consumer capabilities. Every Plus-account, connector, clean-machine,
+> signing, platform, and soak gate remains open. [See the exact release
+> gates](docs/release-gates.md).
 
-## What this looks like
+## What GSV 1.0 is for
 
-| You ask Codex | The saved GSV record keeps |
+The 1.0 product is intended to give Codex a durable model of the parts of your
+life you choose to share:
+
+- **What you care about:** current direction, priorities, constraints, and
+  routines.
+- **What is happening:** active work, personal obligations, decisions, people,
+  and longer-running situations.
+- **What changed:** bounded evidence from connected sources, including honest
+  gaps when a source is stale or unavailable.
+- **What happens next:** the next actor, exact continuation, approval boundary,
+  and one active Codex hand for each real outcome.
+
+Bridge follows one simple contract: **read here, talk in Codex**. In this
+foundation slice, its authenticated control route can queue an explicit setup
+choice, approval, correction, or undo request. A separate CLI or MCP process
+can accept or reject that queued intent durably. Disposition does not execute
+the request, authorize an external action, change semantic records, or mark
+work complete. This control lane currently requires secure directory-pinned
+storage available on macOS and Linux; Windows fails closed and remains an open
+cross-platform gate while canonical Bridge reads stay available.
+
+## Why cross-source context matters
+
+In the private resident workflow that informs this product, an invoice
+follow-up looked overdue because documents mentioned in WhatsApp were missing
+from the local package. Teams showed that those documents had already been
+sent. The resident GSV cancelled the duplicate chase and changed the next
+action to reconcile the received files. This is product evidence from the
+private workflow, not proof that the public build currently connects WhatsApp
+or Teams.
+
+A mailbox-only assistant would have kept chasing. A chat summary would have
+lost the correction later. GSV carried the decision, evidence references, and
+new next action into the exact Codex task doing the work.
+
+The same model applies to ordinary work:
+
+| Situation | What GSV keeps current |
 | --- | --- |
-| “Continue the failed release.” | Why CI failed, the decision already made, and the next check. |
-| “Pick up the recruiter reply.” | Who it concerns, the current status, and the next action. |
-| “Finish the invoice review.” | Which items are verified or missing, decisions already made, and the next check. |
+| A dentist appointment is discussed by email and appears on the calendar. | The commitment, date, open preparation, and whether anything still needs a reply. |
+| A recruiter asks for a CV while another thread contains role constraints. | The person, role, latest approved document, constraints, and exact reply task. |
+| A family commitment conflicts with a project deadline. | Both commitments, the constraint, the decision, and who needs to act next. |
+| A release fails in Codex and continues in a fresh task. | The real outcome, failure evidence, decision already made, and exact next check. |
 
-The work does not have to be software. GSV records an outcome, status, related
-people or projects, supporting references, and the next action you chose to
-save. It does not guess priorities from chat history or activity.
+## Why GSV 1.0 aims to replace OpenClaw or Hermes
 
-## What you can do
+[OpenClaw](https://docs.openclaw.ai/) and
+[Hermes Agent](https://hermes-agent.nousresearch.com/docs/) are capable local,
+proactive agent systems. They support memory, schedules, messaging, tools, and
+Codex execution. GSV 1.0 is designed for a different daily setup: native Codex
+stays the conversation and execution surface, while GSV maintains an explicit
+whole-life operating model around it.
 
-- **See what is open.** The local dashboard shows work that is ready, in
-  progress, waiting, saved for later, or closed, including who acts next when
-  that has been recorded.
-- **Open an unfinished item in Codex.** GSV creates a new-task link with a
-  prompt that names the work item and points Codex to your local GSV folder.
-- **Keep decisions from being overwritten.** If an older process tries to save
-  over newer work, GSV rejects the update.
-- **Inspect and back up your GSV records.** Tasks, context, people, projects,
-  and longer-running work are plain Markdown files.
+That model includes Direction, Portfolio, commitments, canonical people and
+projects, ongoing WorkThreads, source freshness, the next actor, and exact
+Codex-task continuity. Messages and files become bounded evidence for authored
+claims and references that a later session can inspect directly.
 
-## A normal GSV flow
+The replacement case is for people who want Codex to be the app they live in
+and one local Mind to manage work and life across sources. Until the release
+ledger passes, the public build remains a continuity kernel rather than a
+proven OpenClaw or Hermes replacement.
 
-```text
-Ask Codex to do something
-        ↓
-Codex reads or updates the relevant local record
-        ↓
-GSV shows what happened and what comes next
-        ↓
-Open that item in Codex when you are ready to continue
-```
+## What is proven, and what is only foundation code
 
-The current candidate proves the file and process recovery path with synthetic
-data. A real continuation into a second Codex task is still being validated
-and is not claimed as complete.
+- Durable local Tasks, Entities, WorkThreads, Mind, and current orientation.
+- Compare-and-swap writes, crash recovery, verified backup/restore, and
+  reversible Codex integration.
+- A private loopback Bridge with exact continuation links.
 
-## How it fits with other tools
+This foundation branch adds an authenticated, compare-and-swap Bridge control
+queue plus durable accept/reject dispositions readable from a fresh CLI or MCP
+process on macOS and Linux. Windows has no secure pinned-store backend in this
+foundation and fails the control lane closed. That bounded loop is not a
+semantic mutation or action executor.
 
-| Product | Its job | Where GSV fits |
-| --- | --- | --- |
-| **Codex** | Lets you ask AI to write code, review changes, and carry out work. | GSV keeps the saved work those Codex tasks can read and update on your computer. |
-| **OpenClaw** | Lets you reach and run agents through messaging apps. | GSV keeps you in Codex instead of adding another chat surface. |
-| **Hermes Agent** | Runs an agent with its own tools, memory, schedules, and messaging. | GSV keeps Codex as your agent app and organizes its work locally. |
+The branch also contains context-first onboarding state, host readiness
+receipts, source-attestation validators, Pulse admission, and scheduler-canary
+planners. Those modules are inert foundation contracts until they are wired to
+supported public interfaces and pass the installed-path gates.
+
+The code does not claim consumer onboarding, live connectors, unattended
+Plus-account operation, signed native installs, or cross-platform daily-use
+proof until those paths have passed their release gates.
 
 ## On your computer
 
 GSV stores its records in `~/GSV` by default. They are normal Markdown files,
 so Git, `grep`, backup tools, and optional local search tools can inspect them.
-The dashboard listens only on your computer and is read-only. It never decides
-what a task means or marks work complete from browser activity.
+The dashboard listens only on your computer. Its read views cannot change
+semantic records. The one control endpoint can append a CAS-protected setup
+choice, approval, correction, or undo request for later disposition. Accepting
+or rejecting that receipt acknowledges the intent; it does not apply it.
+Browser activity never decides what a task means or marks work complete.
 
 GSV has no hosted service, database server, embedding model, API key, cloud
 sync, or autonomous background worker. These limits describe GSV itself;
@@ -75,10 +122,13 @@ Codex has separate processing and account boundaries.
 
 ## Release status
 
-The macOS Apple Silicon `0.2.0` candidate has passed local installation and
-recovery checks. Other platforms and a real continuation into a second Codex
-task remain release gates. No public `0.2.0` build exists yet,
-and the published `0.1.0` release does not include the dashboard.
+A predecessor macOS Apple Silicon `0.2.0` continuity candidate passed local
+installation and recovery checks. That evidence does not promote this branch
+or the 1.0 product. The Culture-Grade foundation has not passed Gate 0, a clean
+Plus-account install, live connector proof, scheduled autonomy, macOS/Windows
+signing, the cross-platform matrix, the 72-hour scheduler soak, the 30-day
+account soak, or the six-person beta. No public `0.2.0` build exists yet, and
+the published `0.1.0` release does not include the dashboard.
 
 ## Install
 
@@ -177,6 +227,8 @@ the exact recovery command instead of guessing.
 - [Architecture](docs/architecture.md)
 - [Trust model](docs/trust-model.md)
 - [Codex integration evidence](docs/codex-integration.md)
+- [Onboarding target and current gaps](docs/onboarding.md)
+- [1.0 replacement release gates](docs/release-gates.md)
 
 ## Develop
 

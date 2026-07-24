@@ -7,9 +7,10 @@ currently exists, and the `0.1.0` release does not contain the Bridge. The
 consumer commands below become live only after the exact `0.2.0` assets and
 checksums are published.
 
-The exact `0.2.0` candidate is currently validated locally on macOS Apple
-Silicon. macOS Intel, Linux x86_64/ARM64, and Windows x86_64 remain unpromoted
-until the exact candidate passes its own hosted build and clean-install run.
+A predecessor `0.2.0` development snapshot passed local macOS Apple Silicon
+checks. That evidence does not transfer to this candidate. Every target,
+including macOS Apple Silicon, remains unpromoted until the exact release bytes
+pass their own hosted build and clean-install run.
 
 ## Agent-led install
 
@@ -21,11 +22,11 @@ checksum is unavailable.
 
 ## Consumer prerequisites
 
-GSV needs an installed Codex command surface. On the validated macOS path, it
-checks `GSV_CODEX`, `PATH`, and the installed Codex Desktop app bundle; Codex
+GSV needs an installed Codex command surface. The macOS discovery code checks
+`GSV_CODEX`, `PATH`, and the installed Codex Desktop app bundle; Codex
 does not need to be added to `PATH` when that bundle contains the command.
-Discovery on other platforms is not a support claim until that exact artifact
-passes its hosted acceptance run.
+Source-level discovery behavior is not a support claim until the exact artifact
+passes its hosted acceptance run on that target.
 
 A release install does not require Python, `uv`, or `make`. The POSIX installer
 uses HTTPS plus `sha256sum` or `shasum`; the Windows installer uses PowerShell's

@@ -33,9 +33,11 @@ from continuity_kernel.config import (
     restore_config,
     save_config,
 )
+from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
 from continuity_kernel.errors import ContinuityError, SetupError
 from continuity_kernel.mcp_server import serve
+from continuity_kernel.operations import OperationLedger, capture_operation_binding
 from continuity_kernel.records import record_dict
 from continuity_kernel.vault import Vault, doctor_dict
 
@@ -226,6 +228,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return _entity(vault, args)
     if args.command == "thread":
         return _thread(vault, args)
+    if args.command == "operation":
+        return _operation(vault, args)
     if args.command == "document":
         if args.document_command == "show":
             return vault.read_document(args.name)
@@ -428,6 +432,38 @@ def _thread(vault: Vault, args: argparse.Namespace) -> Any:
     )
 
 
+def _operation(vault: Vault, args: argparse.Namespace) -> Any:
+    """Read or disposition Bridge intents without executing their requested effect."""
+
+    ledger = OperationLedger(vault.root)
+    binding = capture_operation_binding(vault.root)
+    if args.operation_command == "list":
+        return ledger.snapshot(
+            expected_vault_id=binding.vault_id,
+            expected_root_identity=binding.root_identity,
+        ).to_dict()
+    if args.operation_command in {"accept", "reject"}:
+        return ledger.decide(
+            event_id=args.event_id,
+            decision="accepted" if args.operation_command == "accept" else "rejected",
+            actor_ref=args.actor_ref,
+            reason_code=args.reason_code,
+            expected_queue_revision=args.expected_queue_revision,
+            expected_disposition_revision=args.expected_disposition_revision,
+            expected_vault_id=args.expected_vault_id,
+            expected_root_identity=binding.root_identity,
+            result_ref=args.result_ref,
+        ).to_dict()
+    if args.operation_command == "archive-closed":
+        return ledger.archive_closed(
+            expected_queue_revision=args.expected_queue_revision,
+            expected_disposition_revision=args.expected_disposition_revision,
+            expected_vault_id=args.expected_vault_id,
+            expected_root_identity=binding.root_identity,
+        )
+    raise AssertionError("unreachable operation command")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gsv",
@@ -526,6 +562,39 @@ def _parser() -> argparse.ArgumentParser:
     thread_update.add_argument("--entity-id", action="append")
     thread_update.add_argument("--add-ref", action="append", default=[])
     thread_update.add_argument("--remove-ref", action="append", default=[])
+
+    if CONTROL_STORE_SUPPORTED:
+        operation = commands.add_parser(
+            "operation",
+            help=(
+                "Read and disposition bounded Bridge intents on macOS/Linux. Never execute "
+                "their requested effect."
+            ),
+        )
+        operation_commands = operation.add_subparsers(dest="operation_command", required=True)
+        operation_commands.add_parser("list", help="List pending and durably decided intents.")
+        for name, help_text in (
+            (
+                "accept",
+                "Acknowledge one intent for later review; this does not approve or execute it.",
+            ),
+            ("reject", "Reject one intent without changing semantic canon."),
+        ):
+            disposition = operation_commands.add_parser(name, help=help_text)
+            disposition.add_argument("event_id")
+            disposition.add_argument("--expected-queue-revision", required=True)
+            disposition.add_argument("--expected-disposition-revision", required=True)
+            disposition.add_argument("--expected-vault-id", required=True)
+            disposition.add_argument("--actor-ref", required=True)
+            disposition.add_argument("--reason-code", required=True)
+            disposition.add_argument("--result-ref")
+        archive_closed = operation_commands.add_parser(
+            "archive-closed",
+            help="Recover bounded queue capacity after every live intent has a disposition.",
+        )
+        archive_closed.add_argument("--expected-queue-revision", required=True)
+        archive_closed.add_argument("--expected-disposition-revision", required=True)
+        archive_closed.add_argument("--expected-vault-id", required=True)
 
     document = commands.add_parser("document", help="Read or update MIND.md and NOW.md.")
     document_commands = document.add_subparsers(dest="document_command", required=True)

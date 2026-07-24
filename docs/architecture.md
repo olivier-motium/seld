@@ -7,7 +7,10 @@
 - **Mind** is the authored point of view in durable documents and records.
 - **Hands** are replaceable MCP or Codex execution episodes using the same
   kernel.
-- **Bridge** is the read-only human surface over current authored state.
+- **Bridge** is the human read surface plus a narrow append-only queue for
+  explicit setup choices, approvals, corrections, and undo requests. A queued
+  intent and its accept/reject disposition cannot author semantic canon or
+  authorize an external action.
 - **Pulse** and **Shipyard** are operating roles with durable review boundaries
   in `0.2.0`, not autonomous scheduler or self-modification services.
 
@@ -17,6 +20,14 @@
 records. `continuity_kernel.vault` owns validation, locking, atomic persistence,
 context rendering, backup, restore, and health checks. The CLI and
 dependency-free stdio MCP server are adapters over that same vault.
+
+The Culture-Grade branch also contains onboarding storage, source recipes and
+attestation validation, Pulse admission, scheduler planning, privacy screening,
+and migration modules. Unless a module is exposed through a documented public
+CLI/MCP path and proved through its installed user flow, it is foundation code,
+not a shipped capability. Bridge does not publish onboarding or host-readiness
+foundation state. Public onboarding/source mutation and validation, Pulse,
+scheduler, and migration interfaces remain unexposed.
 
 Markdown in the vault is authoritative. Deterministic code may persist,
 validate, traverse, and render authored facts. It may not infer task meaning,
@@ -40,9 +51,10 @@ starts the Bridge. A later setup failure rolls back only components introduced
 by that invocation. Existing or concurrently changed user components are left
 untouched.
 
-On the validated macOS path, Codex discovery checks an explicit `GSV_CODEX`,
-`PATH`, and known Codex Desktop app bundles. Codex does not have to be on
-`PATH` when the installed bundle exposes its command.
+The macOS discovery implementation checks an explicit `GSV_CODEX`, `PATH`, and
+known Codex Desktop app bundles. Codex does not have to be on `PATH` when the
+installed bundle exposes its command. This code path is not current-candidate
+installed-platform evidence.
 
 ## Bridge lifecycle
 
@@ -54,8 +66,9 @@ in an owner-only state receipt.
 The private snapshot and health endpoints require the per-launch bearer. The
 browser receives it in the URL fragment, moves it into `sessionStorage`, and
 removes it from the visible URL before requesting private data. Static assets
-do not require vault access. The Bridge rejects cross-origin requests, writes,
-path traversal, symlinked assets, and oversized assets.
+do not require vault access. The Bridge rejects cross-origin requests, every
+write outside its single bounded control endpoint, path traversal, symlinked
+assets, and oversized assets.
 
 Stop is fail-closed. GSV signals a receipt PID only when the live authenticated
 health response matches the same instance, PID, port, and vault. A stale,
@@ -121,6 +134,29 @@ than retrying with a stale revision.
 
 Global operations such as backup hold the global lock before record locks so a
 snapshot cannot mix record versions.
+
+Bridge control events follow a deliberately smaller write flow. The browser
+reads the current queue revision from the authenticated snapshot, submits one
+of four fixed intent shapes, and the core appends it only when that revision is
+still current. A separate CLI or MCP process reads the logical vault ID plus
+queue and disposition revisions and may durably accept or reject one event
+exactly once against all three values. A long-lived MCP process also binds
+operations to the physical vault root it opened. That disposition survives
+restart, but it only acknowledges the intent. It does not execute it, authorize
+an external action, or mutate semantic canon. Provider text cannot add fields
+or turn an event or disposition into authority. Closed-queue archival is an
+operator capacity-recovery seam, not an ordinary Bridge or onboarding action.
+Snapshot, Bridge GET, CLI list, and MCP list are observational: they never
+anchor or repair disposition state. An explicit accept, reject, or archive
+mutation validates the vault binding and revisions from that observation
+before performing any deterministic recovery it needs.
+
+This control write flow currently depends on POSIX directory descriptors,
+`O_NOFOLLOW`, and directory-root locking. It is enabled on macOS and Linux. The
+Windows foundation deliberately does not advertise the operation CLI or MCP
+surface until an equivalent secure pinned-store backend exists. Bridge reports
+the control lane unavailable, does not fall back to a path-based writer, and
+keeps canonical read projections usable.
 
 Backup creation reads each included regular file once, hashes those captured
 bytes, and writes the same bytes into a staged ZIP. Symlinks and other special

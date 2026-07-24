@@ -1,4 +1,4 @@
-"""The Bridge: a small, read-only loopback view of one GSV vault."""
+"""The Bridge: a loopback view plus narrow control queue for one GSV vault."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from socketserver import TCPServer
 from typing import Any, BinaryIO, Final, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from continuity_kernel import __version__
 from continuity_kernel.atomic import atomic_write, exclusive_lock, read_regular_file
@@ -45,12 +45,22 @@ from continuity_kernel.bridge_projection import (
     codex_deep_link as codex_deep_link,
 )
 from continuity_kernel.config import data_dir
-from continuity_kernel.errors import ContinuityError, SetupError, ValidationError
+from continuity_kernel.control_queue import ControlQueue, ControlStorageError, event_dict
+from continuity_kernel.errors import (
+    ConflictError,
+    ContinuityError,
+    DegradedIntegrityError,
+    MutationCommittedError,
+    SetupError,
+    ValidationError,
+)
+from continuity_kernel.operations import OperationLedger
 from continuity_kernel.vault import Vault
 
 LOOPBACK_HOST: Final = "127.0.0.1"
 DEFAULT_PORT: Final = 0
 MAX_TARGET_LENGTH: Final = 4_096
+MAX_CONTROL_BODY_BYTES: Final = 16 * 1_024
 MAX_STATIC_BYTES: Final = 4 * 1024 * 1024
 MAX_STATE_BYTES: Final = 64 * 1024
 STATE_VERSION: Final = 1
@@ -146,6 +156,8 @@ def bridge_snapshot(
     *,
     doctor: dict[str, Any] | None = None,
     integration: dict[str, Any] | None = None,
+    expected_vault_id: str | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """Return the exact authored records needed by the read-only Bridge."""
 
@@ -153,6 +165,8 @@ def bridge_snapshot(
         vault,
         doctor=doctor if doctor is not None else _bridge_doctor(vault),
         integration=integration if integration is not None else _codex_metadata(),
+        expected_vault_id=expected_vault_id,
+        expected_root_identity=expected_root_identity,
     )
 
 
@@ -199,7 +213,20 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         self.access_token = access_token
         self.instance_id = instance_id
         self.vault = vault
+        root_metadata = os.lstat(vault.root)
+        if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+            raise ValidationError("Bridge vault root must be a real directory")
+        self.vault_root_identity = (
+            int(root_metadata.st_dev),
+            int(root_metadata.st_ino),
+        )
         self.vault_id = str(vault.identity()["vault_id"])
+        current_root = os.lstat(vault.root)
+        if (
+            not stat.S_ISDIR(current_root.st_mode)
+            or (int(current_root.st_dev), int(current_root.st_ino)) != self.vault_root_identity
+        ):
+            raise ValidationError("Bridge vault root changed during startup")
         self.static_root = static_root.resolve()
         self.integration_provider = integration_provider or _codex_metadata
         self._doctor: dict[str, Any] | None = None
@@ -216,14 +243,37 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         super().__init__(address, BridgeRequestHandler)
 
     def snapshot(self) -> dict[str, Any]:
+        self._require_current_vault_identity()
         now = time.monotonic()
         doctor = self._doctor_snapshot(now)
         integration = self._integration_snapshot(now)
-        return bridge_snapshot(
+        snapshot = bridge_snapshot(
             self.vault,
             doctor=doctor,
             integration=integration,
+            expected_vault_id=self.vault_id,
+            expected_root_identity=self.vault_root_identity,
         )
+        self._require_current_vault_identity()
+        return snapshot
+
+    def _require_current_vault_identity(self) -> None:
+        """Refuse reads or writes after the Bridge pathname names another vault."""
+
+        try:
+            root_metadata = os.lstat(self.vault.root)
+            current = str(self.vault.identity()["vault_id"])
+        except (ContinuityError, OSError, KeyError, TypeError) as exc:
+            raise DegradedIntegrityError(
+                "the Bridge vault identity is no longer available"
+            ) from exc
+        if (
+            stat.S_ISLNK(root_metadata.st_mode)
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or (int(root_metadata.st_dev), int(root_metadata.st_ino)) != self.vault_root_identity
+            or current != self.vault_id
+        ):
+            raise DegradedIntegrityError("the Bridge vault identity changed after startup")
 
     def _doctor_snapshot(self, now: float) -> dict[str, Any]:
         with self._metadata_lock:
@@ -276,7 +326,7 @@ class BridgeHTTPServer(ThreadingHTTPServer):
 
 
 class BridgeRequestHandler(BaseHTTPRequestHandler):
-    """Serve a read-only projection with strict loopback and browser headers."""
+    """Serve local reads plus one authenticated, bounded intent endpoint."""
 
     protocol_version = "HTTP/1.1"
 
@@ -291,27 +341,59 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self._handle(head_only=True)
 
     def do_POST(self) -> None:
-        self._error(HTTPStatus.METHOD_NOT_ALLOWED, "The Bridge is read-only")
+        if len(self.path) > MAX_TARGET_LENGTH:
+            self._error(HTTPStatus.REQUEST_URI_TOO_LONG, "Request target is too long")
+            return
+        if not self._valid_host() or not self._valid_origin(required=True):
+            self._error(HTTPStatus.FORBIDDEN, "The Bridge is available only on this computer")
+            return
+        target = urlsplit(self.path)
+        if target.path != "/api/v1/control":
+            self._error(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                "The Bridge accepts only bounded control requests",
+            )
+            return
+        if not self._authorized():
+            self._error(HTTPStatus.FORBIDDEN, "That Bridge session is not available")
+            return
+        self._append_control()
 
-    do_PUT = do_POST
-    do_PATCH = do_POST
-    do_DELETE = do_POST
+    def _reject_non_post_write(self) -> None:
+        self.close_connection = True
+        self._error(HTTPStatus.METHOD_NOT_ALLOWED, "Only POST can append a Bridge intent")
+
+    do_PUT = _reject_non_post_write
+    do_PATCH = _reject_non_post_write
+    do_DELETE = _reject_non_post_write
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
 
     def _handle(self, *, head_only: bool) -> None:
         if len(self.path) > MAX_TARGET_LENGTH:
-            self._error(HTTPStatus.REQUEST_URI_TOO_LONG, "Request target is too long")
+            self._error(
+                HTTPStatus.REQUEST_URI_TOO_LONG,
+                "Request target is too long",
+                head_only=head_only,
+            )
             return
         if not self._valid_host() or not self._valid_origin():
-            self._error(HTTPStatus.FORBIDDEN, "The Bridge is available only on this computer")
+            self._error(
+                HTTPStatus.FORBIDDEN,
+                "The Bridge is available only on this computer",
+                head_only=head_only,
+            )
             return
         target = urlsplit(self.path)
         try:
             if target.path == "/api/v1/health":
                 if not self._authorized():
-                    self._error(HTTPStatus.FORBIDDEN, "That Bridge session is not available")
+                    self._error(
+                        HTTPStatus.FORBIDDEN,
+                        "That Bridge session is not available",
+                        head_only=head_only,
+                    )
                     return
                 self._json(
                     {
@@ -321,6 +403,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                         "port": int(self.bridge.server_address[1]),
                         "service": "gsv-bridge",
                         "vault_id": self.bridge.vault_id,
+                        "vault_root_device": self.bridge.vault_root_identity[0],
+                        "vault_root_inode": self.bridge.vault_root_identity[1],
                         "version": __version__,
                     },
                     head_only=head_only,
@@ -328,7 +412,11 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 return
             if target.path == "/api/v1/snapshot":
                 if not self._authorized():
-                    self._error(HTTPStatus.FORBIDDEN, "That Bridge session is not available")
+                    self._error(
+                        HTTPStatus.FORBIDDEN,
+                        "That Bridge session is not available",
+                        head_only=head_only,
+                    )
                     return
                 self._json(self.bridge.snapshot(), head_only=head_only)
                 return
@@ -338,35 +426,113 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             if target.path.startswith("/static/"):
                 self._static(target.path.removeprefix("/static/"), head_only=head_only)
                 return
-            self._error(HTTPStatus.NOT_FOUND, "That Bridge view does not exist")
+            self._error(
+                HTTPStatus.NOT_FOUND,
+                "That Bridge view does not exist",
+                head_only=head_only,
+            )
         except (ContinuityError, OSError, UnicodeError, ValueError):
-            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "The local GSV vault is unavailable")
+            self._error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "The local GSV vault is unavailable",
+                head_only=head_only,
+            )
+
+    def _append_control(self) -> None:
+        content_type = self.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            self._error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Control requests must be JSON")
+            return
+        if self.headers.get("Transfer-Encoding") is not None:
+            self._error(HTTPStatus.BAD_REQUEST, "Streaming request bodies are not accepted")
+            return
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length) if raw_length is not None else -1
+        except ValueError:
+            length = -1
+        if not 0 < length <= MAX_CONTROL_BODY_BYTES:
+            self._error(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "Control request is empty or too large",
+            )
+            return
+        try:
+            raw = self.rfile.read(length)
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._error(HTTPStatus.BAD_REQUEST, "Control request is not valid JSON")
+            return
+        if not isinstance(payload, dict) or set(payload) - {
+            "choice",
+            "expected_revision",
+            "kind",
+            "subject",
+            "target_revision",
+        }:
+            self._error(HTTPStatus.BAD_REQUEST, "Control request has an unsupported shape")
+            return
+        try:
+            self.bridge._require_current_vault_identity()
+            OperationLedger(self.bridge.vault.root).snapshot(
+                expected_vault_id=self.bridge.vault_id,
+                expected_root_identity=self.bridge.vault_root_identity,
+            )
+            snapshot = ControlQueue(self.bridge.vault.root).append(
+                kind=payload.get("kind"),
+                subject=payload.get("subject"),
+                choice=payload.get("choice"),
+                expected_revision=payload.get("expected_revision"),
+                target_revision=payload.get("target_revision"),
+                expected_vault_id=self.bridge.vault_id,
+                expected_root_identity=self.bridge.vault_root_identity,
+            )
+            event = snapshot.events[-1]
+            self.bridge._require_current_vault_identity()
+        except ConflictError as exc:
+            self._error(HTTPStatus.CONFLICT, str(exc))
+            return
+        except (MutationCommittedError, DegradedIntegrityError):
+            self._error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "The control queue may have changed, but GSV could not confirm its durable "
+                "result. Reload the queue before retrying",
+            )
+            return
+        except (ControlStorageError, OSError):
+            self._error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "The private Bridge control queue is unavailable; canonical reads remain usable",
+            )
+            return
+        except ValidationError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self._json(
+            {
+                "event": event_dict(event),
+                "ok": True,
+                "revision": snapshot.revision,
+            },
+            head_only=False,
+            status=HTTPStatus.CREATED,
+        )
 
     def _valid_host(self) -> bool:
         raw = self.headers.get("Host", "")
-        if not raw:
-            return False
-        try:
-            parsed = urlsplit(f"http://{raw}")
-            return parsed.hostname in {LOOPBACK_HOST, "localhost", "::1"} and parsed.port == int(
-                self.bridge.server_address[1]
-            )
-        except ValueError:
-            return False
+        port = int(self.bridge.server_address[1])
+        return raw in {f"{LOOPBACK_HOST}:{port}", f"localhost:{port}", f"[::1]:{port}"}
 
-    def _valid_origin(self) -> bool:
+    def _valid_origin(self, *, required: bool = False) -> bool:
         raw = self.headers.get("Origin")
         if raw is None:
-            return True
-        try:
-            parsed = urlsplit(raw)
-            return (
-                parsed.scheme == "http"
-                and parsed.hostname in {LOOPBACK_HOST, "localhost", "::1"}
-                and parsed.port == int(self.bridge.server_address[1])
-            )
-        except ValueError:
-            return False
+            return not required
+        port = int(self.bridge.server_address[1])
+        return raw in {
+            f"http://{LOOPBACK_HOST}:{port}",
+            f"http://localhost:{port}",
+            f"http://[::1]:{port}",
+        }
 
     def _authorized(self) -> bool:
         authorization = self.headers.get("Authorization", "")
@@ -383,13 +549,27 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         decoded = unquote(relative)
         path = PurePosixPath(decoded)
         if path.is_absolute() or ".." in path.parts or "\\" in decoded:
-            self._error(HTTPStatus.NOT_FOUND, "That Bridge asset does not exist")
+            self._error(
+                HTTPStatus.NOT_FOUND,
+                "That Bridge asset does not exist",
+                head_only=head_only,
+            )
             return
-        target = (self.bridge.static_root / Path(*path.parts)).resolve()
+        target = self.bridge.static_root
         try:
+            for part in path.parts:
+                target /= part
+                metadata = os.lstat(target)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise ValidationError("Bridge static assets cannot be symlinks")
+            target = target.resolve(strict=True)
             target.relative_to(self.bridge.static_root)
-        except ValueError:
-            self._error(HTTPStatus.NOT_FOUND, "That Bridge asset does not exist")
+        except (OSError, RuntimeError, ValidationError, ValueError):
+            self._error(
+                HTTPStatus.NOT_FOUND,
+                "That Bridge asset does not exist",
+                head_only=head_only,
+            )
             return
         try:
             payload = read_regular_file(
@@ -398,7 +578,11 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 max_bytes=MAX_STATIC_BYTES,
             )
         except ValidationError:
-            self._error(HTTPStatus.NOT_FOUND, "That Bridge asset does not exist")
+            self._error(
+                HTTPStatus.NOT_FOUND,
+                "That Bridge asset does not exist",
+                head_only=head_only,
+            )
             return
         content_type = _MIME_TYPES.get(
             target.suffix.lower(),
@@ -412,24 +596,30 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             head_only=head_only,
         )
 
-    def _json(self, payload: dict[str, Any], *, head_only: bool) -> None:
+    def _json(
+        self,
+        payload: dict[str, Any],
+        *,
+        head_only: bool,
+        status: HTTPStatus = HTTPStatus.OK,
+    ) -> None:
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send(
-            HTTPStatus.OK,
+            status,
             encoded,
             content_type="application/json; charset=utf-8",
             cache_control="no-store",
             head_only=head_only,
         )
 
-    def _error(self, status: HTTPStatus, message: str) -> None:
+    def _error(self, status: HTTPStatus, message: str, *, head_only: bool = False) -> None:
         payload = json.dumps({"error": message, "ok": False}).encode("utf-8")
         self._send(
             status,
             payload,
             content_type="application/json; charset=utf-8",
             cache_control="no-store",
-            head_only=False,
+            head_only=head_only,
         )
 
     def _send(
@@ -513,7 +703,7 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
 
     root = _private_runtime_dir()
     with exclusive_lock(root / "bridge.lock", timeout=BRIDGE_LOCK_TIMEOUT):
-        current, current_running, health_unavailable = _current_state()
+        current, current_running, health_unavailable, current_health = _current_state()
         if health_unavailable:
             raise SetupError(
                 "The existing Bridge process is still alive, but its private health check "
@@ -525,6 +715,11 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
                 raise SetupError(
                     "The Bridge is already running for another GSV vault. "
                     "Run `gsv bridge stop` before switching vaults."
+                )
+            if not _health_matches_vault(current_health, vault):
+                raise SetupError(
+                    "The running Bridge belongs to an earlier vault directory at this path. "
+                    "Run `gsv bridge stop`, then run `gsv bridge open` again."
                 )
             url = current.url
             started = False
@@ -568,6 +763,13 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
                 _terminate_pid(process.pid)
                 _remove_state_if_owned(state.pid, instance_id)
                 raise SetupError(f"The Bridge reported an unexpected identity. See {log_path}")
+            if not _health_matches_vault(health, vault):
+                _terminate_pid(process.pid)
+                _remove_state_if_owned(state.pid, instance_id)
+                raise SetupError(
+                    "The Bridge started against a different vault directory identity. "
+                    f"See {log_path}"
+                )
             url = state.url
             started = True
     opened = open_bridge_in_browser(vault) if open_browser else False
@@ -589,10 +791,12 @@ def open_bridge_in_browser(vault: Vault) -> bool:
 
     root = _private_runtime_dir()
     with exclusive_lock(root / "bridge.lock", timeout=BRIDGE_LOCK_TIMEOUT):
-        state, running, _ = _current_state()
+        state, running, _, health = _current_state()
         if not running or state is None:
             return False
         if Path(state.vault).resolve() != vault.root:
+            return False
+        if not _health_matches_vault(health, vault):
             return False
         try:
             return _launch_browser(_open_url(state))
@@ -613,7 +817,7 @@ def bridge_status() -> dict[str, Any]:
 
 
 def _bridge_status_locked() -> dict[str, Any]:
-    state, running, health_unavailable = _current_state()
+    state, running, health_unavailable, _ = _current_state()
     if state is None:
         return {"running": False}
     return {
@@ -721,21 +925,21 @@ def _load_state_safely() -> tuple[BridgeState | None, bool]:
         return None, _discard_state()
 
 
-def _current_state() -> tuple[BridgeState | None, bool, bool]:
+def _current_state() -> tuple[BridgeState | None, bool, bool, dict[str, Any] | None]:
     state, _ = _load_state_safely()
     if state is None:
-        return None, False, False
+        return None, False, False, None
     pid = state.pid
     if not _pid_alive(pid):
         _remove_state_if_owned(pid, state.instance_id)
-        return None, False, False
+        return None, False, False, None
     probe = _probe_health(state.url, token=state.token, timeout=0.5)
     if probe.outcome is _HealthOutcome.UNAVAILABLE:
-        return state, False, True
+        return state, False, True, None
     if probe.outcome is _HealthOutcome.REFUSED or not _state_matches_health(state, probe.payload):
         _remove_state_if_owned(pid, state.instance_id)
-        return None, False, False
-    return state, True, False
+        return None, False, False, None
+    return state, True, False, probe.payload
 
 
 def _remove_state_if_owned(pid: int, instance_id: str) -> None:
@@ -795,10 +999,45 @@ def _probe_health(url: str, *, token: str, timeout: float) -> _HealthProbe:
         time.sleep(0.05)
 
 
-def _open_loopback(request: Request, *, timeout: float) -> Any:
-    """Open a local health request without inheriting ambient proxy settings."""
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> Request | None:
+        del message, new_url
+        raise HTTPError(
+            request.full_url,
+            code,
+            "GSV refuses redirects for authenticated loopback requests",
+            headers,
+            file_pointer,
+        )
 
-    return build_opener(ProxyHandler({})).open(request, timeout=timeout)
+
+def _open_loopback(request: Request, *, timeout: float) -> Any:
+    """Open an exact local URL without proxies or redirect credential forwarding."""
+
+    target = urlsplit(request.full_url)
+    try:
+        port = target.port
+    except ValueError as exc:
+        raise ValueError("Bridge health received an invalid loopback URL") from exc
+    if (
+        target.scheme != "http"
+        or target.hostname != LOOPBACK_HOST
+        or port is None
+        or port < 1
+        or target.username is not None
+        or target.password is not None
+        or target.fragment
+    ):
+        raise ValueError("Bridge health accepts only http://127.0.0.1:<port> URLs")
+    return build_opener(ProxyHandler({}), _RejectRedirects()).open(request, timeout=timeout)
 
 
 def _is_connection_refused(error: BaseException) -> bool:
@@ -922,6 +1161,25 @@ def _state_matches_health(state: BridgeState, health: dict[str, Any] | None) -> 
         and health.get("port") == state.port
         and health.get("vault_id") == state.vault_id
         and _state_url_matches(state)
+    )
+
+
+def _health_matches_vault(health: dict[str, Any] | None, vault: Vault) -> bool:
+    """Bind reuse/browser launch to the server's captured root, not only its path."""
+
+    if health is None:
+        return False
+    try:
+        metadata = os.lstat(vault.root)
+        vault_id = str(vault.identity()["vault_id"])
+    except (ContinuityError, OSError, KeyError, TypeError):
+        return False
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and health.get("vault_id") == vault_id
+        and health.get("vault_root_device") == int(metadata.st_dev)
+        and health.get("vault_root_inode") == int(metadata.st_ino)
     )
 
 

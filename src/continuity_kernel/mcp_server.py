@@ -5,23 +5,46 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import IO, Any, Final
 
 from continuity_kernel import __version__
 from continuity_kernel.config import resolve_vault
-from continuity_kernel.errors import ContinuityError, ValidationError
+from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
+from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
+from continuity_kernel.operations import (
+    OperationBinding,
+    OperationLedger,
+    capture_operation_binding,
+)
 from continuity_kernel.records import record_dict
 from continuity_kernel.vault import Vault, doctor_dict
 
 PROTOCOL_VERSION: Final = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS: Final = frozenset({PROTOCOL_VERSION})
 MAX_REQUEST_BYTES: Final = 1024 * 1024
+OPERATION_TOOL_NAMES: Final = frozenset(
+    {
+        "gsv_operation_accept",
+        "gsv_operation_archive_closed",
+        "gsv_operation_list",
+        "gsv_operation_reject",
+    }
+)
+
+
+@dataclass
+class _OperationSession:
+    """Lazy, process-lifetime binding for the optional operation tool family."""
+
+    binding: OperationBinding | None = None
 
 
 def serve(vault: Vault | None = None) -> int:
     """Serve line-delimited MCP JSON-RPC until stdin closes."""
 
     bound = vault or Vault(resolve_vault())
+    operation_session = _OperationSession() if CONTROL_STORE_SUPPORTED else None
     for raw_line in _bounded_lines(sys.stdin.buffer):
         if raw_line is None:
             _write(_error(None, -32600, "JSON-RPC request exceeds its size bound"))
@@ -34,7 +57,7 @@ def serve(vault: Vault | None = None) -> int:
             if not isinstance(message, dict):
                 raise ValidationError("JSON-RPC message must be an object")
             request_id = message.get("id")
-            response = _handle(message, vault=bound)
+            response = _handle(message, vault=bound, operation_session=operation_session)
             if response is not None:
                 _write(response)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -59,7 +82,13 @@ def _bounded_lines(stream: IO[bytes]) -> Iterator[bytes | None]:
         yield None
 
 
-def _handle(message: dict[str, Any], *, vault: Vault | None = None) -> dict[str, Any] | None:
+def _handle(
+    message: dict[str, Any],
+    *,
+    vault: Vault | None = None,
+    operation_binding: OperationBinding | None = None,
+    operation_session: _OperationSession | None = None,
+) -> dict[str, Any] | None:
     method = message.get("method")
     request_id = message.get("id")
     if method == "notifications/initialized":
@@ -86,7 +115,7 @@ def _handle(message: dict[str, Any], *, vault: Vault | None = None) -> dict[str,
     if method == "ping":
         return _result(request_id, {})
     if method == "tools/list":
-        return _result(request_id, {"tools": TOOLS})
+        return _result(request_id, {"tools": _advertised_tools()})
     if method == "tools/call":
         params = message.get("params")
         if not isinstance(params, dict) or not isinstance(params.get("name"), str):
@@ -95,7 +124,13 @@ def _handle(message: dict[str, Any], *, vault: Vault | None = None) -> dict[str,
         if not isinstance(arguments, dict):
             return _error(request_id, -32602, "tool arguments must be an object")
         try:
-            payload = _call(params["name"], arguments, vault=vault)
+            payload = _call(
+                params["name"],
+                arguments,
+                vault=vault,
+                operation_binding=operation_binding,
+                operation_session=operation_session,
+            )
             return _result(
                 request_id,
                 {
@@ -124,8 +159,24 @@ def _handle(message: dict[str, Any], *, vault: Vault | None = None) -> dict[str,
     return _error(request_id, -32601, f"method not found: {method}")
 
 
-def _call(name: str, values: dict[str, Any], *, vault: Vault | None = None) -> dict[str, Any]:
+def _call(
+    name: str,
+    values: dict[str, Any],
+    *,
+    vault: Vault | None = None,
+    operation_binding: OperationBinding | None = None,
+    operation_session: _OperationSession | None = None,
+) -> dict[str, Any]:
+    if name in OPERATION_TOOL_NAMES and not CONTROL_STORE_SUPPORTED:
+        raise ValidationError(f"unknown tool: {name}")
     vault = vault or Vault(resolve_vault())
+    if name in OPERATION_TOOL_NAMES:
+        if operation_session is not None:
+            if operation_session.binding is None:
+                operation_session.binding = capture_operation_binding(vault.root)
+            operation_binding = operation_session.binding
+        elif operation_binding is None:
+            operation_binding = capture_operation_binding(vault.root)
     if name == "gsv_status":
         return vault.status()
     if name == "gsv_context":
@@ -243,7 +294,58 @@ def _call(name: str, values: dict[str, Any], *, vault: Vault | None = None) -> d
         )
     if name == "gsv_backup_create":
         return vault.create_backup()
+    if name == "gsv_operation_list":
+        assert operation_binding is not None
+        return (
+            OperationLedger(vault.root)
+            .snapshot(
+                expected_vault_id=operation_binding.vault_id,
+                expected_root_identity=operation_binding.root_identity,
+            )
+            .to_dict()
+        )
+    if name in {"gsv_operation_accept", "gsv_operation_reject"}:
+        assert operation_binding is not None
+        expected_vault_id = _bound_operation_vault_id(values, operation_binding)
+        return (
+            OperationLedger(vault.root)
+            .decide(
+                event_id=_string(values, "event_id"),
+                decision="accepted" if name == "gsv_operation_accept" else "rejected",
+                actor_ref=_string(values, "actor_ref"),
+                reason_code=_string(values, "reason_code"),
+                expected_queue_revision=_string(values, "expected_queue_revision"),
+                expected_disposition_revision=_string(values, "expected_disposition_revision"),
+                expected_vault_id=expected_vault_id,
+                expected_root_identity=operation_binding.root_identity,
+                result_ref=_optional_string(values, "result_ref"),
+            )
+            .to_dict()
+        )
+    if name == "gsv_operation_archive_closed":
+        assert operation_binding is not None
+        expected_vault_id = _bound_operation_vault_id(values, operation_binding)
+        return OperationLedger(vault.root).archive_closed(
+            expected_queue_revision=_string(values, "expected_queue_revision"),
+            expected_disposition_revision=_string(values, "expected_disposition_revision"),
+            expected_vault_id=expected_vault_id,
+            expected_root_identity=operation_binding.root_identity,
+        )
     raise ValidationError(f"unknown tool: {name}")
+
+
+def _bound_operation_vault_id(
+    values: dict[str, Any],
+    binding: OperationBinding,
+) -> str:
+    """Reject caller-supplied identity changes inside one live MCP session."""
+
+    supplied = _string(values, "expected_vault_id")
+    if supplied != binding.vault_id:
+        raise ConflictError(
+            "operation vault binding changed; start a fresh MCP session before retrying"
+        )
+    return binding.vault_id
 
 
 def _tool(
@@ -441,7 +543,82 @@ TOOLS: Final = [
         {},
         read_only=False,
     ),
+    _tool(
+        "gsv_operation_list",
+        "Read pending Bridge intents and their durable accept/reject dispositions.",
+        {},
+        read_only=True,
+    ),
+    _tool(
+        "gsv_operation_accept",
+        (
+            "Acknowledge one Bridge intent for later review. This does not approve or execute "
+            "the intent, authorize an external effect, or mutate semantic canon."
+        ),
+        {
+            "actor_ref": TEXT,
+            "event_id": TEXT,
+            "expected_disposition_revision": TEXT,
+            "expected_queue_revision": TEXT,
+            "expected_vault_id": TEXT,
+            "reason_code": TEXT,
+            "result_ref": TEXT,
+        },
+        (
+            "event_id",
+            "expected_queue_revision",
+            "expected_disposition_revision",
+            "expected_vault_id",
+            "actor_ref",
+            "reason_code",
+        ),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_operation_reject",
+        "Reject one Bridge intent durably without executing it or mutating semantic canon.",
+        {
+            "actor_ref": TEXT,
+            "event_id": TEXT,
+            "expected_disposition_revision": TEXT,
+            "expected_queue_revision": TEXT,
+            "expected_vault_id": TEXT,
+            "reason_code": TEXT,
+            "result_ref": TEXT,
+        },
+        (
+            "event_id",
+            "expected_queue_revision",
+            "expected_disposition_revision",
+            "expected_vault_id",
+            "actor_ref",
+            "reason_code",
+        ),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_operation_archive_closed",
+        (
+            "Archive a fully dispositioned live queue generation to recover bounded capacity; "
+            "this never executes an intent or changes semantic canon."
+        ),
+        {
+            "expected_disposition_revision": TEXT,
+            "expected_queue_revision": TEXT,
+            "expected_vault_id": TEXT,
+        },
+        ("expected_queue_revision", "expected_disposition_revision", "expected_vault_id"),
+        read_only=False,
+    ),
 ]
+
+
+def _advertised_tools() -> list[dict[str, Any]]:
+    """Hide the POSIX-only operation lane when its secure store is unavailable."""
+
+    if CONTROL_STORE_SUPPORTED:
+        return list(TOOLS)
+    return [tool for tool in TOOLS if tool["name"] not in OPERATION_TOOL_NAMES]
 
 
 def _result(request_id: object, result: dict[str, Any]) -> dict[str, Any]:
