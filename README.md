@@ -2,14 +2,10 @@
 
 **The agent is not the thread.**
 
-A synthetic MCP execution hand writes a commitment and returns its new revision. That
-process is terminated. A fresh independent process then recovers the exact
-revision and next action without a rebrief.
-
-GSV gives one resident AI Mind a user-owned home above individual agent
-sessions. It keeps the current picture and open work in local Markdown, rejects
-stale writes, and gives you a private Bridge to see exactly what the next hand
-will inherit.
+GSV gives Codex durable, user-owned state above individual agent sessions. It
+keeps the current picture and open work in local Markdown, rejects stale
+writes, and gives you a private Bridge to see exactly what the next hand will
+inherit.
 
 Give any coding agent this instruction:
 
@@ -30,17 +26,36 @@ instruction above remains the portable path.
 > an unproven release-promotion gate. Other platform claims remain gated on
 > their own hosted `0.2.0` runs. The `0.1.0` release does not contain the Bridge.
 
-## What survives
+## Where GSV sits
 
-- **The current picture.** `MIND.md` and `NOW.md` keep identity, judgment, and
-  orientation legible to the next task.
-- **Open commitments.** Tasks carry an outcome, next actor, next action, and an
-  exact revision. Ending a Codex task does not silently end the work.
+GSV is a continuity layer for Codex. Codex stays the daily interface on your
+desktop. A Codex task can finish, fail, or be replaced without becoming the
+owner of the work.
+
+[OpenClaw](https://docs.openclaw.ai/) centres on a self-hosted gateway that
+connects chat apps to AI agents and manages their sessions. [Hermes
+Agent](https://github.com/NousResearch/hermes-agent) is a full agent runtime
+with CLI and messaging surfaces, tools, memory, and scheduling. GSV focuses on
+the continuity state that Codex tasks inherit: authored decisions and
+commitments with exact revisions and explicit handoffs. It does not replace an
+agent runtime or a messaging gateway.
+
+## What GSV adds to Codex
+
+- **Authored memory.** `MIND.md` and `NOW.md` keep identity, judgment, and
+  orientation legible without turning a chat transcript into authority.
+- **Durable work.** Tasks, entities, and WorkThreads record outcomes, actors,
+  next actions, relationships, and exact revisions. Ending a Codex task does
+  not silently end the work.
 - **Safe handoffs.** Every update compares revisions. An older hand cannot
   overwrite a newer decision.
 - **Recovery evidence.** The synthetic demo has one process write a commitment,
   terminates that process, and proves a fresh process recovers the exact new
   revision and next action without a rebrief.
+- **Local recall on your terms.** The vault is plain Markdown, so `grep`, Git,
+  backup tools, and optional on-device indexes such as
+  [QMD](https://github.com/tobi/qmd) can read it. GSV does not bundle or depend
+  on QMD, and an index never becomes authoritative; the Markdown records do.
 - **A private human view.** The Bridge reads the local vault through a
   per-launch bearer capability. It never writes task meaning from the browser.
 - **Reversible ownership.** Setup preserves existing Codex instructions;
