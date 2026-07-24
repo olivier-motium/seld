@@ -32,11 +32,11 @@ const ui = {
 startThinkingOrb(ui.connectionOrb);
 
 const viewCopy = {
-  commitments: ["Commitments", "Outcomes that remain open when an execution hand ends."],
-  mind: ["Mind", "The durable point of view that owns meaning and judgment."],
-  now: ["Your Mind, between tasks.", "Current orientation and the work that survives every hand."],
-  storylines: ["Storylines", "The longer concerns connecting people, work, and next moves."],
-  system: ["The vehicle", "Local health, integration, and the boundaries around your Mind."],
+  commitments: ["Work", "Everything you want to keep moving or revisit later."],
+  mind: ["Context", "The saved notes and decisions you want Codex to use."],
+  now: ["Your work in Codex, in one place.", "See what is open, in progress, waiting, or closed."],
+  storylines: ["Related work", "Tasks and decisions that belong to the same larger effort."],
+  system: ["System", "Your local files, Codex connection, and dashboard health."],
 };
 
 const state = {
@@ -168,8 +168,8 @@ function renderNow(snapshot) {
   const orientation = element("section", "orientation");
   const kicker = element("div", "orientation-kicker");
   kicker.append(
-    textElement("p", "section-label", "Latest pulse"),
-    textElement("strong", "", "Current orientation"),
+    textElement("p", "section-label", "Last saved update"),
+    textElement("strong", "", "Current status"),
     textElement("span", "", revisionLabel(snapshot.now.revision)),
   );
   orientation.append(kicker, renderDocument(snapshot.now.content));
@@ -179,7 +179,7 @@ function renderNow(snapshot) {
   const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
   const completed = snapshot.tasks.filter((task) => ["done", "dropped"].includes(task.status));
   if (taskProjection.state !== "complete") {
-    fragment.append(renderProjectionWarning(taskProjection, "commitments"));
+    fragment.append(renderProjectionWarning(taskProjection, "work"));
     if (openTasks.length > 0) {
       fragment.append(renderOpenTaskHeading(openTasks.length), renderTaskBoard(openTasks, 3));
     }
@@ -204,43 +204,57 @@ function renderOpenTaskHeading(count) {
   const heading = element("div", "section-head");
   const headingText = element("div");
   headingText.append(
-    textElement("p", "section-label", "Open work"),
-    textElement("h2", "", "What remains true after this task"),
+    textElement("p", "section-label", "Current records"),
+    textElement("h2", "", "Open work"),
   );
   heading.append(headingText, textElement("p", "section-meta", `${count} open`));
   return heading;
 }
 
 function renderContinuity(snapshot) {
-  const line = element("section", "continuity-line", { "aria-label": "GSV continuity" });
+  const line = element("section", "continuity-line", { "aria-label": "GSV work flow" });
   const taskProjection = projectionSection(snapshot, "tasks");
   const open = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status)).length;
   const inMotion = snapshot.tasks.filter((task) => task.status === "doing").length;
-  const commitments =
+  const openRecords =
     taskProjection.state === "unavailable"
       ? "Unavailable"
       : taskProjection.state === "partial"
         ? `${open} shown · partial`
         : open
-          ? `${open} held`
+          ? `${open} open`
           : "Clear";
-  const nextHand =
-    taskProjection.state === "complete"
-      ? open
-        ? "Can resume"
-        : "Ready when needed"
-      : "Review needed";
+  const integration = snapshot.codex.checking
+    ? "Checking"
+    : codexReady(snapshot)
+      ? "Installed"
+      : snapshot.codex.error
+        ? "Status unknown"
+        : snapshot.codex.available
+          ? "Setup incomplete"
+          : "Codex not found";
+  const inProgress =
+    taskProjection.state === "unavailable"
+      ? "Unavailable"
+      : taskProjection.state === "partial"
+        ? `${inMotion} shown · partial`
+        : String(inMotion);
   line.append(
-    continuityStage("01", "Mind", snapshot.mind.revision ? "Authored" : "Ready", "is-persistent"),
+    continuityStage("01", "Saved context", snapshot.mind.revision ? "Available" : "Not set up", "is-persistent"),
     continuityStage(
       "02",
-      "Hands",
-      inMotion ? `${inMotion} doing` : "Replaceable",
+      "Open work",
+      openRecords,
+      "is-held",
+    ),
+    continuityStage(
+      "03",
+      "Marked in progress",
+      inProgress,
       "",
       inMotion ? "working" : "",
     ),
-    continuityStage("03", "Commitments", commitments, "is-held"),
-    continuityStage("04", "Next hand", nextHand),
+    continuityStage("04", "Codex integration", integration),
   );
   return line;
 }
@@ -262,12 +276,12 @@ function renderFirstRun(snapshot) {
   const empty = element("section", "empty-state");
   const copy = element("div");
   copy.append(
-    textElement("p", "section-label", "Your first hand"),
-    textElement("h2", "", "Shape the Mind that will meet you here."),
+    textElement("p", "section-label", "Get started"),
+    textElement("h2", "", "Tell Codex what you want GSV to keep track of."),
     textElement(
       "p",
       "",
-      "Codex will read the local GSV context, ask only what matters, and leave the first durable orientation behind.",
+      "Codex will ask a few questions and save the context you choose to keep.",
     ),
   );
   empty.append(copy, renderCodexAction(snapshot, "Start in Codex", "new_mind_url"));
@@ -278,11 +292,11 @@ function renderAllClear(snapshot) {
   const empty = element("section", "empty-state");
   const copy = element("div");
   copy.append(
-    textElement("p", "section-label", "Commitments"),
+    textElement("p", "section-label", "Work"),
     textElement("h2", "", "All clear"),
-    textElement("p", "", "No commitments are open."),
+    textElement("p", "", "Nothing is open right now."),
   );
-  empty.append(copy, renderCodexAction(snapshot, "Start a new hand"));
+  empty.append(copy, renderCodexAction(snapshot, "Start a Codex task"));
   return empty;
 }
 
@@ -292,7 +306,7 @@ function renderCommitments(snapshot) {
   const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
   const completed = snapshot.tasks.filter((task) => ["done", "dropped"].includes(task.status));
   if (taskProjection.state !== "complete") {
-    container.append(renderProjectionWarning(taskProjection, "commitments"));
+    container.append(renderProjectionWarning(taskProjection, "work"));
   }
   if (taskProjection.state === "complete" && snapshot.tasks.length === 0) {
     container.append(renderFirstRun(snapshot));
@@ -312,8 +326,8 @@ function appendClosedHistory(container, tasks) {
   const heading = element("div", "section-head");
   const headingText = element("div");
   headingText.append(
-    textElement("p", "section-label", "Record"),
-    textElement("h2", "", "Closed deliberately"),
+    textElement("p", "section-label", "History"),
+    textElement("h2", "", "Closed work"),
   );
   heading.append(headingText, textElement("p", "section-meta", `${tasks.length} recorded`));
   heading.style.marginTop = "48px";
@@ -338,7 +352,7 @@ function renderTaskBoard(tasks, limit = null) {
         const disclosure = textElement(
           "button",
           "primary-action",
-          `${remaining} more · View Commitments`,
+          `${remaining} more · View all work`,
         );
         disclosure.type = "button";
         disclosure.addEventListener("click", () => navigate("commitments"));
@@ -362,7 +376,7 @@ function taskLanes(tasks) {
     return leftIndex - rightIndex;
   });
   return statuses.map((status) => ({
-    empty: "No commitments in this lane.",
+    empty: "Nothing here.",
     tasks: tasks.filter((task) => String(task.status) === status),
     title: statusLabel({ status }),
   }));
@@ -380,7 +394,7 @@ function renderTaskCard(task) {
   );
   const foot = element("div", "task-foot");
   foot.append(
-    textElement("span", "", task.next_actor ? actorLabel(task.next_actor) : "Actor open"),
+    textElement("span", "", task.next_actor ? actorLabel(task.next_actor) : "Next step not assigned"),
     relativeTimeElement(task.updated_at),
   );
   card.append(foot);
@@ -409,16 +423,16 @@ function renderStorylines(snapshot) {
   const headingText = element("div");
   headingText.append(
     textElement("p", "section-label", "Across tasks"),
-    textElement("h2", "", "Concerns with a longer life"),
+    textElement("h2", "", "Work that belongs together"),
   );
   heading.append(headingText, textElement("p", "section-meta", `${snapshot.threads.length} total`));
   container.append(heading);
   if (threadProjection.state !== "complete") {
-    container.append(renderProjectionWarning(threadProjection, "storylines"));
+    container.append(renderProjectionWarning(threadProjection, "related work"));
   }
   if (snapshot.threads.length === 0) {
     if (threadProjection.state === "complete") {
-      container.append(textElement("div", "empty-lane", "No storylines have been authored yet."));
+      container.append(textElement("div", "empty-lane", "No related work has been saved yet."));
     }
     return container;
   }
@@ -433,7 +447,12 @@ function renderStorylines(snapshot) {
     const body = element("div");
     body.append(textElement("p", "", thread.summary));
     if (thread.next_move) body.append(textElement("p", "storyline-next", `Next: ${thread.next_move}`));
-    row.append(title, body, textElement("span", "system-state", `${thread.task_ids.length} tasks`));
+    const taskCount = thread.task_ids.length;
+    row.append(
+      title,
+      body,
+      textElement("span", "system-state", `${taskCount} ${taskCount === 1 ? "task" : "tasks"}`),
+    );
     list.append(row);
   }
   container.append(list);
@@ -447,20 +466,20 @@ function renderMind(snapshot) {
   const head = element("div", "section-head");
   const headText = element("div");
   headText.append(
-    textElement("p", "section-label", "Authored judgment"),
-    textElement("h2", "", "The point of view that persists"),
+    textElement("p", "section-label", "Saved context"),
+    textElement("h2", "", "What you want Codex to know"),
   );
   head.append(headText, textElement("p", "section-meta", revisionLabel(snapshot.mind.revision)));
   main.append(head, renderDocument(snapshot.mind.content));
 
   const side = element("aside", "mind-side");
-  side.append(textElement("h3", "", "Known entities"));
+  side.append(textElement("h3", "", "People and projects"));
   if (entityProjection.state !== "complete") {
-    side.append(renderProjectionWarning(entityProjection, "entities"));
+    side.append(renderProjectionWarning(entityProjection, "people and projects"));
   }
   if (snapshot.entities.length === 0) {
     if (entityProjection.state === "complete") {
-      side.append(textElement("p", "section-meta", "No canonical entities yet."));
+      side.append(textElement("p", "section-meta", "No people or projects have been saved yet."));
     }
   } else {
     const list = element("ul", "entity-list");
@@ -475,7 +494,7 @@ function renderMind(snapshot) {
     side.append(list);
     const remaining = snapshot.entities.length - 12;
     if (remaining > 0) {
-      side.append(textElement("p", "section-meta", `${remaining} more entities not shown.`));
+      side.append(textElement("p", "section-meta", `${remaining} more not shown.`));
     }
   }
   layout.append(main, side);
@@ -499,8 +518,8 @@ function renderProjectionWarning(section, label) {
   const readable = Number(section.readable || 0);
   const summary =
     section.state === "unavailable"
-      ? `GSV could not trust this record section. Review ${paths || label} with gsv doctor.`
-      : `${readable} exact ${readable === 1 ? "record is" : "records are"} shown. Review ${paths || label} with gsv doctor.`;
+      ? `GSV could not safely read these files. Review ${paths || label} with gsv doctor.`
+      : `${readable} readable ${readable === 1 ? "record is" : "records are"} shown; some files could not be read. Review ${paths || label} with gsv doctor.`;
   warning.append(
     textElement("p", "section-label", "Integrity warning"),
     textElement("h2", "", title),
@@ -514,39 +533,33 @@ function renderSystem(snapshot) {
   const list = element("div", "system-list");
   list.append(
     systemRow(
-      "GSV vehicle",
-      `Version ${snapshot.bridge.version}; local Markdown and atomic writes.`,
+      "GSV files",
+      `Version ${snapshot.bridge.version}; readable Markdown. Older processes cannot overwrite newer changes.`,
       snapshot.doctor.healthy ? "Healthy" : "Needs attention",
       snapshot.doctor.healthy ? "" : "is-error",
     ),
     systemRow(
-      "Mind",
-      "MIND.md and NOW.md are present in the user-owned vault.",
+      "Saved context",
+      "Your context and current status files are available.",
       "Present",
       "",
     ),
     systemRow(
-      "Codex hands",
+      "Codex",
       codexSystemCopy(snapshot),
       codexSystemStatus(snapshot),
       codexReady(snapshot) ? "" : "is-warning",
     ),
     systemRow(
-      "Bridge",
-      "Loopback-only, read-only, and rendered from exact authored records.",
+      "Local dashboard",
+      "Available only on this computer and read-only.",
       "Local",
       "",
     ),
     systemRow(
-      "Pulse",
-      "The latest bounded orientation is visible in Now; no continuous-awake claim is made.",
-      "Discrete",
-      "",
-    ),
-    systemRow(
-      "Shipyard",
-      "Changes remain ordinary reviewed work under the same approval boundaries.",
-      "Bounded",
+      "Automatic task updates",
+      "GSV shows saved changes but does not change task status on its own.",
+      "Off",
       "",
     ),
   );
@@ -563,13 +576,13 @@ function renderDoctorRecovery(doctor) {
   const copy = element("div");
   copy.append(
     textElement("p", "section-label", "Integrity check"),
-    textElement("h2", "", "The vault needs attention"),
+    textElement("h2", "", "Your GSV files need attention"),
   );
   const issues = element("ul", "issue-list");
   for (const issue of doctor.issues || []) {
     const item = element("li");
     item.append(
-      textElement("strong", "", issue.path || issue.code || "Vault issue"),
+      textElement("strong", "", issue.path || issue.code || "File issue"),
       textElement("span", "", issue.message || "The integrity check did not pass."),
       textElement("small", "", issue.repairable ? "Repairable by GSV" : "Review required"),
     );
@@ -649,15 +662,17 @@ function codexReady(snapshot) {
 
 function codexSystemCopy(snapshot) {
   if (snapshot.codex.checking) return "Checking the local Codex integration.";
-  if (codexReady(snapshot)) return "The GSV plugin can load durable context in a fresh Codex task.";
+  if (codexReady(snapshot)) {
+    return "The GSV integration is installed. New-task links point Codex to your saved GSV record.";
+  }
   if (snapshot.codex.error) return snapshot.codex.error;
   if (snapshot.codex.available) return "Codex is present, but its GSV integration is incomplete.";
-  return "The local vault works, but Codex could not be found.";
+  return "Your GSV files are available, but Codex could not be found.";
 }
 
 function codexSystemStatus(snapshot) {
   if (snapshot.codex.checking) return "Checking";
-  if (codexReady(snapshot)) return "Connected";
+  if (codexReady(snapshot)) return "Installed";
   if (snapshot.codex.available) return "Run setup";
   return "Unavailable";
 }
@@ -716,7 +731,7 @@ function openInspector(taskId) {
 }
 
 function renderInspector(task) {
-  ui.inspectorEyebrow.textContent = `${statusLabel(task)} commitment`;
+  ui.inspectorEyebrow.textContent = `${statusLabel(task)} work item`;
   ui.inspectorTitle.textContent = task.title;
   ui.inspectorBody.replaceChildren(
     detail("Outcome", task.outcome),
@@ -730,7 +745,7 @@ function renderInspector(task) {
     ui.inspectorFoot.hidden = false;
   } else {
     ui.continueInCodex.removeAttribute("href");
-    ui.inspectorFoot.replaceChildren(renderCodexAction(state.snapshot, "Start a new hand"));
+    ui.inspectorFoot.replaceChildren(renderCodexAction(state.snapshot, "Start a Codex task"));
     ui.inspectorFoot.hidden = false;
   }
 }
@@ -809,7 +824,7 @@ function setConnectionState(connectionState, message = "") {
     ui.statusDot.hidden = false;
   }
   if (partial) {
-    ui.connectionCopy.textContent = "The vault is readable, but its integrity check needs attention.";
+    ui.connectionCopy.textContent = "Your GSV files are readable, but an integrity check needs attention.";
   } else if (!healthy) {
     ui.connectionCopy.textContent = message;
   }
@@ -827,7 +842,7 @@ function renderUnavailable() {
   const unavailable = element("section", "unavailable-state");
   const copy = element("div");
   copy.append(
-    textElement("p", "section-label", "Bridge unavailable"),
+    textElement("p", "section-label", "Dashboard unavailable"),
     textElement("h2", "", "Your local files have not been changed."),
     textElement("p", "", "Run gsv again to open a fresh private session."),
   );
@@ -836,13 +851,13 @@ function renderUnavailable() {
 }
 
 function connectionMessage(_error) {
-  return "The private Bridge session could not be reached. Your local files were not changed.";
+  return "The private GSV dashboard could not be reached. Your local files were not changed.";
 }
 
 function updateFreshness() {
   if (!state.snapshot || !state.lastSuccessAt) return;
   if (Date.now() - state.lastSuccessAt > 30_000) {
-    setConnectionState("stale", "Showing the last successful local snapshot while The Bridge reconnects.");
+    setConnectionState("stale", "Showing the last successful local snapshot while GSV reconnects.");
   }
 }
 
@@ -912,7 +927,11 @@ function capitalize(value) {
 }
 
 function actorLabel(actor) {
-  return { agent: "Agent next", external: "World next", human: "You next" }[actor] || actor;
+  return {
+    agent: "Codex acts next",
+    external: "Waiting outside GSV",
+    human: "You act next",
+  }[actor] || actor;
 }
 
 function relativeTime(timestamp) {
