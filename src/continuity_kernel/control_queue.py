@@ -934,7 +934,11 @@ def _bounded_text(value: object, name: str, *, max_bytes: int) -> str:
     if not isinstance(value, str):
         raise ValidationError(f"{name} must be a string")
     cleaned = value.strip()
-    if not cleaned or "\x00" in cleaned or len(cleaned.encode("utf-8")) > max_bytes:
+    try:
+        encoded = cleaned.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValidationError(f"{name} contains invalid Unicode text") from exc
+    if not cleaned or "\x00" in cleaned or len(encoded) > max_bytes:
         raise ValidationError(f"{name} is empty, unsafe, or exceeds its size bound")
     return cleaned
 

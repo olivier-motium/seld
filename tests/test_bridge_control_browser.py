@@ -327,6 +327,47 @@ class RunningTransport(DeliveryUncertainTransport):
         return receipt
 
 
+class FailedSafeThenDriftTransport(DeliveryUncertainTransport):
+    """Fail before delivery, then make the queued semantic context stale."""
+
+    def submit(self, context: TurnContext) -> TurnReceipt:
+        exact = context.validated()
+        existing = self.receipts.get(exact.event_id)
+        if existing is not None:
+            return existing
+        self.submit_count += 1
+        now = format_time(datetime.now(UTC))
+        receipt = TurnReceipt(
+            schema_version=TRANSPORT_SCHEMA_VERSION,
+            event_id=exact.event_id,
+            mode=exact.mode,
+            state=TurnState.FAILED_SAFE,
+            attempt=1,
+            vault_id=str(self.vault.identity()["vault_id"]),
+            context_hash=exact.context_hash,
+            queue_revision=exact.queue_revision,
+            target_revision=exact.target_revision,
+            thread_id=exact.active_thread_id,
+            owner_instance_id=None,
+            decision=None,
+            result_ref=None,
+            canonical_revision=None,
+            result_context_hash=None,
+            reason_code="pre_dispatch_failure",
+            created_at=now,
+            updated_at=now,
+        )
+        self.receipts[exact.event_id] = receipt
+        assert exact.session_task_id is not None
+        session = self.vault.get_task(exact.session_task_id)
+        self.vault.update_task(
+            session.identifier,
+            expected_revision=session.revision,
+            next_action="A concurrent semantic update changed this exact review step.",
+        )
+        return receipt
+
+
 def test_browser_finished_review_keeps_terminal_delivery_recovery_visible(
     tmp_path: Path,
 ) -> None:
@@ -762,7 +803,7 @@ def test_browser_fresh_process_resumes_one_restored_pending_receipt(
             assert not thread.is_alive()
 
 
-@pytest.mark.parametrize("race_kind", ("queue", "session"))
+@pytest.mark.parametrize("race_kind", ("queue", "session", "conflict"))
 def test_browser_guided_review_preserves_unsent_draft_after_stale_cas(
     tmp_path: Path,
     race_kind: str,
@@ -837,6 +878,19 @@ def test_browser_guided_review_preserves_unsent_draft_after_stale_cas(
                 commitments = page.locator('[data-view="commitments"]')
                 commitments.focus()
                 commitments.press("Enter")
+                if race_kind == "queue":
+                    oversized = "🧠" * 1024
+                    page.get_by_label("Tell the Mind what you want").fill(oversized)
+                    page.get_by_role("button", name="Send and keep going").click()
+                    page.get_by_text(
+                        "longer than the 4,096-byte local limit", exact=False
+                    ).wait_for(timeout=5_000)
+                    assert page.locator("#guided-review-answer").input_value() == oversized
+                    assert len(ledger.snapshot().pending) == 0
+                    page.wait_for_function(
+                        "() => !document.querySelector("
+                        "'.guided-review-form button.primary-action').disabled"
+                    )
                 draft = "Move this below maintenance, but keep the outcome open."
                 page.get_by_label("Tell the Mind what you want").fill(draft)
                 if race_kind == "queue":
@@ -847,18 +901,21 @@ def test_browser_guided_review_preserves_unsent_draft_after_stale_cas(
                         expected_revision=ledger.snapshot().queue_revision,
                         target_revision=session.revision,
                     )
-                else:
+                elif race_kind == "session":
                     vault.update_task(
                         session.identifier,
                         expected_revision=session.revision,
                         next_action="A concurrent semantic update changed this review step.",
                     )
+                else:
+                    review_thread = vault.get_thread("thread:life-portfolio-review")
+                    vault.update_thread(
+                        review_thread.identifier,
+                        expected_revision=review_thread.revision,
+                        clear_focus_task=True,
+                    )
                 page.get_by_role("button", name="Send and keep going").click()
-                conflict_text = (
-                    "The review queue changed before this answer was saved."
-                    if race_kind == "queue"
-                    else "The review queue changed while you were answering."
-                )
+                conflict_text = "The review queue changed while you were answering."
                 page.get_by_text(conflict_text, exact=False).wait_for(timeout=5_000)
                 assert page.locator("#guided-review-answer").input_value() == draft
                 assert (
@@ -867,6 +924,113 @@ def test_browser_guided_review_preserves_unsent_draft_after_stale_cas(
                 )
                 assert vault.get_task(outcome.identifier).revision == outcome.revision
                 assert len(ledger.snapshot().pending) == (1 if race_kind == "queue" else 0)
+                if race_kind == "conflict":
+                    assert (
+                        page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                            "href"
+                        )
+                        == f"codex://threads/{REVIEW_HAND_ID}"
+                    )
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_browser_failed_safe_retry_reports_semantic_drift_without_replay(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Guided review failed-safe drift")
+    outcome = vault.create_task(
+        identifier="exact-outcome",
+        title="Exact outcome",
+        outcome="Keep one exact answer durable when semantic context changes.",
+        status="ready",
+        next_actor="human",
+    )
+    session = vault.create_task(
+        identifier="review-session",
+        title="Review every open outcome",
+        outcome="Check every exact outcome.",
+        status="waiting",
+        next_actor="human",
+        next_action="Ask the one useful question.",
+        waiting_on="What should change about this outcome?",
+        active_thread_id=REVIEW_HAND_ID,
+        refs=("review-scope:all-open", "review-subject:task:exact-outcome"),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Finite Portfolio reviews",
+        purpose="Own only bounded all-open review sessions.",
+        summary="One exact review session is active.",
+        status="active",
+        next_move="Continue the focused review session.",
+        focus_task_id=session.identifier,
+        task_ids=(session.identifier,),
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="One exact open outcome.",
+        items=(
+            portfolio_item(
+                task_id_value=outcome.identifier,
+                task_revision=outcome.revision,
+                stance="needs-human",
+                reason="The answer must remain singular and durable.",
+            ),
+        ),
+    )
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    ledger = OperationLedger(vault.root)
+    transport = FailedSafeThenDriftTransport(vault)
+
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            turn_transport=transport,
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"height": 844, "width": 390})
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
+                page.locator('[data-view="commitments"]').press("Enter")
+                answer = "Move this below maintenance, but keep it open."
+                page.get_by_label("Tell the Mind what you want").fill(answer)
+                page.get_by_role("button", name="Send and keep going").click()
+                page.get_by_text(
+                    "The review changed after this answer was queued.", exact=False
+                ).wait_for(timeout=5_000)
+
+                pending = ledger.snapshot().pending
+                assert len(pending) == 1
+                assert answer in pending[0].choice
+                assert transport.submit_count == 1
+                assert page.get_by_text("wording remains saved once", exact=False).is_visible()
+                assert page.get_by_text("Bridge could not read", exact=False).count() == 0
+                assert (
+                    page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                        "href"
+                    )
+                    == f"codex://threads/{REVIEW_HAND_ID}"
+                )
                 browser.close()
         finally:
             server.shutdown()

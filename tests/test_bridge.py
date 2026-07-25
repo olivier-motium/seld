@@ -2268,6 +2268,82 @@ def test_state_receipt_is_private_and_open_token_stays_in_fragment(vault: Vault)
     assert "token" not in bridge.bridge_status()
 
 
+def test_serve_bridge_holds_one_runtime_owner_for_its_full_lifetime(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    constructed: list[str] = []
+    failures: list[BaseException] = []
+
+    class BlockingServer:
+        def __init__(
+            self,
+            _address: tuple[str, int],
+            target_vault: Vault,
+            _static_root: Path,
+            *,
+            access_token: str,
+            instance_id: str,
+        ) -> None:
+            assert access_token
+            constructed.append(instance_id)
+            self.instance_id = instance_id
+            self.server_address = (bridge.LOOPBACK_HOST, 43117)
+            self.vault_id = str(target_vault.identity()["vault_id"])
+
+        def serve_forever(self, *, poll_interval: float) -> None:
+            assert poll_interval == 0.25
+            if self.instance_id != INSTANCE_ID:
+                if release.is_set():
+                    return
+                raise AssertionError("a second server was constructed while the owner was live")
+            entered.set()
+            assert release.wait(timeout=5)
+
+        def server_close(self) -> None:
+            return None
+
+    monkeypatch.setattr(bridge, "BridgeHTTPServer", BlockingServer)
+
+    def run_owner() -> None:
+        try:
+            bridge.serve_bridge(
+                vault,
+                write_state=False,
+                access_token=ACCESS_TOKEN,
+                instance_id=INSTANCE_ID,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    owner = threading.Thread(target=run_owner)
+    owner.start()
+    assert entered.wait(timeout=5)
+
+    with pytest.raises(SetupError, match="already owns this local runtime"):
+        bridge.serve_bridge(
+            vault,
+            write_state=False,
+            access_token="d" * 48,
+            instance_id="c" * 32,
+        )
+
+    assert constructed == [INSTANCE_ID]
+    release.set()
+    owner.join(timeout=5)
+    assert not owner.is_alive()
+    assert failures == []
+
+    bridge.serve_bridge(
+        vault,
+        write_state=False,
+        access_token="d" * 48,
+        instance_id="c" * 32,
+    )
+    assert constructed == [INSTANCE_ID, "c" * 32]
+
+
 def test_frozen_bridge_child_requests_an_independent_pyinstaller_runtime(
     vault: Vault, monkeypatch: pytest.MonkeyPatch
 ) -> None:

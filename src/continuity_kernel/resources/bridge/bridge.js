@@ -454,6 +454,14 @@ function renderGuidedReview(snapshot) {
       textElement("strong", "", "Review state needs repair"),
       textElement("p", "", review.issue),
     );
+    if (review.hand_url && !guidedReviewDelivery?.receipt) {
+      warning.append(exactHandFallback(review.hand_url));
+    }
+    if (guidedReviewDraft) {
+      warning.append(guidedReviewDraftRecovery(
+        "The review state changed before this answer was saved. Your draft remains here; repair current truth, then retry.",
+      ));
+    }
     section.append(warning);
   }
 
@@ -567,27 +575,10 @@ function renderGuidedReview(snapshot) {
       ),
     );
     if (review.hand_url) pending.append(exactHandFallback(review.hand_url));
-    if (guidedReviewDraft) {
-      const recovery = element("div", "guided-review-draft-recovery");
-      const label = textElement("label", "guided-review-label", "Your unsent answer");
-      const draft = element("textarea", "control-input", {
-        maxlength: "4096",
-        rows: "3",
-      });
-      draft.id = "guided-review-answer";
-      label.htmlFor = draft.id;
-      draft.value = guidedReviewDraft;
-      draft.addEventListener("input", () => { guidedReviewDraft = draft.value; });
-      recovery.append(
-        label,
-        draft,
-        textElement(
-          "p",
-          "control-status",
-          "The review queue changed before this answer was saved. Your draft remains here; retry after the current receipt is resolved.",
-        ),
-      );
-      pending.append(recovery);
+    if (guidedReviewDraft && !review.issue) {
+      pending.append(guidedReviewDraftRecovery(
+        "The review queue changed before this answer was saved. Your draft remains here; retry after the current receipt is resolved.",
+      ));
     }
     section.append(pending);
     return section;
@@ -740,6 +731,21 @@ function exactHandFallback(url) {
   return link;
 }
 
+function guidedReviewDraftRecovery(message) {
+  const recovery = element("div", "guided-review-draft-recovery");
+  const label = textElement("label", "guided-review-label", "Your unsent answer");
+  const draft = element("textarea", "control-input", {
+    maxlength: "4096",
+    rows: "3",
+  });
+  draft.id = "guided-review-answer";
+  label.htmlFor = draft.id;
+  draft.value = guidedReviewDraft;
+  draft.addEventListener("input", () => { guidedReviewDraft = draft.value; });
+  recovery.append(label, draft, textElement("p", "control-status", message));
+  return recovery;
+}
+
 function setGuidedReviewControlsDisabled(form, disabled) {
   for (const control of form.querySelectorAll("button, textarea")) {
     control.disabled = disabled;
@@ -780,7 +786,9 @@ async function queueGuidedReviewIntent(snapshot, intent, { form = null, handUrl 
     if (error.status === 409) {
       const refreshed = await loadSnapshot({ quiet: true });
       const currentInput = document.querySelector("#guided-review-answer");
-      const currentStatus = document.querySelector(".guided-review-form .control-status");
+      const currentStatus = document.querySelector(
+        ".guided-review-form .control-status, .guided-review-draft-recovery .control-status",
+      );
       if (currentInput) {
         currentInput.value = guidedReviewDraft;
         currentInput.focus();
@@ -827,9 +835,11 @@ async function continueGuidedReviewTurn(eventId, handUrl) {
     );
   } catch (error) {
     updateGuidedReviewMessage(
-      error.status === 404
-        ? "The turn receipt is no longer available in this Bridge. Reload canonical truth before doing anything else."
-        : "Bridge could not read the turn receipt. Your queued answer was not replayed; inspect the exact hand before retrying.",
+      error.status === 409
+        ? "The review changed after this answer was queued. Your wording remains saved once and was not replayed. Reload current truth, then reconcile the queued receipt before retrying."
+        : error.status === 404
+          ? "The review receipt is unavailable. Reload current truth; do not retry until the queued intent is reconciled."
+          : "Bridge could not read the review receipt. Your queued answer was not replayed; inspect the exact hand before retrying.",
     );
     await loadSnapshot({ quiet: true });
   }

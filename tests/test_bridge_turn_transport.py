@@ -20,6 +20,7 @@ from continuity_kernel.bridge import (
     bridge_snapshot,
 )
 from continuity_kernel.codex_turn_transport import (
+    RESUME_REVIEW_CHOICE,
     START_REVIEW_CHOICE,
     START_REVIEW_SUBJECT,
     TRANSPORT_SCHEMA_VERSION,
@@ -261,6 +262,37 @@ def test_guided_control_post_returns_service_unavailable_for_partial_vault(
         assert transport.contexts == []
 
 
+def test_control_post_rejects_lone_surrogate_as_bounded_bad_request(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Bridge invalid Unicode control")
+    static = tmp_path / "static"
+    static.mkdir()
+    transport = _FakeTransport()
+
+    with (
+        _running_bridge(vault, static, transport) as (base, _server),
+        pytest.raises(HTTPError) as invalid,
+    ):
+        _post(
+            base,
+            "/api/v1/control",
+            {
+                "choice": "\ud800",
+                "expected_revision": EMPTY_REVISION,
+                "kind": "correction",
+                "subject": "mind:user-correction",
+            },
+        )
+
+    assert invalid.value.code == HTTPStatus.BAD_REQUEST
+    assert json.loads(invalid.value.read()) == {
+        "error": "choice contains invalid Unicode text",
+        "ok": False,
+    }
+    assert not (vault.root / ".gsv/control").exists()
+    assert transport.contexts == []
+
+
 def test_authenticated_control_append_triggers_exact_event_and_poll_is_non_enumerating(
     tmp_path: Path,
 ) -> None:
@@ -373,6 +405,41 @@ def test_stale_review_session_revision_is_rejected_before_answer_is_queued(
     assert stale.value.code == HTTPStatus.CONFLICT
     assert "review step changed" in json.loads(stale.value.read())["error"]
     assert ControlQueue(vault.root).snapshot().revision == EMPTY_REVISION
+    assert transport.contexts == []
+
+
+def test_review_turn_retry_reports_canonical_drift_without_replaying_queued_answer(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Bridge queued answer drift")
+    seeded = _seed_active(vault)
+    queued = ControlQueue(vault.root).append(
+        kind="correction",
+        subject=f"record:task/{seeded['session'].identifier}",
+        choice="Keep this exact wording queued once.",
+        target_revision=seeded["session"].revision,
+        expected_revision=EMPTY_REVISION,
+    )
+    event_id = queued.events[-1].event_id
+    vault.update_task(
+        seeded["session"].identifier,
+        expected_revision=seeded["session"].revision,
+        next_action="A concurrent semantic update changed the review step.",
+    )
+    static = tmp_path / "static"
+    static.mkdir()
+    transport = _FakeTransport()
+
+    with (
+        _running_bridge(vault, static, transport) as (base, _server),
+        pytest.raises(HTTPError) as changed,
+    ):
+        _post(base, "/api/v1/review-turn", {"event_id": event_id})
+
+    assert changed.value.code == HTTPStatus.CONFLICT
+    assert "remains queued once and was not replayed" in json.loads(changed.value.read())["error"]
+    assert [event.event_id for event in ControlQueue(vault.root).snapshot().events] == [event_id]
     assert transport.contexts == []
 
 
@@ -725,3 +792,115 @@ def test_noncanonical_legacy_review_hand_is_rejected_before_answer_is_queued(
     assert rejected.value.code == HTTPStatus.CONFLICT
     assert not (vault.root / ".gsv/control").exists()
     assert transport.contexts == []
+
+
+def test_conflicted_review_state_is_rejected_before_answer_is_queued(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Conflicted guided review")
+    seeded = _seed_active(vault)
+    review_thread = vault.get_thread("thread:life-portfolio-review")
+    vault.update_thread(
+        review_thread.identifier,
+        expected_revision=review_thread.revision,
+        clear_focus_task=True,
+    )
+    projected = bridge_snapshot(
+        vault,
+        doctor={"healthy": True, "issues": []},
+        integration={"available": True, "ready": True},
+    )
+    review = projected["portfolio"]["review"]
+    assert review["state"] == "conflict"
+    assert review["issue"]
+    assert review["hand_url"] == f"codex://threads/{THREAD_ID}"
+    static = tmp_path / "static"
+    static.mkdir()
+    transport = _FakeTransport()
+
+    with (
+        _running_bridge(vault, static, transport) as (base, _server),
+        pytest.raises(HTTPError) as rejected,
+    ):
+        _post(
+            base,
+            "/api/v1/control",
+            {
+                "choice": "Do not strand this answer in a conflicted session.",
+                "expected_revision": EMPTY_REVISION,
+                "kind": "correction",
+                "subject": f"record:task/{seeded['session'].identifier}",
+                "target_revision": seeded["session"].revision,
+            },
+        )
+
+    assert rejected.value.code == HTTPStatus.CONFLICT
+    assert "needs repair" in json.loads(rejected.value.read())["error"]
+    assert not (vault.root / ".gsv/control").exists()
+    assert transport.contexts == []
+
+
+def test_paused_review_rejects_non_resume_answer_before_queue_append(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Paused guided review")
+    seeded = _seed_active(vault)
+    paused = vault.update_task(
+        seeded["session"].identifier,
+        expected_revision=seeded["session"].revision,
+        add_refs=("review-state:paused",),
+    )
+    static = tmp_path / "static"
+    static.mkdir()
+    transport = _FakeTransport()
+
+    with (
+        _running_bridge(vault, static, transport) as (base, _server),
+        pytest.raises(HTTPError) as rejected,
+    ):
+        _post(
+            base,
+            "/api/v1/control",
+            {
+                "choice": "This answer must wait until the review is resumed.",
+                "expected_revision": EMPTY_REVISION,
+                "kind": "correction",
+                "subject": f"record:task/{paused.identifier}",
+                "target_revision": paused.revision,
+            },
+        )
+
+    assert rejected.value.code == HTTPStatus.CONFLICT
+    assert "is paused" in json.loads(rejected.value.read())["error"]
+    assert not (vault.root / ".gsv/control").exists()
+    assert transport.contexts == []
+
+
+def test_paused_review_accepts_only_the_exact_resume_intent(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Paused guided review resume")
+    seeded = _seed_active(vault)
+    paused = vault.update_task(
+        seeded["session"].identifier,
+        expected_revision=seeded["session"].revision,
+        add_refs=("review-state:paused",),
+    )
+    static = tmp_path / "static"
+    static.mkdir()
+    transport = _FakeTransport()
+
+    with _running_bridge(vault, static, transport) as (base, _server):
+        status, payload = _post(
+            base,
+            "/api/v1/control",
+            {
+                "choice": RESUME_REVIEW_CHOICE,
+                "expected_revision": EMPTY_REVISION,
+                "kind": "correction",
+                "subject": f"record:task/{paused.identifier}",
+                "target_revision": paused.revision,
+            },
+        )
+
+    assert status == HTTPStatus.CREATED
+    assert payload["transport"]["state"] == "pending"
+    assert len(transport.contexts) == 1
+    assert transport.contexts[0].active_thread_id == THREAD_ID

@@ -671,7 +671,12 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                     queue_revision=operations.queue_revision,
                 )
                 if context is None:
-                    self._error(HTTPStatus.NOT_FOUND, "That review turn is not available")
+                    self._error(
+                        HTTPStatus.CONFLICT,
+                        "The guided review changed after this answer was queued. "
+                        "The answer remains queued once and was not replayed; reload current "
+                        "truth and reconcile its exact receipt before retrying.",
+                    )
                     return
                 receipt = self.bridge.turn_transport.submit(context)
                 transport = receipt.public()
@@ -951,6 +956,13 @@ def _validate_guided_review_intent(
     session_id = session.get("identifier") if isinstance(session, dict) else None
     if not isinstance(session_id, str) or subject != f"record:task/{session_id}":
         return
+    review_state = review.get("state")
+    if review.get("issue") or review_state not in {"active", "paused"}:
+        raise ConflictError("the guided review needs repair; reload current truth before answering")
+    if review_state == "paused" and payload.get("choice") != RESUME_REVIEW_CHOICE:
+        raise ConflictError(
+            "the guided review is paused; reload current truth and resume it before answering"
+        )
     session_revision = review.get("session_revision")
     if not isinstance(session_revision, str) or payload.get("target_revision") != session_revision:
         raise ConflictError("the guided-review step changed; reload before retrying this answer")
@@ -1113,37 +1125,48 @@ def serve_bridge(
     token = access_token or secrets.token_hex(24)
     if not _valid_access_token(token):
         raise ValidationError("Bridge access token must be 48 lowercase hexadecimal characters")
-    static_resource = files("continuity_kernel") / "resources/bridge"
-    with as_file(static_resource) as static_root:
-        server = BridgeHTTPServer(
-            (LOOPBACK_HOST, port),
-            vault,
-            Path(static_root),
-            access_token=token,
-            instance_id=identity,
-        )
-        bound_port = int(server.server_address[1])
-        state = BridgeState(
-            format_version=STATE_VERSION,
-            instance_id=identity,
-            pid=os.getpid(),
-            port=bound_port,
-            token=token,
-            url=f"http://{LOOPBACK_HOST}:{bound_port}/",
-            vault=str(vault.root),
-            vault_id=server.vault_id,
-        )
-        if write_state:
-            _write_state(state)
-        try:
-            server.serve_forever(poll_interval=0.25)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            server.server_close()
-            if write_state:
-                _remove_state_if_owned(os.getpid(), identity)
-        return bound_port
+    lifecycle_lock_acquired = False
+    try:
+        with exclusive_lock(_private_runtime_dir() / "bridge-instance.lock", timeout=0.0):
+            lifecycle_lock_acquired = True
+            static_resource = files("continuity_kernel") / "resources/bridge"
+            with as_file(static_resource) as static_root:
+                server = BridgeHTTPServer(
+                    (LOOPBACK_HOST, port),
+                    vault,
+                    Path(static_root),
+                    access_token=token,
+                    instance_id=identity,
+                )
+                bound_port = int(server.server_address[1])
+                state = BridgeState(
+                    format_version=STATE_VERSION,
+                    instance_id=identity,
+                    pid=os.getpid(),
+                    port=bound_port,
+                    token=token,
+                    url=f"http://{LOOPBACK_HOST}:{bound_port}/",
+                    vault=str(vault.root),
+                    vault_id=server.vault_id,
+                )
+                if write_state:
+                    _write_state(state)
+                try:
+                    server.serve_forever(poll_interval=0.25)
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    server.server_close()
+                    if write_state:
+                        _remove_state_if_owned(os.getpid(), identity)
+                return bound_port
+    except ConflictError as exc:
+        if lifecycle_lock_acquired:
+            raise
+        raise SetupError(
+            "Another GSV Bridge process already owns this local runtime. "
+            "Use `gsv bridge status` or `gsv bridge stop` before starting another one."
+        ) from exc
 
 
 def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:

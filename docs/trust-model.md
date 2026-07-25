@@ -55,10 +55,12 @@ receipt; only a complete identity match permits signalling.
 
 The server binds only to `127.0.0.1`, validates the exact Host and Origin for
 its bound port, and serves only bounded regular files inside its packaged
-static root. Its only write route is `POST /api/v1/control`: an authenticated,
-size-bounded, compare-and-swap append to a local queue. The route accepts only
-setup choices, approvals, corrections, and undo requests. These are user-intent
-receipts. The CLI and MCP operation surfaces may durably accept or reject a
+static root. It exposes two authenticated write routes. `POST /api/v1/control`
+is a size-bounded, compare-and-swap append to the local intent queue; it accepts
+only setup choices, approvals, corrections, and undo requests. `POST
+/api/v1/review-turn` advances only the content-free transport-receipt lane and
+may launch the restricted same-hand Codex transport; it cannot author semantic
+canon. The CLI and MCP operation surfaces may durably accept or reject an intent
 receipt, but disposition does not execute it or grant external-action authority.
 Each mutation requires the logical vault ID and both CAS revisions returned by
 the preceding operation snapshot. A live MCP process additionally binds to the
@@ -79,7 +81,8 @@ promotion remains blocked until an installed lifecycle contract can also own or
 reconcile the detached child itself.
 Neither the receipt nor its disposition can directly write Tasks, Entities,
 WorkThreads, `MIND.md`, `NOW.md`, onboarding, source readiness, grants, or
-action policy. Every other HTTP write method and path remains denied. The
+action policy. Every HTTP write method and path other than those two exact POST
+routes remains denied. The
 browser renders authored content using `textContent`, not HTML interpolation.
 
 The control queue and its CLI/MCP disposition surfaces currently require the
