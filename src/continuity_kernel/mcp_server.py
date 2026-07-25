@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import IO, Any, Final
@@ -11,13 +12,18 @@ from typing import IO, Any, Final
 from continuity_kernel import __version__
 from continuity_kernel.config import resolve_vault
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
+from continuity_kernel.direction import direction_aim, direction_dict
 from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
 from continuity_kernel.operations import (
     OperationBinding,
     OperationLedger,
     capture_operation_binding,
 )
-from continuity_kernel.portfolio import portfolio_dict, portfolio_item
+from continuity_kernel.portfolio import (
+    portfolio_dict,
+    portfolio_inspection_dict,
+    portfolio_item,
+)
 from continuity_kernel.records import record_dict
 from continuity_kernel.vault import Vault, doctor_dict
 
@@ -32,6 +38,32 @@ OPERATION_TOOL_NAMES: Final = frozenset(
         "gsv_operation_reject",
     }
 )
+GUIDED_REVIEW_PROFILE: Final = "guided-review"
+GUIDED_REVIEW_TOOL_NAMES: Final = frozenset(
+    {
+        "gsv_status",
+        "gsv_context",
+        "gsv_task_list",
+        "gsv_task_show",
+        "gsv_task_create",
+        "gsv_task_update",
+        "gsv_direction_show",
+        "gsv_portfolio_show",
+        "gsv_portfolio_inspect",
+        "gsv_portfolio_set",
+        "gsv_entity_list",
+        "gsv_entity_show",
+        "gsv_entity_create",
+        "gsv_entity_update",
+        "gsv_thread_list",
+        "gsv_thread_show",
+        "gsv_thread_create",
+        "gsv_thread_update",
+        "gsv_operation_list",
+        "gsv_operation_accept",
+        "gsv_operation_reject",
+    }
+)
 
 
 @dataclass
@@ -41,9 +73,15 @@ class _OperationSession:
     binding: OperationBinding | None = None
 
 
-def serve(vault: Vault | None = None) -> int:
+def serve(
+    vault: Vault | None = None,
+    *,
+    profile: str | None = None,
+    event_id: str | None = None,
+) -> int:
     """Serve line-delimited MCP JSON-RPC until stdin closes."""
 
+    bound_event_id = _profile_event_id(profile, event_id)
     bound = vault or Vault(resolve_vault())
     operation_session = _OperationSession() if CONTROL_STORE_SUPPORTED else None
     for raw_line in _bounded_lines(sys.stdin.buffer):
@@ -58,7 +96,13 @@ def serve(vault: Vault | None = None) -> int:
             if not isinstance(message, dict):
                 raise ValidationError("JSON-RPC message must be an object")
             request_id = message.get("id")
-            response = _handle(message, vault=bound, operation_session=operation_session)
+            response = _handle(
+                message,
+                vault=bound,
+                operation_session=operation_session,
+                profile=profile,
+                event_id=bound_event_id,
+            )
             if response is not None:
                 _write(response)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -89,7 +133,10 @@ def _handle(
     vault: Vault | None = None,
     operation_binding: OperationBinding | None = None,
     operation_session: _OperationSession | None = None,
+    profile: str | None = None,
+    event_id: str | None = None,
 ) -> dict[str, Any] | None:
+    bound_event_id = _profile_event_id(profile, event_id)
     method = message.get("method")
     request_id = message.get("id")
     if method == "notifications/initialized":
@@ -116,7 +163,7 @@ def _handle(
     if method == "ping":
         return _result(request_id, {})
     if method == "tools/list":
-        return _result(request_id, {"tools": _advertised_tools()})
+        return _result(request_id, {"tools": _advertised_tools(profile=profile)})
     if method == "tools/call":
         params = message.get("params")
         if not isinstance(params, dict) or not isinstance(params.get("name"), str):
@@ -131,6 +178,8 @@ def _handle(
                 vault=vault,
                 operation_binding=operation_binding,
                 operation_session=operation_session,
+                profile=profile,
+                event_id=bound_event_id,
             )
             return _result(
                 request_id,
@@ -167,7 +216,16 @@ def _call(
     vault: Vault | None = None,
     operation_binding: OperationBinding | None = None,
     operation_session: _OperationSession | None = None,
+    profile: str | None = None,
+    event_id: str | None = None,
 ) -> dict[str, Any]:
+    allowed = _profile_tool_names(profile)
+    if allowed is not None and name not in allowed:
+        raise ValidationError(f"unknown tool: {name}")
+    if name in {"gsv_operation_accept", "gsv_operation_reject"} and event_id is not None:
+        requested_event_id = _string(values, "event_id")
+        if requested_event_id != event_id:
+            raise ValidationError("operation event is outside this guided-review MCP binding")
     if name in OPERATION_TOOL_NAMES and not CONTROL_STORE_SUPPORTED:
         raise ValidationError(f"unknown tool: {name}")
     vault = vault or Vault(resolve_vault())
@@ -228,8 +286,46 @@ def _call(
                 remove_refs=_strings(values, "remove_refs"),
             )
         )
+    if name == "gsv_direction_show":
+        return direction_dict(vault.get_direction())
+    if name == "gsv_direction_set":
+        raw_aims = values.get("aims")
+        if not isinstance(raw_aims, list):
+            raise ValidationError("aims must be an array")
+        aims = []
+        for raw in raw_aims:
+            if not isinstance(raw, dict):
+                raise ValidationError("each Direction aim must be an object")
+            aims.append(
+                direction_aim(
+                    identifier=_string(raw, "id"),
+                    title=_string(raw, "title"),
+                    desired_state=_string(raw, "desired_state"),
+                )
+            )
+        return direction_dict(
+            vault.set_direction(
+                expected_revision=_string(values, "expected_revision"),
+                status=_string(values, "status"),
+                current_chapter=_string(values, "current_chapter"),
+                aims=tuple(aims),
+            )
+        )
     if name == "gsv_portfolio_show":
         return portfolio_dict(vault.get_portfolio())
+    if name == "gsv_portfolio_inspect":
+        return portfolio_inspection_dict(vault.inspect_portfolio())
+    if name == "gsv_portfolio_migrate_review_session":
+        return record_dict(
+            vault.migrate_legacy_review_session(
+                _string(values, "session_id"),
+                expected_session_revision=_string(values, "expected_session_revision"),
+                expected_review_thread_revision=_string(values, "expected_review_thread_revision"),
+                thread_title=_optional_string(values, "thread_title"),
+                thread_purpose=_optional_string(values, "thread_purpose"),
+                thread_summary=_optional_string(values, "thread_summary"),
+            )
+        )
     if name == "gsv_portfolio_set":
         raw_items = values.get("items")
         if not isinstance(raw_items, list):
@@ -246,6 +342,8 @@ def _call(
                     reason=_string(raw, "reason"),
                     work_thread_id=_optional_string(raw, "work_thread_id"),
                     work_thread_revision=_optional_string(raw, "work_thread_revision"),
+                    direction_aim_ids=_strings(raw, "direction_aim_ids"),
+                    unaligned_reason=_optional_string(raw, "unaligned_reason"),
                 )
             )
         return portfolio_dict(
@@ -253,6 +351,7 @@ def _call(
                 expected_revision=_string(values, "expected_revision"),
                 summary=_string(values, "summary"),
                 items=tuple(items),
+                direction_revision=_optional_string(values, "direction_revision"),
             )
         )
     if name == "gsv_entity_list":
@@ -296,6 +395,7 @@ def _call(
                 summary=_string(values, "summary"),
                 status=_optional_string(values, "status") or "active",
                 next_move=_optional_string(values, "next_move"),
+                focus_task_id=_optional_string(values, "focus_task_id"),
                 task_ids=_strings(values, "task_ids"),
                 entity_ids=_strings(values, "entity_ids"),
                 refs=_strings(values, "refs"),
@@ -312,6 +412,8 @@ def _call(
                 status=_optional_string(values, "status"),
                 next_move=_optional_string(values, "next_move"),
                 clear_next_move=_boolean(values, "clear_next_move"),
+                focus_task_id=_optional_string(values, "focus_task_id"),
+                clear_focus_task=_boolean(values, "clear_focus_task"),
                 task_ids=_optional_strings(values, "task_ids"),
                 entity_ids=_optional_strings(values, "entity_ids"),
                 add_refs=_strings(values, "add_refs"),
@@ -330,32 +432,26 @@ def _call(
         return vault.create_backup()
     if name == "gsv_operation_list":
         assert operation_binding is not None
-        return (
-            OperationLedger(vault.root)
-            .snapshot(
-                expected_vault_id=operation_binding.vault_id,
-                expected_root_identity=operation_binding.root_identity,
-            )
-            .to_dict()
+        snapshot = OperationLedger(vault.root).snapshot(
+            expected_vault_id=operation_binding.vault_id,
+            expected_root_identity=operation_binding.root_identity,
         )
+        return _scoped_operation_snapshot(snapshot.to_dict(), event_id)
     if name in {"gsv_operation_accept", "gsv_operation_reject"}:
         assert operation_binding is not None
         expected_vault_id = _bound_operation_vault_id(values, operation_binding)
-        return (
-            OperationLedger(vault.root)
-            .decide(
-                event_id=_string(values, "event_id"),
-                decision="accepted" if name == "gsv_operation_accept" else "rejected",
-                actor_ref=_string(values, "actor_ref"),
-                reason_code=_string(values, "reason_code"),
-                expected_queue_revision=_string(values, "expected_queue_revision"),
-                expected_disposition_revision=_string(values, "expected_disposition_revision"),
-                expected_vault_id=expected_vault_id,
-                expected_root_identity=operation_binding.root_identity,
-                result_ref=_optional_string(values, "result_ref"),
-            )
-            .to_dict()
+        snapshot = OperationLedger(vault.root).decide(
+            event_id=_string(values, "event_id"),
+            decision="accepted" if name == "gsv_operation_accept" else "rejected",
+            actor_ref=_string(values, "actor_ref"),
+            reason_code=_string(values, "reason_code"),
+            expected_queue_revision=_string(values, "expected_queue_revision"),
+            expected_disposition_revision=_string(values, "expected_disposition_revision"),
+            expected_vault_id=expected_vault_id,
+            expected_root_identity=operation_binding.root_identity,
+            result_ref=_optional_string(values, "result_ref"),
         )
+        return _scoped_operation_snapshot(snapshot.to_dict(), event_id)
     if name == "gsv_operation_archive_closed":
         assert operation_binding is not None
         expected_vault_id = _bound_operation_vault_id(values, operation_binding)
@@ -411,6 +507,30 @@ def _tool(
 TEXT = {"type": "string"}
 TEXTS = {"items": {"type": "string"}, "type": "array"}
 BOOLEAN = {"type": "boolean"}
+TASK_ACTIVE_THREAD_ID = {
+    "description": (
+        "Opaque active Codex hand identifier. In guided review this must be the raw Codex thread "
+        "UUID, never a GSV WorkThread ID such as thread:life-portfolio-review; omit it until the "
+        "Codex UUID is known."
+    ),
+    "type": "string",
+}
+TASK_REFS = {
+    "description": (
+        "Task navigation or evidence references. Never use a codex-thread:* reference as a "
+        "substitute for active_thread_id or for ownership by a GSV WorkThread."
+    ),
+    "items": {"type": "string"},
+    "type": "array",
+}
+TASK_REMOVE_REFS = {
+    "description": (
+        "Exact task references to remove. In guided review remove every codex-thread:* shadow "
+        "reference; the real Codex UUID belongs only in active_thread_id."
+    ),
+    "items": {"type": "string"},
+    "type": "array",
+}
 
 TOOLS: Final = [
     _tool("gsv_status", "Read vault identity, counts, and digest.", {}, read_only=True),
@@ -439,11 +559,11 @@ TOOLS: Final = [
         "Create one explicit durable outcome. Do not infer task meaning from source text.",
         {
             "id": TEXT,
-            "active_thread_id": TEXT,
+            "active_thread_id": TASK_ACTIVE_THREAD_ID,
             "next_action": TEXT,
             "next_actor": {"enum": ["agent", "human", "external"], "type": "string"},
             "outcome": TEXT,
-            "refs": TEXTS,
+            "refs": TASK_REFS,
             "rank": {"minimum": 0, "type": "integer"},
             "status": TEXT,
             "title": TEXT,
@@ -456,8 +576,8 @@ TOOLS: Final = [
         "gsv_task_update",
         "Update an exact task using its latest compare-and-swap revision.",
         {
-            "add_refs": TEXTS,
-            "active_thread_id": TEXT,
+            "add_refs": TASK_REFS,
+            "active_thread_id": TASK_ACTIVE_THREAD_ID,
             "clear_active_thread_id": BOOLEAN,
             "clear_next_action": BOOLEAN,
             "clear_next_actor": BOOLEAN,
@@ -468,7 +588,7 @@ TOOLS: Final = [
             "next_action": TEXT,
             "next_actor": {"enum": ["agent", "human", "external"], "type": "string"},
             "outcome": TEXT,
-            "remove_refs": TEXTS,
+            "remove_refs": TASK_REMOVE_REFS,
             "rank": {"minimum": 0, "type": "integer"},
             "status": TEXT,
             "title": TEXT,
@@ -478,10 +598,68 @@ TOOLS: Final = [
         read_only=False,
     ),
     _tool(
+        "gsv_direction_show",
+        "Read the exact current whole-life Direction and stable authored aims.",
+        {},
+        read_only=True,
+    ),
+    _tool(
+        "gsv_direction_set",
+        "CAS-author the complete Direction from explicit stable aims; never derive aims from text.",
+        {
+            "aims": {
+                "items": {
+                    "additionalProperties": False,
+                    "properties": {
+                        "desired_state": TEXT,
+                        "id": TEXT,
+                        "title": TEXT,
+                    },
+                    "required": ["id", "title", "desired_state"],
+                    "type": "object",
+                },
+                "type": "array",
+            },
+            "current_chapter": TEXT,
+            "expected_revision": TEXT,
+            "status": {"enum": ["provisional", "confirmed"], "type": "string"},
+        },
+        ("expected_revision", "status", "current_chapter", "aims"),
+        read_only=False,
+    ),
+    _tool(
         "gsv_portfolio_show",
         "Read the complete authored Portfolio and its exact revision.",
         {},
         read_only=True,
+    ),
+    _tool(
+        "gsv_portfolio_inspect",
+        "Inspect exact Direction, Portfolio, review coverage, and new or changed open work.",
+        {},
+        read_only=True,
+    ),
+    _tool(
+        "gsv_portfolio_migrate_review_session",
+        (
+            "CAS-bind one pre-focus review Task and its existing Codex hand to the canonical "
+            "review WorkThread. Supply authored WorkThread prose only when its expected "
+            "revision is absent."
+        ),
+        {
+            "expected_review_thread_revision": TEXT,
+            "expected_session_revision": TEXT,
+            "session_id": TEXT,
+            "thread_purpose": TEXT,
+            "thread_summary": TEXT,
+            "thread_title": TEXT,
+        },
+        (
+            "session_id",
+            "expected_session_revision",
+            "expected_review_thread_revision",
+        ),
+        read_only=False,
     ),
     _tool(
         "gsv_portfolio_set",
@@ -509,12 +687,15 @@ TOOLS: Final = [
                         "task_revision": TEXT,
                         "work_thread_id": TEXT,
                         "work_thread_revision": TEXT,
+                        "direction_aim_ids": TEXTS,
+                        "unaligned_reason": TEXT,
                     },
                     "required": ["task_id", "task_revision", "stance", "reason"],
                     "type": "object",
                 },
                 "type": "array",
             },
+            "direction_revision": TEXT,
             "summary": TEXT,
         },
         ("expected_revision", "summary", "items"),
@@ -570,6 +751,7 @@ TOOLS: Final = [
         "Create an explicitly authored work thread with exact relationships.",
         {
             "entity_ids": TEXTS,
+            "focus_task_id": TEXT,
             "id": TEXT,
             "next_move": TEXT,
             "purpose": TEXT,
@@ -588,9 +770,11 @@ TOOLS: Final = [
         {
             "add_refs": TEXTS,
             "clear_next_move": BOOLEAN,
+            "clear_focus_task": BOOLEAN,
             "entity_ids": TEXTS,
             "expected_revision": TEXT,
             "id": TEXT,
+            "focus_task_id": TEXT,
             "next_move": TEXT,
             "purpose": TEXT,
             "remove_refs": TEXTS,
@@ -696,12 +880,63 @@ TOOLS: Final = [
 ]
 
 
-def _advertised_tools() -> list[dict[str, Any]]:
-    """Hide the POSIX-only operation lane when its secure store is unavailable."""
+def _advertised_tools(*, profile: str | None = None) -> list[dict[str, Any]]:
+    """Apply an explicit profile and hide an unavailable secure operation lane."""
 
-    if CONTROL_STORE_SUPPORTED:
-        return list(TOOLS)
-    return [tool for tool in TOOLS if tool["name"] not in OPERATION_TOOL_NAMES]
+    allowed = _profile_tool_names(profile)
+    tools = TOOLS if allowed is None else [tool for tool in TOOLS if tool["name"] in allowed]
+    if not CONTROL_STORE_SUPPORTED:
+        tools = [tool for tool in tools if tool["name"] not in OPERATION_TOOL_NAMES]
+    return list(tools)
+
+
+def _profile_tool_names(profile: str | None) -> frozenset[str] | None:
+    if profile is None:
+        return None
+    if profile == GUIDED_REVIEW_PROFILE:
+        return GUIDED_REVIEW_TOOL_NAMES
+    raise ValidationError(f"unknown MCP profile: {profile}")
+
+
+def _profile_event_id(profile: str | None, event_id: str | None) -> str | None:
+    _profile_tool_names(profile)
+    if profile is None:
+        if event_id is not None:
+            raise ValidationError("an MCP event binding requires an explicit profile")
+        return None
+    if event_id is None:
+        raise ValidationError("guided-review MCP profile requires an exact event ID")
+    try:
+        parsed = str(uuid.UUID(event_id))
+    except (AttributeError, ValueError) as exc:
+        raise ValidationError("guided-review MCP event ID must be a canonical UUID") from exc
+    if parsed != event_id:
+        raise ValidationError("guided-review MCP event ID must be a canonical UUID")
+    return event_id
+
+
+def _scoped_operation_snapshot(
+    payload: dict[str, Any],
+    event_id: str | None,
+) -> dict[str, Any]:
+    if event_id is None:
+        return payload
+    scoped = dict(payload)
+    scoped["pending"] = [event for event in payload["pending"] if event.get("event_id") == event_id]
+    scoped["decided"] = [
+        item for item in payload["decided"] if item.get("event", {}).get("event_id") == event_id
+    ]
+    archived = []
+    for generation in payload["archived"]:
+        decided = [
+            item
+            for item in generation.get("decided", [])
+            if item.get("event", {}).get("event_id") == event_id
+        ]
+        if decided:
+            archived.append({**generation, "decided": decided})
+    scoped["archived"] = archived
+    return scoped
 
 
 def _result(request_id: object, result: dict[str, Any]) -> dict[str, Any]:

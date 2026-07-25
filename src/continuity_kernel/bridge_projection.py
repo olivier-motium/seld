@@ -11,12 +11,19 @@ from typing import Any, Final, cast
 from urllib.parse import urlencode
 
 from continuity_kernel import __version__
-from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED, event_dict
-from continuity_kernel.errors import ContinuityError, ValidationError
+from continuity_kernel.codex_turn_transport import (
+    START_REVIEW_CHOICE,
+    START_REVIEW_SUBJECT,
+    is_canonical_uuid,
+)
+from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED, ControlEvent, event_dict
+from continuity_kernel.direction import direction_dict
+from continuity_kernel.errors import ContinuityError, NotFoundError, ValidationError
 from continuity_kernel.operations import OperationLedger, disposition_dict
 from continuity_kernel.portfolio import portfolio_dict
 from continuity_kernel.records import (
     MAX_RECORD_BYTES,
+    REVIEW_WORK_THREAD_ID,
     TERMINAL_TASK_STATUSES,
     Entity,
     Record,
@@ -82,16 +89,34 @@ _CONTROL_REVIEW_PROMPT: Final = (
     "canonical records, use provider tools, or take external action. If nothing is pending, say so."
 )
 _GUIDED_REVIEW_PROMPT: Final = (
-    "Start or resume one finite all-open GSV Portfolio review. Use one ordinary review-session "
-    "Task with exactly one review-scope:all-open ref, at most one current "
-    "review-subject:task:<id> ref, and review-covered:task:<id> refs only for outcomes the user "
-    "explicitly checked. Covered never means resolved. Keep one exact active Codex hand on the "
-    "session Task. Read pending Bridge correction intents through gsv operation list; interpret "
-    "each answer yourself, apply only explicit semantic decisions through fresh native Task, "
-    "WorkThread, and complete Portfolio CAS writes plus readback, then acknowledge or reject the "
-    "intent with a result ref. Accepting an intent is only acknowledgement and never performs the "
-    "semantic write. Present one exact current outcome, recommendation, and useful question. Do "
-    "not infer meaning, end because of time or energy, or create a transcript store."
+    "Start or resume exactly one finite all-open GSV Portfolio review. Read Direction, the "
+    "complete authored Portfolio, every open Task, and relevant WorkThreads and Entities. Use one "
+    "ordinary "
+    "nonterminal review-session Task owned only by thread:life-portfolio-review; that WorkThread "
+    "must contain and focus the session. Keep exactly one review-scope:all-open ref, at most one "
+    "review-subject:task:<id>, one exact active Codex hand, and review-state:paused only while the "
+    "user explicitly pauses. Store the raw Codex thread UUID only in active_thread_id, the GSV "
+    "WorkThread ID only in thread ownership and focus, and never add a codex-thread:* shadow ref. "
+    "A nonterminal current subject uses status=waiting, next_actor=human, a nonempty next_action "
+    "recommendation, and a nonempty waiting_on question. Present one exact authored outcome with "
+    "current Task and owning "
+    "WorkThread state, evidence and known staleness or contradiction, one grounded recommendation, "
+    "authored option consequences, and one useful question. Read only the exact pending Bridge "
+    "answer through gsv operation list. Interpret it yourself; apply only explicit semantic "
+    "decisions through fresh native Task and WorkThread CAS, Direction CAS when relevant, and "
+    "complete Portfolio CAS when affected, plus readback; then "
+    "acknowledge or reject the receipt with a result ref. Acceptance is acknowledgement, never the "
+    "semantic write. After an explicit answer or skip, anchor checked progress as "
+    "review-covered:task:<id>@<task-revision>, adding "
+    "|thread:<thread-id>@<thread-revision> when an owning WorkThread exists. Task or WorkThread "
+    "drift makes that coverage stale; revisit it, and include new open outcomes. Checked never "
+    "means resolved. The agent, not Bridge or Portfolio order, authors the next subject and option "
+    "consequences through fresh session CAS. On explicit pause, preserve subject, coverage, focus, "
+    "and the same hand. End only on explicit instruction or when every current open outcome has "
+    "current anchored coverage; then clear the subject, paused state, active hand, every "
+    "codex-thread:* shadow ref, and WorkThread focus while retaining scope and coverage evidence. "
+    "Do not infer meaning, end because of time or energy, take unapproved external action, or "
+    "create a transcript store."
 )
 
 
@@ -161,6 +186,12 @@ def project_snapshot(
     entities = [record_dict(item) for item in entity_records]
     mind = vault.read_document("MIND.md")
     now = vault.read_document("NOW.md")
+    try:
+        direction: dict[str, Any] | None = direction_dict(vault.get_direction())
+    except NotFoundError:
+        direction = None
+    except (ContinuityError, OSError, UnicodeError, ValueError):
+        direction = {"available": False}
     status = {
         **vault.identity(),
         "counts": {
@@ -169,7 +200,7 @@ def project_snapshot(
             "threads": len(thread_records),
         },
     }
-    controls = _project_controls(
+    controls, pending_controls = _project_controls(
         vault,
         codex_ready=codex_ready,
         expected_vault_id=expected_vault_id,
@@ -180,7 +211,7 @@ def project_snapshot(
         tasks=task_records,
         threads=thread_records,
         codex_ready=codex_ready,
-        controls=controls,
+        pending_controls=pending_controls,
     )
     return {
         "bridge": {
@@ -207,6 +238,7 @@ def project_snapshot(
         },
         "controls": controls,
         "doctor": resolved_doctor,
+        "direction": direction,
         "entities": entities,
         "mind": mind,
         "now": now,
@@ -226,32 +258,79 @@ def _project_portfolio(
     tasks: tuple[Task, ...],
     threads: tuple[WorkThread, ...],
     codex_ready: bool,
-    controls: dict[str, Any],
+    pending_controls: tuple[ControlEvent, ...] | None,
 ) -> dict[str, Any]:
     """Project authored Portfolio and finite-review navigation without choosing meaning."""
 
     start_url = codex_deep_link(vault.root, _GUIDED_REVIEW_PROMPT) if codex_ready else None
+    pending_starts = (
+        []
+        if pending_controls is None
+        else [
+            event
+            for event in pending_controls
+            if event.subject == START_REVIEW_SUBJECT and event.choice == START_REVIEW_CHOICE
+        ]
+    )
+    pending_start = event_dict(pending_starts[0]) if len(pending_starts) == 1 else None
     try:
         portfolio = vault.get_portfolio()
+        inspection = vault.inspect_portfolio()
     except (ContinuityError, OSError, UnicodeError, ValueError):
         return {
             "available": False,
             "items": [],
-            "review": {"state": "unavailable", "start_url": start_url},
+            "review": {
+                "pending_start": pending_start,
+                "state": "unavailable",
+                "start_url": start_url,
+            },
             "state": "missing",
+        }
+    if inspection.portfolio.revision != portfolio.revision:
+        return {
+            **portfolio_dict(portfolio),
+            "available": False,
+            "items": [],
+            "review": {
+                "issue": "The Portfolio changed during inspection; reload current truth.",
+                "pending_start": pending_start,
+                "start_url": start_url,
+                "state": "unavailable",
+            },
+            "state": "unavailable",
         }
 
     task_by_id = {task.identifier: task for task in tasks}
     thread_by_id = {thread.identifier: thread for thread in threads}
+    current_owners_by_task: dict[str, list[WorkThread]] = {}
+    for candidate in threads:
+        if candidate.identifier == REVIEW_WORK_THREAD_ID or candidate.status == "closed":
+            continue
+        for task_id_value in candidate.task_ids:
+            current_owners_by_task.setdefault(task_id_value, []).append(candidate)
     projected_items = []
     stale_count = 0
     for position, item in enumerate(portfolio.items, 1):
         task = task_by_id.get(item.task_id)
-        thread = thread_by_id.get(item.work_thread_id) if item.work_thread_id else None
-        task_stale = task is None or task.revision != item.task_revision
-        thread_stale = bool(
-            item.work_thread_id and (thread is None or thread.revision != item.work_thread_revision)
+        current_owners = tuple(
+            sorted(
+                current_owners_by_task.get(item.task_id, []),
+                key=lambda value: value.identifier,
+            )
         )
+        thread = current_owners[0] if len(current_owners) == 1 else None
+        task_stale = (
+            item.task_id in inspection.stale_portfolio_task_ids
+            or task is None
+            or task.revision != item.task_revision
+        )
+        owner_is_current = len(current_owners) == 1 and (
+            item.work_thread_id == current_owners[0].identifier
+            and item.work_thread_revision == current_owners[0].revision
+        )
+        unthreaded_is_current = not current_owners and item.work_thread_id is None
+        thread_stale = not owner_is_current and not unthreaded_is_current
         stale = task_stale or thread_stale
         stale_count += int(stale)
         projected_items.append(
@@ -259,60 +338,69 @@ def _project_portfolio(
                 **item.__dict__,
                 "position": position,
                 "stale": stale,
+                "task_stale": task_stale,
                 "task": record_dict(task) if task is not None else None,
+                "thread_stale": thread_stale,
                 "work_thread": record_dict(thread) if thread is not None else None,
             }
         )
-
-    review_candidates = [
-        task
-        for task in tasks
-        if task.status not in TERMINAL_TASK_STATUSES
-        and any(ref.startswith("review-scope:") for ref in task.refs)
-    ]
-    review: dict[str, Any]
-    if len(review_candidates) > 1:
-        review = {
-            "issue": "More than one nonterminal Task claims the guided-review scope.",
-            "start_url": start_url,
-            "state": "conflict",
-        }
-    elif not review_candidates:
-        review = {"start_url": start_url, "state": "available"}
-    else:
-        session = review_candidates[0]
-        scope_refs = [ref for ref in session.refs if ref.startswith("review-scope:")]
-        subject_refs = [ref for ref in session.refs if ref.startswith("review-subject:")]
-        covered_refs = [ref for ref in session.refs if ref.startswith("review-covered:")]
-        issue = ""
-        if scope_refs != ["review-scope:all-open"]:
-            issue = "The review session must carry exactly one review-scope:all-open ref."
-        subject_ids = [
-            ref.removeprefix("review-subject:task:")
-            for ref in subject_refs
-            if ref.startswith("review-subject:task:")
-        ]
-        covered_ids = [
-            ref.removeprefix("review-covered:task:")
-            for ref in covered_refs
-            if ref.startswith("review-covered:task:")
-        ]
-        if not issue and (len(subject_ids) != len(subject_refs) or len(subject_ids) > 1):
-            issue = "The review session has malformed or conflicting subject refs."
-        if not issue and (
-            len(covered_ids) != len(covered_refs) or len(set(covered_ids)) != len(covered_ids)
-        ):
-            issue = "The review session has malformed or duplicate covered refs."
-        if not issue and any(identifier not in task_by_id for identifier in covered_ids):
-            issue = "The review session references a covered Task that is not present."
-        pending_intents = [
-            item["event"]
-            for item in controls.get("items", [])
-            if isinstance(item, dict)
-            and item.get("status") == "pending"
-            and isinstance(item.get("event"), dict)
-            and item["event"].get("subject") == f"record:task/{session.identifier}"
-        ]
+    inspected_review = inspection.review
+    review: dict[str, Any] = {
+        "checked_count": len(inspected_review.coverages),
+        "checked_current_count": len(inspected_review.current_coverage_task_ids),
+        "covered_task_ids": list(inspected_review.current_coverage_task_ids),
+        "issue": inspected_review.issue,
+        "new_open_count": len(inspected_review.new_open_task_ids),
+        "new_open_task_ids": list(inspected_review.new_open_task_ids),
+        "open_count": len(inspected_review.open_task_ids),
+        "options": [
+            {"consequence": option.consequence, "intent": option.intent}
+            for option in inspected_review.options
+        ],
+        "pending_start": pending_start,
+        "revisit_count": len(inspected_review.revisit_task_ids),
+        "revisit_task_ids": list(inspected_review.revisit_task_ids),
+        "start_target_revision": portfolio.revision,
+        "start_url": start_url,
+        "state": inspected_review.state,
+        "uncovered_count": len(inspected_review.uncovered_task_ids),
+        "uncovered_task_ids": list(inspected_review.uncovered_task_ids),
+    }
+    if pending_controls is None:
+        review["issue"] = (
+            review["issue"] or "The review queue is unavailable; reload current truth."
+        )
+        if inspected_review.session_task_id is None:
+            review["state"] = "unavailable"
+    elif len(pending_starts) > 1:
+        review["issue"] = review["issue"] or "More than one guided review start is pending."
+        if inspected_review.session_task_id is None:
+            review["state"] = "unavailable"
+    session = (
+        task_by_id.get(inspected_review.session_task_id)
+        if inspected_review.session_task_id is not None
+        else None
+    )
+    review_thread = thread_by_id.get(REVIEW_WORK_THREAD_ID)
+    if session is not None:
+        pending_intents = (
+            []
+            if pending_controls is None
+            else [
+                event_dict(event)
+                for event in pending_controls
+                if event.subject == f"record:task/{session.identifier}"
+            ]
+        )
+        issue = review["issue"]
+        active_thread_id = (
+            session.active_thread_id if is_canonical_uuid(session.active_thread_id) else None
+        )
+        if session.active_thread_id is not None and active_thread_id is None and not issue:
+            issue = (
+                "The guided review hand is not an exact Codex task UUID; repair it before "
+                "continuing."
+            )
         if not issue and len(pending_intents) > 1:
             issue = "More than one pending answer targets this exact review session."
         if (
@@ -321,53 +409,61 @@ def _project_portfolio(
             and pending_intents[0].get("target_revision") != session.revision
         ):
             issue = "The pending review answer targets an older session revision."
-        open_outcome_ids = {
-            task.identifier
-            for task in tasks
-            if task.status not in TERMINAL_TASK_STATUSES
-            and "review-scope:all-open" not in task.refs
-        }
-        subject_id = subject_ids[0] if subject_ids else None
+        subject_id = inspected_review.current_subject_task_id
         subject_matches = [item for item in projected_items if item["task_id"] == subject_id]
-        subject = subject_matches[0] if len(subject_matches) == 1 else None
-        subject_safe = bool(
-            subject is not None
-            and subject_id in open_outcome_ids
-            and subject["stale"] is False
-            and subject_id not in set(covered_ids)
-        )
-        if not issue and subject_id and not subject_safe:
-            issue = (
-                "The exact authored review subject is stale, closed, absent, or already covered."
+        subject = dict(subject_matches[0]) if len(subject_matches) == 1 else None
+        if subject is not None and subject.get("task") is not None:
+            task_refs = [
+                ref for ref in subject["task"].get("refs", []) if not ref.startswith("review-")
+            ]
+            thread_refs = (
+                subject["work_thread"].get("refs", [])
+                if subject.get("work_thread") is not None
+                else []
             )
-        checked_open = len(open_outcome_ids & set(covered_ids))
-        review = {
-            "active_thread_id": session.active_thread_id,
-            "actionable": bool(
-                subject_safe and session.active_thread_id and not issue and not pending_intents
-            ),
-            "checked_count": len(covered_ids),
-            "checked_open_count": checked_open,
-            "covered_task_ids": covered_ids,
-            "hand_url": (
-                f"codex://threads/{session.active_thread_id}" if session.active_thread_id else None
-            ),
-            "issue": issue or None,
-            "open_count": len(open_outcome_ids),
-            "pending_intent": pending_intents[0] if len(pending_intents) == 1 else None,
-            "question": session.waiting_on,
-            "recommendation": session.next_action,
-            "session": record_dict(session),
-            "session_revision": session.revision,
-            "start_url": start_url,
-            "state": "active" if not issue else "conflict",
-            "subject": subject,
-            "subject_task_id": subject_id,
-            "uncovered_count": max(0, len(open_outcome_ids) - checked_open),
-        }
+            subject["evidence_refs"] = list(dict.fromkeys((*task_refs, *thread_refs)))
+            staleness: list[str] = []
+            if subject["task_stale"]:
+                staleness.append("The Task changed after this Portfolio judgment was authored.")
+            if subject["thread_stale"]:
+                staleness.append(
+                    "The owning WorkThread changed after this Portfolio judgment was authored."
+                )
+            if inspection.direction_changed:
+                staleness.append("Direction changed after this Portfolio judgment was authored.")
+            subject["staleness"] = staleness
+        review.update(
+            {
+                "active_thread_id": active_thread_id,
+                "actionable": bool(
+                    inspected_review.state == "active"
+                    and subject is not None
+                    and subject.get("stale") is False
+                    and not subject.get("staleness")
+                    and active_thread_id
+                    and not issue
+                    and not pending_intents
+                    and not pending_starts
+                ),
+                "hand_url": (f"codex://threads/{active_thread_id}" if active_thread_id else None),
+                "issue": issue,
+                "pending_intent": (pending_intents[0] if len(pending_intents) == 1 else None),
+                "question": session.waiting_on,
+                "recommendation": session.next_action,
+                "review_thread": (
+                    record_dict(review_thread) if review_thread is not None else None
+                ),
+                "session": record_dict(session),
+                "session_revision": session.revision,
+                "state": "conflict" if issue else inspected_review.state,
+                "subject": subject,
+                "subject_task_id": subject_id,
+            }
+        )
     return {
         **portfolio_dict(portfolio),
         "available": True,
+        "direction_changed": inspection.direction_changed,
         "items": projected_items,
         "review": review,
         "stale_count": stale_count,
@@ -381,7 +477,7 @@ def _project_controls(
     codex_ready: bool,
     expected_vault_id: str | None,
     expected_root_identity: tuple[int, int] | None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], tuple[ControlEvent, ...] | None]:
     """Degrade the noncanonical control lane without hiding canonical records."""
 
     try:
@@ -390,20 +486,23 @@ def _project_controls(
             expected_root_identity=expected_root_identity,
         )
     except (ContinuityError, OSError, UnicodeError, ValueError):
-        return {
-            "archived_decided": None,
-            "available": False,
-            "decided": None,
-            "disposition_revision": None,
-            "generation": None,
-            "history": [],
-            "items": [],
-            "pending": None,
-            "queue_revision": None,
-            "review_prompt": None,
-            "review_url": None,
-            "state": "unavailable",
-        }
+        return (
+            {
+                "archived_decided": None,
+                "available": False,
+                "decided": None,
+                "disposition_revision": None,
+                "generation": None,
+                "history": [],
+                "items": [],
+                "pending": None,
+                "queue_revision": None,
+                "review_prompt": None,
+                "review_url": None,
+                "state": "unavailable",
+            },
+            None,
+        )
     items: list[dict[str, Any]] = [
         {"event": event_dict(event), "status": "pending"} for event in snapshot.pending
     ]
@@ -430,20 +529,25 @@ def _project_controls(
     history.sort(
         key=lambda item: (str(item["event"]["created_at"]), str(item["event"]["event_id"]))
     )
-    return {
-        "archived_decided": len(history),
-        "available": True,
-        "decided": len(snapshot.decided),
-        "disposition_revision": snapshot.disposition_revision,
-        "generation": snapshot.queue_generation,
-        "history": history[-20:],
-        "items": items[-20:],
-        "pending": len(snapshot.pending),
-        "queue_revision": snapshot.queue_revision,
-        "review_prompt": _CONTROL_REVIEW_PROMPT,
-        "review_url": codex_deep_link(vault.root, _CONTROL_REVIEW_PROMPT) if codex_ready else None,
-        "state": "ready",
-    }
+    return (
+        {
+            "archived_decided": len(history),
+            "available": True,
+            "decided": len(snapshot.decided),
+            "disposition_revision": snapshot.disposition_revision,
+            "generation": snapshot.queue_generation,
+            "history": history[-20:],
+            "items": items[-20:],
+            "pending": len(snapshot.pending),
+            "queue_revision": snapshot.queue_revision,
+            "review_prompt": _CONTROL_REVIEW_PROMPT,
+            "review_url": (
+                codex_deep_link(vault.root, _CONTROL_REVIEW_PROMPT) if codex_ready else None
+            ),
+            "state": "ready",
+        },
+        snapshot.pending,
+    )
 
 
 def _project_record_section(

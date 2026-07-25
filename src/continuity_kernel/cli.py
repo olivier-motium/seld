@@ -35,10 +35,15 @@ from continuity_kernel.config import (
 )
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
+from continuity_kernel.direction import direction_aim, direction_dict
 from continuity_kernel.errors import ContinuityError, SetupError
-from continuity_kernel.mcp_server import serve
+from continuity_kernel.mcp_server import GUIDED_REVIEW_PROFILE, serve
 from continuity_kernel.operations import OperationLedger, capture_operation_binding
-from continuity_kernel.portfolio import portfolio_dict, portfolio_item
+from continuity_kernel.portfolio import (
+    portfolio_dict,
+    portfolio_inspection_dict,
+    portfolio_item,
+)
 from continuity_kernel.records import record_dict
 from continuity_kernel.vault import Vault, doctor_dict
 
@@ -55,7 +60,11 @@ def main(arguments: list[str] | None = None) -> int:
             args.bridge_command = "open"
             args.no_browser = False
         if args.command == "mcp":
-            return serve(Vault(resolve_vault(getattr(args, "vault", None))))
+            return serve(
+                Vault(resolve_vault(getattr(args, "vault", None))),
+                profile=args.profile,
+                event_id=args.event_id,
+            )
         result = _dispatch(args)
         failure = _result_failure(args, result)
         _print(
@@ -225,6 +234,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return context if args.format == "markdown" else {"context": context}
     if args.command == "task":
         return _task(vault, args)
+    if args.command == "direction":
+        return _direction(vault, args)
     if args.command == "portfolio":
         return _portfolio(vault, args)
     if args.command == "entity":
@@ -405,6 +416,19 @@ def _entity(vault: Vault, args: argparse.Namespace) -> Any:
 def _portfolio(vault: Vault, args: argparse.Namespace) -> Any:
     if args.portfolio_command == "show":
         return portfolio_dict(vault.get_portfolio())
+    if args.portfolio_command == "inspect":
+        return portfolio_inspection_dict(vault.inspect_portfolio())
+    if args.portfolio_command == "migrate-review-session":
+        return record_dict(
+            vault.migrate_legacy_review_session(
+                args.session_id,
+                expected_session_revision=args.expected_session_revision,
+                expected_review_thread_revision=args.expected_review_thread_revision,
+                thread_title=args.thread_title,
+                thread_purpose=args.thread_purpose,
+                thread_summary=args.thread_summary,
+            )
+        )
     parsed = []
     for encoded in args.item_json:
         value = json.loads(encoded)
@@ -418,6 +442,8 @@ def _portfolio(vault: Vault, args: argparse.Namespace) -> Any:
                 reason=value.get("reason"),
                 work_thread_id=value.get("work_thread_id"),
                 work_thread_revision=value.get("work_thread_revision"),
+                direction_aim_ids=value.get("direction_aim_ids", ()),
+                unaligned_reason=value.get("unaligned_reason"),
             )
         )
     return portfolio_dict(
@@ -425,6 +451,32 @@ def _portfolio(vault: Vault, args: argparse.Namespace) -> Any:
             expected_revision=args.expected_revision,
             summary=args.summary,
             items=tuple(parsed),
+            direction_revision=args.direction_revision,
+        )
+    )
+
+
+def _direction(vault: Vault, args: argparse.Namespace) -> Any:
+    if args.direction_command == "show":
+        return direction_dict(vault.get_direction())
+    aims = []
+    for encoded in args.aim_json:
+        value = json.loads(encoded)
+        if not isinstance(value, dict):
+            raise ValueError("each --aim-json value must be a JSON object")
+        aims.append(
+            direction_aim(
+                identifier=value.get("id"),
+                title=value.get("title"),
+                desired_state=value.get("desired_state"),
+            )
+        )
+    return direction_dict(
+        vault.set_direction(
+            expected_revision=args.expected_revision,
+            status=args.status,
+            current_chapter=args.current_chapter,
+            aims=tuple(aims),
         )
     )
 
@@ -443,6 +495,7 @@ def _thread(vault: Vault, args: argparse.Namespace) -> Any:
                 summary=args.summary,
                 status=args.status,
                 next_move=args.next_move,
+                focus_task_id=args.focus_task_id,
                 task_ids=tuple(args.task_id),
                 entity_ids=tuple(args.entity_id),
                 refs=tuple(args.ref),
@@ -460,6 +513,8 @@ def _thread(vault: Vault, args: argparse.Namespace) -> Any:
             status=args.status,
             next_move=args.next_move,
             clear_next_move=args.clear_next_move,
+            focus_task_id=args.focus_task_id,
+            clear_focus_task=args.clear_focus_task,
             task_ids=task_ids,
             entity_ids=entity_ids,
             add_refs=tuple(args.add_ref),
@@ -565,10 +620,33 @@ def _parser() -> argparse.ArgumentParser:
     )
     portfolio_commands = portfolio.add_subparsers(dest="portfolio_command", required=True)
     portfolio_commands.add_parser("show")
+    portfolio_commands.add_parser("inspect")
+    portfolio_migrate = portfolio_commands.add_parser(
+        "migrate-review-session",
+        help="CAS-bind one legacy review task to the canonical review WorkThread.",
+    )
+    portfolio_migrate.add_argument("--session-id", required=True)
+    portfolio_migrate.add_argument("--expected-session-revision", required=True)
+    portfolio_migrate.add_argument("--expected-review-thread-revision", required=True)
+    portfolio_migrate.add_argument("--thread-title")
+    portfolio_migrate.add_argument("--thread-purpose")
+    portfolio_migrate.add_argument("--thread-summary")
     portfolio_set = portfolio_commands.add_parser("set")
     portfolio_set.add_argument("--expected-revision", required=True)
     portfolio_set.add_argument("--summary", required=True)
+    portfolio_set.add_argument("--direction-revision")
     portfolio_set.add_argument("--item-json", action="append", default=[])
+
+    direction = commands.add_parser(
+        "direction", help="Show or author the current whole-life Direction."
+    )
+    direction_commands = direction.add_subparsers(dest="direction_command", required=True)
+    direction_commands.add_parser("show")
+    direction_set = direction_commands.add_parser("set")
+    direction_set.add_argument("--expected-revision", required=True)
+    direction_set.add_argument("--status", choices=("provisional", "confirmed"), required=True)
+    direction_set.add_argument("--current-chapter", required=True)
+    direction_set.add_argument("--aim-json", action="append", default=[], required=True)
 
     entity = commands.add_parser("entity", help="Create and inspect canonical entities.")
     entity_commands = entity.add_subparsers(dest="entity_command", required=True)
@@ -608,6 +686,8 @@ def _parser() -> argparse.ArgumentParser:
     thread_update.add_argument("--status")
     thread_update.add_argument("--next-move")
     thread_update.add_argument("--clear-next-move", action="store_true")
+    thread_update.add_argument("--focus-task-id")
+    thread_update.add_argument("--clear-focus-task", action="store_true")
     thread_update.add_argument("--task-id", action="append")
     thread_update.add_argument("--entity-id", action="append")
     thread_update.add_argument("--add-ref", action="append", default=[])
@@ -688,7 +768,9 @@ def _parser() -> argparse.ArgumentParser:
 
     mcp = commands.add_parser("mcp", help="Run the local MCP server.")
     mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
-    mcp_commands.add_parser("serve")
+    mcp_serve = mcp_commands.add_parser("serve")
+    mcp_serve.add_argument("--profile", choices=(GUIDED_REVIEW_PROFILE,))
+    mcp_serve.add_argument("--event-id")
     return parser
 
 
@@ -712,6 +794,7 @@ def _thread_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--summary", required=True)
     parser.add_argument("--status", default="active")
     parser.add_argument("--next-move")
+    parser.add_argument("--focus-task-id")
     parser.add_argument("--task-id", action="append", default=[])
     parser.add_argument("--entity-id", action="append", default=[])
     parser.add_argument("--ref", action="append", default=[])

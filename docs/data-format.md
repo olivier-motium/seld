@@ -7,6 +7,7 @@ GSV/
   .gsv/
     manifest.json
     locks/
+  DIRECTION.md
   MIND.md
   NOW.md
   PORTFOLIO.md
@@ -63,16 +64,70 @@ quotes stored content and labels it as data so text in the vault is not treated
 as higher-priority instructions.
 
 `PORTFOLIO.md` is a typed authored judgment over the complete nonterminal Task
-set. Its ordered items carry an exact Task revision, stance, reason, and an
-optional exact owning WorkThread revision. The order is authored priority; the
-kernel does not derive it from rank, age, status, due dates, activity, or text.
-`portfolio set` requires the current Portfolio revision (`absent` for the first
-write), complete open-set coverage, and fresh item anchors.
+set. Version 2 carries one exact Direction revision. Its ordered items carry an
+exact Task revision, stance, reason, optional exact owning WorkThread revision,
+and either exact Direction aim IDs or an explicit unaligned reason. The order
+is authored priority; the kernel does not derive it from rank, age, status, due
+dates, activity, or text. `portfolio set` requires the current Portfolio
+revision (`absent` for the first write), complete open-set coverage, and fresh
+Direction, Task, and WorkThread anchors. Version 1 remains readable for
+migration but has no Direction alignment authority. Once Direction exists, the
+next complete Portfolio write is the explicit version-1-to-version-2 migration:
+it fails with a validation error until the current Direction revision and an
+alignment or explicit unaligned reason for every item are supplied.
 
 Tasks may carry an optional authored integer `rank` and one opaque
 `active_thread_id`. Rank is task truth, independent of Portfolio order. The
 active hand is execution continuity, not evidence of progress or completion;
 terminal Tasks cannot retain one.
+
+WorkThreads carry an optional `focus_task_id` that must name one of their exact
+`task_ids`. A closed WorkThread cannot retain focus. The bounded review session
+belongs to `thread:life-portfolio-review`, which focuses that session Task while
+the review is active or paused.
+
+## Guided review references
+
+One nonterminal review-session Task carries deterministic navigation facts:
+
+```text
+review-scope:all-open
+review-subject:task:<task-id>
+review-state:paused
+review-option:<intent>:<canonical-percent-encoded-consequence>
+review-covered:task:<task-id>@<task-sha256>
+review-covered:task:<task-id>@<task-sha256>|thread:<thread-id>@<thread-sha256>
+```
+
+Canonical option encoding leaves only `A-Z`, `a-z`, `0-9`, `_`, `.`, `-`, and
+`~` unescaped. Every other UTF-8 byte is percent-encoded with uppercase
+hexadecimal digits.
+
+Scope appears exactly once. Subject and paused state appear at most once.
+Options use one of `keep`, `act-next`, `defer`, `reprioritize`, `reshape`,
+`drop-or-merge`, or `skip`, at most once each. Their one-line consequence text
+is agent-authored for the exact subject; Bridge decodes and displays it but
+never supplies meaning. Replacing a subject also replaces its option refs.
+Coverage records the exact Task revision checked and, when the Portfolio item
+has an owning WorkThread, that exact thread revision too. Legacy unanchored
+`review-covered:task:<task-id>` refs from unreleased development builds remain
+readable only for explicit migration; they are stale and never count as current
+coverage. Duplicate, malformed, wrong-owner, or conflicting review refs fail
+closed.
+
+One review-session Task currently supports at most 512 open outcomes as a
+product contract. The typed Portfolio can represent a larger open set, but a
+single Task's 256 KiB record envelope cannot carry worst-case revision-aware
+coverage for all 10,000 Portfolio items. Larger guided reviews remain a
+promotion blocker until bounded checkpointing or compaction exists; they must
+not be presented as complete.
+
+Coverage is a checked-on-these-bytes navigation fact. A Task or owning
+WorkThread revision change invalidates it; a newly open Task has no coverage and
+joins the remaining set. Neither case changes Portfolio order or semantics
+mechanically. A terminal review Task retains its historical scope and coverage
+but must clear subject, paused state, and active hand; its owning WorkThread
+must clear focus.
 
 ## Context Pack
 
@@ -112,3 +167,8 @@ Failed unpublished restore stages remain named recovery evidence; they are not
 recursively removed by doctor repair.
 Checksums detect accidental corruption; they are not cryptographic
 authentication or encryption.
+
+The full-vault logical digest covers both canonical Markdown and the private
+`.gsv/control/` intent, disposition, archive, and transport-receipt lane. It is
+a backup-fidelity signal, not a canon-only "did my semantic records change"
+digest.

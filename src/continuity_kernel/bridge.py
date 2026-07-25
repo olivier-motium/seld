@@ -19,6 +19,7 @@ import uuid
 import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from hmac import compare_digest
 from http import HTTPStatus
@@ -29,7 +30,7 @@ from pathlib import Path, PurePosixPath
 from socketserver import TCPServer
 from typing import Any, BinaryIO, Final, cast
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from continuity_kernel import __version__
@@ -44,8 +45,26 @@ from continuity_kernel.bridge_projection import (
 from continuity_kernel.bridge_projection import (
     codex_deep_link as codex_deep_link,
 )
+from continuity_kernel.codex_turn_transport import (
+    RESUME_REVIEW_CHOICE,
+    START_REVIEW_CHOICE,
+    START_REVIEW_SUBJECT,
+    CodexTurnCoordinator,
+    ReceiptCapacityError,
+    TurnContext,
+    TurnMode,
+    TurnState,
+    TurnTransport,
+    is_canonical_uuid,
+)
 from continuity_kernel.config import data_dir
-from continuity_kernel.control_queue import ControlQueue, ControlStorageError, event_dict
+from continuity_kernel.control_queue import (
+    ControlEvent,
+    ControlKind,
+    ControlQueue,
+    ControlStorageError,
+    event_dict,
+)
 from continuity_kernel.errors import (
     ConflictError,
     ContinuityError,
@@ -54,7 +73,8 @@ from continuity_kernel.errors import (
     SetupError,
     ValidationError,
 )
-from continuity_kernel.operations import OperationLedger
+from continuity_kernel.operations import OperationLedger, OperationSnapshot
+from continuity_kernel.records import format_time
 from continuity_kernel.vault import Vault
 
 LOOPBACK_HOST: Final = "127.0.0.1"
@@ -209,6 +229,7 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         access_token: str,
         instance_id: str,
         integration_provider: Callable[[], dict[str, Any]] | None = None,
+        turn_transport: TurnTransport | None = None,
     ) -> None:
         self.access_token = access_token
         self.instance_id = instance_id
@@ -240,6 +261,12 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         self._integration_at = 0.0
         self._integration_refreshing = False
         self._metadata_lock = threading.Lock()
+        self.turn_transport = turn_transport or CodexTurnCoordinator(
+            vault.root,
+            instance_id=instance_id,
+            expected_vault_id=self.vault_id,
+            expected_root_identity=self.vault_root_identity,
+        )
         super().__init__(address, BridgeRequestHandler)
 
     def snapshot(self) -> dict[str, Any]:
@@ -254,8 +281,34 @@ class BridgeHTTPServer(ThreadingHTTPServer):
             expected_vault_id=self.vault_id,
             expected_root_identity=self.vault_root_identity,
         )
+        event_id = _current_guided_review_event_id(snapshot)
+        try:
+            snapshot["guided_review_transport"] = self.turn_transport.snapshot(event_id)
+        except (ContinuityError, OSError, UnicodeError, ValueError):
+            snapshot["guided_review_transport"] = _unavailable_turn_transport(
+                "transport_state_unavailable"
+            )
         self._require_current_vault_identity()
         return snapshot
+
+    def submit_review_turn(
+        self,
+        event: Any,
+        *,
+        queue_revision: str,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Submit one exact guided event selected from a pre-append snapshot."""
+
+        context = _guided_review_turn_context(
+            snapshot,
+            event=event,
+            queue_revision=queue_revision,
+        )
+        if context is None:
+            return None
+        receipt = self.turn_transport.submit(context)
+        return receipt.public()
 
     def _require_current_vault_identity(self) -> None:
         """Refuse reads or writes after the Bridge pathname names another vault."""
@@ -342,26 +395,37 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if len(self.path) > MAX_TARGET_LENGTH:
-            self._error(HTTPStatus.REQUEST_URI_TOO_LONG, "Request target is too long")
+            self._reject_unread_post(HTTPStatus.REQUEST_URI_TOO_LONG, "Request target is too long")
             return
         if not self._valid_host() or not self._valid_origin(required=True):
-            self._error(HTTPStatus.FORBIDDEN, "The Bridge is available only on this computer")
+            self._reject_unread_post(
+                HTTPStatus.FORBIDDEN, "The Bridge is available only on this computer"
+            )
             return
         target = urlsplit(self.path)
-        if target.path != "/api/v1/control":
-            self._error(
+        if target.path not in {"/api/v1/control", "/api/v1/review-turn"}:
+            self._reject_unread_post(
                 HTTPStatus.METHOD_NOT_ALLOWED,
                 "The Bridge accepts only bounded control requests",
             )
             return
         if not self._authorized():
-            self._error(HTTPStatus.FORBIDDEN, "That Bridge session is not available")
+            self._reject_unread_post(HTTPStatus.FORBIDDEN, "That Bridge session is not available")
             return
-        self._append_control()
+        if target.path == "/api/v1/control":
+            self._append_control()
+        else:
+            self._trigger_review_turn()
 
     def _reject_non_post_write(self) -> None:
         self.close_connection = True
         self._error(HTTPStatus.METHOD_NOT_ALLOWED, "Only POST can append a Bridge intent")
+
+    def _reject_unread_post(self, status: HTTPStatus, message: str) -> None:
+        """Close HTTP/1.1 when rejecting before consuming the request body."""
+
+        self.close_connection = True
+        self._error(status, message)
 
     do_PUT = _reject_non_post_write
     do_PATCH = _reject_non_post_write
@@ -387,6 +451,16 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             return
         target = urlsplit(self.path)
         try:
+            if target.path == "/api/v1/review-turn":
+                if not self._authorized():
+                    self._error(
+                        HTTPStatus.FORBIDDEN,
+                        "That Bridge session is not available",
+                        head_only=head_only,
+                    )
+                    return
+                self._review_turn_status(target.query, head_only=head_only)
+                return
             if target.path == "/api/v1/health":
                 if not self._authorized():
                     self._error(
@@ -441,10 +515,14 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     def _append_control(self) -> None:
         content_type = self.headers.get("Content-Type", "").partition(";")[0].strip().lower()
         if content_type != "application/json":
-            self._error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Control requests must be JSON")
+            self._reject_unread_post(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Control requests must be JSON"
+            )
             return
         if self.headers.get("Transfer-Encoding") is not None:
-            self._error(HTTPStatus.BAD_REQUEST, "Streaming request bodies are not accepted")
+            self._reject_unread_post(
+                HTTPStatus.BAD_REQUEST, "Streaming request bodies are not accepted"
+            )
             return
         raw_length = self.headers.get("Content-Length")
         try:
@@ -452,7 +530,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             length = -1
         if not 0 < length <= MAX_CONTROL_BODY_BYTES:
-            self._error(
+            self._reject_unread_post(
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                 "Control request is empty or too large",
             )
@@ -472,12 +550,27 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         }:
             self._error(HTTPStatus.BAD_REQUEST, "Control request has an unsupported shape")
             return
+        pre_append_snapshot: dict[str, Any] | None = None
         try:
             self.bridge._require_current_vault_identity()
-            OperationLedger(self.bridge.vault.root).snapshot(
+            if payload.get("subject") == START_REVIEW_SUBJECT or (
+                isinstance(payload.get("subject"), str)
+                and cast(str, payload["subject"]).startswith("record:task/")
+            ):
+                try:
+                    pre_append_snapshot = self.bridge.snapshot()
+                except (ContinuityError, OSError, UnicodeError, ValueError):
+                    self._error(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "The local GSV vault is unavailable",
+                    )
+                    return
+            operations = OperationLedger(self.bridge.vault.root).snapshot(
                 expected_vault_id=self.bridge.vault_id,
                 expected_root_identity=self.bridge.vault_root_identity,
             )
+            if pre_append_snapshot is not None:
+                _validate_guided_review_intent(payload, pre_append_snapshot, operations)
             snapshot = ControlQueue(self.bridge.vault.root).append(
                 kind=payload.get("kind"),
                 subject=payload.get("subject"),
@@ -508,15 +601,190 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         except ValidationError as exc:
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return
+        transport: dict[str, Any] | None = None
+        if pre_append_snapshot is not None:
+            try:
+                transport = self.bridge.submit_review_turn(
+                    event,
+                    queue_revision=snapshot.revision,
+                    snapshot=pre_append_snapshot,
+                )
+                self.bridge._require_current_vault_identity()
+            except ConflictError:
+                transport = _transient_turn_state(
+                    event.event_id,
+                    state=TurnState.BLOCKED,
+                    reason_code="context_changed_after_queue_append",
+                )
+            except ReceiptCapacityError:
+                transport = _transient_turn_state(
+                    event.event_id,
+                    state=TurnState.BLOCKED,
+                    reason_code="transport_receipt_store_full",
+                )
+            except (ContinuityError, OSError, UnicodeError, ValueError):
+                transport = _transient_turn_state(
+                    event.event_id,
+                    state=TurnState.BLOCKED,
+                    reason_code="transport_submission_unavailable",
+                )
         self._json(
             {
                 "event": event_dict(event),
                 "ok": True,
                 "revision": snapshot.revision,
+                "transport": transport,
             },
             head_only=False,
             status=HTTPStatus.CREATED,
         )
+
+    def _trigger_review_turn(self) -> None:
+        payload = self._bounded_json_body(allowed=frozenset({"event_id"}))
+        if payload is None:
+            return
+        event_id = payload.get("event_id")
+        if not isinstance(event_id, str):
+            self._error(HTTPStatus.BAD_REQUEST, "Review-turn request requires an event ID")
+            return
+        try:
+            existing = self.bridge.turn_transport.receipt(event_id)
+            if existing is not None and existing.state not in {
+                TurnState.PENDING,
+                TurnState.FAILED_SAFE,
+            }:
+                transport = self.bridge.turn_transport.snapshot(existing.event_id)["event"]
+            else:
+                self.bridge._require_current_vault_identity()
+                operations = OperationLedger(self.bridge.vault.root).snapshot(
+                    expected_vault_id=self.bridge.vault_id,
+                    expected_root_identity=self.bridge.vault_root_identity,
+                )
+                matching = [event for event in operations.pending if event.event_id == event_id]
+                if len(matching) != 1:
+                    self._error(HTTPStatus.NOT_FOUND, "That review turn is not available")
+                    return
+                snapshot = self.bridge.snapshot()
+                context = _guided_review_turn_context(
+                    snapshot,
+                    event=matching[0],
+                    queue_revision=operations.queue_revision,
+                )
+                if context is None:
+                    self._error(HTTPStatus.NOT_FOUND, "That review turn is not available")
+                    return
+                receipt = self.bridge.turn_transport.submit(context)
+                transport = receipt.public()
+        except ConflictError as exc:
+            self._error(HTTPStatus.CONFLICT, str(exc))
+            return
+        except ControlStorageError:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "Review-turn state is unavailable")
+            return
+        except ReceiptCapacityError:
+            transport = _transient_turn_state(
+                event_id,
+                state=TurnState.BLOCKED,
+                reason_code="transport_receipt_store_full",
+            )
+        except ValidationError:
+            self._error(HTTPStatus.NOT_FOUND, "That review turn is not available")
+            return
+        except (ContinuityError, OSError, UnicodeError, ValueError):
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "Review-turn state is unavailable")
+            return
+        if not isinstance(transport, dict):
+            self._error(HTTPStatus.NOT_FOUND, "That review turn is not available")
+            return
+        state = transport.get("state")
+        if state in {TurnState.DELIVERY_UNCERTAIN.value, TurnState.BLOCKED.value}:
+            status = HTTPStatus.CONFLICT
+        elif state == TurnState.COMPLETED.value:
+            status = HTTPStatus.OK
+        else:
+            status = HTTPStatus.ACCEPTED
+        self._json({"ok": True, "transport": transport}, head_only=False, status=status)
+
+    def _review_turn_status(self, query: str, *, head_only: bool) -> None:
+        if head_only:
+            self._error(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                "Review-turn status requires GET",
+                head_only=True,
+            )
+            return
+        values = parse_qs(query, keep_blank_values=True)
+        if set(values) != {"event_id"} or len(values["event_id"]) != 1:
+            self._error(
+                HTTPStatus.BAD_REQUEST,
+                "Review-turn status requires one exact event ID",
+                head_only=head_only,
+            )
+            return
+        try:
+            transport = self.bridge.turn_transport.snapshot(values["event_id"][0])["event"]
+        except ControlStorageError:
+            self._error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Review-turn state is unavailable",
+                head_only=head_only,
+            )
+            return
+        except ValidationError:
+            self._error(
+                HTTPStatus.NOT_FOUND,
+                "That review turn is not available",
+                head_only=head_only,
+            )
+            return
+        except (ContinuityError, OSError, UnicodeError, ValueError):
+            self._error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Review-turn state is unavailable",
+                head_only=head_only,
+            )
+            return
+        if not isinstance(transport, dict):
+            self._error(
+                HTTPStatus.NOT_FOUND,
+                "That review turn is not available",
+                head_only=head_only,
+            )
+            return
+        self._json({"ok": True, "transport": transport}, head_only=head_only)
+
+    def _bounded_json_body(self, *, allowed: frozenset[str]) -> dict[str, Any] | None:
+        content_type = self.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            self._reject_unread_post(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Control requests must be JSON"
+            )
+            return None
+        if self.headers.get("Transfer-Encoding") is not None:
+            self._reject_unread_post(
+                HTTPStatus.BAD_REQUEST, "Streaming request bodies are not accepted"
+            )
+            return None
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length) if raw_length is not None else -1
+        except ValueError:
+            length = -1
+        if not 0 < length <= MAX_CONTROL_BODY_BYTES:
+            self._reject_unread_post(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "Control request is empty or too large",
+            )
+            return None
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._error(HTTPStatus.BAD_REQUEST, "Control request is not valid JSON")
+            return None
+        if not isinstance(payload, dict) or set(payload) - allowed:
+            self._error(HTTPStatus.BAD_REQUEST, "Control request has an unsupported shape")
+            return None
+        return payload
 
     def _valid_host(self) -> bool:
         raw = self.headers.get("Host", "")
@@ -645,6 +913,186 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(payload)
             except (BrokenPipeError, ConnectionResetError):
                 return
+
+
+def _validate_guided_review_intent(
+    payload: dict[str, Any],
+    snapshot: dict[str, Any] | None,
+    operations: OperationSnapshot,
+) -> None:
+    if snapshot is None:
+        raise ConflictError("guided-review state is unavailable; reload before continuing")
+    portfolio = snapshot.get("portfolio")
+    if not isinstance(portfolio, dict) or not isinstance(portfolio.get("revision"), str):
+        raise ConflictError("the complete Portfolio is unavailable; reload before continuing")
+    review = portfolio.get("review")
+    if not isinstance(review, dict):
+        raise ConflictError("guided-review state changed; reload before continuing")
+    subject = payload.get("subject")
+    if subject == START_REVIEW_SUBJECT:
+        if (
+            payload.get("kind") != ControlKind.CORRECTION.value
+            or payload.get("choice") != START_REVIEW_CHOICE
+        ):
+            raise ValidationError("guided-review start must use the fixed local start request")
+        if review.get("state") != "available":
+            raise ConflictError("guided-review state changed; reload before starting")
+        if payload.get("target_revision") != portfolio["revision"]:
+            raise ConflictError("the Portfolio changed; reload before starting its review")
+        if any(
+            event.subject == START_REVIEW_SUBJECT and event.choice == START_REVIEW_CHOICE
+            for event in operations.pending
+        ):
+            raise ConflictError(
+                "a guided review start is already queued; wait for its exact receipt"
+            )
+        return
+    session = review.get("session")
+    session_id = session.get("identifier") if isinstance(session, dict) else None
+    if not isinstance(session_id, str) or subject != f"record:task/{session_id}":
+        return
+    session_revision = review.get("session_revision")
+    if not isinstance(session_revision, str) or payload.get("target_revision") != session_revision:
+        raise ConflictError("the guided-review step changed; reload before retrying this answer")
+    if not is_canonical_uuid(review.get("active_thread_id")):
+        raise ConflictError(
+            "the guided review hand is not an exact Codex task UUID; repair it before answering"
+        )
+    if any(event.subject == subject for event in operations.pending):
+        raise ConflictError(
+            "an answer for this exact guided review step is already queued; "
+            "wait for its disposition"
+        )
+
+
+def _guided_review_turn_context(
+    snapshot: dict[str, Any],
+    *,
+    event: ControlEvent,
+    queue_revision: str,
+) -> TurnContext | None:
+    if event.kind is not ControlKind.CORRECTION or event.target_revision is None:
+        return None
+    portfolio = snapshot.get("portfolio")
+    if not isinstance(portfolio, dict) or not isinstance(portfolio.get("revision"), str):
+        return None
+    review = portfolio.get("review")
+    if not isinstance(review, dict):
+        return None
+    revisions = _snapshot_revision_inputs(snapshot)
+    if event.subject == START_REVIEW_SUBJECT:
+        if (
+            event.choice != START_REVIEW_CHOICE
+            or event.target_revision != portfolio["revision"]
+            or review.get("state") != "available"
+        ):
+            return None
+        return TurnContext(
+            event_id=event.event_id,
+            mode=TurnMode.START,
+            queue_revision=queue_revision,
+            target_revision=event.target_revision,
+            portfolio_revision=portfolio["revision"],
+            canonical_revisions=revisions,
+        ).validated()
+    session = review.get("session")
+    if not isinstance(session, dict):
+        return None
+    session_id = session.get("identifier")
+    session_revision = review.get("session_revision")
+    active_thread_id = review.get("active_thread_id")
+    if (
+        not isinstance(session_id, str)
+        or event.subject != f"record:task/{session_id}"
+        or not isinstance(session_revision, str)
+        or event.target_revision != session_revision
+        or not isinstance(active_thread_id, str)
+        or not (
+            review.get("state") == "active"
+            or (review.get("state") == "paused" and event.choice == RESUME_REVIEW_CHOICE)
+        )
+    ):
+        return None
+    return TurnContext(
+        event_id=event.event_id,
+        mode=TurnMode.RESUME,
+        queue_revision=queue_revision,
+        target_revision=event.target_revision,
+        portfolio_revision=portfolio["revision"],
+        canonical_revisions=revisions,
+        session_task_id=session_id,
+        active_thread_id=active_thread_id,
+    ).validated()
+
+
+def _snapshot_revision_inputs(snapshot: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    values: list[tuple[str, str]] = []
+    for section, prefix in (("tasks", "task"), ("threads", "thread"), ("entities", "entity")):
+        records = snapshot.get(section)
+        if not isinstance(records, list):
+            raise ValidationError("guided-review canonical context is incomplete")
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValidationError("guided-review canonical context is malformed")
+            identifier = record.get("identifier")
+            revision = record.get("revision")
+            if not isinstance(identifier, str) or not isinstance(revision, str):
+                raise ValidationError("guided-review canonical context is malformed")
+            values.append((f"{prefix}:{identifier}", revision))
+    direction = snapshot.get("direction")
+    if direction is not None:
+        if not isinstance(direction, dict) or not isinstance(direction.get("revision"), str):
+            raise ValidationError("guided-review Direction context is incomplete")
+        values.append(("direction:current", direction["revision"]))
+    portfolio = snapshot.get("portfolio")
+    if not isinstance(portfolio, dict) or not isinstance(portfolio.get("revision"), str):
+        raise ValidationError("guided-review Portfolio context is incomplete")
+    values.append(("portfolio:current", portfolio["revision"]))
+    if len({reference for reference, _ in values}) != len(values):
+        raise ValidationError("guided-review canonical context contains duplicate records")
+    return tuple(sorted(values))
+
+
+def _current_guided_review_event_id(snapshot: dict[str, Any]) -> str | None:
+    portfolio = snapshot.get("portfolio")
+    review = portfolio.get("review") if isinstance(portfolio, dict) else None
+    pending = review.get("pending_intent") if isinstance(review, dict) else None
+    if isinstance(pending, dict) and isinstance(pending.get("event_id"), str):
+        return cast(str, pending["event_id"])
+    pending_start = review.get("pending_start") if isinstance(review, dict) else None
+    if isinstance(pending_start, dict) and isinstance(pending_start.get("event_id"), str):
+        return cast(str, pending_start["event_id"])
+    return None
+
+
+def _unavailable_turn_transport(reason_code: str) -> dict[str, Any]:
+    return {
+        "automatic_resume": False,
+        "automatic_start": False,
+        "available": False,
+        "enabled": False,
+        "event": None,
+        "reason_code": reason_code,
+    }
+
+
+def _transient_turn_state(
+    event_id: str,
+    *,
+    state: TurnState,
+    reason_code: str,
+) -> dict[str, Any]:
+    return {
+        "event_id": event_id,
+        "final_answer": None,
+        "mode": None,
+        "reason_code": reason_code,
+        "retryable": False,
+        "state": state.value,
+        "terminal": True,
+        "thread_id": None,
+        "updated_at": format_time(datetime.now(UTC)),
+    }
 
 
 def serve_bridge(

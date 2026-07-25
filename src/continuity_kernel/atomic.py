@@ -266,6 +266,49 @@ class PinnedPathRoot:
         finally:
             os.close(descriptor)
 
+    def count_directory_entries(
+        self,
+        relative: Path | str,
+        *,
+        suffix: str | None = None,
+        stop_at: int | None = None,
+    ) -> int:
+        """Count bounded matching entries through an already-pinned directory descriptor."""
+
+        if suffix is not None and (not suffix or "/" in suffix or "\\" in suffix):
+            raise ValidationError("directory entry suffix must be one non-empty filename suffix")
+        if stop_at is not None and (
+            not isinstance(stop_at, int) or isinstance(stop_at, bool) or stop_at <= 0
+        ):
+            raise ValidationError("directory entry count bound must be a positive integer")
+        parts = _relative_parts(relative)
+        self._validate_root_identity()
+        try:
+            descriptor = self._open_directory(parts)
+        except OSError as exc:
+            raise ValidationError(
+                f"could not open directory beneath the pinned root: {self.root}: {exc}"
+            ) from exc
+        try:
+            self._validate_directory_path(parts, descriptor)
+            count = 0
+            try:
+                with os.scandir(descriptor) as entries:
+                    for entry in entries:
+                        if suffix is not None and not entry.name.endswith(suffix):
+                            continue
+                        count += 1
+                        if stop_at is not None and count >= stop_at:
+                            break
+            except OSError as exc:
+                raise ValidationError(
+                    f"could not count directory entries beneath the pinned root: {self.root}: {exc}"
+                ) from exc
+            self._validate_directory_path(parts, descriptor)
+            return count
+        finally:
+            os.close(descriptor)
+
     def ensure_directory(self, relative: Path | str, *, mode: int = 0o700) -> None:
         parts = _relative_parts(relative)
         self._validate_root_identity()

@@ -7,6 +7,7 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, TypeVar
+from urllib.parse import quote, unquote_to_bytes
 
 from continuity_kernel.atomic import sha256_bytes
 from continuity_kernel.errors import ValidationError
@@ -16,6 +17,7 @@ MAX_RECORD_BYTES: Final = 256 * 1024
 MAX_TEXT_BYTES: Final = 64 * 1024
 MAX_TITLE_LENGTH: Final = 180
 MAX_REFERENCES: Final = 2_000
+MAX_REFERENCE_LENGTH: Final = 1_000
 MAX_RELATIONS: Final = 100
 MAX_TASK_RANK: Final = 2_147_483_647
 SAFE_ID = re.compile(r"^[a-z][a-z0-9]*(?::[a-z0-9][a-z0-9-]{0,95})$")
@@ -34,6 +36,20 @@ TASK_STATUSES: Final = frozenset(
 TERMINAL_TASK_STATUSES: Final = frozenset({"done", "dropped"})
 ACTORS: Final = frozenset({"agent", "human", "external"})
 THREAD_STATUSES: Final = frozenset({"active", "waiting", "dormant", "closed"})
+REVIEW_WORK_THREAD_ID: Final = "thread:life-portfolio-review"
+REVIEW_SCOPE_REF: Final = "review-scope:all-open"
+REVIEW_PAUSED_REF: Final = "review-state:paused"
+SHA256_REVISION = re.compile(r"^[0-9a-f]{64}$")
+REVIEW_SUBJECT = re.compile(r"^review-subject:task:([a-z0-9][a-z0-9-]{0,95})$")
+REVIEW_COVERED_LEGACY = re.compile(r"^review-covered:task:([a-z0-9][a-z0-9-]{0,95})$")
+REVIEW_COVERED_ANCHORED = re.compile(
+    r"^review-covered:task:([a-z0-9][a-z0-9-]{0,95})@([0-9a-f]{64})"
+    r"(?:\|(thread:[a-z0-9][a-z0-9-]{0,95})@([0-9a-f]{64}))?$"
+)
+REVIEW_OPTION_INTENTS: Final = frozenset(
+    {"keep", "act-next", "defer", "reprioritize", "reshape", "drop-or-merge", "skip"}
+)
+MAX_REVIEW_OPTION_LENGTH: Final = 500
 WINDOWS_RESERVED_NAMES: Final = frozenset(
     {
         "aux",
@@ -92,12 +108,46 @@ class WorkThread:
     purpose: str
     summary: str
     next_move: str | None
+    focus_task_id: str | None
     task_ids: tuple[str, ...]
     entity_ids: tuple[str, ...]
     refs: tuple[str, ...]
     created_at: str
     updated_at: str
     revision: str
+
+
+@dataclass(frozen=True)
+class ReviewCoverage:
+    """One checked anchor; missing revisions identify readable legacy coverage."""
+
+    task_id: str
+    task_revision: str | None
+    work_thread_id: str | None
+    work_thread_revision: str | None
+    reference: str
+
+
+@dataclass(frozen=True)
+class ReviewOption:
+    """One agent-authored contextual shortcut; deterministic code stores only."""
+
+    intent: str
+    consequence: str
+    reference: str
+
+
+@dataclass(frozen=True)
+class ReviewReferences:
+    """Typed navigation facts carried by one bounded review-session Task."""
+
+    has_all_open_scope: bool
+    paused: bool
+    subject_task_ids: tuple[str, ...]
+    coverages: tuple[ReviewCoverage, ...]
+    options: tuple[ReviewOption, ...]
+    malformed_refs: tuple[str, ...]
+    issues: tuple[str, ...]
 
 
 Record = Task | Entity | WorkThread
@@ -176,6 +226,7 @@ def new_thread(
     summary: str,
     status: str = "active",
     next_move: str | None = None,
+    focus_task_id: str | None = None,
     task_ids: tuple[str, ...] = (),
     entity_ids: tuple[str, ...] = (),
     refs: tuple[str, ...] = (),
@@ -189,6 +240,7 @@ def new_thread(
         purpose=body_text(purpose, "thread purpose", required=True),
         summary=body_text(summary, "thread summary", required=True),
         next_move=optional_body(next_move, "next move"),
+        focus_task_id=task_id(focus_task_id) if focus_task_id is not None else None,
         task_ids=task_ids_value(task_ids),
         entity_ids=entity_ids_value(entity_ids),
         refs=references(refs),
@@ -202,6 +254,7 @@ def new_thread(
 
 def render_task(task: Task) -> str:
     _validate_task_state(task)
+    validate_review_references(task.refs, terminal=task.status in TERMINAL_TASK_STATUSES)
     metadata = {
         "created_at": stored_time(task.created_at, "created_at"),
         "id": task_id(task.identifier),
@@ -248,6 +301,7 @@ def render_thread(thread: WorkThread) -> str:
         "entity_ids": list(entity_ids_value(thread.entity_ids)),
         "id": canonical_id(thread.identifier, "thread ID", prefix="thread"),
         "kind": "thread",
+        "focus_task_id": thread.focus_task_id,
         "next_move_present": thread.next_move is not None,
         "refs": list(references(thread.refs)),
         "status": thread_status(thread.status),
@@ -315,6 +369,11 @@ def parse_thread(markdown: str) -> WorkThread:
         purpose=body_text(sections["Purpose"], "thread purpose", required=True),
         summary=body_text(sections["Current summary"], "thread summary", required=True),
         next_move=_optional_section(meta, "next_move_present", sections["Next move"]),
+        focus_task_id=(
+            task_id(value)
+            if (value := _optional_string(meta, "focus_task_id")) is not None
+            else None
+        ),
         task_ids=task_ids_value(_string_tuple(meta, "task_ids")),
         entity_ids=entity_ids_value(_string_tuple(meta, "entity_ids")),
         refs=references(_string_tuple(meta, "refs")),
@@ -427,6 +486,166 @@ def hand_id(value: str | None) -> str | None:
     return clean
 
 
+def review_coverage_ref(
+    *,
+    task_id_value: str,
+    task_revision: str,
+    work_thread_id: str | None = None,
+    work_thread_revision: str | None = None,
+) -> str:
+    """Render the one canonical revision-aware checked-coverage reference."""
+
+    clean_task = task_id(task_id_value)
+    clean_task_revision = _review_revision(task_revision, "review task revision")
+    if (work_thread_id is None) != (work_thread_revision is None):
+        raise ValidationError(
+            "review coverage WorkThread ID and revision must be authored together"
+        )
+    suffix = ""
+    if work_thread_id is not None:
+        clean_thread = canonical_id(work_thread_id, "review WorkThread ID", prefix="thread")
+        clean_thread_revision = _review_revision(work_thread_revision, "review WorkThread revision")
+        suffix = f"|{clean_thread}@{clean_thread_revision}"
+    return f"review-covered:task:{clean_task}@{clean_task_revision}{suffix}"
+
+
+def review_option_ref(*, intent: str, consequence: str) -> str:
+    """Render one canonical agent-authored option without choosing it."""
+
+    clean_intent = _review_option_intent(intent)
+    clean_consequence = _review_option_consequence(consequence)
+    reference = f"review-option:{clean_intent}:{quote(clean_consequence, safe='')}"
+    if len(reference) > MAX_REFERENCE_LENGTH:
+        raise ValidationError("encoded review option reference exceeds the reference limit")
+    references((reference,))
+    return reference
+
+
+def parse_review_references(values: tuple[str, ...] | list[str]) -> ReviewReferences:
+    """Parse review refs without letting malformed or legacy facts hide work."""
+
+    clean = references(values)
+    scope = False
+    paused = False
+    subjects: list[str] = []
+    coverages: list[ReviewCoverage] = []
+    options: list[ReviewOption] = []
+    malformed: list[str] = []
+    for value in clean:
+        if value == REVIEW_SCOPE_REF:
+            scope = True
+            continue
+        if value.startswith("review-scope:"):
+            malformed.append(value)
+            continue
+        if value == REVIEW_PAUSED_REF:
+            paused = True
+            continue
+        if value.startswith("review-state:"):
+            malformed.append(value)
+            continue
+        if value.startswith("review-subject:"):
+            matched = REVIEW_SUBJECT.fullmatch(value)
+            if matched is None:
+                malformed.append(value)
+            else:
+                subjects.append(matched.group(1))
+            continue
+        if value.startswith("review-covered:"):
+            anchored = REVIEW_COVERED_ANCHORED.fullmatch(value)
+            if anchored is not None:
+                coverages.append(
+                    ReviewCoverage(
+                        task_id=anchored.group(1),
+                        task_revision=anchored.group(2),
+                        work_thread_id=anchored.group(3),
+                        work_thread_revision=anchored.group(4),
+                        reference=value,
+                    )
+                )
+                continue
+            legacy = REVIEW_COVERED_LEGACY.fullmatch(value)
+            if legacy is not None:
+                coverages.append(
+                    ReviewCoverage(
+                        task_id=legacy.group(1),
+                        task_revision=None,
+                        work_thread_id=None,
+                        work_thread_revision=None,
+                        reference=value,
+                    )
+                )
+            else:
+                malformed.append(value)
+            continue
+        if value.startswith("review-option:"):
+            option = _parse_review_option(value)
+            if option is None:
+                malformed.append(value)
+            else:
+                options.append(option)
+            continue
+        if value.startswith("review-"):
+            malformed.append(value)
+    issues: list[str] = []
+    if len(subjects) > 1:
+        issues.append("review session has more than one current subject")
+    coverage_ids = [value.task_id for value in coverages]
+    if len(set(coverage_ids)) != len(coverage_ids):
+        issues.append("review session has conflicting coverage anchors for one task")
+    option_intents = [value.intent for value in options]
+    if len(set(option_intents)) != len(option_intents):
+        issues.append("review session has duplicate option intents")
+    if (paused or subjects or coverages or options) and not scope:
+        issues.append("review navigation refs require review-scope:all-open")
+    if malformed:
+        issues.append("review session contains malformed review refs")
+    return ReviewReferences(
+        has_all_open_scope=scope,
+        paused=paused,
+        subject_task_ids=tuple(subjects),
+        coverages=tuple(coverages),
+        options=tuple(options),
+        malformed_refs=tuple(malformed),
+        issues=tuple(issues),
+    )
+
+
+def validate_review_references(
+    values: tuple[str, ...] | list[str], *, terminal: bool = False
+) -> ReviewReferences:
+    parsed = parse_review_references(values)
+    if parsed.malformed_refs:
+        raise ValidationError(
+            "review session contains a malformed review ref; review-option consequences must "
+            "percent-encode every character outside A-Z, a-z, 0-9, underscore, period, hyphen, "
+            "and tilde using uppercase hexadecimal"
+        )
+    if parsed.issues:
+        raise ValidationError(parsed.issues[0])
+    if terminal and parsed.subject_task_ids:
+        raise ValidationError("terminal review sessions cannot retain a current subject")
+    if terminal and parsed.paused:
+        raise ValidationError("terminal review sessions cannot remain paused")
+    if terminal and parsed.options:
+        raise ValidationError("terminal review sessions cannot retain current options")
+    return parsed
+
+
+def has_review_session_signal(task: Task) -> bool:
+    """Identify structural session state without interpreting task prose."""
+
+    parsed = parse_review_references(task.refs)
+    return bool(
+        task.active_thread_id is not None
+        or parsed.paused
+        or parsed.subject_task_ids
+        or parsed.coverages
+        or parsed.options
+        or parsed.malformed_refs
+    )
+
+
 def safe_token(value: str, label: str) -> str:
     clean = str(value).strip().lower()
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", clean):
@@ -435,7 +654,17 @@ def safe_token(value: str, label: str) -> str:
 
 
 def references(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
-    return lines(tuple(values), "reference", MAX_REFERENCES, max_length=1000)
+    raw = tuple(values)
+    clean = lines(raw, "reference", MAX_REFERENCES, max_length=MAX_REFERENCE_LENGTH)
+    seen_review_refs: set[str] = set()
+    for value in raw:
+        item = str(value).strip()
+        if not item.startswith("review-"):
+            continue
+        if item in seen_review_refs:
+            raise ValidationError("duplicate review reference")
+        seen_review_refs.add(item)
+    return clean
 
 
 def lines(
@@ -506,6 +735,52 @@ def _validate_task_state(task: Task) -> None:
 def _validate_thread_state(thread: WorkThread) -> None:
     if thread.status == "closed" and thread.next_move is not None:
         raise ValidationError("closed threads cannot contain a next move")
+    if thread.status == "closed" and thread.focus_task_id is not None:
+        raise ValidationError("closed threads cannot retain a focus task")
+    if thread.focus_task_id is not None and thread.focus_task_id not in thread.task_ids:
+        raise ValidationError("focus task must be an exact member of the WorkThread")
+
+
+def _review_revision(value: object, label: str) -> str:
+    if not isinstance(value, str) or SHA256_REVISION.fullmatch(value) is None:
+        raise ValidationError(f"{label} must be a SHA-256 revision")
+    return value
+
+
+def _review_option_intent(value: object) -> str:
+    if not isinstance(value, str) or value not in REVIEW_OPTION_INTENTS:
+        raise ValidationError(f"invalid review option intent: {value}")
+    return value
+
+
+def _review_option_consequence(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValidationError("review option consequence must be a string")
+    clean = value.strip()
+    if (
+        not clean
+        or len(clean) > MAX_REVIEW_OPTION_LENGTH
+        or "\n" in clean
+        or "\r" in clean
+        or "\x00" in clean
+    ):
+        raise ValidationError("review option consequence must be one bounded non-empty line")
+    return clean
+
+
+def _parse_review_option(value: str) -> ReviewOption | None:
+    parts = value.split(":", 2)
+    if len(parts) != 3 or parts[0] != "review-option":
+        return None
+    try:
+        intent = _review_option_intent(parts[1])
+        consequence = unquote_to_bytes(parts[2]).decode("utf-8")
+        consequence = _review_option_consequence(consequence)
+    except (UnicodeError, ValidationError):
+        return None
+    if quote(consequence, safe="") != parts[2]:
+        return None
+    return ReviewOption(intent=intent, consequence=consequence, reference=value)
 
 
 def _render(metadata: dict[str, Any], title: str, sections: tuple[tuple[str, str], ...]) -> str:

@@ -139,6 +139,11 @@
     gap: 28px;
   }
 
+  .guided-review-current,
+  .guided-review-judgment {
+    grid-template-columns: 1fr;
+  }
+
   .mind-side {
     padding: 20px 0 0;
     border-top: 1px solid var(--line);
@@ -162,6 +167,28 @@
   .connection-notice {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .guided-review {
+    padding: 18px 16px;
+    border-radius: 18px;
+  }
+
+  .guided-review-intents {
+    grid-template-columns: 1fr;
+  }
+
+  .guided-review-option {
+    min-height: 54px;
+  }
+
+  .guided-review-session-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .guided-review-session-actions .quiet-action {
+    width: 100%;
   }
 }
 

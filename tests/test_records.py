@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -8,10 +9,12 @@ import pytest
 
 from continuity_kernel.errors import ValidationError
 from continuity_kernel.records import (
+    REVIEW_SCOPE_REF,
     new_entity,
     new_task,
     new_thread,
     parse_entity,
+    parse_review_references,
     parse_task,
     parse_thread,
     render_entity,
@@ -77,6 +80,68 @@ def test_task_round_trips_authored_rank_and_exact_active_hand() -> None:
 
 
 @pytest.mark.parametrize(
+    "reference",
+    [
+        REVIEW_SCOPE_REF,
+        "review-subject:task:exact-outcome",
+        f"review-covered:task:exact-outcome@{'a' * 64}",
+        "review-option:keep:Keep%20the%20exact%20outcome.",
+    ],
+    ids=("scope", "subject", "coverage", "option"),
+)
+def test_exact_duplicate_review_references_fail_on_parse_and_write(reference: str) -> None:
+    refs = (
+        (reference, reference)
+        if reference == REVIEW_SCOPE_REF
+        else (REVIEW_SCOPE_REF, reference, reference)
+    )
+
+    with pytest.raises(ValidationError, match="duplicate review reference"):
+        parse_review_references(refs)
+    with pytest.raises(ValidationError, match="duplicate review reference"):
+        new_task(
+            identifier="duplicate-review-ref",
+            title="Duplicate review ref",
+            outcome="Reject ambiguous review control state.",
+            refs=refs,
+            observed_at=NOW,
+        )
+
+    valid_refs = (reference,) if reference == REVIEW_SCOPE_REF else (REVIEW_SCOPE_REF, reference)
+    task = new_task(
+        identifier="raw-duplicate-review-ref",
+        title="Raw duplicate review ref",
+        outcome="Reject an invalid record loaded from disk.",
+        refs=valid_refs,
+        observed_at=NOW,
+    )
+    rendered = render_task(task)
+    header, body = rendered.split("\n", 1)
+    metadata = json.loads(header.removeprefix("<!-- gsv:").removesuffix(" -->"))
+    metadata["refs"].append(reference)
+    malformed = (
+        "<!-- gsv:"
+        + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + " -->\n"
+        + body
+    )
+    with pytest.raises(ValidationError, match="duplicate review reference"):
+        parse_task(malformed)
+
+
+def test_ordinary_duplicate_references_remain_backward_compatible() -> None:
+    task = new_task(
+        identifier="ordinary-duplicate-ref",
+        title="Ordinary duplicate ref",
+        outcome="Keep the established normalization contract for ordinary references.",
+        refs=("source:one", "source:one"),
+        observed_at=NOW,
+    )
+
+    assert task.refs == ("source:one",)
+
+
+@pytest.mark.parametrize(
     ("values", "message"),
     [
         ({"identifier": "UPPER CASE"}, "task ID"),
@@ -112,6 +177,29 @@ def test_terminal_task_cannot_claim_future_work() -> None:
             outcome="Finished.",
             status="done",
             active_thread_id="review-hand",
+            observed_at=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    ("reference", "message"),
+    [
+        ("review-subject:task:one-outcome", "current subject"),
+        ("review-state:paused", "remain paused"),
+        ("review-option:keep:Leave%20it%20unchanged", "current options"),
+    ],
+)
+def test_terminal_review_session_cannot_retain_current_navigation(
+    reference: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        new_task(
+            identifier="done-review-navigation",
+            title="Done review navigation",
+            outcome="The bounded review ended.",
+            status="done",
+            refs=(REVIEW_SCOPE_REF, reference),
             observed_at=NOW,
         )
 

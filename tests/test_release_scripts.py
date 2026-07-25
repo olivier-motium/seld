@@ -195,6 +195,25 @@ def test_candidate_version_is_consistent_across_runtime_installers_and_lock() ->
     )
 
 
+def test_release_claims_match_the_no_generated_visual_artifact_policy() -> None:
+    artifact_suffixes = frozenset({".gif", ".jpeg", ".jpg", ".mov", ".mp4", ".png", ".webp"})
+    ignored_roots = frozenset(
+        {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "build", "dist"}
+    )
+    artifacts: list[str] = []
+    for directory, names, filenames in os.walk(ROOT):
+        names[:] = [name for name in names if name not in ignored_roots]
+        base = Path(directory)
+        artifacts.extend(
+            (base / name).relative_to(ROOT).as_posix()
+            for name in filenames
+            if Path(name).suffix.lower() in artifact_suffixes
+        )
+
+    assert artifacts == []
+    assert "README visuals" not in (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+
 def test_cli_json_keeps_the_posix_cleanup_gate_stable(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

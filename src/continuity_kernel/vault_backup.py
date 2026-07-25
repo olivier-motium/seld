@@ -334,7 +334,14 @@ def _is_owned_vault_temp(relative: str) -> bool:
         return False
     parent = path.parent.as_posix()
     if parent == ".":
-        return target_name in {"AGENTS.md", "MIND.md", "NOW.md", "PORTFOLIO.md", "README.md"}
+        return target_name in {
+            "AGENTS.md",
+            "DIRECTION.md",
+            "MIND.md",
+            "NOW.md",
+            "PORTFOLIO.md",
+            "README.md",
+        }
     if parent in {"tasks", "entities", "threads"}:
         return target_name.endswith(".md")
     if parent == "onboarding":
@@ -345,6 +352,8 @@ def _is_owned_vault_temp(relative: str) -> bool:
         )
     if parent == ".gsv/control/archive":
         return target_name.startswith("queue-") and target_name.endswith(".jsonl")
+    if parent == ".gsv/control/runtime/turns":
+        return target_name.endswith(".json")
     return (
         parent == ".gsv"
         and target_name in {"manifest.json", "migration-culture-grade-foundation-v1.json"}

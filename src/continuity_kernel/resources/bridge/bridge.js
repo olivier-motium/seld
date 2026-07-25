@@ -3,7 +3,10 @@ import {
   appendControlIntent,
   controlSystemCopy,
   controlSystemStatus,
+  readReviewTurn,
   renderControlPanel,
+  renderControlReviewActions,
+  triggerReviewTurn,
 } from "./bridge-controls.js";
 
 const bridgeToken = captureBridgeToken();
@@ -55,6 +58,23 @@ const state = {
   snapshotSignature: null,
 };
 let guidedReviewDraft = "";
+let guidedReviewDelivery = null;
+let guidedReviewSendPending = false;
+let guidedReviewPollGeneration = 0;
+const guidedReviewRestoredPendingEvents = new Set();
+
+const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;
+const GUIDED_REVIEW_POLL_LIMIT = 680;
+
+const guidedReviewOptionLabels = {
+  "act-next": "Do / next",
+  "defer": "Defer",
+  "drop-or-merge": "Drop / merge",
+  "keep": "Keep current",
+  "reprioritize": "Reprioritize",
+  "reshape": "Edit",
+  "skip": "Skip for now",
+};
 
 for (const button of document.querySelectorAll("[data-view]")) {
   button.addEventListener("click", () => navigate(button.dataset.view));
@@ -334,6 +354,8 @@ function renderCommitments(snapshot) {
 function renderGuidedReview(snapshot) {
   const portfolio = snapshot.portfolio || {};
   const review = portfolio.review || {};
+  const transport = snapshot.guided_review_transport || {};
+  syncGuidedReviewDelivery(transport.event, review.hand_url, review, snapshot.controls);
   const section = element("section", "guided-review");
   const head = element("div", "guided-review-head");
   const copy = element("div");
@@ -343,13 +365,29 @@ function renderGuidedReview(snapshot) {
     textElement(
       "p",
       "guided-review-progress",
-      review.state === "active"
-        ? `${review.checked_count || 0} checked this session · ${review.uncovered_count || 0} still to check. Checked never means resolved.`
+      ["active", "paused"].includes(review.state)
+        ? `${review.checked_current_count ?? review.checked_count ?? 0} checked on current evidence · ${review.uncovered_count || 0} still to check. Checked never means resolved.`
         : "One exact outcome at a time, with authored priority and native compare-and-swap changes.",
     ),
   );
   head.append(copy);
   section.append(head);
+
+  if (review.state === "finished") {
+    const finished = element("div", "guided-review-empty is-finished", { role: "status" });
+    finished.append(
+      textElement("strong", "", "Nothing open is waiting for review"),
+      textElement(
+        "p",
+        "",
+        "Every currently open outcome has been checked on its current task and storyline versions. Open outcomes may still remain unresolved.",
+      ),
+    );
+    const delivery = renderGuidedReviewDelivery(review, snapshot.controls);
+    if (delivery) finished.append(delivery);
+    section.append(finished);
+    return section;
+  }
 
   if (!portfolio.available || review.state === "available" || review.state === "unavailable") {
     const empty = element("div", "guided-review-empty");
@@ -362,10 +400,49 @@ function renderGuidedReview(snapshot) {
           : "The complete authored Portfolio is not available yet. Codex must author it from the full open task set before review can begin.",
       ),
     );
-    if (review.start_url) {
-      const start = textElement("a", "primary-action", "Start the review hand");
+    const delivery = renderGuidedReviewDelivery(review, snapshot.controls);
+    if (delivery) empty.append(delivery);
+    if (
+      review.state === "available" &&
+      transport.enabled &&
+      transport.automatic_start &&
+      snapshot.controls?.available &&
+      !review.pending_start &&
+      !guidedReviewDeliveryBlocksInput()
+    ) {
+      const status = element("p", "control-status", {
+        "aria-live": "polite",
+        role: "status",
+      });
+      const start = textElement("button", "primary-action", "Start review here");
+      start.type = "button";
+      start.addEventListener("click", async () => {
+        const queued = await queueGuidedReviewIntent(
+          snapshot,
+          {
+            choice: "start-all-open-review",
+            kind: "correction",
+            subject: "mind:guided-review",
+            target_revision: review.start_target_revision,
+          },
+          { handUrl: review.hand_url, status },
+        );
+        if (queued) status.textContent = "Starting the review in this Bridge…";
+      });
+      empty.append(start, status);
+    } else if (review.start_url && !review.pending_start && !guidedReviewDeliveryBlocksInput()) {
+      const start = textElement("a", "primary-action", "Start in Codex");
       start.href = review.start_url;
-      empty.append(start);
+      empty.append(
+        start,
+        textElement(
+          "p",
+          "guided-review-capability-note",
+          transport.enabled
+            ? "Automatic continuation is not currently available on this installed path."
+            : "Same-hand Bridge continuation is off in this foundation build.",
+        ),
+      );
     }
     section.append(empty);
     return section;
@@ -390,16 +467,79 @@ function renderGuidedReview(snapshot) {
       textElement("span", "", `Portfolio ${subject.position} of ${review.open_count}`),
       textElement("span", "", task.rank === null ? "No authored rank" : `Rank ${task.rank}`),
     );
-    card.append(
-      facts,
-      textElement("h3", "", task.title),
-      textElement("p", "", task.outcome),
+    const title = textElement("h3", "", task.title);
+    title.id = "guided-review-current-title";
+    card.setAttribute("aria-labelledby", title.id);
+    card.append(facts, title, textElement("p", "guided-review-outcome", task.outcome));
+
+    const current = element("dl", "guided-review-current");
+    appendReviewFact(current, "Current next move", task.next_action || "No next move is authored.");
+    appendReviewFact(current, "Waiting for", task.waiting_on || "Nothing is explicitly waiting.");
+    if (subject.work_thread) {
+      appendReviewFact(
+        current,
+        "Storyline",
+        subject.work_thread.next_move || subject.work_thread.summary,
+      );
+    }
+    card.append(current);
+
+    const staleFacts = subject.staleness || [];
+    const contradictions = subject.contradictions || [];
+    if (staleFacts.length || contradictions.length || subject.stale) {
+      const evidenceWarning = element("div", "guided-review-evidence is-warning", {
+        role: "status",
+      });
+      evidenceWarning.append(
+        textElement("strong", "", contradictions.length ? "Current records disagree" : "Evidence changed"),
+        textElement(
+          "p",
+          "",
+          [...staleFacts, ...contradictions].join(" ") ||
+            "The Portfolio anchor is older than the current task or storyline.",
+        ),
+      );
+      card.append(evidenceWarning);
+    }
+    if ((subject.evidence_refs || []).length) {
+      const evidence = element("div", "guided-review-evidence");
+      evidence.append(textElement("strong", "guided-review-label", "Evidence on this outcome"));
+      const list = element("ul", "guided-review-evidence-list");
+      for (const reference of subject.evidence_refs) {
+        list.append(textElement("li", "", reference));
+      }
+      evidence.append(list);
+      card.append(evidence);
+    } else {
+      card.append(
+        textElement(
+          "p",
+          "guided-review-evidence-note",
+          "No separate evidence reference is authored on this outcome.",
+        ),
+      );
+    }
+
+    const judgment = element("div", "guided-review-judgment");
+    const recommendation = element("div", "guided-review-recommendation");
+    recommendation.append(
       textElement("strong", "guided-review-label", "The Mind recommends"),
       textElement("p", "", review.recommendation || "No recommendation has been authored yet."),
-      textElement("strong", "guided-review-label", "One question"),
+    );
+    const question = element("div", "guided-review-question");
+    question.append(
+      textElement("strong", "guided-review-label", "One useful question"),
       textElement("p", "", review.question || "The current question has not been authored yet."),
     );
+    judgment.append(recommendation, question);
+    card.append(judgment);
     section.append(card);
+  }
+
+  const delivery = renderGuidedReviewDelivery(review, snapshot.controls);
+  if (delivery) {
+    section.append(delivery);
+    if (guidedReviewDeliveryBlocksInput()) return section;
   }
 
   if (!review.active_thread_id) {
@@ -423,61 +563,133 @@ function renderGuidedReview(snapshot) {
       textElement(
         "p",
         "",
-        "The review agent must read current truth, apply any justified native CAS changes, and acknowledge this exact receipt before another answer is accepted.",
+        "The same review hand is reading current truth. It must apply any justified native CAS changes and acknowledge this exact receipt before another answer is accepted.",
       ),
     );
+    if (review.hand_url) pending.append(exactHandFallback(review.hand_url));
+    if (guidedReviewDraft) {
+      const recovery = element("div", "guided-review-draft-recovery");
+      const label = textElement("label", "guided-review-label", "Your unsent answer");
+      const draft = element("textarea", "control-input", {
+        maxlength: "4096",
+        rows: "3",
+      });
+      draft.id = "guided-review-answer";
+      label.htmlFor = draft.id;
+      draft.value = guidedReviewDraft;
+      draft.addEventListener("input", () => { guidedReviewDraft = draft.value; });
+      recovery.append(
+        label,
+        draft,
+        textElement(
+          "p",
+          "control-status",
+          "The review queue changed before this answer was saved. Your draft remains here; retry after the current receipt is resolved.",
+        ),
+      );
+      pending.append(recovery);
+    }
     section.append(pending);
     return section;
   }
 
+  if (review.state === "paused") {
+    const paused = element("div", "guided-review-empty", { role: "status" });
+    paused.append(
+      textElement("strong", "", "Review paused at this exact outcome"),
+      textElement("p", "", "Resume continues the same durable session and Codex hand."),
+    );
+    if (
+      transport.enabled &&
+      transport.automatic_resume &&
+      snapshot.controls?.available &&
+      review.session_revision
+    ) {
+      const resume = textElement("button", "primary-action", "Resume review here");
+      const status = element("p", "control-status", {
+        "aria-live": "polite",
+        role: "status",
+      });
+      resume.type = "button";
+      resume.addEventListener("click", async () => {
+        const queued = await queueGuidedReviewIntent(
+          snapshot,
+          {
+            choice: "resume-guided-review",
+            kind: "correction",
+            subject: `record:task/${review.session.identifier}`,
+            target_revision: review.session_revision,
+          },
+          { handUrl: review.hand_url, status },
+        );
+        if (queued) status.textContent = "Resuming the exact review hand…";
+      });
+      paused.append(resume, status);
+    }
+    if (review.hand_url) paused.append(exactHandFallback(review.hand_url));
+    section.append(paused);
+    return section;
+  }
+
   if (!review.actionable || !subject || !task) return section;
+  if (!transport.enabled || !transport.automatic_resume) {
+    const fallback = element("div", "guided-review-empty", { role: "status" });
+    fallback.append(
+      textElement("strong", "", "Continue in the exact Codex hand"),
+      textElement(
+        "p",
+        "",
+        transport.enabled
+          ? "The restricted same-hand continuation check did not pass, so Bridge will not queue an answer it cannot deliver."
+          : "Same-hand Bridge continuation is off in this foundation build.",
+      ),
+    );
+    if (review.hand_url) fallback.append(exactHandFallback(review.hand_url));
+    section.append(fallback);
+    return section;
+  }
   const form = element("form", "guided-review-form");
+  form.setAttribute("aria-labelledby", "guided-review-current-title");
   const intentList = element("div", "guided-review-intents", {
-    "aria-label": "Direction for the current exact outcome",
+    "aria-label": "Ways to answer about this outcome",
     role: "group",
   });
+  intentList.append(textElement("p", "guided-review-options-intro", "Choose a direction, or answer in your own words."));
   const status = element("p", "control-status", { "aria-live": "polite", role: "status" });
-  const send = async (choice, trigger) => {
-    trigger.disabled = true;
-    status.textContent = "Saving your exact wording locally…";
-    try {
-      await appendControlIntent(snapshot, bridgeToken, {
-        choice,
-        kind: "correction",
-        subject: `record:task/${review.session.identifier}`,
-        target_revision: review.session_revision,
-      });
-      await loadSnapshot({ quiet: true });
-      status.textContent = "Queued for the review agent to read. No task meaning changed in the browser.";
-      return true;
-    } catch (error) {
-      if (error.status === 409) {
-        await loadSnapshot({ quiet: true });
-        status.textContent = "The queue or review changed. Your draft is still here; review current truth and retry.";
-      } else {
-        status.textContent = error.message || "The review answer could not be queued.";
-      }
-      return false;
-    } finally {
-      trigger.disabled = false;
-    }
-  };
-  for (const [label, intent] of [
-    ["Keep current", "keep"],
-    ["Do / next", "act-next"],
-    ["Defer", "defer"],
-    ["Reprioritize", "reprioritize"],
-    ["Edit", "reshape"],
-    ["Drop / merge", "drop-or-merge"],
-    ["Skip for now", "skip"],
-  ]) {
-    const button = textElement("button", "command-copy", label);
+  const send = (choice) => queueGuidedReviewIntent(
+    snapshot,
+    {
+      choice,
+      kind: "correction",
+      subject: `record:task/${review.session.identifier}`,
+      target_revision: review.session_revision,
+    },
+    { form, handUrl: review.hand_url, status },
+  );
+  const authoredOptions = (review.options || []).filter(
+    (option) => guidedReviewOptionLabels[option.intent] && option.consequence,
+  );
+  for (const { consequence, intent } of authoredOptions) {
+    const label = guidedReviewOptionLabels[intent];
+    const button = element("button", "guided-review-option", { "aria-label": label });
     button.type = "button";
+    button.append(
+      textElement("strong", "", label),
+      textElement("span", "", consequence),
+    );
     button.addEventListener("click", () => send(
-      `For task:${task.identifier}, my explicit guided-review answer is: ${intent}. Interpret this in the exact current context; do not infer completion or broader authority.`,
-      button,
+      `For task:${task.identifier}, my explicit guided-review answer is: ${intent}. My understood consequence is: ${consequence} Interpret this in the exact current context; do not infer completion or broader authority.`,
     ));
     intentList.append(button);
+  }
+  if (!authoredOptions.length) {
+    intentList.append(
+      textElement(
+        "p",
+        "guided-review-options-empty",
+        "No quick choices are authored for this outcome. Answer in your own words.",
+      ),
+    );
   }
   const label = textElement("label", "guided-review-label", "Tell the Mind what you want");
   const input = element("textarea", "control-input", {
@@ -496,7 +708,6 @@ function renderGuidedReview(snapshot) {
     button.type = "button";
     button.addEventListener("click", () => send(
       `For review session task:${review.session.identifier}, my explicit session instruction is: ${intent}. Preserve checked-versus-resolved semantics.`,
-      button,
     ));
     sessionActions.append(button);
   }
@@ -506,7 +717,6 @@ function renderGuidedReview(snapshot) {
     if (!answer) return;
     const queued = await send(
       `For task:${task.identifier}, my verbatim guided-review answer is:\n${answer}`,
-      submit,
     );
     if (queued) {
       guidedReviewDraft = "";
@@ -516,6 +726,371 @@ function renderGuidedReview(snapshot) {
   form.append(intentList, label, input, submit, sessionActions, status);
   section.append(form);
   return section;
+}
+
+function appendReviewFact(list, label, value) {
+  const fact = element("div");
+  fact.append(textElement("dt", "", label), textElement("dd", "", value));
+  list.append(fact);
+}
+
+function exactHandFallback(url) {
+  const link = textElement("a", "quiet-action", "Open the exact review hand");
+  link.href = url;
+  return link;
+}
+
+function setGuidedReviewControlsDisabled(form, disabled) {
+  for (const control of form.querySelectorAll("button, textarea")) {
+    control.disabled = disabled;
+  }
+  form.setAttribute("aria-busy", disabled ? "true" : "false");
+}
+
+async function queueGuidedReviewIntent(snapshot, intent, { form = null, handUrl = null, status }) {
+  if (guidedReviewSendPending) return false;
+  guidedReviewSendPending = true;
+  if (form) setGuidedReviewControlsDisabled(form, true);
+  status.textContent = "Saving your exact wording locally…";
+  try {
+    const payload = await appendControlIntent(snapshot, bridgeToken, intent);
+    const eventId = payload.event?.event_id;
+    if (!eventId) throw new Error("The Bridge saved no exact review receipt.");
+    guidedReviewDelivery = {
+      eventId,
+      handUrl,
+      message: "Your answer is saved locally. The same review hand is reading it…",
+      pendingSeen: false,
+      queueRevision: payload.revision || null,
+      receipt: payload.transport || {
+        event_id: eventId,
+        final_answer: null,
+        mode: intent.subject === "mind:guided-review" ? "start" : "resume",
+        reason_code: null,
+        retryable: false,
+        state: "pending",
+        terminal: false,
+        thread_id: null,
+      },
+    };
+    render();
+    void continueGuidedReviewTurn(eventId, handUrl);
+    return true;
+  } catch (error) {
+    if (error.status === 409) {
+      const refreshed = await loadSnapshot({ quiet: true });
+      const currentInput = document.querySelector("#guided-review-answer");
+      const currentStatus = document.querySelector(".guided-review-form .control-status");
+      if (currentInput) {
+        currentInput.value = guidedReviewDraft;
+        currentInput.focus();
+      }
+      const message = refreshed
+        ? "The review queue changed while you were answering. Your draft is still here; review the refreshed outcome, then retry."
+        : "The review queue changed while you were answering. Your draft is still here; refresh current truth, then retry.";
+      if (currentStatus) currentStatus.textContent = message;
+      else status.textContent = message;
+    } else {
+      status.textContent = error.message || "The review answer could not be queued.";
+    }
+    return false;
+  } finally {
+    guidedReviewSendPending = false;
+    const currentForm = document.querySelector(".guided-review-form");
+    if (currentForm) setGuidedReviewControlsDisabled(currentForm, false);
+  }
+}
+
+async function continueGuidedReviewTurn(eventId, handUrl) {
+  const generation = ++guidedReviewPollGeneration;
+  try {
+    const triggered = await triggerReviewTurn(bridgeToken, eventId);
+    if (generation !== guidedReviewPollGeneration) return;
+    updateGuidedReviewReceipt(triggered, handUrl);
+    if (guidedReviewReceiptStopsPolling(triggered)) {
+      await finishGuidedReviewDelivery(triggered);
+      return;
+    }
+    for (let attempt = 0; attempt < GUIDED_REVIEW_POLL_LIMIT; attempt += 1) {
+      await wait(GUIDED_REVIEW_POLL_INTERVAL_MS);
+      if (generation !== guidedReviewPollGeneration) return;
+      const receipt = await readReviewTurn(bridgeToken, eventId);
+      if (generation !== guidedReviewPollGeneration) return;
+      updateGuidedReviewReceipt(receipt, handUrl);
+      if (guidedReviewReceiptStopsPolling(receipt)) {
+        await finishGuidedReviewDelivery(receipt);
+        return;
+      }
+    }
+    updateGuidedReviewMessage(
+      "The review hand is still working. GSV will not resend your answer; use the exact hand if you need to inspect it now.",
+    );
+  } catch (error) {
+    updateGuidedReviewMessage(
+      error.status === 404
+        ? "The turn receipt is no longer available in this Bridge. Reload canonical truth before doing anything else."
+        : "Bridge could not read the turn receipt. Your queued answer was not replayed; inspect the exact hand before retrying.",
+    );
+    await loadSnapshot({ quiet: true });
+  }
+}
+
+function guidedReviewReceiptStopsPolling(receipt) {
+  return receipt?.terminal === true || receipt?.retryable === true;
+}
+
+async function finishGuidedReviewDelivery(receipt) {
+  if (receipt.state === "completed") {
+    updateGuidedReviewMessage(
+      receipt.final_answer
+        ? "The same review hand replied. Canonical state has been refreshed below."
+        : "The review turn completed. Canonical state has been refreshed below.",
+    );
+  } else if (receipt.state === "failed_safe") {
+    updateGuidedReviewMessage(
+      "The turn was proven not to have been delivered. You may retry this exact receipt once the cause is fixed.",
+    );
+  } else if (receipt.state === "delivery_uncertain") {
+    updateGuidedReviewMessage(
+      receipt.thread_id
+        ? "GSV cannot prove whether Codex received this answer. It will not resend it; reconcile the exact hand and canonical records."
+        : "GSV cannot recover the Codex hand for this turn. It will not resend it; inspect recent Codex tasks and canonical records before deciding what to do.",
+    );
+  } else {
+    updateGuidedReviewMessage(
+      "Automatic continuation is blocked. Your local receipt remains visible and has not been replayed.",
+    );
+  }
+  await loadSnapshot({ quiet: true });
+}
+
+function updateGuidedReviewReceipt(receipt, handUrl) {
+  if (!receipt?.event_id) return;
+  const previous = guidedReviewDelivery?.eventId === receipt.event_id
+    ? guidedReviewDelivery.receipt
+    : null;
+  guidedReviewDelivery = {
+    eventId: receipt.event_id,
+    handUrl: handUrl || guidedReviewDelivery?.handUrl || null,
+    message: guidedReviewDelivery?.message || null,
+    pendingSeen: guidedReviewDelivery?.pendingSeen || false,
+    queueRevision: guidedReviewDelivery?.queueRevision || null,
+    receipt: {
+      ...receipt,
+      final_answer: receipt.final_answer || previous?.final_answer || null,
+    },
+  };
+  render();
+}
+
+function updateGuidedReviewMessage(message) {
+  if (!guidedReviewDelivery) return;
+  guidedReviewDelivery = { ...guidedReviewDelivery, message };
+  render();
+}
+
+function syncGuidedReviewDelivery(receipt, handUrl, review, controls) {
+  if (!receipt?.event_id) {
+    const current = guidedReviewDelivery?.receipt;
+    const pendingEventIds = [review?.pending_intent?.event_id, review?.pending_start?.event_id]
+      .filter(Boolean);
+    if (current?.event_id && pendingEventIds.includes(current.event_id)) {
+      guidedReviewDelivery = { ...guidedReviewDelivery, pendingSeen: true };
+      return;
+    }
+    const observedQueuedRevision =
+      guidedReviewDelivery?.queueRevision &&
+      controls?.queue_revision === guidedReviewDelivery.queueRevision;
+    const resolvedVisible = [...(controls?.items || []), ...(controls?.history || [])].some(
+      (item) =>
+        item?.event?.event_id === current?.event_id &&
+        ["accepted", "rejected"].includes(item?.status),
+    );
+    if (
+      current?.event_id &&
+      current.state !== "completed" &&
+      review?.state !== "unavailable" &&
+      controls?.available === true &&
+      (guidedReviewDelivery?.pendingSeen === true || observedQueuedRevision || resolvedVisible)
+    ) {
+      guidedReviewPollGeneration += 1;
+      guidedReviewDelivery = null;
+    }
+    return;
+  }
+  const previous = guidedReviewDelivery?.eventId === receipt.event_id
+    ? guidedReviewDelivery.receipt
+    : null;
+  const selectedReceipt = newerGuidedReviewReceipt(previous, receipt);
+  guidedReviewDelivery = {
+    eventId: receipt.event_id,
+    handUrl: handUrl || guidedReviewDelivery?.handUrl || null,
+    message: guidedReviewDelivery?.message || null,
+    pendingSeen: true,
+    queueRevision: guidedReviewDelivery?.queueRevision || controls?.queue_revision || null,
+    receipt: {
+      ...selectedReceipt,
+      final_answer: selectedReceipt.final_answer || previous?.final_answer || null,
+    },
+  };
+  if (
+    receipt.state === "pending" &&
+    previous === null &&
+    !guidedReviewRestoredPendingEvents.has(receipt.event_id)
+  ) {
+    guidedReviewRestoredPendingEvents.add(receipt.event_id);
+    window.queueMicrotask(() => {
+      const current = guidedReviewDelivery?.receipt;
+      if (current?.event_id !== receipt.event_id || current.state !== "pending") return;
+      void continueGuidedReviewTurn(receipt.event_id, handUrl);
+    });
+  }
+}
+
+function newerGuidedReviewReceipt(previous, incoming) {
+  if (!previous) return incoming;
+  const previousAt = Date.parse(previous.updated_at || "");
+  const incomingAt = Date.parse(incoming.updated_at || "");
+  if (Number.isFinite(previousAt) && Number.isFinite(incomingAt)) {
+    if (incomingAt < previousAt) return previous;
+    if (incomingAt > previousAt) return incoming;
+  }
+  const progress = {
+    blocked: 3,
+    completed: 3,
+    delivery_uncertain: 3,
+    failed_safe: 3,
+    pending: 0,
+    running: 2,
+    starting: 1,
+  };
+  return (progress[incoming.state] ?? -1) < (progress[previous.state] ?? -1)
+    ? previous
+    : incoming;
+}
+
+function guidedReviewDeliveryBlocksInput() {
+  const stateName = guidedReviewDelivery?.receipt?.state;
+  return [
+    "blocked",
+    "delivery_uncertain",
+    "failed_safe",
+    "pending",
+    "running",
+    "starting",
+  ].includes(stateName);
+}
+
+function renderGuidedReviewDelivery(review, controls) {
+  if (!guidedReviewDelivery?.receipt) return null;
+  const { receipt } = guidedReviewDelivery;
+  const panel = element("aside", `guided-review-delivery is-${receipt.state}`, {
+    "aria-live": "polite",
+    role: "status",
+  });
+  const titles = {
+    blocked: "Automatic continuation is unavailable",
+    completed: "The review hand replied",
+    delivery_uncertain: "Delivery could not be confirmed",
+    failed_safe: "The turn did not start",
+    pending: "Answer saved locally",
+    running: "The Mind is working",
+    starting: "Opening the exact review hand",
+  };
+  panel.append(
+    textElement("strong", "", titles[receipt.state] || "Review turn status"),
+    textElement(
+      "p",
+      "",
+      guidedReviewDelivery.message || guidedReviewStateCopy(receipt),
+    ),
+  );
+  if (receipt.final_answer) {
+    panel.append(textElement("p", "guided-review-final-answer", receipt.final_answer));
+  }
+  const actions = element("div", "guided-review-delivery-actions");
+  if (receipt.retryable) {
+    const retry = textElement("button", "primary-action", "Retry this exact turn");
+    retry.type = "button";
+    retry.addEventListener("click", () => {
+      if (guidedReviewSendPending) return;
+      guidedReviewSendPending = true;
+      retry.disabled = true;
+      void continueGuidedReviewTurn(receipt.event_id, guidedReviewDelivery.handUrl)
+        .finally(() => { guidedReviewSendPending = false; });
+    });
+    actions.append(retry);
+  }
+  const receiptHandUrl = exactGuidedReviewHandUrl(receipt.thread_id);
+  const fallbackUrl = receiptHandUrl ||
+    retainedExactGuidedReviewHandUrl(guidedReviewDelivery.handUrl) ||
+    retainedExactGuidedReviewHandUrl(review.hand_url);
+  if (fallbackUrl && ["blocked", "delivery_uncertain", "failed_safe"].includes(receipt.state)) {
+    actions.append(exactHandFallback(fallbackUrl));
+  }
+  const unresolvedPendingEvent =
+    ["blocked", "delivery_uncertain"].includes(receipt.state) &&
+    [review.pending_intent?.event_id, review.pending_start?.event_id].includes(receipt.event_id);
+  if (unresolvedPendingEvent) {
+    const resolution = renderControlReviewActions(controls || {}, {
+      linkLabel: "Resolve queued receipt",
+    });
+    if (resolution) actions.append(resolution);
+  }
+  if (receipt.state === "completed") {
+    const dismiss = textElement("button", "quiet-action", "Dismiss reply");
+    dismiss.type = "button";
+    dismiss.addEventListener("click", () => {
+      guidedReviewDelivery = null;
+      render();
+    });
+    actions.append(dismiss);
+  }
+  if (actions.childElementCount) panel.append(actions);
+  if (receipt.reason_code && receipt.state !== "completed") {
+    panel.append(
+      textElement(
+        "small",
+        "guided-review-reason",
+        `Reason: ${receipt.reason_code.replaceAll("_", " ")}`,
+      ),
+    );
+  }
+  return panel;
+}
+
+function exactGuidedReviewHandUrl(threadId) {
+  if (
+    typeof threadId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(threadId)
+  ) return null;
+  return `codex://threads/${threadId}`;
+}
+
+function retainedExactGuidedReviewHandUrl(url) {
+  if (typeof url !== "string" || !url.startsWith("codex://threads/")) return null;
+  const threadId = url.slice("codex://threads/".length);
+  return exactGuidedReviewHandUrl(threadId) === url ? url : null;
+}
+
+function guidedReviewStateCopy(receipt) {
+  if (["pending", "starting", "running"].includes(receipt.state)) {
+    return "Your wording is queued once. Bridge is following only this receipt while the exact hand reads current canonical truth.";
+  }
+  if (receipt.state === "completed") {
+    return "The turn completed and canonical state has been refreshed.";
+  }
+  if (receipt.state === "failed_safe") {
+    return "GSV proved the turn was not delivered, so this exact receipt is safe to retry.";
+  }
+  if (receipt.state === "delivery_uncertain") {
+    return "GSV will not replay an answer that Codex may already have received.";
+  }
+  return "The queued receipt remains local. Continue in the exact hand or repair the installed capability.";
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function appendClosedHistory(container, tasks) {

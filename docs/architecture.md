@@ -147,40 +147,70 @@ restart, but it only acknowledges the intent. It does not execute it, authorize
 an external action, or mutate semantic canon. Provider text cannot add fields
 or turn an event or disposition into authority. Closed-queue archival is an
 operator capacity-recovery seam, not an ordinary Bridge or onboarding action.
-Snapshot, Bridge GET, CLI list, and MCP list are observational: they never
-anchor or repair disposition state. An explicit accept, reject, or archive
-mutation validates the vault binding and revisions from that observation
-before performing any deterministic recovery it needs.
+Snapshot, Bridge GET, CLI list, and MCP list are observational for queue and
+disposition state: they never anchor or repair those append-only logs. The
+snapshot and review-transport GET paths may durably classify a content-free
+in-flight turn receipt as `delivery_uncertain` after a crash; that monotone
+reconciliation disables replay and does not mutate semantic canon. An explicit
+accept, reject, or archive mutation validates the vault binding and revisions
+from the queue/disposition observation before performing any deterministic
+recovery it needs.
 
 ### Guided Portfolio review
 
-The guided review is a thin composition of existing primitives:
+The guided review is a thin composition of existing primitives. It does not
+introduce a transcript database or a second task system:
 
-1. An agent authors the complete `PORTFOLIO.md` through `portfolio set`, with
-   exact Task and optional WorkThread anchors.
-2. One ordinary nonterminal review-session Task carries the all-open scope,
-   exact current subject, covered Task references, current recommendation and
-   question, and one exact active Codex hand.
-3. Bridge projects those declarations. It never chooses a next Task or derives
-   meaning from an answer. A stale current-subject anchor disables semantic
-   controls; unrelated Portfolio drift stays visible but does not make the
-   exact current subject unsafe.
+1. The agent authors the complete `PORTFOLIO.md` through `portfolio set`, with
+   exact Direction, Task, and optional owning-WorkThread anchors.
+2. One ordinary nonterminal review-session Task belongs to exactly
+   `thread:life-portfolio-review`, and that WorkThread focuses the session Task.
+   The Task carries one all-open scope, at most one exact subject, current
+   recommendation and question, and one exact Codex hand. `review-state:paused`
+   pauses that same session without clearing its subject or hand.
+3. Bridge projects those authored declarations. It never chooses the next Task,
+   interprets an answer, derives rank from card position, or changes canon.
+   The current card includes authored Task/WorkThread state, exact evidence refs,
+   structural staleness or contradiction, recommendation, choice consequences,
+   and one question.
 4. A button or freeform answer appends one authenticated correction intent
-   bound to the review-session revision. A queue conflict preserves the typed
-   draft.
-5. The review agent reloads the operation, Task, WorkThread, and Portfolio
-   revisions; interprets the answer; applies only justified native CAS writes;
-   reads canonical truth back; then accepts or rejects the intent. Acceptance
-   acknowledges the receipt only.
-6. Advancing adds `review-covered:task:<id>` only after the user answered or
-   explicitly skipped that subject, and replaces the exact subject in the same
-   Task CAS write. It does not reorder Portfolio or complete the reviewed Task.
+   bound to the current review-session revision. A stale queue CAS preserves
+   the typed answer and requires a deliberate retry against the refreshed card.
+5. When the local Codex capability check passes, the authenticated append
+   creates and schedules one durable turn receipt. The browser's bounded
+   review-turn endpoint is an idempotent trigger and recovery path for that
+   exact event ID. START first creates a Codex hand, then immediately resumes it
+   to bind the emitted UUID; later answers resume the authored hand once. Every
+   invocation uses the required vault-bound GSV MCP server and exposes no
+   provider, Computer Use, shell-write, or external-action tools. The browser
+   polls only that event ID.
+6. The review agent reloads the operation, Task, owning WorkThread, Direction,
+   and Portfolio revisions; interprets the answer; applies only the explicit
+   semantic decision through native CAS; reads canonical truth back; then
+   accepts or rejects the receipt. Acceptance is acknowledgement, never the
+   semantic write itself.
+7. Advancing replaces the exact subject and adds a revision-aware coverage ref
+   in the same fresh Task CAS. A Task or owning WorkThread change makes that
+   coverage stale and returns the outcome to the remaining scope. A newly open
+   outcome joins the scope. Checked never means resolved and never changes
+   Portfolio order mechanically.
+8. A successful turn may return one bounded final answer for transient Bridge
+   display before the browser reloads canon. The answer is never persisted.
+   Safe pre-delivery failure may be retried. `delivery_uncertain` is terminal,
+   disables replay, and offers the exact-hand link for reconciliation. When a
+   terminal transport receipt still has a pending intent, Bridge also exposes
+   the existing operation-review link and copyable prompt so the user can
+   explicitly acknowledge or reject that receipt without replaying it.
 
 There is no transcript store, semantic queue executor, review database, or
-browser-side task policy. Public Codex integration currently exposes new-task
-deep links, not a supported API for waking an existing Codex turn; therefore an
-active hand is rendered exactly when authored, but automatic same-hand turn
-delivery remains outside this public slice.
+browser-side task policy. The same-hand transport is capability-gated: when the
+required executable, auth, or restricted MCP configuration cannot be proved,
+Bridge leaves the receipt pending. A missing exact hand also blocks later
+answers; START instead creates and binds the one new hand described above.
+Bridge uses the exact-hand fallback whenever one is available. This source path
+and synthetic tests are not Gate 0 or provider-backed release evidence. The
+local capability probe is cached for only a bounded interval, so repaired Codex
+authentication can become visible without restarting Bridge.
 
 This control write flow currently depends on POSIX directory descriptors,
 `O_NOFOLLOW`, and directory-root locking. It is enabled on macOS and Linux. The

@@ -29,8 +29,12 @@
 - A Bridge control event receives at most one durable accept/reject disposition;
   stale queue or disposition revisions are rejected, and a fresh process reads
   the same result.
-- Bridge, CLI, and MCP operation reads leave the canonical control store
-  byte-for-byte unchanged; crash recovery belongs to an explicit mutation.
+- Bridge, CLI, and MCP queue/disposition reads leave those append-only logs
+  byte-for-byte unchanged; their crash recovery belongs to an explicit
+  mutation. Guided-review snapshot and transport-status reads use a separate
+  content-free receipt lane: polling may durably classify an orphaned in-flight
+  receipt as `delivery_uncertain`, which disables replay without changing
+  semantic canon.
 
 ## Bridge boundary
 
@@ -60,6 +64,19 @@ Each mutation requires the logical vault ID and both CAS revisions returned by
 the preceding operation snapshot. A live MCP process additionally binds to the
 physical vault root it opened, so copied tokens and same-path replacement
 cannot cross a vault boundary.
+The supported host lifecycle keeps one Bridge server active for a vault. If
+independently constructed servers race on one transport receipt, receipt CAS
+fails closed to an uncertain delivery state rather than replaying the turn.
+Stopping or killing Bridge does not prove that an already detached Codex child
+stopped: the parent owns an eight-minute timeout for each Codex invocation,
+while the child runs in its own process session. A START uses two sequential
+invocations and can therefore take about sixteen minutes plus bounded setup;
+the browser may stop foreground polling earlier while durable reconciliation
+continues. A later Bridge therefore marks the orphaned
+receipt `delivery_uncertain`, preserves any exact hand, and never replays it;
+the user must reconcile that hand and its queued receipt explicitly. Consumer
+promotion remains blocked until an installed lifecycle contract can also own or
+reconcile the detached child itself.
 Neither the receipt nor its disposition can directly write Tasks, Entities,
 WorkThreads, `MIND.md`, `NOW.md`, onboarding, source readiness, grants, or
 action policy. Every other HTTP write method and path remains denied. The

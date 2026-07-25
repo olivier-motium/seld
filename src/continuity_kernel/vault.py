@@ -23,6 +23,14 @@ from continuity_kernel.atomic import (
     sha256_bytes,
     sha256_file,
 )
+from continuity_kernel.direction import (
+    ABSENT_DIRECTION_REVISION,
+    Direction,
+    DirectionAim,
+    new_direction,
+    parse_direction,
+    render_direction,
+)
 from continuity_kernel.errors import (
     ConflictError,
     DegradedIntegrityError,
@@ -34,13 +42,17 @@ from continuity_kernel.errors import (
 from continuity_kernel.portfolio import (
     ABSENT_PORTFOLIO_REVISION,
     Portfolio,
+    PortfolioInspection,
     PortfolioItem,
+    inspect_portfolio_state,
     new_portfolio,
     parse_portfolio,
     portfolio_items,
     render_portfolio,
 )
 from continuity_kernel.records import (
+    REVIEW_WORK_THREAD_ID,
+    TERMINAL_TASK_STATUSES,
     Entity,
     Record,
     Task,
@@ -50,12 +62,14 @@ from continuity_kernel.records import (
     entity_ids_value,
     format_time,
     hand_id,
+    has_review_session_signal,
     new_entity,
     new_task,
     new_thread,
     next_timestamp,
     optional_body,
     parse_entity,
+    parse_review_references,
     parse_task,
     parse_thread,
     parse_time,
@@ -336,11 +350,20 @@ class Vault:
             if clear_active_thread_id:
                 target_active_thread_id = None
             if target_status in {"done", "dropped"}:
+                self._require_task_focus_cleared(before.identifier)
                 target_actor = None
                 target_next = None
                 target_waiting = None
                 target_active_thread_id = None
             refs = tuple(item for item in before.refs if item not in set(remove_refs))
+            if target_status in {"done", "dropped"}:
+                refs = tuple(
+                    item
+                    for item in refs
+                    if not item.startswith("review-subject:")
+                    and not item.startswith("review-option:")
+                    and item != "review-state:paused"
+                )
             refs = references((*refs, *add_refs))
             candidate = replace(
                 before,
@@ -416,8 +439,10 @@ class Vault:
 
     def create_thread(self, **values: Any) -> WorkThread:
         thread = new_thread(**values)
-        self._validate_relations(thread.task_ids, thread.entity_ids)
-        return self._create_record("thread", thread)
+        with exclusive_lock(self.state / "locks/global.lock"):
+            self._validate_relations(thread.task_ids, thread.entity_ids)
+            self._validate_thread_focus(thread)
+            return self._create_record_locked("thread", thread)
 
     def get_thread(self, identifier: str) -> WorkThread:
         clean_id = canonical_id(identifier, "thread ID", prefix="thread")
@@ -447,6 +472,8 @@ class Vault:
         status: str | None = None,
         next_move: str | None = None,
         clear_next_move: bool = False,
+        focus_task_id: str | None = None,
+        clear_focus_task: bool = False,
         task_ids: tuple[str, ...] | None = None,
         entity_ids: tuple[str, ...] | None = None,
         add_refs: tuple[str, ...] = (),
@@ -466,6 +493,15 @@ class Vault:
                 entity_ids_value(entity_ids) if entity_ids is not None else before.entity_ids
             )
             self._validate_relations(target_tasks, target_entities)
+            if focus_task_id is not None and clear_focus_task:
+                raise ValidationError("choose a focus task or clear it")
+            target_focus = (
+                task_id(focus_task_id)
+                if focus_task_id is not None
+                else None
+                if clear_focus_task
+                else before.focus_task_id
+            )
             refs = tuple(item for item in before.refs if item not in set(remove_refs))
             target_next = (
                 optional_body(next_move, "next move") if next_move is not None else before.next_move
@@ -475,6 +511,8 @@ class Vault:
                 raise ValidationError("closed thread updates cannot also set a next move")
             if clear_next_move or target_status == "closed":
                 target_next = None
+            if target_status == "closed":
+                target_focus = None
             candidate = replace(
                 before,
                 title=title_text(title) if title is not None else before.title,
@@ -482,14 +520,154 @@ class Vault:
                 summary=summary.strip() if summary is not None else before.summary,
                 status=target_status,
                 next_move=target_next,
+                focus_task_id=target_focus,
                 task_ids=target_tasks,
                 entity_ids=target_entities,
                 refs=references((*refs, *add_refs)),
                 updated_at=next_timestamp(before.updated_at, observed_at),
                 revision="",
             )
+            self._validate_thread_focus(
+                candidate,
+                allow_unfocused_review=clear_focus_task or target_status == "closed",
+            )
             after = parse_thread(render_thread(candidate))
             self._replace_record(path, "thread", before, after, render_thread(after))
+            return after
+
+    def migrate_legacy_review_session(
+        self,
+        session_identifier: str,
+        *,
+        expected_session_revision: str,
+        expected_review_thread_revision: str,
+        thread_title: str | None = None,
+        thread_purpose: str | None = None,
+        thread_summary: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> WorkThread:
+        """CAS-bind one pre-focus review session without changing its task or hand."""
+
+        clean_session_id = task_id(session_identifier)
+        thread_path = self._path("thread", REVIEW_WORK_THREAD_ID)
+        with exclusive_lock(self.state / "locks/global.lock"):
+            session = self._read_task(clean_session_id)
+            self._expect(session.revision, expected_session_revision)
+            parsed = parse_review_references(session.refs)
+            if (
+                session.status in TERMINAL_TASK_STATUSES
+                or not parsed.has_all_open_scope
+                or not has_review_session_signal(session)
+            ):
+                raise ValidationError(
+                    "legacy review migration requires one nonterminal scoped task with "
+                    "structural session state"
+                )
+            if parsed.issues:
+                raise ValidationError(parsed.issues[0])
+
+            if os.path.lexists(thread_path):
+                before = self.get_thread(REVIEW_WORK_THREAD_ID)
+                self._expect(before.revision, expected_review_thread_revision)
+                if before.status == "closed":
+                    raise ValidationError(
+                        "reopen the canonical review WorkThread deliberately before migration"
+                    )
+                if any(
+                    value is not None for value in (thread_title, thread_purpose, thread_summary)
+                ):
+                    raise ValidationError(
+                        "existing review WorkThread prose is preserved during migration"
+                    )
+                candidate = replace(
+                    before,
+                    focus_task_id=session.identifier,
+                    task_ids=task_ids_value((*before.task_ids, session.identifier)),
+                    updated_at=next_timestamp(before.updated_at, observed_at),
+                    revision="",
+                )
+                self._validate_thread_focus(candidate)
+                after = parse_thread(render_thread(candidate))
+                self._replace_record(
+                    thread_path,
+                    "thread",
+                    before,
+                    after,
+                    render_thread(after),
+                )
+                return after
+
+            if expected_review_thread_revision != "absent":
+                raise ConflictError(
+                    "review WorkThread changed; reload before migrating the legacy session"
+                )
+            if thread_title is None or thread_purpose is None or thread_summary is None:
+                raise ValidationError(
+                    "creating the canonical review WorkThread requires authored title, purpose, "
+                    "and summary"
+                )
+            after = new_thread(
+                identifier=REVIEW_WORK_THREAD_ID,
+                title=thread_title,
+                purpose=thread_purpose,
+                summary=thread_summary,
+                focus_task_id=session.identifier,
+                task_ids=(session.identifier,),
+                observed_at=observed_at,
+            )
+            self._validate_relations(after.task_ids, after.entity_ids)
+            self._validate_thread_focus(after)
+            return self._create_record_locked("thread", after)
+
+    def get_direction(self) -> Direction:
+        return parse_direction(self._read_text(self.root / "DIRECTION.md"))
+
+    def set_direction(
+        self,
+        *,
+        expected_revision: str,
+        status: str,
+        current_chapter: str,
+        aims: tuple[DirectionAim, ...],
+        observed_at: datetime | None = None,
+    ) -> Direction:
+        """CAS-author one complete Direction without deriving aims from task text."""
+
+        path = self.root / "DIRECTION.md"
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self.state / "locks/direction.lock"),
+        ):
+            before: Direction | None
+            previous: bytes | None
+            if os.path.lexists(path):
+                previous = self._read_bytes(path)
+                before = parse_direction(previous.decode("utf-8"))
+                self._expect(before.revision, expected_revision)
+                timestamp = next_timestamp(before.updated_at, observed_at)
+            else:
+                previous = None
+                before = None
+                if expected_revision != ABSENT_DIRECTION_REVISION:
+                    raise ConflictError(
+                        "Direction changed; reload it before authoring the complete aims"
+                    )
+                timestamp = format_time(observed_at or datetime.now(UTC))
+            after = new_direction(
+                status=status,
+                current_chapter=current_chapter,
+                aims=aims,
+                observed_at=parse_time(timestamp),
+            )
+            self._persist_with_event(
+                path=path,
+                content=render_direction(after).encode("utf-8"),
+                previous=previous,
+                operation="direction.set",
+                identifier="direction:current",
+                before_revision=before.revision if before is not None else None,
+                after_revision=after.revision,
+            )
             return after
 
     def get_portfolio(self) -> Portfolio:
@@ -501,6 +679,7 @@ class Vault:
         expected_revision: str,
         summary: str,
         items: tuple[PortfolioItem, ...],
+        direction_revision: str | None = None,
         observed_at: datetime | None = None,
     ) -> Portfolio:
         """Author the complete open Portfolio with one exact CAS write."""
@@ -526,10 +705,12 @@ class Vault:
                         "Portfolio changed; reload it before authoring the complete set"
                     )
                 timestamp = format_time(observed_at or datetime.now(UTC))
-            self._validate_portfolio_items(clean_items)
+            direction = self._direction_for_portfolio(direction_revision)
+            self._validate_portfolio_items(clean_items, direction=direction)
             after = new_portfolio(
                 summary=summary,
                 items=clean_items,
+                direction_revision=direction.revision if direction is not None else None,
                 observed_at=parse_time(timestamp),
             )
             self._persist_with_event(
@@ -542,6 +723,21 @@ class Vault:
                 after_revision=after.revision,
             )
             return after
+
+    def inspect_portfolio(self) -> PortfolioInspection:
+        """Inspect exact Portfolio and review anchors without changing authored judgment."""
+
+        with exclusive_lock(self.state / "locks/global.lock"):
+            try:
+                direction = self.get_direction()
+            except NotFoundError:
+                direction = None
+            return inspect_portfolio_state(
+                tasks=self.list_tasks(),
+                threads=self.list_threads(),
+                portfolio=self.get_portfolio(),
+                direction=direction,
+            )
 
     def read_document(self, name: str) -> dict[str, str]:
         path = self._document_path(name)
@@ -654,6 +850,13 @@ class Vault:
             except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
                 issues.append(DoctorIssue("invalid-document", name, str(exc)))
 
+        direction_path = self.root / "DIRECTION.md"
+        if os.path.lexists(direction_path):
+            try:
+                parse_direction(self._read_text(direction_path))
+            except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
+                issues.append(DoctorIssue("invalid-direction", "DIRECTION.md", str(exc)))
+
         portfolio_path = self.root / "PORTFOLIO.md"
         if os.path.lexists(portfolio_path):
             try:
@@ -695,6 +898,24 @@ class Vault:
                     issues.append(
                         DoctorIssue(
                             "missing-entity", record.identifier, f"references missing entity {item}"
+                        )
+                    )
+            if record.focus_task_id is not None:
+                focus = records.get(f"task:{record.focus_task_id}")
+                if not isinstance(focus, Task):
+                    issues.append(
+                        DoctorIssue(
+                            "missing-focus-task",
+                            record.identifier,
+                            f"focuses missing task {record.focus_task_id}",
+                        )
+                    )
+                elif focus.status in TERMINAL_TASK_STATUSES:
+                    issues.append(
+                        DoctorIssue(
+                            "terminal-focus-task",
+                            record.identifier,
+                            f"focus task {record.focus_task_id} is terminal",
                         )
                     )
 
@@ -755,20 +976,25 @@ class Vault:
         return sha256_bytes("".join(entries).encode("utf-8"))
 
     def _create_record(self, kind: RecordKind, record: RecordValue) -> RecordValue:
-        path = self._path(kind, record.identifier)
         with exclusive_lock(self.state / "locks/global.lock"):
-            if path.exists():
-                raise ConflictError(f"{kind} already exists: {record.identifier}")
-            rendered = _render_record(record)
-            self._persist_with_event(
-                path=path,
-                content=rendered.encode("utf-8"),
-                previous=None,
-                operation=f"{kind}.create",
-                identifier=record.identifier,
-                before_revision=None,
-                after_revision=record.revision,
-            )
+            return self._create_record_locked(kind, record)
+
+    def _create_record_locked(self, kind: RecordKind, record: RecordValue) -> RecordValue:
+        """Publish a validated record while the caller owns the global vault lock."""
+
+        path = self._path(kind, record.identifier)
+        if path.exists():
+            raise ConflictError(f"{kind} already exists: {record.identifier}")
+        rendered = _render_record(record)
+        self._persist_with_event(
+            path=path,
+            content=rendered.encode("utf-8"),
+            previous=None,
+            operation=f"{kind}.create",
+            identifier=record.identifier,
+            before_revision=None,
+            after_revision=record.revision,
+        )
         return record
 
     def _replace_record(
@@ -1001,12 +1227,112 @@ class Vault:
         for identifier in entity_ids:
             self.get_entity(identifier)
 
-    def _validate_portfolio_items(self, items: tuple[PortfolioItem, ...]) -> None:
+    def _validate_thread_focus(
+        self, thread: WorkThread, *, allow_unfocused_review: bool = False
+    ) -> None:
+        if thread.focus_task_id is None:
+            if thread.identifier == REVIEW_WORK_THREAD_ID and thread.status != "closed":
+                members = [self.get_task(identifier) for identifier in thread.task_ids]
+                scoped = [
+                    task
+                    for task in members
+                    if parse_review_references(task.refs).has_all_open_scope
+                    and task.status not in TERMINAL_TASK_STATUSES
+                ]
+                if scoped and not allow_unfocused_review:
+                    raise ValidationError(
+                        "the review WorkThread must explicitly focus its nonterminal session"
+                    )
+            return
+        focus = self.get_task(thread.focus_task_id)
+        if focus.status in TERMINAL_TASK_STATUSES:
+            raise ValidationError("a WorkThread focus task must be nonterminal")
+        if thread.identifier != REVIEW_WORK_THREAD_ID:
+            return
+        members = [self.get_task(identifier) for identifier in thread.task_ids]
+        scoped = [
+            task
+            for task in members
+            if task.status not in TERMINAL_TASK_STATUSES
+            and parse_review_references(task.refs).has_all_open_scope
+        ]
+        if len(scoped) != 1 or scoped[0].identifier != thread.focus_task_id:
+            raise ValidationError(
+                "the review WorkThread must own and focus exactly one nonterminal review session"
+            )
+        parsed = parse_review_references(scoped[0].refs)
+        if parsed.issues:
+            raise ValidationError(parsed.issues[0])
+
+    def _require_task_focus_cleared(self, task_identifier: str) -> None:
+        blockers = [
+            thread.identifier
+            for thread in self.list_threads()
+            if thread.status != "closed" and thread.focus_task_id == task_identifier
+        ]
+        if blockers:
+            raise ValidationError(
+                "clear WorkThread focus with its exact revision before terminalizing the task: "
+                + ", ".join(blockers)
+            )
+
+    def _direction_for_portfolio(self, expected_revision: str | None) -> Direction | None:
+        try:
+            direction = self.get_direction()
+        except NotFoundError:
+            if expected_revision is not None:
+                raise ConflictError(
+                    "Direction is absent; reload before authoring Portfolio alignment"
+                ) from None
+            return None
+        if expected_revision is None:
+            raise ValidationError("Portfolio alignment requires the current Direction revision")
+        if expected_revision != direction.revision:
+            raise ConflictError(
+                "Direction changed; reload it before authoring the complete Portfolio"
+            )
+        return direction
+
+    def _validate_portfolio_items(
+        self,
+        items: tuple[PortfolioItem, ...],
+        *,
+        direction: Direction | None,
+    ) -> None:
         tasks = self.list_tasks()
+        threads = self.list_threads()
+        review_session_id: str | None = None
+        review_thread = next(
+            (thread for thread in threads if thread.identifier == REVIEW_WORK_THREAD_ID),
+            None,
+        )
+        if review_thread is not None and review_thread.status != "closed":
+            sessions = [
+                task
+                for task in tasks
+                if task.identifier in review_thread.task_ids
+                and task.status not in TERMINAL_TASK_STATUSES
+                and parse_review_references(task.refs).has_all_open_scope
+            ]
+            if not sessions and review_thread.focus_task_id is not None:
+                raise ValidationError(
+                    "the review WorkThread cannot focus without one nonterminal session"
+                )
+            if sessions and (
+                len(sessions) != 1 or review_thread.focus_task_id != sessions[0].identifier
+            ):
+                raise ValidationError(
+                    "the review WorkThread must own and focus exactly one nonterminal session"
+                )
+            if sessions:
+                parsed_session = parse_review_references(sessions[0].refs)
+                if parsed_session.issues:
+                    raise ValidationError(parsed_session.issues[0])
+                review_session_id = sessions[0].identifier
         open_tasks = {
             task.identifier: task
             for task in tasks
-            if task.status not in {"done", "dropped"} and "review-scope:all-open" not in task.refs
+            if task.status not in TERMINAL_TASK_STATUSES and task.identifier != review_session_id
         }
         item_ids = {item.task_id for item in items}
         if item_ids != set(open_tasks):
@@ -1020,23 +1346,60 @@ class Vault:
             raise ValidationError(
                 "Portfolio must cover the complete open task set; " + "; ".join(details)
             )
+        owners_by_task: dict[str, list[WorkThread]] = {}
+        for thread in threads:
+            if thread.identifier == REVIEW_WORK_THREAD_ID or thread.status == "closed":
+                continue
+            for identifier in thread.task_ids:
+                owners_by_task.setdefault(identifier, []).append(thread)
         for item in items:
             task = open_tasks[item.task_id]
             if item.task_revision != task.revision:
                 raise ConflictError(
                     f"Portfolio task anchor changed for {item.task_id}; reload before writing"
                 )
-            if item.work_thread_id is None:
-                continue
-            thread = self.get_thread(item.work_thread_id)
-            if item.work_thread_revision != thread.revision:
+            owners = owners_by_task.get(item.task_id, [])
+            if len(owners) > 1:
+                raise ValidationError(
+                    f"Portfolio task {item.task_id} has multiple nonterminal WorkThread owners"
+                )
+            owner = owners[0] if owners else None
+            if owner is None:
+                if item.work_thread_id is not None:
+                    raise ValidationError(
+                        f"Portfolio task {item.task_id} is not owned by a current WorkThread"
+                    )
+            elif item.work_thread_id != owner.identifier:
+                raise ValidationError(
+                    f"Portfolio item must anchor its exact owning WorkThread: {item.task_id}"
+                )
+            elif item.work_thread_revision != owner.revision:
                 raise ConflictError(
                     f"Portfolio work-thread anchor changed for {item.task_id}; "
                     "reload before writing"
                 )
-            if item.task_id not in thread.task_ids:
+            if direction is None:
+                if item.direction_aim_ids or item.unaligned_reason is not None:
+                    raise ValidationError("Portfolio aim alignment requires an authored Direction")
+                continue
+            known_aims = {aim.identifier for aim in direction.aims}
+            if item.direction_aim_ids:
+                unknown = next(
+                    (
+                        identifier
+                        for identifier in item.direction_aim_ids
+                        if identifier not in known_aims
+                    ),
+                    None,
+                )
+                if unknown is not None:
+                    raise ValidationError(
+                        f"Portfolio item names unknown Direction aim: {item.task_id} -> {unknown}"
+                    )
+            elif item.unaligned_reason is None:
                 raise ValidationError(
-                    f"Portfolio work thread {thread.identifier} does not contain {item.task_id}"
+                    "Portfolio item requires exact Direction aim IDs or an explicit "
+                    f"unaligned reason: {item.task_id}"
                 )
 
     def _assert_inside(self, path: Path) -> None:

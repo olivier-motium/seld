@@ -13,7 +13,7 @@ export function renderControlPanel(snapshot, { bridgeToken, currentControls, ref
       "The Bridge records your wording exactly. Reviewing it only acknowledges or rejects what you wrote; it never applies the correction or takes action.",
     ),
   );
-  const review = renderReviewActions(controls);
+  const review = renderControlReviewActions(controls);
   if (review) copy.append(review);
 
   const recent = element("ul", "issue-list control-history");
@@ -148,11 +148,11 @@ export function renderControlPanel(snapshot, { bridgeToken, currentControls, ref
   return panel;
 }
 
-function renderReviewActions(controls) {
+export function renderControlReviewActions(controls, { linkLabel = "Review in Codex" } = {}) {
   if (!controls.available || !controls.review_prompt) return null;
   const actions = element("div", "control-review-actions");
   if (controls.review_url) {
-    const link = textElement("a", "primary-action", "Review in Codex");
+    const link = textElement("a", "primary-action", linkLabel);
     link.href = controls.review_url;
     actions.append(link);
   }
@@ -221,6 +221,51 @@ export async function appendControlIntent(snapshot, bridgeToken, intent) {
     throw error;
   }
   return payload;
+}
+
+export async function triggerReviewTurn(bridgeToken, eventId) {
+  if (!validEventId(eventId)) throw new Error("The local review turn is not available.");
+  return reviewTurnRequest(bridgeToken, "/api/v1/review-turn", {
+    body: JSON.stringify({ event_id: eventId }),
+    headers: { "Content-Type": "application/json" },
+    method: "POST",
+  });
+}
+
+export async function readReviewTurn(bridgeToken, eventId) {
+  if (!validEventId(eventId)) throw new Error("The local review turn is not available.");
+  const query = new URLSearchParams({ event_id: eventId });
+  return reviewTurnRequest(bridgeToken, `/api/v1/review-turn?${query}`, {
+    method: "GET",
+  });
+}
+
+async function reviewTurnRequest(bridgeToken, url, options) {
+  if (!bridgeToken) {
+    throw new Error("The local review turn is not available.");
+  }
+  const response = await fetch(url, {
+    ...options,
+    cache: "no-store",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${bridgeToken}`,
+      ...(options.headers || {}),
+    },
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (payload.ok === true && payload.transport) return payload.transport;
+  if (!response.ok) {
+    const error = new Error(payload.error || `Bridge returned ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  throw new Error("The Bridge returned no review-turn receipt.");
+}
+
+function validEventId(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 }
 
 function relativeTime(timestamp) {

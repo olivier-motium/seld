@@ -2,14 +2,32 @@
 
 ## 0.2.0 - Unreleased
 
+- Add authored whole-life Direction and a complete ordered Portfolio whose
+  judgments are bound to exact Direction, Task, and WorkThread revisions.
+- Add a finite guided review of every open outcome, carried by one ordinary
+  review-session Task and the canonical life-portfolio-review WorkThread, with
+  revision-anchored checked coverage, pause/resume, and explicit terminal
+  semantics.
+- Add the authenticated, append-only Bridge control queue with vault-bound CAS,
+  bounded generations, durable CLI/MCP accept or reject dispositions, and
+  archival only after every live intent is decided. Disposition acknowledges an
+  intent; it never approves or executes an external action.
+- Add the event-bound, GSV-only MCP profile and same-hand Codex review-turn
+  transport. The transport is off by default and remains foundation-gated while
+  installed-candidate, clean-account, platform, signing, and soak gates are
+  open.
+- Add tested foundation contracts for context-first onboarding, deterministic
+  source attestations, local privacy screening, mechanical and cognitive Pulse
+  admission, scheduler canaries, and reversible migration. They remain
+  unexposed until their named release gates close.
 - Add the private, read-only Bridge for current orientation, commitments, and
   storylines, including authenticated loopback access and responsive states.
 - Make live-Bridge upgrades quiesce before executable replacement and restore
   the previous Bridge best-effort on rollback.
 - Make bare `gsv` open the configured Bridge and make setup install Codex
   before starting or opening the local surface.
-- Add the killed-hand synthetic continuity proof and regenerable README
-  visuals.
+- Add the killed-hand synthetic continuity proof and a packaged-Bridge browser
+  gate that persists no generated screenshots or GIFs.
 - Make backup creation no-clobber, collision-resistant, traversal-complete,
   alias-safe, and identity-checked across post-publication verification. Use
   native atomic no-replace moves when hard links are unavailable, without ever

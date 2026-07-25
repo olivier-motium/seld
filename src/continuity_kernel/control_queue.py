@@ -236,10 +236,6 @@ class ControlQueue:
             expected_vault_id=clean_vault_id,
             expected_root_identity=expected_root_identity,
         ) as store:
-            if expected_root_identity is not None:
-                _validate_root_binding(self.vault_root, expected_root_identity)
-            if clean_vault_id is not None:
-                _validate_vault_binding(store, clean_vault_id)
             store.ensure_directory(".gsv/control")
             with store.bind_directory(".gsv/control"):
                 return self._append_with_store(
@@ -327,23 +323,6 @@ class ControlQueue:
             ),
             revision=sha256_bytes(after),
         )
-
-    def _rotate_closed(
-        self,
-        *,
-        expected_revision: str,
-        closed_event_ids: frozenset[str],
-        observed_at: datetime | None = None,
-    ) -> dict[str, Any]:
-        """Archive a fully dispositioned generation and open a non-ABA queue."""
-
-        with locked_control_store(self.vault_root) as store:
-            return self._rotate_closed_with_store(
-                store,
-                expected_revision=expected_revision,
-                closed_event_ids=closed_event_ids,
-                observed_at=observed_at,
-            )
 
     def _rotate_closed_with_store(
         self,

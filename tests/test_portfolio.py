@@ -63,7 +63,7 @@ def test_vault_portfolio_requires_complete_open_set_and_exact_cas(vault: Vault) 
         status="doing",
         next_actor="agent",
     )
-    vault.create_task(
+    review = vault.create_task(
         identifier="finite-review",
         title="Review every outcome",
         outcome="Check the open outcomes without owning them.",
@@ -71,6 +71,14 @@ def test_vault_portfolio_requires_complete_open_set_and_exact_cas(vault: Vault) 
         next_actor="agent",
         active_thread_id="review-hand",
         refs=("review-scope:all-open",),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Review the current Portfolio",
+        purpose="Carry one finite all-open review session.",
+        summary="The exact review session is active.",
+        focus_task_id=review.identifier,
+        task_ids=(review.identifier,),
     )
 
     with pytest.raises(ValidationError, match="missing open tasks"):

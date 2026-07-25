@@ -11,7 +11,12 @@ import pytest
 
 from continuity_kernel import atomic as atomic_module
 from continuity_kernel import control_queue as control_queue_module
-from continuity_kernel.control_queue import EMPTY_REVISION, ControlQueue, ControlStorageError
+from continuity_kernel.control_queue import (
+    EMPTY_REVISION,
+    ControlQueue,
+    ControlStorageError,
+    locked_control_store,
+)
 from continuity_kernel.errors import (
     ConflictError,
     DegradedIntegrityError,
@@ -334,20 +339,24 @@ def test_snapshot_bounds_lineage_io_but_mutation_verifies_the_full_chain(
         choice="first generation",
         expected_revision=EMPTY_REVISION,
     )
-    first_rotation = queue._rotate_closed(
-        expected_revision=first.revision,
-        closed_event_ids=frozenset({first.events[0].event_id}),
-    )
+    with locked_control_store(queue.vault_root) as store:
+        first_rotation = queue._rotate_closed_with_store(
+            store,
+            expected_revision=first.revision,
+            closed_event_ids=frozenset({first.events[0].event_id}),
+        )
     second = queue.append(
         kind="correction",
         subject="record:second",
         choice="second generation",
         expected_revision=first_rotation["revision"],
     )
-    second_rotation = queue._rotate_closed(
-        expected_revision=second.revision,
-        closed_event_ids=frozenset({second.events[0].event_id}),
-    )
+    with locked_control_store(queue.vault_root) as store:
+        second_rotation = queue._rotate_closed_with_store(
+            store,
+            expected_revision=second.revision,
+            closed_event_ids=frozenset({second.events[0].event_id}),
+        )
     oldest = queue.vault_root / first_rotation["archive"]
     oldest.write_bytes(b"corrupt old history\n")
 

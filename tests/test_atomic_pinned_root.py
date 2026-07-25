@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,6 +15,34 @@ from continuity_kernel.vault import Vault
 pytestmark = pytest.mark.skipif(
     os.name == "nt", reason="secure directory-pinned storage is POSIX-only foundation"
 )
+
+
+def test_pinned_directory_count_uses_descriptor_and_honors_match_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "pinned"
+    receipts = root / "receipts"
+    receipts.mkdir(parents=True)
+    (receipts / "one.json").write_bytes(b"one")
+    (receipts / "two.json").write_bytes(b"two")
+    (receipts / "ignored.tmp").write_bytes(b"temp")
+    actual_scandir = os.scandir
+    observed: list[object] = []
+
+    def tracked_scandir(path: Any) -> Any:
+        observed.append(path)
+        return actual_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", tracked_scandir)
+    store = atomic_module.PinnedPathRoot(root)
+    try:
+        assert store.count_directory_entries("receipts", suffix=".json") == 2
+        assert store.count_directory_entries("receipts", suffix=".json", stop_at=1) == 1
+    finally:
+        store.close()
+
+    assert observed
+    assert all(isinstance(value, int) for value in observed)
 
 
 def test_pinned_write_reports_unknown_if_root_is_replaced_after_publication(

@@ -22,7 +22,7 @@ from urllib.request import ProxyHandler, Request, urlopen
 
 import pytest
 
-from continuity_kernel import __version__, bridge, mcp_server
+from continuity_kernel import __version__, bridge, bridge_projection, mcp_server
 from continuity_kernel import control_queue as control_queue_module
 from continuity_kernel.config import data_dir
 from continuity_kernel.control_queue import (
@@ -34,10 +34,12 @@ from continuity_kernel.control_queue import (
 from continuity_kernel.errors import MutationCommittedError, SetupError, ValidationError
 from continuity_kernel.operations import OperationLedger
 from continuity_kernel.portfolio import ABSENT_PORTFOLIO_REVISION, portfolio_item
+from continuity_kernel.records import review_coverage_ref, review_option_ref
 from continuity_kernel.vault import Vault, doctor_dict
 
 INSTANCE_ID = "a" * 32
 ACCESS_TOKEN = "b" * 48
+REVIEW_HAND_ID = "019f95fd-009e-7603-ab87-f9927cf31c4d"
 
 
 def test_codex_metadata_degrades_when_provider_process_cannot_start(
@@ -51,6 +53,47 @@ def test_codex_metadata_degrades_when_provider_process_cannot_start(
     result = bridge._codex_metadata()
 
     assert result == {"available": False, "error": "missing Codex executable"}
+
+
+def test_guided_review_deep_link_fallback_matches_installed_skill_contract() -> None:
+    prompt = " ".join(bridge_projection._GUIDED_REVIEW_PROMPT.split()).casefold()
+    skill_resource = (
+        files("continuity_kernel")
+        / "resources"
+        / "marketplace"
+        / "plugins"
+        / "gsv"
+        / "skills"
+        / "gsv"
+        / "SKILL.md"
+    )
+    skill = " ".join(skill_resource.read_text(encoding="utf-8").split()).casefold()
+    shared_contract_markers = (
+        "thread:life-portfolio-review",
+        "workthreads and entities",
+        "review-state:paused",
+        "review-covered:task:<id>@<task-revision>",
+        "|thread:<thread-id>@<thread-revision>",
+        "direction cas when relevant",
+        "complete portfolio cas when affected",
+        "new open outcomes",
+        "active hand",
+        "workthread focus",
+        "raw codex thread uuid",
+        "active_thread_id",
+        "gsv workthread id",
+        "codex-thread:*",
+        "status=waiting",
+        "next_actor=human",
+        "next_action",
+        "waiting_on",
+    )
+    for marker in shared_contract_markers:
+        assert marker in prompt
+        assert marker in skill
+    for semantic_word in ("checked", "never", "resolved", "clear"):
+        assert semantic_word in prompt
+        assert semantic_word in skill
 
 
 @pytest.fixture
@@ -229,6 +272,10 @@ def test_snapshot_projects_one_exact_guided_review_subject_without_inference(
         next_actor="human",
         rank=20,
     )
+    keep_option = review_option_ref(
+        intent="keep",
+        consequence="Leave the outcome unchanged and check only this review step.",
+    )
     session = vault.create_task(
         identifier="review-session",
         title="Review every open outcome",
@@ -237,8 +284,22 @@ def test_snapshot_projects_one_exact_guided_review_subject_without_inference(
         next_actor="human",
         next_action="Keep this current and advance.",
         waiting_on="Should I keep it unchanged?",
-        active_thread_id="exact-review-hand",
-        refs=("review-scope:all-open", "review-subject:task:first-outcome"),
+        active_thread_id=REVIEW_HAND_ID,
+        refs=(
+            "review-scope:all-open",
+            "review-subject:task:first-outcome",
+            keep_option,
+        ),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Finite Portfolio reviews",
+        purpose="Own only bounded all-open review sessions.",
+        summary="One review session is active.",
+        status="active",
+        next_move="Continue the exact focused review session.",
+        focus_task_id=session.identifier,
+        task_ids=(session.identifier,),
     )
     portfolio = vault.set_portfolio(
         expected_revision=ABSENT_PORTFOLIO_REVISION,
@@ -273,7 +334,15 @@ def test_snapshot_projects_one_exact_guided_review_subject_without_inference(
     assert review["recommendation"] == "Keep this current and advance."
     assert review["question"] == "Should I keep it unchanged?"
     assert review["checked_count"] == 0
+    assert review["checked_current_count"] == 0
     assert review["uncovered_count"] == 2
+    assert review["options"] == [
+        {
+            "consequence": "Leave the outcome unchanged and check only this review step.",
+            "intent": "keep",
+        }
+    ]
+    assert "contradictions" not in review["subject"]
 
     changed_second = vault.update_task(
         second.identifier,
@@ -293,9 +362,12 @@ def test_snapshot_projects_one_exact_guided_review_subject_without_inference(
     advanced = vault.update_task(
         session.identifier,
         expected_revision=session.revision,
-        remove_refs=("review-subject:task:first-outcome",),
+        remove_refs=("review-subject:task:first-outcome", keep_option),
         add_refs=(
-            "review-covered:task:first-outcome",
+            review_coverage_ref(
+                task_id_value=first.identifier,
+                task_revision=first.revision,
+            ),
             "review-subject:task:second-outcome",
         ),
         next_action="Reauthor the stale anchor before asking about the second outcome.",
@@ -308,11 +380,269 @@ def test_snapshot_projects_one_exact_guided_review_subject_without_inference(
         integration={"available": True, "ready": True},
     )["portfolio"]["review"]
     assert checked["checked_count"] == 1
-    assert checked["checked_open_count"] == 1
+    assert checked["checked_current_count"] == 1
     assert vault.get_task(first.identifier).status == "ready"
     assert checked["state"] == "conflict"
     assert checked["actionable"] is False
     assert "stale" in checked["issue"].casefold()
+
+
+def test_snapshot_reenters_changed_coverage_and_includes_new_open_outcomes(
+    vault: Vault,
+) -> None:
+    outcome = vault.create_task(
+        identifier="anchored-outcome",
+        title="Anchored outcome",
+        outcome="Remain checked only while its exact context remains current.",
+        status="ready",
+        next_actor="human",
+    )
+    owner = vault.create_thread(
+        identifier="thread:anchored-work",
+        title="Anchored work",
+        purpose="Own the exact outcome context.",
+        summary="The original context is current.",
+        status="active",
+        next_move="Keep the context explicit.",
+        task_ids=(outcome.identifier,),
+    )
+    coverage = review_coverage_ref(
+        task_id_value=outcome.identifier,
+        task_revision=outcome.revision,
+        work_thread_id=owner.identifier,
+        work_thread_revision=owner.revision,
+    )
+    session = vault.create_task(
+        identifier="anchored-review",
+        title="Review every open outcome",
+        outcome="Check exact current outcomes without inventing completion.",
+        status="waiting",
+        next_actor="human",
+        next_action="Choose the next exact subject deliberately.",
+        waiting_on="Which current outcome should come next?",
+        active_thread_id=REVIEW_HAND_ID,
+        refs=("review-scope:all-open", coverage),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Finite Portfolio reviews",
+        purpose="Own only bounded all-open review sessions.",
+        summary="One review session is active.",
+        status="active",
+        next_move="Continue the exact focused review session.",
+        focus_task_id=session.identifier,
+        task_ids=(session.identifier,),
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="The complete current open set.",
+        items=(
+            portfolio_item(
+                task_id_value=outcome.identifier,
+                task_revision=outcome.revision,
+                stance="needs-human",
+                reason="Keep this visible while its owning context is current.",
+                work_thread_id=owner.identifier,
+                work_thread_revision=owner.revision,
+            ),
+        ),
+    )
+
+    current = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )["portfolio"]["review"]
+    assert current["checked_current_count"] == 1
+    assert current["uncovered_count"] == 0
+
+    changed_owner = vault.update_thread(
+        owner.identifier,
+        expected_revision=owner.revision,
+        summary="The owning context materially changed after review.",
+    )
+    assert changed_owner.revision != owner.revision
+    later = vault.create_task(
+        identifier="later-open-outcome",
+        title="Later open outcome",
+        outcome="Join the exact all-open scope after this session began.",
+        status="ready",
+        next_actor="human",
+    )
+
+    changed = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )["portfolio"]["review"]
+    assert changed["checked_count"] == 1
+    assert changed["checked_current_count"] == 0
+    assert changed["revisit_task_ids"] == [outcome.identifier]
+    assert changed["new_open_task_ids"] == [later.identifier]
+    assert changed["uncovered_task_ids"] == [outcome.identifier, later.identifier]
+    assert changed["uncovered_count"] == 2
+
+
+def test_snapshot_marks_a_new_workthread_owner_as_stale_and_nonactionable(
+    vault: Vault,
+) -> None:
+    outcome = vault.create_task(
+        identifier="unthreaded-subject",
+        title="Unthreaded subject",
+        outcome="Remain current only while the exact unthreaded anchor holds.",
+        status="ready",
+        next_actor="human",
+    )
+    session = vault.create_task(
+        identifier="ownership-review",
+        title="Review every open outcome",
+        outcome="Check exact current outcomes without inventing ownership.",
+        status="waiting",
+        next_actor="human",
+        next_action="Keep the exact owner relation visible.",
+        waiting_on="Does this still belong outside a storyline?",
+        active_thread_id=REVIEW_HAND_ID,
+        refs=(
+            "review-scope:all-open",
+            f"review-subject:task:{outcome.identifier}",
+        ),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Finite Portfolio reviews",
+        purpose="Own only bounded all-open review sessions.",
+        summary="One review session is active.",
+        status="active",
+        next_move="Continue the exact focused review session.",
+        focus_task_id=session.identifier,
+        task_ids=(session.identifier,),
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="The subject is deliberately unthreaded.",
+        items=(
+            portfolio_item(
+                task_id_value=outcome.identifier,
+                task_revision=outcome.revision,
+                stance="needs-human",
+                reason="Keep the exact owner relation explicit.",
+            ),
+        ),
+    )
+    current = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )["portfolio"]
+    assert current["state"] == "current"
+    assert current["review"]["actionable"] is True
+
+    gained_owner = vault.create_thread(
+        identifier="thread:new-owner",
+        title="New exact owner",
+        purpose="Own the subject after Portfolio authorship.",
+        summary="This owner relation is newer than the Portfolio anchor.",
+        status="active",
+        next_move="Reauthor the Portfolio before continuing the review.",
+        task_ids=(outcome.identifier,),
+    )
+
+    drifted = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )["portfolio"]
+    assert drifted["state"] == "stale"
+    assert drifted["stale_count"] == 1
+    assert drifted["items"][0]["thread_stale"] is True
+    assert drifted["items"][0]["work_thread"]["identifier"] == gained_owner.identifier
+    assert drifted["review"]["state"] == "conflict"
+    assert drifted["review"]["actionable"] is False
+
+
+def test_snapshot_never_exposes_review_controls_across_inspection_race(
+    vault: Vault,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = vault.create_task(
+        identifier="racing-subject",
+        title="Racing subject",
+        outcome="Never expose a control against mixed canonical revisions.",
+        status="ready",
+        next_actor="human",
+    )
+    session = vault.create_task(
+        identifier="racing-review",
+        title="Review every open outcome",
+        outcome="Check exact current outcomes only.",
+        status="waiting",
+        next_actor="human",
+        next_action="Keep the exact evidence boundary.",
+        waiting_on="Is this exact revision still current?",
+        active_thread_id=REVIEW_HAND_ID,
+        refs=(
+            "review-scope:all-open",
+            f"review-subject:task:{outcome.identifier}",
+        ),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Finite Portfolio reviews",
+        purpose="Own only bounded all-open review sessions.",
+        summary="One review session is active.",
+        status="active",
+        next_move="Continue the exact focused review session.",
+        focus_task_id=session.identifier,
+        task_ids=(session.identifier,),
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="One exact anchored subject.",
+        items=(
+            portfolio_item(
+                task_id_value=outcome.identifier,
+                task_revision=outcome.revision,
+                stance="needs-human",
+                reason="The control is safe only on this exact revision.",
+            ),
+        ),
+    )
+    earlier_inspection = vault.inspect_portfolio()
+    changed = vault.update_task(
+        outcome.identifier,
+        expected_revision=outcome.revision,
+        next_action="This revision landed after the locked inspection.",
+    )
+    assert changed.revision != outcome.revision
+    monkeypatch.setattr(vault, "inspect_portfolio", lambda: earlier_inspection)
+
+    mixed = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )["portfolio"]
+    assert mixed["review"]["state"] == "active"
+    assert mixed["review"]["subject"]["stale"] is True
+    assert mixed["review"]["subject"]["staleness"]
+    assert mixed["review"]["actionable"] is False
+
+
+def test_snapshot_projects_an_empty_open_scope_as_finished(vault: Vault) -> None:
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="There are no current open outcomes.",
+        items=(),
+    )
+
+    review = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )["portfolio"]["review"]
+
+    assert review["state"] == "finished"
+    assert review["open_count"] == 0
+    assert review["uncovered_count"] == 0
 
 
 def test_snapshot_exposes_mind_shaping_only_for_a_proven_empty_ledger(vault: Vault) -> None:
@@ -1450,6 +1780,78 @@ def test_bridge_control_endpoint_rejects_missing_auth_cross_origin_and_unknown_s
     with pytest.raises(HTTPError) as rejected:
         urlopen(request, timeout=2)
     assert rejected.value.code == HTTPStatus.BAD_REQUEST
+
+
+def test_rejected_post_closes_before_unread_body_can_be_parsed_as_another_request(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+) -> None:
+    server, base = running_bridge
+    target = urlsplit(base)
+    assert target.port is not None
+    smuggled = (
+        "GET /api/v1/snapshot HTTP/1.1\r\n"
+        f"Host: {bridge.LOOPBACK_HOST}:{target.port}\r\n"
+        f"Origin: {base}\r\n"
+        f"Authorization: Bearer {ACCESS_TOKEN}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii")
+    first = (
+        "POST /api/v1/control HTTP/1.1\r\n"
+        f"Host: {bridge.LOOPBACK_HOST}:{target.port}\r\n"
+        "Origin: http://127.0.0.1:9\r\n"
+        "Content-Type: text/plain\r\n"
+        f"Content-Length: {len(smuggled)}\r\n\r\n"
+    ).encode("ascii")
+    received = bytearray()
+    with socket.create_connection((bridge.LOOPBACK_HOST, target.port), timeout=2) as connection:
+        connection.settimeout(2)
+        connection.sendall(first + smuggled)
+        while True:
+            chunk = connection.recv(16 * 1024)
+            if not chunk:
+                break
+            received.extend(chunk)
+
+    assert received.count(b"HTTP/1.1 ") == 1
+    assert b"HTTP/1.1 403" in received
+    assert not (server.vault.root / ".gsv/control").exists()
+
+
+def test_review_turn_storage_failure_is_service_unavailable_not_not_found(
+    running_bridge: tuple[bridge.BridgeHTTPServer, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, base = running_bridge
+    event_id = "11111111-1111-4111-8111-111111111111"
+
+    def unavailable(_event_id: object) -> None:
+        raise ControlStorageError("injected unavailable receipt store")
+
+    monkeypatch.setattr(server.turn_transport, "receipt", unavailable)
+    with pytest.raises(HTTPError) as get_rejected:
+        urlopen(
+            _request(
+                f"{base}/api/v1/review-turn?event_id={event_id}",
+                token=ACCESS_TOKEN,
+                origin=base,
+            ),
+            timeout=2,
+        )
+    assert get_rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+
+    post = Request(
+        f"{base}/api/v1/review-turn",
+        data=json.dumps({"event_id": event_id}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "Origin": base,
+        },
+        method="POST",
+    )
+    with pytest.raises(HTTPError) as post_rejected:
+        urlopen(post, timeout=2)
+    assert post_rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
 
 
 def test_bridge_control_endpoint_rejects_forged_host_without_creating_control_store(

@@ -784,6 +784,7 @@ def test_backup_includes_authoritative_name_containing_tmp_marker(
 def test_backup_excludes_only_exact_writer_owned_atomic_temps(vault: Vault, tmp_path: Path) -> None:
     owned_temps = [
         ".AGENTS.md.tmp-token",
+        ".DIRECTION.md.tmp-token",
         ".MIND.md.tmp-token",
         ".NOW.md.tmp-token",
         ".README.md.tmp-token",
@@ -797,6 +798,7 @@ def test_backup_excludes_only_exact_writer_owned_atomic_temps(vault: Vault, tmp_
         ".gsv/control/.queue.jsonl.tmp-token",
         ".gsv/control/.dispositions-0000000000000000.jsonl.tmp-token",
         ".gsv/control/archive/.queue-0-aaaaaaaa.jsonl.tmp-token",
+        ".gsv/control/runtime/turns/.11111111-1111-4111-8111-111111111111.json.tmp-token",
         "journal/.events.jsonl.tmp-token",
     ]
     for relative in owned_temps:
@@ -818,9 +820,11 @@ def test_backup_with_crash_leftover_foundation_temps_restores_cleanly(
     vault: Vault, tmp_path: Path
 ) -> None:
     owned_temps = (
+        ".DIRECTION.md.tmp-crash",
         ".gsv/control/.queue.jsonl.tmp-crash",
         ".gsv/control/.dispositions-0000000000000000.jsonl.tmp-crash",
         ".gsv/control/archive/.queue-0-aaaaaaaa.jsonl.tmp-crash",
+        ".gsv/control/runtime/turns/.11111111-1111-4111-8111-111111111111.json.tmp-crash",
         ".gsv/.migration-culture-grade-foundation-v1.json.tmp-crash",
         "onboarding/.session.md.tmp-crash",
     )

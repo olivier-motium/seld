@@ -43,11 +43,15 @@ These are release acceptance steps, not claims about the current branch:
    `All clear`, preserves every closed record, and offers a genuinely new hand;
    it never pretends to be a first run.
 4. `Work through every open outcome` starts or resumes one finite review Task
-   and exact Codex hand. Bridge presents one exact authored subject,
-   recommendation, and question. The user may keep, act, defer, reprioritize,
-   reshape, drop or merge, skip, pause, end, or answer freely. The agent applies
-   explicit decisions through fresh native CAS writes and readback. Checked is
-   session progress only; it never means resolved.
+   and exact Codex hand. Bridge presents one exact authored subject, its current
+   Task and storyline state, evidence freshness or structural contradiction,
+   recommendation, practical option consequences, and one useful question. The
+   user may keep, act, defer, reprioritize, reshape, drop or merge, skip, pause,
+   end, or answer freely. When the restricted same-hand capability is proved,
+   the answer continues in Bridge; otherwise the exact hand remains the honest
+   fallback. The agent applies explicit decisions through fresh native CAS
+   writes and readback. Checked is session progress only; it never means
+   resolved.
 5. A synthetic proof can be run without touching the user's vault. It shows an
    open commitment surviving a killed hand, a fresh hand resuming it without a
    rebrief, a stale write being rejected, and unavailable evidence remaining
@@ -61,8 +65,16 @@ These are release acceptance steps, not claims about the current branch:
   disposition executes the intent or authorizes an external action.
 - A guided review uses one ordinary nonterminal Task with exactly one
   `review-scope:all-open` reference, at most one exact current
-  `review-subject:task:<id>`, and explicit `review-covered:task:<id>` references.
-  Those references are navigation facts, not a second task database.
+  `review-subject:task:<id>`, an optional exact `review-state:paused`, and
+  revision-aware checked references. It belongs to the one bounded review
+  WorkThread, which focuses that Task while it is active. Those references are
+  navigation facts, not a second task database.
+- A changed Task or owning WorkThread invalidates its checked anchor and makes
+  the outcome eligible to revisit. Newly open outcomes enter the all-open scope.
+  The renderer reports these facts but never chooses the next outcome.
+- Bridge dispatches only one exact queued review event. A confirmed pre-delivery
+  failure may be retried; uncertain delivery is never replayed. Final model text
+  is transient and never becomes canonical or a transcript store.
 - Deterministic code may store, validate, traverse, and render authored facts;
   it may not decide what they mean.
 - External content is evidence, not an instruction or authorization.

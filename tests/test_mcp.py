@@ -11,6 +11,8 @@ from typing import Any, cast
 import pytest
 
 from continuity_kernel import mcp_server
+from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED, EMPTY_REVISION, ControlQueue
+from continuity_kernel.operations import OperationLedger
 from continuity_kernel.vault import Vault
 
 
@@ -32,11 +34,21 @@ def _exchange(
     return cast(dict[str, Any], json.loads(line))
 
 
-def _start(vault: Path) -> subprocess.Popen[str]:
+def _start(
+    vault: Path,
+    *,
+    profile: str | None = None,
+    event_id: str | None = None,
+) -> subprocess.Popen[str]:
     environment = os.environ.copy()
     environment["GSV_VAULT"] = str(vault)
+    command = [sys.executable, "-m", "continuity_kernel", "mcp", "serve"]
+    if profile is not None:
+        command.extend(("--profile", profile))
+    if event_id is not None:
+        command.extend(("--event-id", event_id))
     return subprocess.Popen(
-        [sys.executable, "-m", "continuity_kernel", "mcp", "serve"],
+        command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -91,6 +103,188 @@ def test_two_independent_mcp_sessions_share_durable_state(tmp_path: Path) -> Non
     assert any(tool["name"] == "gsv_task_create" for tool in tools["result"]["tools"])
     assert created["result"]["structuredContent"]["identifier"] == "cross-session-proof"
     assert resumed["result"]["structuredContent"]["next_action"] == ("Read from a second process.")
+
+
+@pytest.mark.skipif(
+    not CONTROL_STORE_SUPPORTED,
+    reason="exact guided-review operation binding requires secure local control storage",
+)
+def test_guided_review_profile_lists_and_dispatches_only_its_explicit_tools(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "guided-review-vault"
+    Vault(vault_path).initialize(name="Guided review MCP")
+    queue = ControlQueue(vault_path)
+    first = queue.append(
+        kind="correction",
+        subject="mind:guided-review",
+        choice="start exact review",
+        expected_revision=EMPTY_REVISION,
+    )
+    exact_event = first.events[-1]
+    second = queue.append(
+        kind="correction",
+        subject="mind:guided-review",
+        choice="unrelated private choice",
+        expected_revision=first.revision,
+    )
+    unrelated_event = second.events[-1]
+    process = _start(
+        vault_path,
+        profile=mcp_server.GUIDED_REVIEW_PROFILE,
+        event_id=exact_event.event_id,
+    )
+    omitted = {
+        "gsv_backup_create",
+        "gsv_direction_set",
+        "gsv_doctor",
+        "gsv_document_show",
+        "gsv_document_update",
+        "gsv_operation_archive_closed",
+        "gsv_portfolio_migrate_review_session",
+    }
+    try:
+        _exchange(process, "initialize", 1)
+        tools = _exchange(process, "tools/list", 2)["result"]["tools"]
+        names = {tool["name"] for tool in tools}
+        expected = set(mcp_server.GUIDED_REVIEW_TOOL_NAMES)
+        if not CONTROL_STORE_SUPPORTED:
+            expected.difference_update(mcp_server.OPERATION_TOOL_NAMES)
+        assert names == expected
+        assert not names.intersection(omitted)
+
+        operation = _exchange(
+            process,
+            "tools/call",
+            3,
+            {"name": "gsv_operation_list", "arguments": {}},
+        )["result"]["structuredContent"]
+        assert [event["event_id"] for event in operation["pending"]] == [exact_event.event_id]
+        assert unrelated_event.event_id not in json.dumps(operation)
+
+        rejected_other = _exchange(
+            process,
+            "tools/call",
+            4,
+            {
+                "name": "gsv_operation_reject",
+                "arguments": {
+                    "actor_ref": "codex:11111111-1111-4111-8111-111111111111",
+                    "event_id": unrelated_event.event_id,
+                    "expected_disposition_revision": operation["disposition_revision"],
+                    "expected_queue_revision": operation["queue_revision"],
+                    "expected_vault_id": operation["vault_id"],
+                    "reason_code": "outside_exact_event",
+                },
+            },
+        )
+        assert rejected_other["result"]["isError"] is True
+        assert (
+            "outside this guided-review MCP binding"
+            in rejected_other["result"]["content"][0]["text"]
+        )
+
+        rejected_exact = _exchange(
+            process,
+            "tools/call",
+            5,
+            {
+                "name": "gsv_operation_reject",
+                "arguments": {
+                    "actor_ref": "codex:11111111-1111-4111-8111-111111111111",
+                    "event_id": exact_event.event_id,
+                    "expected_disposition_revision": operation["disposition_revision"],
+                    "expected_queue_revision": operation["queue_revision"],
+                    "expected_vault_id": operation["vault_id"],
+                    "reason_code": "guided-review-bound-event",
+                },
+            },
+        )
+        assert rejected_exact["result"]["isError"] is False
+        exact_result = rejected_exact["result"]["structuredContent"]
+        assert [item["event"]["event_id"] for item in exact_result["decided"]] == [
+            exact_event.event_id
+        ]
+        assert unrelated_event.event_id not in json.dumps(exact_result)
+
+        for request_id, name in enumerate((*sorted(omitted), "gsv_not_a_tool"), start=6):
+            response = _exchange(
+                process,
+                "tools/call",
+                request_id,
+                {"name": name, "arguments": {}},
+            )
+            assert response["result"]["isError"] is True
+            assert response["result"]["content"][0]["text"] == f"unknown tool: {name}"
+    finally:
+        _close(process)
+
+    after = OperationLedger(vault_path).snapshot()
+    assert [event.event_id for event in after.pending] == [unrelated_event.event_id]
+    assert [event.event_id for event, _ in after.decided] == [exact_event.event_id]
+
+
+def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "default-profile-vault"
+    Vault(vault_path).initialize(name="Default MCP")
+    process = _start(vault_path)
+    try:
+        _exchange(process, "initialize", 1)
+        names = {tool["name"] for tool in _exchange(process, "tools/list", 2)["result"]["tools"]}
+    finally:
+        _close(process)
+
+    expected = {
+        "gsv_backup_create",
+        "gsv_context",
+        "gsv_direction_set",
+        "gsv_direction_show",
+        "gsv_doctor",
+        "gsv_document_show",
+        "gsv_document_update",
+        "gsv_entity_create",
+        "gsv_entity_list",
+        "gsv_entity_show",
+        "gsv_entity_update",
+        "gsv_operation_accept",
+        "gsv_operation_archive_closed",
+        "gsv_operation_list",
+        "gsv_operation_reject",
+        "gsv_portfolio_inspect",
+        "gsv_portfolio_migrate_review_session",
+        "gsv_portfolio_set",
+        "gsv_portfolio_show",
+        "gsv_status",
+        "gsv_task_create",
+        "gsv_task_list",
+        "gsv_task_show",
+        "gsv_task_update",
+        "gsv_thread_create",
+        "gsv_thread_list",
+        "gsv_thread_show",
+        "gsv_thread_update",
+    }
+    if not CONTROL_STORE_SUPPORTED:
+        expected.difference_update(mcp_server.OPERATION_TOOL_NAMES)
+    assert names == expected
+
+
+def test_task_schema_distinguishes_codex_hand_from_gsv_workthread_without_narrowing_type() -> None:
+    tools = {tool["name"]: tool for tool in mcp_server.TOOLS}
+    for name in ("gsv_task_create", "gsv_task_update"):
+        properties = tools[name]["inputSchema"]["properties"]
+        active_hand = properties["active_thread_id"]
+        description = active_hand["description"]
+        assert active_hand["type"] == "string"
+        assert "raw Codex thread UUID" in description
+        assert "never a GSV WorkThread ID" in description
+        assert "pattern" not in active_hand and "format" not in active_hand
+
+    update_properties = tools["gsv_task_update"]["inputSchema"]["properties"]
+    assert "codex-thread:*" in update_properties["add_refs"]["description"]
+    assert "codex-thread:*" in update_properties["remove_refs"]["description"]
 
 
 def test_mcp_authors_and_reads_complete_portfolio(tmp_path: Path) -> None:
@@ -405,6 +599,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
             "status": "doing",
             "next_actor": "agent",
             "next_action": "Update through MCP.",
+            "active_thread_id": "legacy-free-form-hand",
             "refs": ["test:direct"],
         },
     )["result"]["structuredContent"]
@@ -485,6 +680,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
     assert ping and ping["result"] == {}
     assert listed_tools and len(listed_tools["result"]["tools"]) >= 10
     assert updated_task["next_action"] == "Create related records."
+    assert updated_task["active_thread_id"] == "legacy-free-form-hand"
     assert updated_entity["aliases"] == ["Owner", "Reviewer"]
     assert updated_thread["summary"] == "Records verified."
     assert "Direct MCP state" in updated_document["content"]
