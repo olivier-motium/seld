@@ -29,6 +29,7 @@ from continuity_kernel.portfolio import (
     render_portfolio,
 )
 from continuity_kernel.records import (
+    MAX_REVIEW_OPTIONS,
     REVIEW_PAUSED_REF,
     REVIEW_SCOPE_REF,
     REVIEW_WORK_THREAD_ID,
@@ -37,7 +38,9 @@ from continuity_kernel.records import (
     new_task,
     new_thread,
     parse_review_references,
+    parse_task,
     parse_thread,
+    render_task,
     render_thread,
     review_coverage_ref,
     review_option_ref,
@@ -95,6 +98,7 @@ def _seed(vault: Vault) -> _SeededReview:
             f"review-subject:task:{first.identifier}",
             review_option_ref(
                 intent="act-next",
+                subject_task_id=first.identifier,
                 consequence="GSV carries the next reversible step and leaves approval with you.",
             ),
         ),
@@ -213,14 +217,24 @@ def test_review_refs_are_typed_revision_aware_and_options_are_authored() -> None
     )
     option = review_option_ref(
         intent="defer",
+        subject_task_id="one-outcome",
         consequence="Keep it visible and ask again after the stated dependency changes.",
     )
-    parsed = parse_review_references((REVIEW_SCOPE_REF, REVIEW_PAUSED_REF, anchored, option))
+    parsed = parse_review_references(
+        (
+            REVIEW_SCOPE_REF,
+            REVIEW_PAUSED_REF,
+            "review-subject:task:one-outcome",
+            anchored,
+            option,
+        )
+    )
 
     assert parsed.paused is True
     assert parsed.coverages[0].task_revision == "a" * 64
     assert parsed.coverages[0].work_thread_id == "thread:one-outcome"
     assert parsed.options[0].intent == "defer"
+    assert parsed.options[0].subject_task_id == "one-outcome"
     assert parsed.options[0].consequence.startswith("Keep it visible")
     assert parsed.issues == ()
 
@@ -231,7 +245,7 @@ def test_review_refs_are_typed_revision_aware_and_options_are_authored() -> None
         (
             REVIEW_SCOPE_REF,
             "review-covered:task:one-outcome@not-a-revision",
-            "review-option:invented:Do%20something",
+            "review-option:invented:task:one-outcome:Do%20something",
             "review-checkpoint:unknown",
         )
     )
@@ -239,13 +253,140 @@ def test_review_refs_are_typed_revision_aware_and_options_are_authored() -> None
     assert malformed.issues == ("review session contains malformed review refs",)
 
     with pytest.raises(ValidationError, match="uppercase hexadecimal"):
-        validate_review_references((REVIEW_SCOPE_REF, "review-option:keep:Don't%20change%20this"))
+        validate_review_references(
+            (
+                REVIEW_SCOPE_REF,
+                "review-subject:task:one-outcome",
+                "review-option:keep:task:one-outcome:Don't%20change%20this",
+            )
+        )
+
+    with pytest.raises(ValidationError, match="one bounded non-empty line"):
+        review_option_ref(intent="keep", subject_task_id="one-outcome", consequence="a" * 201)
 
     with pytest.raises(
         ValidationError,
         match="encoded review option reference exceeds the reference limit",
     ):
-        review_option_ref(intent="keep", consequence="界" * 500)
+        review_option_ref(intent="keep", subject_task_id="one-outcome", consequence="界" * 120)
+
+    with pytest.raises(ValidationError, match="one bounded non-empty line"):
+        review_option_ref(
+            intent="keep",
+            subject_task_id="one-outcome",
+            consequence="Approve\u202ethe opposite",
+        )
+
+
+def test_review_options_reject_duplicate_answers_and_more_than_five_choices() -> None:
+    duplicates = (
+        REVIEW_SCOPE_REF,
+        "review-subject:task:one-outcome",
+        review_option_ref(
+            intent="keep",
+            subject_task_id="one-outcome",
+            consequence="Keep this exact answer.",
+        ),
+        review_option_ref(
+            intent="defer",
+            subject_task_id="one-outcome",
+            consequence="KEEP THIS EXACT ANSWER.",
+        ),
+    )
+    with pytest.raises(ValidationError, match="duplicate option answers"):
+        validate_review_references(duplicates)
+
+    options = tuple(
+        review_option_ref(
+            intent=intent,
+            subject_task_id="one-outcome",
+            consequence=f"Choose the complete answer numbered {index}.",
+        )
+        for index, intent in enumerate(
+            ("keep", "act-next", "defer", "reprioritize", "reshape", "skip"),
+            start=1,
+        )
+    )
+    assert len(options) == MAX_REVIEW_OPTIONS + 1
+    with pytest.raises(ValidationError, match="more than 5 current options"):
+        validate_review_references((REVIEW_SCOPE_REF, "review-subject:task:one-outcome", *options))
+
+
+def test_review_options_are_bound_to_the_current_subject() -> None:
+    stale = review_option_ref(
+        intent="keep",
+        subject_task_id="first-outcome",
+        consequence="Keep the first outcome unchanged.",
+    )
+
+    with pytest.raises(ValidationError, match="does not match the current review subject"):
+        validate_review_references((REVIEW_SCOPE_REF, "review-subject:task:second-outcome", stale))
+
+    with pytest.raises(ValidationError, match="exactly one current subject"):
+        validate_review_references((REVIEW_SCOPE_REF, stale))
+
+
+def test_review_navigation_rejects_ambiguous_subject_coverage_and_missing_scope() -> None:
+    with pytest.raises(ValidationError, match="more than one current subject"):
+        validate_review_references(
+            (
+                REVIEW_SCOPE_REF,
+                "review-subject:task:first-outcome",
+                "review-subject:task:second-outcome",
+            )
+        )
+
+    with pytest.raises(ValidationError, match="conflicting coverage anchors"):
+        validate_review_references(
+            (
+                REVIEW_SCOPE_REF,
+                review_coverage_ref(
+                    task_id_value="first-outcome",
+                    task_revision="a" * 64,
+                ),
+                review_coverage_ref(
+                    task_id_value="first-outcome",
+                    task_revision="b" * 64,
+                ),
+            )
+        )
+
+    with pytest.raises(ValidationError, match="require review-scope:all-open"):
+        validate_review_references(("review-subject:task:first-outcome",))
+
+
+def test_task_parse_rejects_terminal_review_navigation_left_on_disk() -> None:
+    task = new_task(
+        identifier="review-session",
+        title="Review every open outcome",
+        outcome="Keep terminal review records free of active navigation.",
+        status="waiting",
+        next_actor="human",
+        next_action="Ask one current question.",
+        waiting_on="Should this exact outcome remain current?",
+        refs=(REVIEW_SCOPE_REF, "review-subject:task:one-outcome"),
+    )
+    rendered = render_task(task)
+    header, body = rendered.split("\n", 1)
+    metadata = json.loads(header.removeprefix("<!-- gsv:").removesuffix(" -->"))
+    metadata.update(
+        {
+            "active_thread_id": None,
+            "next_actor": None,
+            "next_action_present": False,
+            "status": "done",
+            "waiting_on_present": False,
+        }
+    )
+    tampered = (
+        "<!-- gsv:"
+        + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + " -->\n"
+        + body
+    )
+
+    with pytest.raises(ValidationError, match="terminal review sessions cannot retain"):
+        parse_task(tampered)
 
 
 def test_guided_review_fails_closed_above_single_session_coverage_bound() -> None:
@@ -374,6 +515,7 @@ def test_exact_coverage_reenters_after_task_or_owner_revision_changes(vault: Vau
             "review-subject:task:second-outcome",
             review_option_ref(
                 intent="keep",
+                subject_task_id="second-outcome",
                 consequence="Keep this exact outcome as authored and continue the review.",
             ),
         ),
@@ -754,6 +896,7 @@ def test_pause_is_nonterminal_and_terminal_cleanup_preserves_history(vault: Vaul
             "review-subject:task:second-outcome",
             review_option_ref(
                 intent="keep",
+                subject_task_id="second-outcome",
                 consequence="Keep this exact outcome as authored when the review resumes.",
             ),
         ),

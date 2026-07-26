@@ -85,15 +85,20 @@ def test_task_round_trips_authored_rank_and_exact_active_hand() -> None:
         REVIEW_SCOPE_REF,
         "review-subject:task:exact-outcome",
         f"review-covered:task:exact-outcome@{'a' * 64}",
-        "review-option:keep:Keep%20the%20exact%20outcome.",
+        "review-option:keep:task:exact-outcome:Keep%20the%20exact%20outcome.",
     ],
     ids=("scope", "subject", "coverage", "option"),
 )
 def test_exact_duplicate_review_references_fail_on_parse_and_write(reference: str) -> None:
+    base_refs = (
+        (REVIEW_SCOPE_REF, "review-subject:task:exact-outcome")
+        if reference.startswith("review-option:")
+        else (REVIEW_SCOPE_REF,)
+    )
     refs = (
         (reference, reference)
         if reference == REVIEW_SCOPE_REF
-        else (REVIEW_SCOPE_REF, reference, reference)
+        else (*base_refs, reference, reference)
     )
 
     with pytest.raises(ValidationError, match="duplicate review reference"):
@@ -107,7 +112,7 @@ def test_exact_duplicate_review_references_fail_on_parse_and_write(reference: st
             observed_at=NOW,
         )
 
-    valid_refs = (reference,) if reference == REVIEW_SCOPE_REF else (REVIEW_SCOPE_REF, reference)
+    valid_refs = (reference,) if reference == REVIEW_SCOPE_REF else (*base_refs, reference)
     task = new_task(
         identifier="raw-duplicate-review-ref",
         title="Raw duplicate review ref",
@@ -186,20 +191,28 @@ def test_terminal_task_cannot_claim_future_work() -> None:
     [
         ("review-subject:task:one-outcome", "current subject"),
         ("review-state:paused", "remain paused"),
-        ("review-option:keep:Leave%20it%20unchanged", "current options"),
+        (
+            "review-option:keep:task:one-outcome:Leave%20it%20unchanged",
+            "current options",
+        ),
     ],
 )
 def test_terminal_review_session_cannot_retain_current_navigation(
     reference: str,
     message: str,
 ) -> None:
+    refs = (
+        (REVIEW_SCOPE_REF, "review-subject:task:one-outcome", reference)
+        if reference.startswith("review-option:")
+        else (REVIEW_SCOPE_REF, reference)
+    )
     with pytest.raises(ValidationError, match=message):
         new_task(
             identifier="done-review-navigation",
             title="Done review navigation",
             outcome="The bounded review ended.",
             status="done",
-            refs=(REVIEW_SCOPE_REF, reference),
+            refs=refs,
             observed_at=NOW,
         )
 

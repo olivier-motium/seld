@@ -927,13 +927,17 @@ def _validate_guided_review_intent(
 ) -> None:
     if snapshot is None:
         raise ConflictError("guided-review state is unavailable; reload before continuing")
+    subject = payload.get("subject")
     portfolio = snapshot.get("portfolio")
     if not isinstance(portfolio, dict) or not isinstance(portfolio.get("revision"), str):
+        if subject != START_REVIEW_SUBJECT:
+            return
         raise ConflictError("the complete Portfolio is unavailable; reload before continuing")
     review = portfolio.get("review")
     if not isinstance(review, dict):
+        if subject != START_REVIEW_SUBJECT:
+            return
         raise ConflictError("guided-review state changed; reload before continuing")
-    subject = payload.get("subject")
     if subject == START_REVIEW_SUBJECT:
         if (
             payload.get("kind") != ControlKind.CORRECTION.value

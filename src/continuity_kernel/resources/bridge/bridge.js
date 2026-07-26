@@ -59,12 +59,16 @@ const state = {
 };
 let guidedReviewDraft = "";
 let guidedReviewDelivery = null;
+let guidedReviewNotice = "";
+let guidedReviewNoticeContext = null;
 let guidedReviewSendPending = false;
 let guidedReviewPollGeneration = 0;
+let guidedReviewActivePollEventId = null;
 const guidedReviewRestoredPendingEvents = new Set();
 
 const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;
 const GUIDED_REVIEW_POLL_LIMIT = 680;
+const GUIDED_REVIEW_DISPOSITION_GRACE_MS = 2_250;
 
 const guidedReviewOptionLabels = {
   "act-next": "Do / next",
@@ -131,6 +135,21 @@ async function loadSnapshot({ quiet = false } = {}) {
     const snapshotChanged = snapshotSignature !== state.snapshotSignature;
     state.snapshot = snapshot;
     state.snapshotSignature = snapshotSignature;
+    if (
+      guidedReviewNotice &&
+      guidedReviewNoticeContext !== null &&
+      guidedReviewNoticeContext !== guidedReviewContextFingerprint(snapshot)
+    ) {
+      guidedReviewNotice = "";
+      guidedReviewNoticeContext = null;
+    }
+    const review = snapshot.portfolio?.review || {};
+    syncGuidedReviewDelivery(
+      snapshot.guided_review_transport?.event,
+      review.hand_url,
+      review,
+      snapshot.controls,
+    );
     state.lastSuccessAt = Date.now();
     setConnectionState(state.snapshot.doctor.healthy ? "healthy" : "partial");
     if (snapshotChanged) render();
@@ -355,7 +374,6 @@ function renderGuidedReview(snapshot) {
   const portfolio = snapshot.portfolio || {};
   const review = portfolio.review || {};
   const transport = snapshot.guided_review_transport || {};
-  syncGuidedReviewDelivery(transport.event, review.hand_url, review, snapshot.controls);
   const section = element("section", "guided-review");
   const head = element("div", "guided-review-head");
   const copy = element("div");
@@ -372,6 +390,37 @@ function renderGuidedReview(snapshot) {
   );
   head.append(copy);
   section.append(head);
+  if (guidedReviewNotice) {
+    const notice = element("p", "control-status guided-review-notice", {
+      "aria-live": "polite",
+      role: "status",
+    });
+    notice.textContent = guidedReviewNotice;
+    section.append(notice);
+  }
+
+  if (review.issue) {
+    const warning = element("div", "guided-review-warning", { role: "alert" });
+    warning.append(
+      textElement("strong", "", "Review state needs repair"),
+      textElement("p", "", review.issue),
+    );
+    const repairHandUrl = retainedExactGuidedReviewHandUrl(review.hand_url);
+    if (repairHandUrl && !guidedReviewDelivery?.receipt) {
+      warning.append(exactHandFallback(repairHandUrl));
+    }
+    if (guidedReviewDraft) {
+      warning.append(guidedReviewDraftRecovery(
+        "The review state changed before this answer was saved. Your draft remains here; repair current truth, then retry.",
+      ));
+    }
+    section.append(warning);
+    if (["available", "unavailable"].includes(review.state)) {
+      const delivery = renderGuidedReviewDelivery(review, snapshot.controls);
+      if (delivery) section.append(delivery);
+      return section;
+    }
+  }
 
   if (review.state === "finished") {
     const finished = element("div", "guided-review-empty is-finished", { role: "status" });
@@ -448,23 +497,6 @@ function renderGuidedReview(snapshot) {
     return section;
   }
 
-  if (review.issue) {
-    const warning = element("div", "guided-review-warning", { role: "alert" });
-    warning.append(
-      textElement("strong", "", "Review state needs repair"),
-      textElement("p", "", review.issue),
-    );
-    if (review.hand_url && !guidedReviewDelivery?.receipt) {
-      warning.append(exactHandFallback(review.hand_url));
-    }
-    if (guidedReviewDraft) {
-      warning.append(guidedReviewDraftRecovery(
-        "The review state changed before this answer was saved. Your draft remains here; repair current truth, then retry.",
-      ));
-    }
-    section.append(warning);
-  }
-
   const subject = review.subject;
   const task = subject?.task;
   if (subject && task) {
@@ -493,17 +525,16 @@ function renderGuidedReview(snapshot) {
     card.append(current);
 
     const staleFacts = subject.staleness || [];
-    const contradictions = subject.contradictions || [];
-    if (staleFacts.length || contradictions.length || subject.stale) {
+    if (staleFacts.length || subject.stale) {
       const evidenceWarning = element("div", "guided-review-evidence is-warning", {
         role: "status",
       });
       evidenceWarning.append(
-        textElement("strong", "", contradictions.length ? "Current records disagree" : "Evidence changed"),
+        textElement("strong", "", "Evidence changed"),
         textElement(
           "p",
           "",
-          [...staleFacts, ...contradictions].join(" ") ||
+          staleFacts.join(" ") ||
             "The Portfolio anchor is older than the current task or storyline.",
         ),
       );
@@ -553,10 +584,20 @@ function renderGuidedReview(snapshot) {
   if (!review.active_thread_id) {
     const resume = element("div", "guided-review-empty");
     resume.append(
-      textElement("p", "", "The session is durable, but no exact Codex hand is currently claimed."),
+      textElement(
+        "p",
+        "",
+        review.issue
+          ? "The session needs a fresh Codex repair hand before review can continue."
+          : "The session is durable, but no exact Codex hand is currently claimed.",
+      ),
     );
     if (review.start_url) {
-      const link = textElement("a", "primary-action", "Resume the review hand");
+      const link = textElement(
+        "a",
+        "primary-action",
+        review.issue ? "Repair in Codex" : "Resume the review hand",
+      );
       link.href = review.start_url;
       resume.append(link);
     }
@@ -574,7 +615,8 @@ function renderGuidedReview(snapshot) {
         "The same review hand is reading current truth. It must apply any justified native CAS changes and acknowledge this exact receipt before another answer is accepted.",
       ),
     );
-    if (review.hand_url) pending.append(exactHandFallback(review.hand_url));
+    const pendingHandUrl = retainedExactGuidedReviewHandUrl(review.hand_url);
+    if (pendingHandUrl) pending.append(exactHandFallback(pendingHandUrl));
     if (guidedReviewDraft && !review.issue) {
       pending.append(guidedReviewDraftRecovery(
         "The review queue changed before this answer was saved. Your draft remains here; retry after the current receipt is resolved.",
@@ -617,7 +659,8 @@ function renderGuidedReview(snapshot) {
       });
       paused.append(resume, status);
     }
-    if (review.hand_url) paused.append(exactHandFallback(review.hand_url));
+    const pausedHandUrl = retainedExactGuidedReviewHandUrl(review.hand_url);
+    if (pausedHandUrl) paused.append(exactHandFallback(pausedHandUrl));
     section.append(paused);
     return section;
   }
@@ -635,7 +678,8 @@ function renderGuidedReview(snapshot) {
           : "Same-hand Bridge continuation is off in this foundation build.",
       ),
     );
-    if (review.hand_url) fallback.append(exactHandFallback(review.hand_url));
+    const unavailableHandUrl = retainedExactGuidedReviewHandUrl(review.hand_url);
+    if (unavailableHandUrl) fallback.append(exactHandFallback(unavailableHandUrl));
     section.append(fallback);
     return section;
   }
@@ -662,15 +706,15 @@ function renderGuidedReview(snapshot) {
   );
   for (const { consequence, intent } of authoredOptions) {
     const label = guidedReviewOptionLabels[intent];
-    const button = element("button", "guided-review-option", { "aria-label": label });
+    const button = element("button", "guided-review-option", {
+      "aria-label": `${label}: ${consequence}`,
+    });
     button.type = "button";
     button.append(
       textElement("strong", "", label),
       textElement("span", "", consequence),
     );
-    button.addEventListener("click", () => send(
-      `For task:${task.identifier}, my explicit guided-review answer is: ${intent}. My understood consequence is: ${consequence} Interpret this in the exact current context; do not infer completion or broader authority.`,
-    ));
+    button.addEventListener("click", () => send(consequence));
     intentList.append(button);
   }
   if (!authoredOptions.length) {
@@ -758,16 +802,22 @@ async function queueGuidedReviewIntent(snapshot, intent, { form = null, handUrl 
   guidedReviewSendPending = true;
   if (form) setGuidedReviewControlsDisabled(form, true);
   status.textContent = "Saving your exact wording locally…";
+  guidedReviewNotice = "";
+  guidedReviewNoticeContext = null;
   try {
     const payload = await appendControlIntent(snapshot, bridgeToken, intent);
     const eventId = payload.event?.event_id;
     if (!eventId) throw new Error("The Bridge saved no exact review receipt.");
     guidedReviewDelivery = {
+      checkedAt: null,
       eventId,
       handUrl,
-      message: "Your answer is saved locally. The same review hand is reading it…",
+      liveCheckedAt: null,
+      message: "Your exact answer is saved locally once. You can leave this view; the review keeps its place.",
       pendingSeen: false,
       queueRevision: payload.revision || null,
+      resolvedAt: null,
+      startedAt: Date.now(),
       receipt: payload.transport || {
         event_id: eventId,
         final_answer: null,
@@ -784,20 +834,18 @@ async function queueGuidedReviewIntent(snapshot, intent, { form = null, handUrl 
     return true;
   } catch (error) {
     if (error.status === 409) {
+      guidedReviewNotice = "The review queue changed while you were answering. Your draft is still here; review the refreshed outcome, then retry.";
       const refreshed = await loadSnapshot({ quiet: true });
+      if (!refreshed) {
+        guidedReviewNotice = "The review queue changed while you were answering. Your draft is still here; refresh current truth, then retry.";
+      }
+      guidedReviewNoticeContext = guidedReviewContextFingerprint(state.snapshot);
+      render();
       const currentInput = document.querySelector("#guided-review-answer");
-      const currentStatus = document.querySelector(
-        ".guided-review-form .control-status, .guided-review-draft-recovery .control-status",
-      );
       if (currentInput) {
         currentInput.value = guidedReviewDraft;
         currentInput.focus();
       }
-      const message = refreshed
-        ? "The review queue changed while you were answering. Your draft is still here; review the refreshed outcome, then retry."
-        : "The review queue changed while you were answering. Your draft is still here; refresh current truth, then retry.";
-      if (currentStatus) currentStatus.textContent = message;
-      else status.textContent = message;
     } else {
       status.textContent = error.message || "The review answer could not be queued.";
     }
@@ -811,12 +859,18 @@ async function queueGuidedReviewIntent(snapshot, intent, { form = null, handUrl 
 
 async function continueGuidedReviewTurn(eventId, handUrl) {
   const generation = ++guidedReviewPollGeneration;
+  guidedReviewActivePollEventId = eventId;
   try {
     const triggered = await triggerReviewTurn(bridgeToken, eventId);
     if (generation !== guidedReviewPollGeneration) return;
-    updateGuidedReviewReceipt(triggered, handUrl);
-    if (guidedReviewReceiptStopsPolling(triggered)) {
-      await finishGuidedReviewDelivery(triggered);
+    if (!updateGuidedReviewReceipt(triggered, handUrl, eventId)) {
+      throw new Error("Bridge returned a different review receipt.");
+    }
+    const triggeredCurrent = guidedReviewDelivery?.eventId === eventId
+      ? guidedReviewDelivery.receipt
+      : triggered;
+    if (guidedReviewReceiptStopsPolling(triggeredCurrent)) {
+      await finishGuidedReviewDelivery(triggeredCurrent);
       return;
     }
     for (let attempt = 0; attempt < GUIDED_REVIEW_POLL_LIMIT; attempt += 1) {
@@ -824,9 +878,14 @@ async function continueGuidedReviewTurn(eventId, handUrl) {
       if (generation !== guidedReviewPollGeneration) return;
       const receipt = await readReviewTurn(bridgeToken, eventId);
       if (generation !== guidedReviewPollGeneration) return;
-      updateGuidedReviewReceipt(receipt, handUrl);
-      if (guidedReviewReceiptStopsPolling(receipt)) {
-        await finishGuidedReviewDelivery(receipt);
+      if (!updateGuidedReviewReceipt(receipt, handUrl, eventId)) {
+        throw new Error("Bridge returned a different review receipt.");
+      }
+      const currentReceipt = guidedReviewDelivery?.eventId === eventId
+        ? guidedReviewDelivery.receipt
+        : receipt;
+      if (guidedReviewReceiptStopsPolling(currentReceipt)) {
+        await finishGuidedReviewDelivery(currentReceipt);
         return;
       }
     }
@@ -834,6 +893,9 @@ async function continueGuidedReviewTurn(eventId, handUrl) {
       "The review hand is still working. GSV will not resend your answer; use the exact hand if you need to inspect it now.",
     );
   } catch (error) {
+    if (guidedReviewDelivery?.eventId === eventId) {
+      guidedReviewDelivery = { ...guidedReviewDelivery, liveCheckedAt: null };
+    }
     updateGuidedReviewMessage(
       error.status === 409
         ? "The review changed after this answer was queued. Your wording remains saved once and was not replayed. Reload current truth, then reconcile the queued receipt before retrying."
@@ -842,11 +904,26 @@ async function continueGuidedReviewTurn(eventId, handUrl) {
           : "Bridge could not read the review receipt. Your queued answer was not replayed; inspect the exact hand before retrying.",
     );
     await loadSnapshot({ quiet: true });
+  } finally {
+    if (generation === guidedReviewPollGeneration) guidedReviewActivePollEventId = null;
   }
 }
 
 function guidedReviewReceiptStopsPolling(receipt) {
   return receipt?.terminal === true || receipt?.retryable === true;
+}
+
+function guidedReviewContextFingerprint(snapshot) {
+  const review = snapshot?.portfolio?.review || {};
+  return JSON.stringify([
+    snapshot?.controls?.queue_revision || null,
+    snapshot?.portfolio?.revision || null,
+    review.issue || null,
+    review.pending_intent?.event_id || null,
+    review.pending_start?.event_id || null,
+    review.session_revision || null,
+    review.state || null,
+  ]);
 }
 
 async function finishGuidedReviewDelivery(receipt) {
@@ -874,23 +951,43 @@ async function finishGuidedReviewDelivery(receipt) {
   await loadSnapshot({ quiet: true });
 }
 
-function updateGuidedReviewReceipt(receipt, handUrl) {
-  if (!receipt?.event_id) return;
+function updateGuidedReviewReceipt(receipt, handUrl, expectedEventId = null) {
+  if (
+    !receipt?.event_id ||
+    (expectedEventId !== null && receipt.event_id !== expectedEventId)
+  ) return false;
   const previous = guidedReviewDelivery?.eventId === receipt.event_id
     ? guidedReviewDelivery.receipt
     : null;
+  const selectedReceipt = newerGuidedReviewReceipt(previous, receipt);
+  const stateChanged = guidedReviewReceiptFingerprint(previous) !==
+    guidedReviewReceiptFingerprint(selectedReceipt);
   guidedReviewDelivery = {
+    checkedAt: Date.now(),
     eventId: receipt.event_id,
     handUrl: handUrl || guidedReviewDelivery?.handUrl || null,
+    liveCheckedAt:
+      selectedReceipt.state === "running" && exactGuidedReviewHandUrl(selectedReceipt.thread_id)
+        ? Date.now()
+        : null,
     message: guidedReviewDelivery?.message || null,
     pendingSeen: guidedReviewDelivery?.pendingSeen || false,
     queueRevision: guidedReviewDelivery?.queueRevision || null,
+    resolvedAt: guidedReviewDelivery?.resolvedAt || null,
+    startedAt: guidedReviewStartedAt(selectedReceipt, guidedReviewDelivery),
     receipt: {
-      ...receipt,
-      final_answer: receipt.final_answer || previous?.final_answer || null,
+      ...selectedReceipt,
+      final_answer: selectedReceipt.final_answer || previous?.final_answer || null,
     },
   };
-  render();
+  if (stateChanged) {
+    render();
+    window.queueMicrotask(() => pulseGuidedReviewObservation(receipt.event_id));
+  } else {
+    updateGuidedReviewActivity();
+    pulseGuidedReviewObservation(receipt.event_id);
+  }
+  return true;
 }
 
 function updateGuidedReviewMessage(message) {
@@ -923,21 +1020,55 @@ function syncGuidedReviewDelivery(receipt, handUrl, review, controls) {
       controls?.available === true &&
       (guidedReviewDelivery?.pendingSeen === true || observedQueuedRevision || resolvedVisible)
     ) {
+      if (guidedReviewActivePollEventId === current.event_id) {
+        if (!guidedReviewDelivery.resolvedAt) {
+          const resolvedAt = Date.now();
+          guidedReviewDelivery = { ...guidedReviewDelivery, resolvedAt };
+          window.setTimeout(() => {
+            const delivery = guidedReviewDelivery;
+            if (
+              delivery?.eventId !== current.event_id ||
+              delivery.receipt?.state === "completed" ||
+              delivery.resolvedAt !== resolvedAt ||
+              Date.now() - resolvedAt < GUIDED_REVIEW_DISPOSITION_GRACE_MS
+            ) return;
+            guidedReviewPollGeneration += 1;
+            guidedReviewActivePollEventId = null;
+            guidedReviewDelivery = null;
+            render();
+          }, GUIDED_REVIEW_DISPOSITION_GRACE_MS);
+          return;
+        }
+        if (
+          Date.now() - guidedReviewDelivery.resolvedAt <
+          GUIDED_REVIEW_DISPOSITION_GRACE_MS
+        ) return;
+      }
       guidedReviewPollGeneration += 1;
+      guidedReviewActivePollEventId = null;
       guidedReviewDelivery = null;
     }
     return;
   }
+  if (guidedReviewDelivery?.eventId && guidedReviewDelivery.eventId !== receipt.event_id) return;
   const previous = guidedReviewDelivery?.eventId === receipt.event_id
     ? guidedReviewDelivery.receipt
     : null;
   const selectedReceipt = newerGuidedReviewReceipt(previous, receipt);
+  const stateChanged = previous !== null && previous.state !== selectedReceipt.state;
   guidedReviewDelivery = {
+    checkedAt: guidedReviewDelivery?.checkedAt || Date.now(),
     eventId: receipt.event_id,
     handUrl: handUrl || guidedReviewDelivery?.handUrl || null,
-    message: guidedReviewDelivery?.message || null,
+    liveCheckedAt:
+      receipt.state === "running" && exactGuidedReviewHandUrl(receipt.thread_id)
+        ? Date.now()
+        : null,
+    message: stateChanged ? null : guidedReviewDelivery?.message || null,
     pendingSeen: true,
     queueRevision: guidedReviewDelivery?.queueRevision || controls?.queue_revision || null,
+    resolvedAt: guidedReviewDelivery?.resolvedAt || null,
+    startedAt: guidedReviewStartedAt(selectedReceipt, guidedReviewDelivery),
     receipt: {
       ...selectedReceipt,
       final_answer: selectedReceipt.final_answer || previous?.final_answer || null,
@@ -979,6 +1110,78 @@ function newerGuidedReviewReceipt(previous, incoming) {
     : incoming;
 }
 
+function guidedReviewReceiptFingerprint(receipt) {
+  if (!receipt) return "";
+  return JSON.stringify([
+    receipt.state,
+    receipt.thread_id,
+    receipt.final_answer,
+    receipt.reason_code,
+    receipt.retryable,
+    receipt.terminal,
+  ]);
+}
+
+function guidedReviewStartedAt(receipt, current) {
+  if (Number.isFinite(current?.startedAt) && current.startedAt > 0) return current.startedAt;
+  const parsed = Date.parse(receipt?.created_at || receipt?.updated_at || "");
+  return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function guidedReviewElapsedLabel(startedAt, now = Date.now()) {
+  if (!Number.isFinite(startedAt) || startedAt <= 0) return "";
+  const seconds = Math.max(0, Math.floor((now - startedAt) / 1_000));
+  if (seconds < 60) return `${seconds}s elapsed`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s elapsed`;
+}
+
+function guidedReviewCheckedLabel(checkedAt, now = Date.now()) {
+  if (!Number.isFinite(checkedAt) || checkedAt <= 0) return "Checking the receipt";
+  const seconds = Math.max(0, Math.floor((now - checkedAt) / 1_000));
+  return seconds < 5 ? "Checked just now" : `Checked ${seconds}s ago`;
+}
+
+function guidedReviewActivityParts(delivery, now = Date.now()) {
+  const receipt = delivery?.receipt;
+  if (!receipt || !["pending", "starting", "running"].includes(receipt.state)) return [];
+  const parts = [
+    receipt.state === "pending"
+      ? "Answer received"
+      : receipt.state === "starting"
+        ? "Confirming delivery"
+        : "Applying against current records",
+  ];
+  const elapsed = guidedReviewElapsedLabel(delivery.startedAt, now);
+  if (elapsed) parts.push(elapsed);
+  parts.push(guidedReviewCheckedLabel(delivery.checkedAt, now));
+  if (
+    receipt.state === "running" &&
+    exactGuidedReviewHandUrl(receipt.thread_id) &&
+    Number.isFinite(delivery.liveCheckedAt) &&
+    now - delivery.liveCheckedAt < 5_000
+  ) {
+    parts.push("Same review hand active");
+  }
+  return parts;
+}
+
+function updateGuidedReviewActivity() {
+  const node = document.querySelector(".guided-review-delivery-activity-copy");
+  if (node && guidedReviewDelivery) {
+    node.textContent = guidedReviewActivityParts(guidedReviewDelivery).join(" · ");
+  }
+}
+
+function pulseGuidedReviewObservation(eventId) {
+  if (guidedReviewDelivery?.eventId !== eventId) return;
+  const pulse = document.querySelector(".guided-review-delivery-pulse");
+  if (!(pulse instanceof HTMLElement)) return;
+  pulse.classList.remove("is-observed");
+  void pulse.offsetWidth;
+  pulse.classList.add("is-observed");
+}
+
 function guidedReviewDeliveryBlocksInput() {
   const stateName = guidedReviewDelivery?.receipt?.state;
   return [
@@ -994,7 +1197,9 @@ function guidedReviewDeliveryBlocksInput() {
 function renderGuidedReviewDelivery(review, controls) {
   if (!guidedReviewDelivery?.receipt) return null;
   const { receipt } = guidedReviewDelivery;
-  const panel = element("aside", `guided-review-delivery is-${receipt.state}`, {
+  const panel = element("aside", `guided-review-delivery is-${receipt.state}`);
+  const statusCopy = element("div", "guided-review-delivery-copy", {
+    "aria-atomic": "true",
     "aria-live": "polite",
     role: "status",
   });
@@ -1007,7 +1212,7 @@ function renderGuidedReviewDelivery(review, controls) {
     running: "The Mind is working",
     starting: "Opening the exact review hand",
   };
-  panel.append(
+  statusCopy.append(
     textElement("strong", "", titles[receipt.state] || "Review turn status"),
     textElement(
       "p",
@@ -1015,6 +1220,19 @@ function renderGuidedReviewDelivery(review, controls) {
       guidedReviewDelivery.message || guidedReviewStateCopy(receipt),
     ),
   );
+  panel.append(statusCopy);
+  const activityParts = guidedReviewActivityParts(guidedReviewDelivery);
+  if (activityParts.length) {
+    const activity = element("div", "guided-review-delivery-activity");
+    const pulse = element("span", "guided-review-delivery-pulse", {
+      "aria-hidden": "true",
+    });
+    activity.append(
+      pulse,
+      textElement("span", "guided-review-delivery-activity-copy", activityParts.join(" · ")),
+    );
+    panel.append(activity);
+  }
   if (receipt.final_answer) {
     panel.append(textElement("p", "guided-review-final-answer", receipt.final_answer));
   }
@@ -1035,7 +1253,12 @@ function renderGuidedReviewDelivery(review, controls) {
   const fallbackUrl = receiptHandUrl ||
     retainedExactGuidedReviewHandUrl(guidedReviewDelivery.handUrl) ||
     retainedExactGuidedReviewHandUrl(review.hand_url);
-  if (fallbackUrl && ["blocked", "delivery_uncertain", "failed_safe"].includes(receipt.state)) {
+  if (
+    fallbackUrl &&
+    ["blocked", "delivery_uncertain", "failed_safe", "running", "starting"].includes(
+      receipt.state,
+    )
+  ) {
     actions.append(exactHandFallback(fallbackUrl));
   }
   const unresolvedPendingEvent =
@@ -1084,8 +1307,14 @@ function retainedExactGuidedReviewHandUrl(url) {
 }
 
 function guidedReviewStateCopy(receipt) {
-  if (["pending", "starting", "running"].includes(receipt.state)) {
-    return "Your wording is queued once. Bridge is following only this receipt while the exact hand reads current canonical truth.";
+  if (receipt.state === "pending") {
+    return "Your exact answer is stored once while Bridge prepares delivery. You can leave this view; the review keeps its place.";
+  }
+  if (receipt.state === "starting") {
+    return "Bridge is confirming delivery to one review hand. You can leave this view; the review keeps its place.";
+  }
+  if (receipt.state === "running") {
+    return "The same review hand is reading current records and applying only what you asked for. This can take a minute or two; you can leave this view without losing your place.";
   }
   if (receipt.state === "completed") {
     return "The turn completed and canonical state has been refreshed.";
@@ -1664,6 +1893,7 @@ function updateFreshness() {
 
 function updateLiveLabels() {
   updateFreshness();
+  updateGuidedReviewActivity();
   for (const node of document.querySelectorAll("[data-relative-time]")) {
     node.textContent = relativeTime(node.dataset.relativeTime);
   }

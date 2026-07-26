@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, TypeVar
@@ -49,7 +50,8 @@ REVIEW_COVERED_ANCHORED = re.compile(
 REVIEW_OPTION_INTENTS: Final = frozenset(
     {"keep", "act-next", "defer", "reprioritize", "reshape", "drop-or-merge", "skip"}
 )
-MAX_REVIEW_OPTION_LENGTH: Final = 500
+MAX_REVIEW_OPTION_LENGTH: Final = 200
+MAX_REVIEW_OPTIONS: Final = 5
 WINDOWS_RESERVED_NAMES: Final = frozenset(
     {
         "aux",
@@ -133,6 +135,7 @@ class ReviewOption:
     """One agent-authored contextual shortcut; deterministic code stores only."""
 
     intent: str
+    subject_task_id: str
     consequence: str
     reference: str
 
@@ -340,6 +343,7 @@ def parse_task(markdown: str) -> Task:
         revision=revision,
     )
     _validate_task_state(task)
+    validate_review_references(task.refs, terminal=task.status in TERMINAL_TASK_STATUSES)
     return task
 
 
@@ -509,12 +513,15 @@ def review_coverage_ref(
     return f"review-covered:task:{clean_task}@{clean_task_revision}{suffix}"
 
 
-def review_option_ref(*, intent: str, consequence: str) -> str:
+def review_option_ref(*, intent: str, subject_task_id: str, consequence: str) -> str:
     """Render one canonical agent-authored option without choosing it."""
 
     clean_intent = _review_option_intent(intent)
+    clean_subject = task_id(subject_task_id)
     clean_consequence = _review_option_consequence(consequence)
-    reference = f"review-option:{clean_intent}:{quote(clean_consequence, safe='')}"
+    reference = (
+        f"review-option:{clean_intent}:task:{clean_subject}:{quote(clean_consequence, safe='')}"
+    )
     if len(reference) > MAX_REFERENCE_LENGTH:
         raise ValidationError("encoded review option reference exceeds the reference limit")
     references((reference,))
@@ -590,12 +597,21 @@ def parse_review_references(values: tuple[str, ...] | list[str]) -> ReviewRefere
     issues: list[str] = []
     if len(subjects) > 1:
         issues.append("review session has more than one current subject")
+    if options and len(subjects) != 1:
+        issues.append("review options require exactly one current subject")
+    elif options and any(option.subject_task_id != subjects[0] for option in options):
+        issues.append("review option subject does not match the current review subject")
     coverage_ids = [value.task_id for value in coverages]
     if len(set(coverage_ids)) != len(coverage_ids):
         issues.append("review session has conflicting coverage anchors for one task")
     option_intents = [value.intent for value in options]
     if len(set(option_intents)) != len(option_intents):
         issues.append("review session has duplicate option intents")
+    option_consequences = [value.consequence.casefold() for value in options]
+    if len(set(option_consequences)) != len(option_consequences):
+        issues.append("review session has duplicate option answers")
+    if len(options) > MAX_REVIEW_OPTIONS:
+        issues.append(f"review session has more than {MAX_REVIEW_OPTIONS} current options")
     if (paused or subjects or coverages or options) and not scope:
         issues.append("review navigation refs require review-scope:all-open")
     if malformed:
@@ -623,12 +639,12 @@ def validate_review_references(
         )
     if parsed.issues:
         raise ValidationError(parsed.issues[0])
+    if terminal and parsed.options:
+        raise ValidationError("terminal review sessions cannot retain current options")
     if terminal and parsed.subject_task_ids:
         raise ValidationError("terminal review sessions cannot retain a current subject")
     if terminal and parsed.paused:
         raise ValidationError("terminal review sessions cannot remain paused")
-    if terminal and parsed.options:
-        raise ValidationError("terminal review sessions cannot retain current options")
     return parsed
 
 
@@ -763,24 +779,31 @@ def _review_option_consequence(value: object) -> str:
         or "\n" in clean
         or "\r" in clean
         or "\x00" in clean
+        or any(unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"} for character in clean)
     ):
         raise ValidationError("review option consequence must be one bounded non-empty line")
     return clean
 
 
 def _parse_review_option(value: str) -> ReviewOption | None:
-    parts = value.split(":", 2)
-    if len(parts) != 3 or parts[0] != "review-option":
+    parts = value.split(":", 4)
+    if len(parts) != 5 or parts[0] != "review-option" or parts[2] != "task":
         return None
     try:
         intent = _review_option_intent(parts[1])
-        consequence = unquote_to_bytes(parts[2]).decode("utf-8")
+        subject_task_id = task_id(parts[3])
+        consequence = unquote_to_bytes(parts[4]).decode("utf-8")
         consequence = _review_option_consequence(consequence)
     except (UnicodeError, ValidationError):
         return None
-    if quote(consequence, safe="") != parts[2]:
+    if quote(consequence, safe="") != parts[4]:
         return None
-    return ReviewOption(intent=intent, consequence=consequence, reference=value)
+    return ReviewOption(
+        intent=intent,
+        subject_task_id=subject_task_id,
+        consequence=consequence,
+        reference=value,
+    )
 
 
 def _render(metadata: dict[str, Any], title: str, sections: tuple[tuple[str, str], ...]) -> str:

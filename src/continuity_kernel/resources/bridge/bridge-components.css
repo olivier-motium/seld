@@ -638,6 +638,52 @@ button.storyline:hover {
   color: var(--muted);
 }
 
+.guided-review-delivery-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.guided-review-delivery-activity {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.guided-review-delivery-pulse {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: var(--radius-pill);
+  background: var(--healthy);
+  box-shadow: 0 0 0 4px var(--healthy-soft);
+}
+
+.guided-review-delivery-pulse.is-observed {
+  animation: guided-review-receipt-pulse 320ms ease-out both;
+}
+
+@keyframes guided-review-receipt-pulse {
+  0% {
+    opacity: 0.42;
+    transform: scale(0.72);
+  }
+
+  55% {
+    opacity: 1;
+    transform: scale(1.28);
+  }
+
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
 .guided-review-delivery.is-pending,
 .guided-review-delivery.is-starting,
 .guided-review-delivery.is-running {
@@ -771,6 +817,11 @@ button.storyline:hover {
   .guided-review-evidence.is-warning {
     border-color: Highlight;
     background: Canvas;
+  }
+
+  .guided-review-delivery-pulse {
+    background: Highlight;
+    box-shadow: none;
   }
 }
 

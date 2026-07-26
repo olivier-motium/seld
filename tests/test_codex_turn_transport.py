@@ -4,17 +4,21 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from continuity_kernel import codex_turn_transport as transport_module
 from continuity_kernel.codex_turn_transport import (
+    GUIDED_REVIEW_MODEL,
+    GUIDED_REVIEW_REASONING_EFFORT,
+    GUIDED_REVIEW_SERVICE_TIER,
     CodexTurnCoordinator,
     ProcessResult,
     ReceiptCapacityError,
@@ -56,11 +60,20 @@ class _Action:
 
 
 class _FakeRunning:
-    def __init__(self, action: _Action):
+    def __init__(
+        self,
+        action: _Action,
+        on_thread_started: Callable[[str], None] | None,
+    ):
         self.action = action
+        self.on_thread_started = on_thread_started
 
     def collect(self, *, timeout: float) -> ProcessResult:
         del timeout
+        if self.on_thread_started is not None and isinstance(self.action.result, ProcessResult):
+            thread_id, _answer = transport_module._parse_codex_jsonl(self.action.result.stdout)
+            if thread_id is not None:
+                self.on_thread_started(thread_id)
         if self.action.wait is not None:
             assert self.action.wait.wait(timeout=5)
         if self.action.callback is not None:
@@ -106,6 +119,7 @@ class _FakeRunner:
         prompt: bytes,
         cwd: Path,
         environment: Mapping[str, str],
+        on_thread_started: Callable[[str], None] | None = None,
     ) -> _FakeRunning:
         del cwd
         self.spawns.append((list(argv), prompt, dict(environment)))
@@ -114,7 +128,7 @@ class _FakeRunner:
         action = self.actions.pop(0)
         if isinstance(action.result, OSError):
             raise action.result
-        return _FakeRunning(action)
+        return _FakeRunning(action, on_thread_started)
 
 
 def _jsonl(*payloads: dict[str, Any]) -> bytes:
@@ -440,7 +454,9 @@ def test_resume_uses_exact_isolated_codex_hand_and_persists_only_content_free_re
         "image_generation",
     ):
         assert ["--disable", feature] == argv[argv.index(feature) - 1 : argv.index(feature) + 1]
-    assert "--model" not in argv and "-m" not in argv
+    assert argv[argv.index("--model") + 1] == GUIDED_REVIEW_MODEL
+    assert f'model_reasoning_effort="{GUIDED_REVIEW_REASONING_EFFORT}"' in argv
+    assert f'service_tier="{GUIDED_REVIEW_SERVICE_TIER}"' in argv
     mcp_args_value = next(value for value in argv if value.startswith("mcp_servers.gsv.args="))
     assert json.loads(mcp_args_value.split("=", 1)[1])[-6:] == [
         "mcp",
@@ -450,16 +466,22 @@ def test_resume_uses_exact_isolated_codex_hand_and_persists_only_content_free_re
         "--event-id",
         event.event_id,
     ]
-    assert b"current Direction" in prompt
-    assert b"complete Portfolio and all open Tasks" in prompt
-    assert b"exact relevant WorkThreads and entities" in prompt
+    assert b"exact current review-session Task" in prompt
+    assert b"current subject Task" in prompt
+    assert b"one current Portfolio inspection" in prompt
+    assert b"do not repeat the opening" in prompt
     assert b"only one next outcome" in prompt
+    assert b"up to five complete standalone review-option" in prompt
+    assert b"subject ID matches that exact subject" in prompt
     assert b"raw UUID" in prompt
     assert b"codex-thread:* shadow ref" in prompt
     assert b"Before either nonterminal or terminal acceptance" in prompt
     assert b"status=waiting and next_actor=human" in prompt
     assert b"nonempty next_action recommendation" in prompt
     assert b"nonempty waiting_on question" in prompt
+    assert b"clear the review WorkThread focus" in prompt
+    assert b"terminalize the session" in prompt
+    assert b"final semantic step" in prompt
     assert b"active_thread_id, status, next_actor" in prompt
     assert b"store a transcript" in prompt
     assert secret_choice.encode() not in prompt
@@ -613,6 +635,49 @@ def test_resume_may_complete_a_terminal_session_without_active_question_fields(
     terminal = vault.get_task(seeded["session"].identifier)
     assert terminal.active_thread_id is None
     assert shadow_ref not in terminal.refs
+    review = vault.inspect_portfolio().review
+    assert review.state == "available"
+    assert review.session_task_id is None
+
+
+def test_resume_end_stopping_after_shell_cleanup_is_unverified(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Incomplete terminal resume")
+    seeded = _seed_active(vault)
+    event, context = _queue_resume(vault, seeded["session"], choice="end this review")
+
+    def clear_shell_without_terminalizing() -> None:
+        current = vault.get_task(seeded["session"].identifier)
+        changed = vault.update_task(
+            current.identifier,
+            expected_revision=current.revision,
+            clear_active_thread_id=True,
+            remove_refs=("review-subject:task:exact-outcome",),
+        )
+        review_thread = vault.get_thread(REVIEW_WORK_THREAD_ID)
+        vault.update_thread(
+            review_thread.identifier,
+            expected_revision=review_thread.revision,
+            clear_focus_task=True,
+        )
+        _decide(
+            vault,
+            event.event_id,
+            decision="accepted",
+            result_ref=f"task:{changed.identifier}/{changed.revision}",
+        )
+
+    coordinator = _coordinator(
+        vault,
+        _FakeRunner(_Action(_success_output(), clear_shell_without_terminalizing)),
+    )
+    coordinator.submit(context)
+
+    receipt = _wait_for(coordinator, event.event_id, TurnState.DELIVERY_UNCERTAIN)
+    assert receipt.reason_code == "semantic_result_unverified"
+    review = vault.inspect_portfolio().review
+    assert review.state == "conflict"
+    assert review.issue == "review WorkThread focus must be the exact nonterminal review session"
 
 
 def test_resume_terminal_result_retaining_shadow_hand_ref_is_unverified(tmp_path: Path) -> None:
@@ -786,6 +851,80 @@ def test_initial_start_uses_canonical_review_focus_despite_unowned_scope_mistag(
     assert b"remove_refs for every codex-thread:* shadow ref" in second_prompt
     assert b"active_thread_id, status, next_actor, next_action, waiting_on, refs" in second_prompt
     assert b"start-all-open-review" not in first_prompt + second_prompt
+
+
+def test_initial_start_publishes_exact_hand_before_first_turn_finishes(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Visible review hand")
+    event, context = _queue_start(vault)
+    release_first_turn = threading.Event()
+
+    def create_session() -> None:
+        session = vault.create_task(
+            identifier="portfolio-review-session",
+            title="Review every open outcome",
+            outcome="Check every open outcome without equating checked with resolved.",
+            status="waiting",
+            next_actor="human",
+            next_action="Present the first exact outcome.",
+            waiting_on="What should change?",
+            refs=(REVIEW_SCOPE_REF, "review-subject:task:start-outcome"),
+        )
+        vault.create_thread(
+            identifier=REVIEW_WORK_THREAD_ID,
+            title="Life Portfolio review",
+            purpose="Carry one finite all-open review.",
+            summary="The exact hand is visible while the first turn continues.",
+            focus_task_id=session.identifier,
+            task_ids=(session.identifier,),
+        )
+
+    def bind_and_acknowledge() -> None:
+        session = vault.get_task("portfolio-review-session")
+        bound = vault.update_task(
+            session.identifier,
+            expected_revision=session.revision,
+            active_thread_id=THREAD_ID,
+        )
+        _decide(
+            vault,
+            event.event_id,
+            decision="accepted",
+            result_ref=f"task:{bound.identifier}/{bound.revision}",
+        )
+
+    runner = _FakeRunner(
+        _Action(
+            _success_output(answer="The first review exchange is still being prepared."),
+            create_session,
+            wait=release_first_turn,
+        ),
+        _Action(_success_output(answer="The review is ready."), bind_and_acknowledge),
+    )
+    coordinator = _coordinator(vault, runner)
+    coordinator.submit(context)
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        visible = coordinator.receipt(event.event_id)
+        if (
+            visible is not None
+            and visible.state is TurnState.RUNNING
+            and visible.thread_id == THREAD_ID
+        ):
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("the emitted review hand was not published while the turn was live")
+
+    public = coordinator.snapshot(event.event_id)["event"]
+    assert public["thread_id"] == THREAD_ID
+    assert len(runner.spawns) == 1
+
+    release_first_turn.set()
+    completed = _wait_for(coordinator, event.event_id, TurnState.COMPLETED)
+    assert completed.thread_id == THREAD_ID
+    assert len(runner.spawns) == 2
 
 
 def test_start_canary_shape_with_workthread_hand_shadow_ref_and_no_question_is_unverified(
@@ -1902,3 +2041,66 @@ def test_subprocess_probe_checks_local_auth_without_model_or_provider_traffic(
     assert all(call["stdin"] is subprocess.DEVNULL for _, call in calls)
     assert all(call["stdout"] is subprocess.DEVNULL for _, call in calls)
     assert all(call["stderr"] is subprocess.DEVNULL for _, call in calls)
+
+
+def test_subprocess_collect_drains_output_before_writing_prompt(tmp_path: Path) -> None:
+    running = SubprocessTurnRunner().spawn(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys; os.write(1, b'x' * 3145728); "
+            "data = sys.stdin.buffer.read(); raise SystemExit(0 if len(data) == 1048576 else 9)",
+        ],
+        prompt=b"p" * 1_048_576,
+        cwd=tmp_path,
+        environment=os.environ,
+    )
+
+    result = running.collect(timeout=5)
+
+    assert result.returncode == 0
+    assert result.output_truncated is True
+    assert len(result.stdout) == transport_module.MAX_CAPTURE_BYTES
+
+
+def test_subprocess_collect_terminates_child_when_stdin_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyStream:
+        def readline(self, _size: int) -> bytes:
+            return b""
+
+    class BrokenInput:
+        def write(self, _value: bytes) -> int:
+            raise BrokenPipeError("child closed stdin")
+
+        def close(self) -> None:
+            raise AssertionError("close must not run after a failed write")
+
+    class Process:
+        stdin = BrokenInput()
+        stdout = EmptyStream()
+        stderr = EmptyStream()
+        pid = 4242
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == 5
+            return 1
+
+    terminated: list[object] = []
+    monkeypatch.setattr(
+        transport_module,
+        "_terminate_exact_process",
+        lambda process: terminated.append(process),
+    )
+    process = Process()
+    running = transport_module._SubprocessTurn(
+        cast(subprocess.Popen[bytes], process),
+        b"prompt",
+        None,
+    )
+
+    with pytest.raises(BrokenPipeError, match="child closed stdin"):
+        running.collect(timeout=3)
+
+    assert terminated == [process]

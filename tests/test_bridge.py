@@ -87,6 +87,7 @@ def test_guided_review_deep_link_fallback_matches_installed_skill_contract() -> 
         "next_actor=human",
         "next_action",
         "waiting_on",
+        "terminalize the session",
     )
     for marker in shared_contract_markers:
         assert marker in prompt
@@ -94,6 +95,12 @@ def test_guided_review_deep_link_fallback_matches_installed_skill_contract() -> 
     for semantic_word in ("checked", "never", "resolved", "clear"):
         assert semantic_word in prompt
         assert semantic_word in skill
+
+    bridge_javascript = (
+        files("continuity_kernel") / "resources" / "bridge" / "bridge.js"
+    ).read_text(encoding="utf-8")
+    assert "subject.contradictions" not in bridge_javascript
+    assert "exactHandFallback(review.hand_url)" not in bridge_javascript
 
 
 @pytest.fixture
@@ -274,6 +281,7 @@ def test_snapshot_projects_one_exact_guided_review_subject_without_inference(
     )
     keep_option = review_option_ref(
         intent="keep",
+        subject_task_id="first-outcome",
         consequence="Leave the outcome unchanged and check only this review step.",
     )
     session = vault.create_task(

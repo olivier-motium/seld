@@ -44,10 +44,11 @@ These are release acceptance steps, not claims about the current branch:
    it never pretends to be a first run.
 4. `Work through every open outcome` starts or resumes one finite review Task
    and exact Codex hand. Bridge presents one exact authored subject, its current
-   Task and storyline state, evidence freshness or structural contradiction,
+   Task and storyline state, evidence references and authored revision staleness,
    recommendation, practical option consequences, and one useful question. The
-   user may keep, act, defer, reprioritize, reshape, drop or merge, skip, pause,
-   end, or answer freely. When the restricted same-hand capability is proved,
+   agent authors up to five complete contextual answer buttons whose visible
+   sentence is queued verbatim; the user may also skip, pause, end, or answer
+   freely. When the restricted same-hand capability is proved,
    the answer continues in Bridge; otherwise the exact hand remains the honest
    fallback. The agent applies explicit decisions through fresh native CAS
    writes and readback. Checked is session progress only; it never means

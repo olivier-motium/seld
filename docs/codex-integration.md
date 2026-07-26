@@ -42,10 +42,19 @@ this is an evidence switch, not a consumer release claim.
    second bind-resume turn writes that exact ID to the review-session Task and
    dispositions the event. Both paths ignore user configuration, use a
    read-only shell sandbox with no approval prompts, and configure only the
-   required vault-bound GSV MCP server for semantic writes.
+   required vault-bound GSV MCP server for semantic writes. The foundation
+   profile pins `gpt-5.6-sol`, low reasoning effort, and priority service for
+   this bounded interactive review only. That exact model/tier combination is
+   source-configured but remains a provider and clean-Plus release gate.
 4. `GET /api/v1/review-turn?event_id=<uuid>` reports only that event. There is no
    transport-history list. The browser polls it until a terminal state, may show
    the bounded final answer in memory, and then reloads canonical state.
+
+For START, the JSONL reader publishes a validated `thread.started` UUID into the
+content-free running receipt as soon as Codex emits it, before the first model
+turn completes. Bridge may therefore expose the exact hand while the initial
+review is still working. A conflicting or malformed emitted ID remains a
+terminal no-replay failure; it never creates a replacement hand.
 
 Triggering the same event is idempotent. A failure proven to occur before
 delivery is `failed_safe` and may be retried deliberately. Once delivery may

@@ -94,7 +94,7 @@ One nonterminal review-session Task carries deterministic navigation facts:
 review-scope:all-open
 review-subject:task:<task-id>
 review-state:paused
-review-option:<intent>:<canonical-percent-encoded-consequence>
+review-option:<intent>:task:<subject-task-id>:<canonical-percent-encoded-consequence>
 review-covered:task:<task-id>@<task-sha256>
 review-covered:task:<task-id>@<task-sha256>|thread:<thread-id>@<thread-sha256>
 ```
@@ -104,10 +104,14 @@ Canonical option encoding leaves only `A-Z`, `a-z`, `0-9`, `_`, `.`, `-`, and
 hexadecimal digits.
 
 Scope appears exactly once. Subject and paused state appear at most once.
-Options use one of `keep`, `act-next`, `defer`, `reprioritize`, `reshape`,
-`drop-or-merge`, or `skip`, at most once each. Their one-line consequence text
-is agent-authored for the exact subject; Bridge decodes and displays it but
-never supplies meaning. Replacing a subject also replaces its option refs.
+Options name the exact current subject Task and use one of `keep`, `act-next`,
+`defer`, `reprioritize`, `reshape`,
+`drop-or-merge`, or `skip`, at most once each. A current subject may carry at
+most five options. Their one-line consequence text is an agent-authored,
+standalone answer of at most 200 characters for the exact subject. Invisible
+format controls and duplicate case-insensitive answers are rejected. Bridge
+decodes and queues that exact visible answer but never supplies meaning or a
+hidden payload. Replacing a subject also replaces its option refs.
 Coverage records the exact Task revision checked and, when the Portfolio item
 has an owning WorkThread, that exact thread revision too. Legacy unanchored
 `review-covered:task:<task-id>` refs from unreleased development builds remain

@@ -154,7 +154,9 @@ in-flight turn receipt as `delivery_uncertain` after a crash; that monotone
 reconciliation disables replay and does not mutate semantic canon. An explicit
 accept, reject, or archive mutation validates the vault binding and revisions
 from the queue/disposition observation before performing any deterministic
-recovery it needs.
+recovery it needs. Running two Bridge processes against one vault is unsupported;
+their instance leases can conservatively classify each other's in-flight review
+turns as `delivery_uncertain` rather than risk replay.
 
 ### Guided Portfolio review
 
@@ -171,11 +173,13 @@ introduce a transcript database or a second task system:
 3. Bridge projects those authored declarations. It never chooses the next Task,
    interprets an answer, derives rank from card position, or changes canon.
    The current card includes authored Task/WorkThread state, exact evidence refs,
-   structural staleness or contradiction, recommendation, choice consequences,
-   and one question.
+   authored revision staleness, recommendation, choice consequences, and one
+   question.
 4. A button or freeform answer appends one authenticated correction intent
    bound to the current review-session revision. A stale queue CAS preserves
    the typed answer and requires a deliberate retry against the refreshed card.
+   An authored quick choice queues the exact standalone sentence shown on its
+   button; there is no hidden choice ID, payload, or different instruction.
 5. When the local Codex capability check passes, the authenticated append
    creates and schedules one durable turn receipt. The browser's bounded
    review-turn endpoint is an idempotent trigger and recovery path for that
@@ -183,10 +187,15 @@ introduce a transcript database or a second task system:
    to bind the emitted UUID; later answers resume the authored hand once. Every
    invocation uses the required vault-bound GSV MCP server and exposes no
    provider, Computer Use, shell-write, or external-action tools. The browser
-   polls only that event ID.
-6. The review agent reloads the operation, Task, owning WorkThread, Direction,
-   and Portfolio revisions; interprets the answer; applies only the explicit
-   semantic decision through native CAS; reads canonical truth back; then
+   polls only that event ID. Its wait card distinguishes locally saved,
+   delivery confirmation, and running states, advances elapsed time locally,
+   and pulses only after an actual receipt read. It says when the exact hand is
+   known and makes clear that the user may leave without losing the durable
+   request; it never displays a fabricated percentage or model-progress claim.
+6. The review agent reloads the operation, exact session, current subject,
+   owning WorkThread, decisive evidence, and one Portfolio inspection;
+   interprets the answer; applies only the explicit semantic decision through
+   native CAS; reads canonical truth back; then
    accepts or rejects the receipt. Acceptance is acknowledgement, never the
    semantic write itself.
 7. Advancing replaces the exact subject and adds a revision-aware coverage ref
@@ -201,6 +210,10 @@ introduce a transcript database or a second task system:
    terminal transport receipt still has a pending intent, Bridge also exposes
    the existing operation-review link and copyable prompt so the user can
    explicitly acknowledge or reject that receipt without replaying it.
+9. Ending a review clears the review WorkThread focus first, then terminalizes
+   the session Task through fresh CAS as the final semantic step. The terminal
+   Task retains only bounded scope and anchored coverage evidence; subject,
+   pause, hand, shadow, and future-work fields are cleared.
 
 There is no transcript store, semantic queue executor, review database, or
 browser-side task policy. The same-hand transport is capability-gated: when the

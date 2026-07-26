@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -58,7 +59,7 @@ class SemanticReviewTransport:
             event_id=exact.event_id,
             mode=exact.mode,
             state=TurnState.PENDING,
-            attempt=0,
+            attempt=1,
             vault_id=str(self.vault.identity()["vault_id"]),
             context_hash=exact.context_hash,
             queue_revision=exact.queue_revision,
@@ -104,7 +105,9 @@ class SemanticReviewTransport:
 
         operation = OperationLedger(self.vault.root).snapshot()
         event = next(value for value in operation.pending if value.event_id == exact.event_id)
-        assert "act-next" in event.choice
+        assert event.choice == (
+            "Author the smallest local next move and keep external action gated."
+        )
 
         outcome = self.vault.get_task("exact-outcome")
         changed_outcome = self.vault.update_task(
@@ -160,6 +163,7 @@ class SemanticReviewTransport:
                 "review-subject:task:next-outcome",
                 review_option_ref(
                     intent="keep",
+                    subject_task_id="next-outcome",
                     consequence="Leave this outcome unchanged and check only this review step.",
                 ),
             ),
@@ -194,7 +198,7 @@ class SemanticReviewTransport:
             result_ref=f"task:{advanced.identifier}/{advanced.revision}",
             canonical_revision=changed_portfolio.revision,
             result_context_hash=exact.context_hash,
-            reason_code="semantic-readback-complete",
+            reason_code=None,
             created_at=now,
             updated_at=now,
         )
@@ -327,6 +331,57 @@ class RunningTransport(DeliveryUncertainTransport):
         return receipt
 
 
+class DispositionBeforeCompletionTransport(SemanticReviewTransport):
+    """Expose the real disposition-before-process-exit completion window."""
+
+    def __init__(self, vault: Vault, *, running_reads: int = 5) -> None:
+        super().__init__(vault)
+        self.running_reads = running_reads
+        self.completed: dict[str, TurnReceipt] = {}
+
+    def submit(self, context: TurnContext) -> TurnReceipt:
+        completed = super().submit(context)
+        self.completed[completed.event_id] = completed
+        running = replace(
+            completed,
+            state=TurnState.RUNNING,
+            owner_instance_id=INSTANCE_ID,
+            decision=None,
+            result_ref=None,
+            canonical_revision=None,
+            result_context_hash=None,
+            reason_code=None,
+        )
+        self.receipts[completed.event_id] = running
+        return running
+
+    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+        receipt = self.receipts.get(event_id) if event_id is not None else None
+        if receipt is not None and receipt.state is TurnState.RUNNING:
+            self.running_reads -= 1
+            if self.running_reads <= 0:
+                receipt = self.completed[receipt.event_id]
+                self.receipts[receipt.event_id] = receipt
+        return {
+            "automatic_resume": True,
+            "automatic_start": True,
+            "available": True,
+            "enabled": True,
+            "event": (
+                receipt.public(
+                    final_answer=(
+                        self.answers.get(receipt.event_id)
+                        if receipt.state is TurnState.COMPLETED
+                        else None
+                    )
+                )
+                if receipt is not None
+                else None
+            ),
+            "reason_code": None,
+        }
+
+
 class FailedSafeThenDriftTransport(DeliveryUncertainTransport):
     """Fail before delivery, then make the queued semantic context stale."""
 
@@ -368,6 +423,234 @@ class FailedSafeThenDriftTransport(DeliveryUncertainTransport):
         return receipt
 
 
+@pytest.mark.parametrize("mode", ("start", "resume"))
+def test_browser_start_and_resume_stale_cas_notice_survives_refresh(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name=f"Guided review {mode} stale CAS")
+    outcome = vault.create_task(
+        identifier="exact-outcome",
+        title="Exact outcome",
+        outcome="Keep the start and resume controls honest across queue races.",
+        status="ready",
+        next_actor="human",
+    )
+    if mode == "resume":
+        session = vault.create_task(
+            identifier="review-session",
+            title="Review every open outcome",
+            outcome="Check every exact outcome.",
+            status="waiting",
+            next_actor="human",
+            next_action="Resume at the exact current outcome.",
+            waiting_on="Should this outcome remain current?",
+            active_thread_id=REVIEW_HAND_ID,
+            refs=(
+                "review-scope:all-open",
+                "review-state:paused",
+                "review-subject:task:exact-outcome",
+            ),
+        )
+        vault.create_thread(
+            identifier="thread:life-portfolio-review",
+            title="Finite Portfolio reviews",
+            purpose="Own only bounded all-open review sessions.",
+            summary="One exact review session is paused.",
+            status="waiting",
+            next_move="Resume the focused review session.",
+            focus_task_id=session.identifier,
+            task_ids=(session.identifier,),
+        )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="One exact open outcome.",
+        items=(
+            portfolio_item(
+                task_id_value=outcome.identifier,
+                task_revision=outcome.revision,
+                stance="needs-human",
+                reason="The review control must remain understandable after a race.",
+            ),
+        ),
+    )
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            turn_transport=NeverSubmittedTransport(),
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"height": 844, "width": 390})
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="load")
+                page.locator('[data-view="commitments"]').press("Enter")
+                page.route(
+                    "**/api/v1/control",
+                    lambda route: route.fulfill(
+                        body='{"error":"control queue changed; reload"}',
+                        content_type="application/json",
+                        status=409,
+                    ),
+                    times=1,
+                )
+                label = "Start review here" if mode == "start" else "Resume review here"
+                page.get_by_role("button", name=label).click()
+
+                notice = page.locator(".guided-review-notice")
+                notice.wait_for(timeout=5_000)
+                assert "queue changed" in notice.text_content().casefold()
+                assert "retry" in notice.text_content().casefold()
+                assert page.get_by_role("button", name=label).is_visible()
+                ledger = OperationLedger(vault.root)
+                assert ledger.snapshot().pending == ()
+                current = ledger.snapshot()
+                ledger.queue.append(
+                    kind="correction",
+                    subject="mind:user-correction",
+                    choice="A separately reconciled local queue update.",
+                    expected_revision=current.queue_revision,
+                )
+                page.locator("#retry-button").evaluate("button => button.click()")
+                page.wait_for_function(
+                    "() => !document.querySelector('.guided-review-notice')",
+                    timeout=5_000,
+                )
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_browser_unavailable_review_shows_repair_issue_without_new_hand(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Unavailable guided review repair")
+    outcome = vault.create_task(
+        identifier="exact-outcome",
+        title="Exact outcome",
+        outcome="Keep unavailable review state visible and fail closed.",
+        status="ready",
+        next_actor="human",
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="One exact open outcome.",
+        items=(
+            portfolio_item(
+                task_id_value=outcome.identifier,
+                task_revision=outcome.revision,
+                stance="needs-human",
+                reason="The review needs an honest repair surface.",
+            ),
+        ),
+    )
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            turn_transport=NeverSubmittedTransport(),
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        snapshot = server.snapshot()
+        snapshot["portfolio"]["review"].update(
+            {
+                "issue": "Two guided review starts are queued; reconcile them before continuing.",
+                "pending_start": None,
+                "state": "unavailable",
+            }
+        )
+        snapshot["guided_review_transport"]["event"] = {
+            "created_at": "2026-07-26T06:00:00Z",
+            "event_id": "019f95fd-009e-7603-ab87-f9927cf31c52",
+            "final_answer": None,
+            "mode": "start",
+            "reason_code": "ambiguous_post_spawn_exit",
+            "retryable": False,
+            "state": "delivery_uncertain",
+            "terminal": True,
+            "thread_id": REVIEW_HAND_ID,
+            "updated_at": "2026-07-26T06:01:00Z",
+        }
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"height": 844, "width": 390})
+                page.route(
+                    "**/api/v1/snapshot",
+                    lambda route: route.fulfill(
+                        body=json.dumps(snapshot),
+                        content_type="application/json",
+                        status=200,
+                    ),
+                )
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="load")
+                page.locator('[data-view="commitments"]').press("Enter")
+
+                page.get_by_text("Review state needs repair", exact=True).wait_for(timeout=5_000)
+                assert page.get_by_text(
+                    "Two guided review starts are queued", exact=False
+                ).is_visible()
+                assert page.get_by_text("Delivery could not be confirmed", exact=True).is_visible()
+                assert (
+                    page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                        "href"
+                    )
+                    == f"codex://threads/{REVIEW_HAND_ID}"
+                )
+                assert page.get_by_role("button", name="Start review here").count() == 0
+                assert page.get_by_role("link", name="Start in Codex").count() == 0
+
+                snapshot["portfolio"]["review"].update(
+                    {
+                        "active_thread_id": None,
+                        "issue": "The durable review session needs repair before it can continue.",
+                        "start_url": "codex://new?prompt=repair-guided-review",
+                        "state": "conflict",
+                    }
+                )
+                snapshot["guided_review_transport"]["event"] = None
+                page.reload(wait_until="load")
+                page.get_by_role("link", name="Repair in Codex").wait_for(timeout=5_000)
+                assert page.get_by_role("link", name="Resume the review hand").count() == 0
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
 def test_browser_finished_review_keeps_terminal_delivery_recovery_visible(
     tmp_path: Path,
 ) -> None:
@@ -400,7 +683,9 @@ def test_browser_finished_review_keeps_terminal_delivery_recovery_visible(
         thread.start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         snapshot = server.snapshot()
+        observed_at = format_time(datetime.now(UTC))
         snapshot["guided_review_transport"]["event"] = {
+            "created_at": observed_at,
             "event_id": event_id,
             "final_answer": None,
             "mode": "resume",
@@ -409,7 +694,7 @@ def test_browser_finished_review_keeps_terminal_delivery_recovery_visible(
             "state": "delivery_uncertain",
             "terminal": True,
             "thread_id": REVIEW_HAND_ID,
-            "updated_at": format_time(datetime.now(UTC)),
+            "updated_at": observed_at,
         }
         try:
             with sync_playwright() as playwright:
@@ -432,6 +717,261 @@ def test_browser_finished_review_keeps_terminal_delivery_recovery_visible(
                 page.get_by_text("Delivery could not be confirmed", exact=True).wait_for(
                     timeout=5_000
                 )
+                assert (
+                    page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                        "href"
+                    )
+                    == f"codex://threads/{REVIEW_HAND_ID}"
+                )
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_browser_clears_stale_working_message_when_receipt_completes(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Guided review receipt progression")
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="No outcomes are currently open.",
+        items=(),
+    )
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    event_id = "019f95fd-009e-4603-ab87-f9927cf31c50"
+
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            turn_transport=NeverSubmittedTransport(),
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        snapshot = server.snapshot()
+        running_receipt = {
+            "created_at": "2026-07-26T06:00:00Z",
+            "event_id": event_id,
+            "final_answer": None,
+            "mode": "resume",
+            "reason_code": None,
+            "retryable": False,
+            "state": "running",
+            "terminal": False,
+            "thread_id": REVIEW_HAND_ID,
+            "updated_at": "2026-07-26T06:00:00Z",
+        }
+        snapshot["guided_review_transport"]["event"] = {
+            **running_receipt,
+            "state": "pending",
+        }
+        stale_message = (
+            "The review hand is still working. GSV will not resend your answer; use the exact "
+            "hand if you need to inspect it now."
+        )
+        bridge_javascript = (Path(static_root) / "bridge.js").read_text(encoding="utf-8")
+        fast_javascript = (
+            bridge_javascript.replace(
+                "const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;",
+                "const GUIDED_REVIEW_POLL_INTERVAL_MS = 10;",
+            )
+            .replace(
+                "const GUIDED_REVIEW_POLL_LIMIT = 680;",
+                "const GUIDED_REVIEW_POLL_LIMIT = 100;",
+            )
+            .replace(
+                "window.setInterval(() => loadSnapshot({ quiet: true }), 10_000);",
+                "window.setInterval(() => loadSnapshot({ quiet: true }), 50);",
+            )
+        )
+        assert fast_javascript != bridge_javascript
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(
+                    reduced_motion="reduce",
+                    viewport={"height": 844, "width": 390},
+                )
+                page.route(
+                    "**/bridge.js",
+                    lambda route: route.fulfill(
+                        body=fast_javascript,
+                        content_type="text/javascript",
+                        status=200,
+                    ),
+                )
+                page.route(
+                    "**/api/v1/snapshot",
+                    lambda route: route.fulfill(
+                        body=json.dumps(snapshot),
+                        content_type="application/json",
+                        status=200,
+                    ),
+                )
+                page.route(
+                    "**/api/v1/review-turn*",
+                    lambda route: route.fulfill(
+                        body=json.dumps({"ok": True, "transport": running_receipt}),
+                        content_type="application/json",
+                        status=202 if route.request.method == "POST" else 200,
+                    ),
+                )
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="load")
+                page.locator('[data-view="commitments"]').press("Enter")
+                page.get_by_text("The Mind is working", exact=True).wait_for(timeout=5_000)
+                page.evaluate(
+                    "window.__gsvReviewStatus = "
+                    "document.querySelector('.guided-review-delivery-copy')"
+                )
+                page.wait_for_timeout(100)
+                assert page.evaluate(
+                    "window.__gsvReviewStatus === "
+                    "document.querySelector('.guided-review-delivery-copy')"
+                )
+                page.get_by_text(stale_message, exact=True).wait_for(timeout=5_000)
+                assert page.get_by_text("Same review hand active", exact=False).is_visible()
+                assert page.get_by_text("Checked just now", exact=False).is_visible()
+                assert (
+                    page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                        "href"
+                    )
+                    == f"codex://threads/{REVIEW_HAND_ID}"
+                )
+                snapshot["guided_review_transport"]["event"] = {
+                    **running_receipt,
+                    "final_answer": "The exact turn finished.",
+                    "state": "completed",
+                    "terminal": True,
+                    "updated_at": "2026-07-26T06:01:00Z",
+                }
+
+                page.get_by_text("The review hand replied", exact=True).wait_for(timeout=5_000)
+                assert page.get_by_text(stale_message, exact=True).count() == 0
+                assert page.get_by_text("The exact turn finished.", exact=True).is_visible()
+                assert page.locator(".guided-review-delivery-activity").count() == 0
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_browser_failed_receipt_read_removes_stale_hand_liveness(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Guided review failed receipt observation")
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="No outcomes are currently open.",
+        items=(),
+    )
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    event_id = "019f95fd-009e-7603-ab87-f9927cf31c51"
+    pending_receipt = {
+        "created_at": "2026-07-26T06:00:00Z",
+        "event_id": event_id,
+        "final_answer": None,
+        "mode": "resume",
+        "reason_code": None,
+        "retryable": False,
+        "state": "pending",
+        "terminal": False,
+        "thread_id": REVIEW_HAND_ID,
+        "updated_at": "2026-07-26T06:00:00Z",
+    }
+    running_receipt = {**pending_receipt, "state": "running"}
+
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            turn_transport=NeverSubmittedTransport(),
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        snapshot = server.snapshot()
+        snapshot["guided_review_transport"]["event"] = pending_receipt
+        bridge_javascript = (Path(static_root) / "bridge.js").read_text(encoding="utf-8")
+        fast_javascript = bridge_javascript.replace(
+            "const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;",
+            "const GUIDED_REVIEW_POLL_INTERVAL_MS = 50;",
+        )
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(
+                    reduced_motion="reduce",
+                    viewport={"height": 844, "width": 390},
+                )
+                page.route(
+                    "**/bridge.js",
+                    lambda route: route.fulfill(
+                        body=fast_javascript,
+                        content_type="text/javascript",
+                        status=200,
+                    ),
+                )
+                page.route(
+                    "**/api/v1/snapshot",
+                    lambda route: route.fulfill(
+                        body=json.dumps(snapshot),
+                        content_type="application/json",
+                        status=200,
+                    ),
+                )
+
+                def review_turn(route: Any) -> None:
+                    if route.request.method == "POST":
+                        route.fulfill(
+                            body=json.dumps({"ok": True, "transport": running_receipt}),
+                            content_type="application/json",
+                            status=202,
+                        )
+                    else:
+                        route.fulfill(
+                            body='{"error":"receipt temporarily unavailable"}',
+                            content_type="application/json",
+                            status=503,
+                        )
+
+                page.route("**/api/v1/review-turn*", review_turn)
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="load")
+                page.locator('[data-view="commitments"]').press("Enter")
+                page.get_by_text("Same review hand active", exact=False).wait_for(timeout=5_000)
+                page.get_by_text("Bridge could not read the review receipt", exact=False).wait_for(
+                    timeout=5_000
+                )
+                assert page.get_by_text("Same review hand active", exact=False).count() == 0
+                page.wait_for_function(
+                    "() => document.querySelector('.guided-review-delivery-activity-copy')"
+                    "?.textContent.includes(' ago')",
+                    timeout=8_000,
+                )
+                activity = page.locator(".guided-review-delivery-activity-copy").text_content()
+                assert "Checked just now" not in activity
+                assert " ago" in activity
                 assert (
                     page.get_by_role("link", name="Open the exact review hand").get_attribute(
                         "href"
@@ -490,6 +1030,7 @@ def test_browser_guided_review_runs_semantic_cas_and_survives_fresh_process(
             "review-subject:task:exact-outcome",
             review_option_ref(
                 intent="act-next",
+                subject_task_id="exact-outcome",
                 consequence="Author the smallest local next move and keep external action gated.",
             ),
         ),
@@ -645,6 +1186,151 @@ def test_browser_guided_review_runs_semantic_cas_and_survives_fresh_process(
             assert not fresh_thread.is_alive()
 
 
+def test_browser_keeps_active_delivery_until_post_disposition_completion(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Guided review disposition window")
+    outcome = vault.create_task(
+        identifier="exact-outcome",
+        title="Exact outcome",
+        outcome="Keep the wait card through the disposition-to-completion window.",
+        status="ready",
+        next_actor="human",
+    )
+    owner = vault.create_thread(
+        identifier="thread:exact-work",
+        title="Exact work storyline",
+        purpose="Carry the exact outcome context.",
+        summary="The exact outcome context is current.",
+        status="active",
+        next_move="Choose the bounded next move.",
+        task_ids=(outcome.identifier,),
+    )
+    second = vault.create_task(
+        identifier="next-outcome",
+        title="Next outcome",
+        outcome="Remain available after the exact turn completes.",
+        status="ready",
+        next_actor="human",
+    )
+    session = vault.create_task(
+        identifier="review-session",
+        title="Review every open outcome",
+        outcome="Check every exact outcome.",
+        status="waiting",
+        next_actor="human",
+        next_action="Keep it current if the evidence still holds.",
+        waiting_on="Does this outcome still earn its place?",
+        active_thread_id=REVIEW_HAND_ID,
+        refs=(
+            "review-scope:all-open",
+            "review-subject:task:exact-outcome",
+            review_option_ref(
+                intent="act-next",
+                subject_task_id="exact-outcome",
+                consequence="Author the smallest local next move and keep external action gated.",
+            ),
+        ),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Finite Portfolio reviews",
+        purpose="Own only bounded all-open review sessions.",
+        summary="One exact review session is active.",
+        status="active",
+        next_move="Continue the focused review session.",
+        focus_task_id=session.identifier,
+        task_ids=(session.identifier,),
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="Two exact open outcomes.",
+        items=(
+            portfolio_item(
+                task_id_value=outcome.identifier,
+                task_revision=outcome.revision,
+                stance="needs-human",
+                reason="The user should decide deliberately.",
+                work_thread_id=owner.identifier,
+                work_thread_revision=owner.revision,
+            ),
+            portfolio_item(
+                task_id_value=second.identifier,
+                task_revision=second.revision,
+                stance="needs-human",
+                reason="The next exact outcome remains open.",
+            ),
+        ),
+    )
+    transport = DispositionBeforeCompletionTransport(vault)
+    ledger = OperationLedger(vault.root)
+    static_resource = files("continuity_kernel") / "resources/bridge"
+
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            turn_transport=transport,
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        bridge_javascript = (Path(static_root) / "bridge.js").read_text(encoding="utf-8")
+        fast_javascript = bridge_javascript.replace(
+            "const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;",
+            "const GUIDED_REVIEW_POLL_INTERVAL_MS = 100;",
+        ).replace(
+            "window.setInterval(() => loadSnapshot({ quiet: true }), 10_000);",
+            "window.setInterval(() => loadSnapshot({ quiet: true }), 25);",
+        )
+        assert fast_javascript != bridge_javascript
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"height": 844, "width": 390})
+                page.route(
+                    "**/bridge.js",
+                    lambda route: route.fulfill(
+                        body=fast_javascript,
+                        content_type="text/javascript",
+                        status=200,
+                    ),
+                )
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="load")
+                page.locator('[data-view="commitments"]').press("Enter")
+                page.get_by_role("button", name="Do / next").click()
+                page.get_by_text("The Mind is working", exact=True).wait_for(timeout=5_000)
+
+                page.wait_for_timeout(150)
+                decided = ledger.snapshot()
+                assert decided.pending == ()
+                assert len(decided.decided) == 1
+                assert page.get_by_text("The Mind is working", exact=True).is_visible()
+
+                page.get_by_text("The review hand replied", exact=True).wait_for(timeout=5_000)
+                assert page.get_by_text(
+                    "I tightened the first next move and kept external action gated.",
+                    exact=False,
+                ).is_visible()
+                assert transport.submit_count == 1
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
 def test_browser_fresh_process_resumes_one_restored_pending_receipt(
     tmp_path: Path,
 ) -> None:
@@ -687,6 +1373,7 @@ def test_browser_fresh_process_resumes_one_restored_pending_receipt(
             "review-subject:task:exact-outcome",
             review_option_ref(
                 intent="act-next",
+                subject_task_id="exact-outcome",
                 consequence="Author the smallest local next move and keep external action gated.",
             ),
         ),
@@ -730,10 +1417,7 @@ def test_browser_fresh_process_resumes_one_restored_pending_receipt(
     queued = ledger.queue.append(
         kind="correction",
         subject=f"record:task/{session.identifier}",
-        choice=(
-            "For task:exact-outcome, the user selected act-next. Practical consequence: "
-            "author the smallest bounded local proof."
-        ),
+        choice="Author the smallest local next move and keep external action gated.",
         expected_revision=ledger.snapshot().queue_revision,
         target_revision=session.revision,
     )
@@ -781,6 +1465,11 @@ def test_browser_fresh_process_resumes_one_restored_pending_receipt(
                     ),
                 )
                 page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
+                for _ in range(20):
+                    if transport.submit_count == 1:
+                        break
+                    page.wait_for_timeout(50)
+                assert transport.submit_count == 1
                 commitments = page.locator('[data-view="commitments"]')
                 commitments.focus()
                 commitments.press("Enter")
@@ -789,7 +1478,6 @@ def test_browser_fresh_process_resumes_one_restored_pending_receipt(
                     "Next outcome", exact=True
                 ).wait_for(timeout=5_000)
                 assert review_posts == [f"{base}/api/v1/review-turn"]
-                assert transport.submit_count == 1
                 applied = ledger.snapshot()
                 assert len(applied.pending) == 0
                 assert len(applied.decided) == 1
@@ -1065,6 +1753,7 @@ def test_browser_guided_review_never_replays_delivery_uncertain_event(
             "review-subject:task:exact-outcome",
             review_option_ref(
                 intent="keep",
+                subject_task_id="exact-outcome",
                 consequence="Leave the canonical outcome unchanged while checking this step.",
             ),
         ),
@@ -1121,7 +1810,7 @@ def test_browser_guided_review_never_replays_delivery_uncertain_event(
                 commitments = page.locator('[data-view="commitments"]')
                 commitments.focus()
                 commitments.press("Enter")
-                page.get_by_role("button", name="Keep current", exact=True).evaluate(
+                page.get_by_role("button", name="Keep current", exact=False).evaluate(
                     "button => { button.click(); button.click(); }"
                 )
                 page.get_by_text("Delivery could not be confirmed", exact=True).wait_for(
