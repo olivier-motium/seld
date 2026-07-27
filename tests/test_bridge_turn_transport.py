@@ -408,6 +408,81 @@ def test_stale_review_session_revision_is_rejected_before_answer_is_queued(
     assert transport.contexts == []
 
 
+def test_only_the_exact_guided_review_step_receives_the_larger_answer_bound(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Bridge bounded prepared answers")
+    seeded = _seed_active(vault)
+    static = tmp_path / "static"
+    static.mkdir()
+    review_answer = '"' * 23_500
+
+    with _running_bridge(vault, static, _FakeTransport()) as (base, _server):
+        status, appended = _post(
+            base,
+            "/api/v1/control",
+            {
+                "choice": review_answer,
+                "expected_revision": EMPTY_REVISION,
+                "kind": "correction",
+                "subject": f"record:task/{seeded['session'].identifier}",
+                "target_revision": seeded["session"].revision,
+            },
+        )
+
+    assert status == HTTPStatus.CREATED
+    assert appended["event"]["choice"] == review_answer
+
+    non_correction = Vault(tmp_path / "non-correction-vault")
+    non_correction.initialize(name="Non-correction control bound")
+    _seed_active(non_correction)
+    non_correction_static = tmp_path / "non-correction-static"
+    non_correction_static.mkdir()
+    operation_id = "11111111-1111-4111-8111-111111111111"
+    with (
+        _running_bridge(non_correction, non_correction_static, _FakeTransport()) as (base, _server),
+        pytest.raises(HTTPError) as non_correction_rejected,
+    ):
+        _post(
+            base,
+            "/api/v1/control",
+            {
+                "choice": review_answer,
+                "expected_revision": EMPTY_REVISION,
+                "kind": "approval",
+                "subject": f"operation:{operation_id}",
+            },
+        )
+
+    assert non_correction_rejected.value.code == HTTPStatus.BAD_REQUEST
+    assert "size bound" in json.loads(non_correction_rejected.value.read())["error"]
+    assert ControlQueue(non_correction.root).snapshot().revision == EMPTY_REVISION
+
+    ordinary = Vault(tmp_path / "ordinary-vault")
+    ordinary.initialize(name="Ordinary control bound")
+    ordinary_static = tmp_path / "ordinary-static"
+    ordinary_static.mkdir()
+    with (
+        _running_bridge(ordinary, ordinary_static, _FakeTransport()) as (base, _server),
+        pytest.raises(HTTPError) as rejected,
+    ):
+        _post(
+            base,
+            "/api/v1/control",
+            {
+                "choice": review_answer,
+                "expected_revision": EMPTY_REVISION,
+                "kind": "correction",
+                "subject": "mind:user-correction",
+            },
+        )
+
+    assert rejected.value.code == HTTPStatus.BAD_REQUEST
+    assert "size bound" in json.loads(rejected.value.read())["error"]
+    assert ControlQueue(ordinary.root).snapshot().revision == EMPTY_REVISION
+
+
 def test_review_turn_retry_reports_canonical_drift_without_replaying_queued_answer(
     tmp_path: Path,
 ) -> None:

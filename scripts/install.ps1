@@ -22,6 +22,8 @@ $Architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSA
 $Asset = "gsv-windows-$Architecture.exe"
 $Temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("gsv-install-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $Temporary | Out-Null
+$RepairRequired = $false
+$RetainedBackup = $null
 
 function Invoke-VerifiedBridgeStop {
     param([Parameter(Mandatory = $true)][string]$Executable)
@@ -57,6 +59,19 @@ function Invoke-FileReplaceWithRetry {
             if ($Attempt -eq 50) { throw }
             Start-Sleep -Milliseconds 100
         }
+    }
+}
+
+function Test-PreviousExecutableCompatibility {
+    param([Parameter(Mandatory = $true)][string]$Executable)
+
+    try {
+        $ProbeRaw = & $Target --json rollback-check $Executable 2>$null
+        if ($LASTEXITCODE -ne 0) { return $false }
+        $Probe = ($ProbeRaw | Out-String) | ConvertFrom-Json
+        return ($Probe.ok -eq $true -and $Probe.result.compatible -eq $true)
+    } catch {
+        return $false
     }
 }
 
@@ -106,10 +121,14 @@ try {
         }
         $InstalledNew = $true
         & $Target setup @args
-        if ($LASTEXITCODE -ne 0) {
+        $SetupStatus = $LASTEXITCODE
+        if ($SetupStatus -eq 4) {
+            $RepairRequired = $true
+            $RetainedBackup = $Backup
+        } elseif ($SetupStatus -ne 0) {
             throw "GSV setup failed with exit code $LASTEXITCODE."
         }
-        if ($Backup -and (Test-Path -LiteralPath $Backup)) {
+        if (-not $RepairRequired -and $Backup -and (Test-Path -LiteralPath $Backup)) {
             Remove-Item -LiteralPath $Backup -Force
         }
     } catch {
@@ -130,6 +149,9 @@ try {
         }
         if ($InstalledNew) {
             if ($Backup -and (Test-Path -LiteralPath $Backup)) {
+                if (-not (Test-PreviousExecutableCompatibility -Executable $Backup)) {
+                    throw "GSV setup failed and the previous executable could not prove it can read the current vault; no rollback was performed. The candidate remains installed and the previous executable remains staged at $Backup. Original error: $($Failure.Exception.Message)"
+                }
                 if (Test-Path -LiteralPath $Target) {
                     $FailedCandidate = Join-Path $InstallDir (".gsv.failed." + [guid]::NewGuid() + ".exe")
                     Invoke-FileReplaceWithRetry -Source $Backup -Destination $Target -Backup $FailedCandidate
@@ -156,5 +178,13 @@ try {
 }
 
 Write-Host "Installed GSV at $Target"
-Write-Host "The Bridge is ready. Run gsv anytime to reopen it."
-Write-Host "Restart Codex, open a fresh task, and ask: What do you remember?"
+if ($RepairRequired) {
+    Write-Warning "GSV and its Codex integration were installed, but the Bridge needs repair. No executable rollback was attempted."
+    if ($RetainedBackup -and (Test-Path -LiteralPath $RetainedBackup)) {
+        Write-Warning "The previous executable remains staged at $RetainedBackup."
+    }
+    Write-Warning "Run gsv --json bridge status, then retry gsv bridge open."
+    exit 4
+}
+Write-Host "GSV setup completed. Run gsv to open or verify the Bridge."
+Write-Host "Restart Codex, open one fresh task, and run `$gsv-onboard."

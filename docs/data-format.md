@@ -63,8 +63,8 @@ duplicate archive paths are rejected. Unknown format versions fail closed.
 quotes stored content and labels it as data so text in the vault is not treated
 as higher-priority instructions.
 
-`PORTFOLIO.md` is a typed authored judgment over the complete nonterminal Task
-set. Version 2 carries one exact Direction revision. Its ordered items carry an
+`PORTFOLIO.md` is a typed authored judgment over the complete nonterminal life-outcome Task
+set; the structural resident Pulse and guided-review session stay outside it. Version 2 carries one exact Direction revision. Its ordered items carry an
 exact Task revision, stance, reason, optional exact owning WorkThread revision,
 and either exact Direction aim IDs or an explicit unaligned reason. The order
 is authored priority; the kernel does not derive it from rank, age, status, due
@@ -79,12 +79,28 @@ alignment or explicit unaligned reason for every item are supplied.
 Tasks may carry an optional authored integer `rank` and one opaque
 `active_thread_id`. Rank is task truth, independent of Portfolio order. The
 active hand is execution continuity, not evidence of progress or completion;
-terminal Tasks cannot retain one.
+terminal Tasks cannot retain one. One exact hand may belong to only one
+nonterminal Task in a vault. Transfer is an explicit two-CAS sequence: clear or
+terminalize the prior owner, read it back, then bind the new owner. The kernel
+does not infer which outcome deserves the hand.
+
+Task record version 1 retains the original zero-or-one current-review-subject
+grammar. Version 2 is emitted only for a prepared set with 2–25 current subject
+refs. The new reader accepts both versions and rejects a version/shape mismatch;
+an older reader is never expected to reinterpret the expanded shape.
 
 WorkThreads carry an optional `focus_task_id` that must name one of their exact
 `task_ids`. A closed WorkThread cannot retain focus. The bounded review session
 belongs to `thread:life-portfolio-review`, which focuses that session Task while
 the review is active or paused.
+
+One structural Task may use the exact ID `resident-pulse` and exact reference
+`system-role:resident-pulse` to bind the single dedicated AI Pulse hand. It is
+transport identity, not a life outcome: Bridge commitment counts and guided
+Portfolio review exclude it even if an older authored Portfolio accidentally
+contains it. The kernel does not run cognition from that marker or infer any
+semantic change; the `$gsv-pulse` model task uses ordinary native CAS/readback
+surfaces.
 
 ## Guided review references
 
@@ -103,15 +119,18 @@ Canonical option encoding leaves only `A-Z`, `a-z`, `0-9`, `_`, `.`, `-`, and
 `~` unescaped. Every other UTF-8 byte is percent-encoded with uppercase
 hexadecimal digits.
 
-Scope appears exactly once. Subject and paused state appear at most once.
-Options name the exact current subject Task and use one of `keep`, `act-next`,
-`defer`, `reprioritize`, `reshape`,
+Scope appears exactly once. Paused state appears at most once. A nonterminal
+session may name at most 25 distinct current subjects. Legacy option references
+are allowed only when there is exactly one current subject; prepared
+multi-subject questions and recommendations are transient and never enter the
+Task record. Options name that exact single subject Task and use one of `keep`,
+`act-next`, `defer`, `reprioritize`, `reshape`,
 `drop-or-merge`, or `skip`, at most once each. A current subject may carry at
 most five options. Their one-line consequence text is an agent-authored,
 standalone answer of at most 200 characters for the exact subject. Invisible
 format controls and duplicate case-insensitive answers are rejected. Bridge
 decodes and queues that exact visible answer but never supplies meaning or a
-hidden payload. Replacing a subject also replaces its option refs.
+hidden payload. Replacing a legacy subject also replaces its option refs.
 Coverage records the exact Task revision checked and, when the Portfolio item
 has an owning WorkThread, that exact thread revision too. Legacy unanchored
 `review-covered:task:<task-id>` refs from unreleased development builds remain
@@ -124,7 +143,14 @@ product contract. The typed Portfolio can represent a larger open set, but a
 single Task's 256 KiB record envelope cannot carry worst-case revision-aware
 coverage for all 10,000 Portfolio items. Larger guided reviews remain a
 promotion blocker until bounded checkpointing or compaction exists; they must
-not be presented as complete.
+not be presented as complete. The current intervention set is separately
+bounded to 25 subjects and a transient sheet of at most 64 KiB; those bounds do
+not raise the 512-outcome session limit.
+
+An explicit Bridge batch selection names only exact current open Task IDs and is
+not a new canonical record type. It may replace the current subject refs through
+fresh review-session CAS, but the selection alone cannot change semantic canon
+or create a `review-covered` ref.
 
 Coverage is a checked-on-these-bytes navigation fact. A Task or owning
 WorkThread revision change invalidates it; a newly open Task has no coverage and
@@ -132,6 +158,13 @@ joins the remaining set. Neither case changes Portfolio order or semantics
 mechanically. A terminal review Task retains its historical scope and coverage
 but must clear subject, paused state, and active hand; its owning WorkThread
 must clear focus.
+
+The control queue applies the same compatibility boundary to user wording.
+Version-1 generations and events retain the 4,096-byte choice limit. Only an
+exact guided-review Task correction above that limit may use event version 2,
+up to 24,000 bytes; its live generation becomes version 2 while prior canonical
+version-1 event lines and archive lineage remain unchanged. Version 2 does not
+interpret, split, summarize, or apply the answer.
 
 ## Context Pack
 

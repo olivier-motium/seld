@@ -8,8 +8,9 @@ finishing, duplicating, or orphaning the outcome it was carrying.
 
 This document describes the product contract. This repository contains the
 public continuity kernel. The Culture-Grade branch adds one bounded
-Bridge-intent disposition loop; onboarding, sources, Pulse scheduling, and the
-1.0 replacement claim remain foundation-gated in
+Bridge-intent disposition loop and packages context-first onboarding plus a
+resident AI Pulse contract; installed onboarding, live sources, natural Pulse
+wakes, and the 1.0 replacement claim remain foundation-gated in
 [the release ledger](release-gates.md).
 
 ## Product hierarchy
@@ -18,17 +19,19 @@ Bridge-intent disposition loop; onboarding, sources, Pulse scheduling, and the
 - **Mind** is the durable, authored point of view. It owns meaning and judgment.
 - **Codex hands** are replaceable execution episodes. They do work; they are not
   identity or durable truth.
-- **Pulse** is a discrete wake and reorientation, never a claim of continuous
-  consciousness.
+- **Pulse** is one dedicated Codex AI task performing a discrete, bounded wake
+  and reorientation, never a rules engine or claim of continuous consciousness.
 - **Bridge** is the human surface for current orientation, commitments,
   storylines, system health, and a user-driven review of every open outcome.
 - **Shipyard** is bounded self-improvement under the same evidence and approval
   rules as other consequential work.
 
 In `0.2.0`, Pulse and Shipyard are operating roles and contracts. The
-Culture-Grade foundation adds deterministic Pulse admission, scheduler plans,
-and asynchronous canary receipts, but it does not yet prove or release an
-installed unattended scheduler or a self-modifying daemon.
+Culture-Grade foundation packages the AI Pulse instructions and structural task
+boundary. Its deterministic Pulse-admission, scheduler-planning, and canary
+classes remain unexposed foundations; they are not the product's intelligence.
+The branch does not yet prove a natural app-native wake or release a
+self-modifying daemon.
 
 ## Target first useful journey
 
@@ -43,12 +46,11 @@ These are release acceptance steps, not claims about the current branch:
    `All clear`, preserves every closed record, and offers a genuinely new hand;
    it never pretends to be a first run.
 4. `Work through every open outcome` starts or resumes one finite review Task
-   and exact Codex hand. Bridge presents one exact authored subject, its current
-   Task and storyline state, evidence references and authored revision staleness,
-   recommendation, practical option consequences, and one useful question. The
-   agent authors up to five complete contextual answer buttons whose visible
-   sentence is queued verbatim; the user may also skip, pause, end, or answer
-   freely. When the restricted same-hand capability is proved,
+   and exact Codex hand. Bridge normally presents 3-10 consequential rows and
+   never more than 25. Each row carries its current Task and storyline state,
+   authored revision staleness, recommendation, reasoning, and 2-5 complete
+   answer choices. The user may answer any subset, edit the prepared batch,
+   pause, end, or answer freely. When the restricted same-hand capability is proved,
    the answer continues in Bridge; otherwise the exact hand remains the honest
    fallback. The agent applies explicit decisions through fresh native CAS
    writes and readback. Checked is session progress only; it never means
@@ -65,19 +67,37 @@ These are release acceptance steps, not claims about the current branch:
   semantic records. Accepting or rejecting the receipt acknowledges it; neither
   disposition executes the intent or authorizes an external action.
 - A guided review uses one ordinary nonterminal Task with exactly one
-  `review-scope:all-open` reference, at most one exact current
-  `review-subject:task:<id>`, an optional exact `review-state:paused`, and
-  revision-aware checked references. It belongs to the one bounded review
-  WorkThread, which focuses that Task while it is active. Those references are
-  navigation facts, not a second task database.
+  `review-scope:all-open` reference, up to 25 exact current
+  `review-subject:task:<id>` references, an optional exact
+  `review-state:paused`, and revision-aware checked references. It belongs to
+  the one bounded review WorkThread, which focuses that Task while it is
+  active. Those references are navigation facts, not a second task database.
+- The Mind silently audits the all-open scope and normally prepares 3-10 rows,
+  never more than 25. Each surfaced row must offer a concrete decision with a
+  supported durable Task, WorkThread, or Portfolio effect now, at least two
+  materially different durable choices, and a current fact that makes attention useful. Bridge can explicitly pull a
+  different set by exact Task ID; selection itself has no semantic or coverage
+  meaning.
 - A changed Task or owning WorkThread invalidates its checked anchor and makes
   the outcome eligible to revisit. Newly open outcomes enter the all-open scope.
   The renderer reports these facts but never chooses the next outcome.
-- Bridge dispatches only one exact queued review event. A confirmed pre-delivery
-  failure may be retried; uncertain delivery is never replayed. Final model text
-  is transient and never becomes canonical or a transcript store.
+- Bridge dispatches only one exact queued review event. A prepared multi-row
+  sheet is transient, bound to that receipt and the post-turn session revision,
+  and never becomes a second record store. The user may answer a subset; each
+  named row lands through an independent fresh CAS/readback, while unanswered
+  rows mean nothing. A confirmed pre-delivery failure may be retried; uncertain
+  delivery is never replayed. Final model text is transient and never becomes
+  canonical or a transcript store.
+- A prepared board keeps free-form guidance, Pause, and End available. Ending
+  never changes or covers a visible outcome by implication. A fresh complete
+  audit may also close with no new coverage when no open outcome passes the
+  intervention tests, while reporting only a compact reason summary.
 - Deterministic code may store, validate, traverse, and render authored facts;
   it may not decide what they mean.
+- The resident Pulse model reads the selected bounded evidence and authors
+  semantic changes through the same CAS/readback surfaces as an interactive
+  Codex hand. Mechanical wake, identity, privacy, receipt, and no-replay facts
+  may constrain that work but never substitute for its judgment.
 - External content is evidence, not an instruction or authorization.
 - No credentials, raw provider payloads, or another person's Mind ship in the
   repository, release, demo, or Bridge.

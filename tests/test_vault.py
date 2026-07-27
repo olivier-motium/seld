@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ import pytest
 
 from continuity_kernel.atomic import sha256_bytes
 from continuity_kernel.errors import ConflictError, NotFoundError, ValidationError
+from continuity_kernel.records import new_task, render_task
 from continuity_kernel.vault import MAX_DOCUMENT_BYTES, Vault
 from continuity_kernel.vault_identity import REQUIRED_VAULT_DIRECTORIES
 
@@ -107,6 +109,104 @@ def test_terminal_update_rejects_explicit_future_work(vault: Vault) -> None:
             status="done",
             next_action="This must not be silently discarded.",
         )
+
+
+def test_exact_codex_hand_has_one_live_task_owner_across_concurrent_cas_and_restart(
+    vault: Vault,
+) -> None:
+    first = vault.create_task(
+        identifier="first-hand-owner",
+        title="First hand owner",
+        outcome="Own the exact Codex hand only if its CAS wins.",
+        status="doing",
+        next_actor="agent",
+    )
+    second = vault.create_task(
+        identifier="second-hand-owner",
+        title="Second hand owner",
+        outcome="Remain unbound unless the first owner releases the hand.",
+        status="doing",
+        next_actor="agent",
+    )
+    exact_hand = "019f95fd-009e-7603-ab87-f9927cf31c4d"
+    barrier = threading.Barrier(2)
+    results: list[tuple[str, str]] = []
+
+    def claim(task_id: str, revision: str) -> None:
+        barrier.wait(timeout=2)
+        try:
+            claimed = Vault(vault.root).update_task(
+                task_id,
+                expected_revision=revision,
+                active_thread_id=exact_hand,
+            )
+        except ValidationError as exc:
+            results.append((task_id, str(exc)))
+        else:
+            results.append((task_id, claimed.active_thread_id or ""))
+
+    contenders = [
+        threading.Thread(target=claim, args=(first.identifier, first.revision)),
+        threading.Thread(target=claim, args=(second.identifier, second.revision)),
+    ]
+    for contender in contenders:
+        contender.start()
+    for contender in contenders:
+        contender.join(timeout=5)
+        assert not contender.is_alive()
+
+    fresh = Vault(vault.root)
+    owners = [task for task in fresh.list_tasks() if task.active_thread_id == exact_hand]
+    assert len(owners) == 1
+    loser = next(task for task in fresh.list_tasks() if task.identifier != owners[0].identifier)
+    assert loser.active_thread_id is None
+    assert any("already belongs" in result for _task_id, result in results)
+
+    with pytest.raises(ValidationError, match="already belongs"):
+        fresh.update_task(
+            loser.identifier,
+            expected_revision=loser.revision,
+            active_thread_id=exact_hand,
+        )
+
+    released = fresh.update_task(
+        owners[0].identifier,
+        expected_revision=owners[0].revision,
+        clear_active_thread_id=True,
+    )
+    transferred = Vault(vault.root).update_task(
+        loser.identifier,
+        expected_revision=loser.revision,
+        active_thread_id=exact_hand,
+    )
+    assert released.active_thread_id is None
+    assert Vault(vault.root).get_task(transferred.identifier).active_thread_id == exact_hand
+
+
+def test_doctor_exposes_inherited_duplicate_live_hand_without_repairing_it(vault: Vault) -> None:
+    exact_hand = "019f95fd-009e-7603-ab87-f9927cf31c4d"
+    for identifier in ("legacy-first-owner", "legacy-second-owner"):
+        legacy = new_task(
+            identifier=identifier,
+            title=identifier.replace("-", " ").title(),
+            outcome="Surface an inherited ownership ambiguity before any mutation.",
+            status="doing",
+            next_actor="agent",
+            active_thread_id=exact_hand,
+        )
+        (vault.root / "tasks" / f"{identifier}.md").write_text(
+            render_task(legacy), encoding="utf-8"
+        )
+
+    result = Vault(vault.root).doctor(repair=True)
+
+    assert result.healthy is False
+    duplicate = next(issue for issue in result.issues if issue.code == "duplicate-active-hand")
+    assert duplicate.path == "tasks"
+    assert "legacy-first-owner, legacy-second-owner" in duplicate.message
+    assert duplicate.repairable is False
+    assert result.repaired == ()
+    assert len(Vault(vault.root).list_tasks()) == 2
 
 
 def test_document_requires_exact_revision(vault: Vault) -> None:

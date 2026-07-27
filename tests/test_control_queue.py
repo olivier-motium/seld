@@ -13,6 +13,7 @@ from continuity_kernel import atomic as atomic_module
 from continuity_kernel import control_queue as control_queue_module
 from continuity_kernel.control_queue import (
     EMPTY_REVISION,
+    MAX_REVIEW_CONTROL_TEXT_BYTES,
     ControlQueue,
     ControlStorageError,
     locked_control_store,
@@ -64,6 +65,125 @@ def test_append_is_cas_protected_and_preserves_existing_events(tmp_path: Path) -
             choice="approve",
             expected_revision=EMPTY_REVISION,
         )
+
+
+def test_larger_choice_bound_is_only_available_to_task_corrections(tmp_path: Path) -> None:
+    queue = _queue(tmp_path)
+
+    with pytest.raises(ValidationError, match="review-correction only"):
+        queue.append(
+            kind="correction",
+            subject="mind:user-correction",
+            choice="x",
+            expected_revision=EMPTY_REVISION,
+            max_choice_bytes=MAX_REVIEW_CONTROL_TEXT_BYTES,
+        )
+
+
+def test_expanded_review_choice_uses_explicit_v2_without_rewriting_v1_history(
+    tmp_path: Path,
+) -> None:
+    queue = _queue(tmp_path)
+    first = queue.append(
+        kind="correction",
+        subject="record:task/review-session",
+        choice="One bounded v1 answer.",
+        expected_revision=EMPTY_REVISION,
+        max_choice_bytes=MAX_REVIEW_CONTROL_TEXT_BYTES,
+        observed_at=datetime(2026, 7, 24, 12, 0, tzinfo=UTC),
+    )
+    before_lines = queue.path.read_bytes().splitlines(keepends=True)
+    assert json.loads(before_lines[0])["schema_version"] == 1
+    assert json.loads(before_lines[1])["schema_version"] == 1
+
+    expanded_choice = "x" * 4_097
+    second = queue.append(
+        kind="correction",
+        subject="record:task/review-session",
+        choice=expanded_choice,
+        expected_revision=first.revision,
+        max_choice_bytes=MAX_REVIEW_CONTROL_TEXT_BYTES,
+        observed_at=datetime(2026, 7, 24, 12, 1, tzinfo=UTC),
+    )
+    after_lines = queue.path.read_bytes().splitlines(keepends=True)
+
+    assert json.loads(after_lines[0])["schema_version"] == 2
+    assert after_lines[1] == before_lines[1]
+    assert json.loads(after_lines[1])["schema_version"] == 1
+    assert json.loads(after_lines[2])["schema_version"] == 2
+    assert second.events[0].event_id == first.events[0].event_id
+    assert second.events[1].choice == expanded_choice
+    assert ControlQueue(queue.vault_root).snapshot() == second
+
+    with pytest.raises(ValidationError, match="size bound"):
+        queue.append(
+            kind="correction",
+            subject="record:task/review-session",
+            choice="x" * (MAX_REVIEW_CONTROL_TEXT_BYTES + 1),
+            expected_revision=second.revision,
+            max_choice_bytes=MAX_REVIEW_CONTROL_TEXT_BYTES,
+        )
+
+
+@pytest.mark.parametrize(
+    ("header_version", "event_version", "subject", "choice", "message"),
+    (
+        (1, 1, "record:task/review-session", "x" * 4_097, "size bound"),
+        (2, 2, "mind:user-correction", "x" * 4_097, "size bound"),
+        (
+            2,
+            2,
+            "record:task/review-session",
+            "short answer",
+            "without an expanded review choice",
+        ),
+        (1, 2, "record:task/review-session", "x" * 4_097, "version 1 generation"),
+        (True, 1, "record:task/review-session", "short", "unsupported version"),
+        (1.0, 1, "record:task/review-session", "short", "unsupported version"),
+        (1, True, "record:task/review-session", "short", "unsupported version"),
+        (1, 1.0, "record:task/review-session", "short", "unsupported version"),
+    ),
+)
+def test_stored_control_versions_keep_their_exact_choice_grammar(
+    tmp_path: Path,
+    header_version: object,
+    event_version: object,
+    subject: str,
+    choice: str,
+    message: str,
+) -> None:
+    queue = _queue(tmp_path)
+    queue.path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "choice": choice,
+        "created_at": "2026-07-24T12:00:00.000000Z",
+        "event_id": "00000000-0000-0000-0000-000000000000",
+        "kind": "correction",
+        "schema_version": event_version,
+        "source": "bridge",
+        "subject": subject,
+        "target_revision": None,
+    }
+    event_line = (
+        json.dumps(event, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+        + b"\n"
+    )
+    header = {
+        "disposition_head_revision": None,
+        "event_count": 1,
+        "events_digest": sha256(event_line).hexdigest(),
+        "generation": 0,
+        "opened_at": "2026-07-24T12:00:00.000000Z",
+        "previous_revision": None,
+        "record_type": "generation",
+        "schema_version": header_version,
+    }
+    queue.path.write_bytes(
+        json.dumps(header, separators=(",", ":"), sort_keys=True).encode() + b"\n" + event_line
+    )
+
+    with pytest.raises(ValidationError, match=message):
+        queue.snapshot()
 
 
 def test_locked_control_store_recovers_a_missing_internal_lock_directory(

@@ -126,8 +126,8 @@ does not roll back Codex integration or configuration.
   background action.
 - A released autonomous Pulse scheduler or self-modifying Shipyard daemon. The
   Culture-Grade foundation contains inert local-only admission and
-  scheduler-canary contracts, but has no public scheduler mutation surface;
-  installed unattended operation remains a release gate.
+  scheduler-canary contracts plus a packaged AI Pulse skill, but has no public
+  scheduler mutation surface; an installed natural wake remains a release gate.
 - Protection after the host, user account, Codex installation, or release
   signing identity is compromised.
 

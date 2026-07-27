@@ -1,6 +1,6 @@
 ---
 name: gsv-onboard
-description: Guide context-first GSV intake and verify whether the exact installed build exposes the public onboarding, source, Bridge-operation, and fresh-task continuity surfaces needed to continue safely. Use for first-time setup, interrupted setup, a new source, stale source evidence, permission drift, or deeper life context; stop at an explicit foundation gate instead of simulating unavailable readiness.
+description: Guide context-first GSV intake, selected connector setup, and registration of one resident AI Pulse task while verifying the exact installed public surfaces. Use for first-time setup, interrupted setup, a new source, stale source evidence, permission drift, Pulse repair, or deeper life context; stop at an explicit foundation gate instead of simulating unavailable readiness.
 ---
 
 # GSV onboarding
@@ -15,9 +15,10 @@ public surfaces exposed by the exact installed build.
 2. Treat absent commands or tools as absent. Do not call an internal Python
    module, edit storage by hand, use browser activity as a substitute, or claim
    that a typed foundation model is a supported product flow.
-3. In the current foundation, expect the Bridge operation loop to be public
-   while onboarding and source commands remain absent. Report any different
-   observed surface rather than relying on this skill's wording.
+3. In the current foundation, expect the Bridge operation loop, native document
+   CAS, and `$gsv-pulse` skill to be public while deterministic onboarding and
+   source-readiness commands remain absent. Report any different observed
+   surface rather than relying on this skill's wording.
 
 ## Keep these boundaries
 
@@ -41,9 +42,14 @@ outcome, exclusions, retention boundary, and action boundary before suggesting
 sources or authentication. Make every question skippable. Never request a
 password, token, financial credential, second factor, or raw private transcript.
 
-If the public onboarding mutation surface is absent, return a proposed intake
-card in the conversation and say plainly that it has not created or advanced a
-durable onboarding session.
+When the person accepts the reflected context, read `MIND.md` and propose one
+bounded owner-neutral edit. Persist it only through `gsv_document_update` with
+the exact current revision, then read it back. Keep source permissions,
+retention, interruption, and action boundaries explicit. This is accepted Mind
+context, not a fabricated onboarding-session state.
+
+If document CAS is absent, return a proposed intake card in the conversation
+and say plainly that it has not created durable context.
 
 ## Use the Bridge intent loop precisely
 
@@ -69,15 +75,43 @@ a source. The current repository contains source-state vocabulary, recipes,
 and validators, but no public `gsv source` workflow. Do not mark a source
 `ready` or claim connector support from those modules or their tests.
 
-When a later installed build exposes a documented source workflow, require its
-identity confirmation, bounded real read, Pulse-capability canary, and
-host-observed attestation. Use the exact installed help and tool schemas rather
-than inventing command syntax.
+In one batched enablement wave, help the person install or authenticate only the
+selected Codex connector plugins. The person completes credentials, OAuth, 2FA,
+legal terms, OS security prompts, and account changes personally. Then use one
+fresh Codex task to verify exposed read-only tools, confirm each account or
+workspace identity with the person, and perform one bounded real read, including
+an explicitly empty result. Record the selected source and its read/retain/
+interrupt/act boundary in accepted Mind context.
+
+Until a deterministic readiness doctor and host-observed attestation surface
+ships, describe this as task-local connector verification, not durable `ready`
+state or `fully_connected`. Tool absence in one task is not uninstall evidence.
+The resident AI Pulse may use a selected connector read-only under
+[its source-acquisition contract](../gsv-pulse/references/source-acquisition.md),
+but it must preserve stale/unknown coverage honestly.
 
 Read [Computer Use](references/computer-use.md) only when the person explicitly
 asks for interactive browser assistance. Computer Use cannot compensate for a
 missing onboarding or source interface and must remain unavailable to scheduled
 work.
+
+## Register the resident AI Pulse last
+
+After accepted context exists and the selected connector wave is complete or
+explicitly deferred, open exactly one dedicated Codex task for `$gsv-pulse`.
+Follow its [registration contract](../gsv-pulse/references/registration.md):
+bind `task:resident-pulse` to that real task UUID, prove one manual bounded wake,
+then obtain fresh approval before creating one app-native heartbeat targeting
+that same task. Inspect existing automations first and never create a duplicate.
+
+The heartbeat wakes the AI skill; it does not turn scheduler or Pulse foundation
+classes into a semantic rules engine. Deterministic code owns only structural
+identity, CAS, bounded receipts, delivery, and fail-closed recovery. The model reads
+bounded evidence and authors every judgment.
+
+Do not call continuity ready from registration alone. Read the automation back
+and observe one natural wake before saying it is usable, and keep clean-account,
+provider, cross-platform, signing, economics, and soak gates open.
 
 ## Preserve the target state contract
 
@@ -108,6 +142,7 @@ Report four separate things:
 3. installed-path evidence that passed; and
 4. unavailable, unknown, or foundation-gated capabilities.
 
-Do not claim onboarding readiness or fresh-task continuity unless their public
-interfaces and real proof exist. Read [recovery](references/recovery.md) for an
-interrupted attempt, stale evidence, or a Bridge queue problem.
+Do not claim onboarding readiness, connector readiness, autonomous continuity,
+or fresh-task continuity unless their exact public interfaces and real proof
+exist. Read [recovery](references/recovery.md) for an interrupted attempt, stale
+evidence, Pulse identity mismatch, or a Bridge queue problem.

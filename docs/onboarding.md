@@ -5,14 +5,15 @@ connector checklist. It first establishes what should become easier, which
 contexts must remain separate, what the system must never retain, and what a
 useful first result would be. Sources come after that context is understood.
 
-> **Current status:** This is the target onboarding contract, not a runnable
-> consumer setup guide. The current public CLI does not expose `gsv onboard`
-> or `gsv source` commands. The repository contains typed onboarding state,
-> source recipes, and attestation validators as foundation code; Bridge does
-> not publish, advance, or validate that state. Their
-> presence and unit tests do not prove a resumable journey, a ready source, or
-> consumer onboarding. The only operable slice described here is the bounded
-> Bridge intent and operation-disposition round trip.
+> **Current status:** The packaged `$gsv-onboard` skill can collect context,
+> persist accepted Mind context through document CAS, guide one selected
+> connector enablement wave, and register the structural resident Pulse path.
+> This is not yet a proven consumer journey. The public CLI still exposes no
+> `gsv onboard` or `gsv source` commands; typed onboarding state, source recipes,
+> attestation validators, and scheduler planners remain unexposed foundation
+> code. Bridge does not publish, advance, or validate that state. Source-tree
+> instructions and tests do not prove a resumable journey, a ready source, a
+> natural app wake, or an installed clean-account flow.
 
 ## Product principles
 
@@ -44,7 +45,7 @@ can resume without interpreting chat prose:
 | `context_synthesis` | Synthesize only accepted context and currently attested evidence, with uncertainty and provenance. |
 | `initial_orientation` | Present the first useful orientation and let the person correct it. |
 | `continuity_and_autonomy_proof` | Prove only the declared continuity and autonomy boundary. |
-| `done` | Finish only when deterministic readiness and fresh-task evidence pass. |
+| `done` | Finish only when host identity/read evidence and fresh-task verification pass. |
 
 Completion is modeled independently as `in_progress`, `waiting_user`,
 `fresh_task_required`, `blocked`, `operational_with_gaps`, `fully_connected`,
@@ -55,15 +56,17 @@ states a consumer can advance through the public CLI.
 
 ### 1. Start from supported durable state
 
-First inspect the exact installed command and MCP surfaces. If onboarding
-status, start, resume, takeover, and doctor interfaces are absent, stop at the
-foundation boundary. Do not edit onboarding Markdown directly, call an
-internal Python API, or reconstruct a journey from a transcript and present it
-as supported onboarding.
+First inspect the exact installed command, MCP, skill, and app automation
+surfaces. Use supported document CAS and operation interfaces when present. If
+onboarding status, start, resume, takeover, and doctor interfaces are absent,
+do not invent their state: continue only with the skill's explicit context,
+task-local connector, and Pulse-registration boundaries. Do not edit
+onboarding Markdown directly, call an internal Python API, or reconstruct a
+journey from a transcript and present it as supported onboarding.
 
 ### 2. Shape the first useful result
 
-The onboarding skill may still conduct a non-durable context conversation. Ask
+The onboarding skill conducts one context conversation. Ask
 one compact batch:
 
 1. What should feel easier in two weeks?
@@ -76,9 +79,11 @@ one compact batch:
    cross-source view?
 
 Mirror back the proposed contexts, outcome, exclusions, action boundary, first
-proof, sources now or later, and remaining uncertainties. Until a supported
-onboarding mutation surface ships, this conversation is a proposal only; do
-not claim that it created or advanced a durable onboarding session.
+proof, sources now or later, and remaining uncertainties. After explicit
+acceptance, write the bounded context to `MIND.md` only through its public
+document CAS surface and read it back. That creates accepted Mind context, not
+a fabricated onboarding session or readiness state. If document CAS is absent,
+the conversation remains a proposal only.
 
 ### 3. Use the implemented Bridge intent loop accurately
 
@@ -159,10 +164,13 @@ reject every proposed addition. Orientation is not external-action permission.
 ### 8. Prove continuity and autonomy separately
 
 The target product must prove fresh-task continuity and a real asynchronous
-scheduled wake while preserving the declared local, reversible boundary. The
-implemented Bridge operation round trip proves neither onboarding readiness
-nor scheduled autonomy. No public onboarding doctor exists in this foundation
-slice, so core onboarding readiness cannot currently be committed.
+app-native heartbeat waking the same dedicated Pulse task while preserving the
+declared local, reversible boundary. The model—not a deterministic scheduler
+controller—must read the frozen evidence and author any resulting semantic
+change through CAS/readback. The implemented Bridge operation round trip and
+packaged skill prove neither onboarding readiness nor natural wake autonomy.
+No public onboarding doctor exists in this foundation slice, so core onboarding
+readiness cannot currently be committed.
 
 ### 9. Report the real operating state
 
@@ -196,6 +204,7 @@ consumer-ready journey.
 
 For 1.0, onboarding will be complete only when the person has accepted the
 useful context and boundaries, the agreed proof works, every source boundary
-is explicit, deterministic readiness passes, and a fresh task resumes without
-the old transcript. Those conditions are not met by this foundation slice.
+is explicit, host-level identity and read evidence passes, the resident AI
+Pulse completes a natural wake, and a fresh task resumes without the old
+transcript. Those conditions are not met by this foundation slice.
 See [Release gates](release-gates.md) for the authoritative claim boundary.

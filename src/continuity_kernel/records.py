@@ -14,6 +14,8 @@ from continuity_kernel.atomic import sha256_bytes
 from continuity_kernel.errors import ValidationError
 
 FORMAT_VERSION: Final = 1
+TASK_FORMAT_VERSION: Final = 2
+TASK_FORMAT_VERSIONS: Final = frozenset({FORMAT_VERSION, TASK_FORMAT_VERSION})
 MAX_RECORD_BYTES: Final = 256 * 1024
 MAX_TEXT_BYTES: Final = 64 * 1024
 MAX_TITLE_LENGTH: Final = 180
@@ -40,6 +42,8 @@ THREAD_STATUSES: Final = frozenset({"active", "waiting", "dormant", "closed"})
 REVIEW_WORK_THREAD_ID: Final = "thread:life-portfolio-review"
 REVIEW_SCOPE_REF: Final = "review-scope:all-open"
 REVIEW_PAUSED_REF: Final = "review-state:paused"
+RESIDENT_PULSE_TASK_ID: Final = "resident-pulse"
+RESIDENT_PULSE_REF: Final = "system-role:resident-pulse"
 SHA256_REVISION = re.compile(r"^[0-9a-f]{64}$")
 REVIEW_SUBJECT = re.compile(r"^review-subject:task:([a-z0-9][a-z0-9-]{0,95})$")
 REVIEW_COVERED_LEGACY = re.compile(r"^review-covered:task:([a-z0-9][a-z0-9-]{0,95})$")
@@ -52,6 +56,7 @@ REVIEW_OPTION_INTENTS: Final = frozenset(
 )
 MAX_REVIEW_OPTION_LENGTH: Final = 200
 MAX_REVIEW_OPTIONS: Final = 5
+MAX_REVIEW_SUBJECTS: Final = 25
 WINDOWS_RESERVED_NAMES: Final = frozenset(
     {
         "aux",
@@ -157,6 +162,12 @@ Record = Task | Entity | WorkThread
 T = TypeVar("T", Task, Entity, WorkThread)
 
 
+def is_resident_pulse_task(task: Task) -> bool:
+    """Identify the one structural Codex Pulse hand, never an ordinary outcome."""
+
+    return task.identifier == RESIDENT_PULSE_TASK_ID and RESIDENT_PULSE_REF in task.refs
+
+
 def new_task(
     *,
     identifier: str,
@@ -257,7 +268,8 @@ def new_thread(
 
 def render_task(task: Task) -> str:
     _validate_task_state(task)
-    validate_review_references(task.refs, terminal=task.status in TERMINAL_TASK_STATUSES)
+    review = validate_review_references(task.refs, terminal=task.status in TERMINAL_TASK_STATUSES)
+    stored_version = TASK_FORMAT_VERSION if len(review.subject_task_ids) > 1 else FORMAT_VERSION
     metadata = {
         "created_at": stored_time(task.created_at, "created_at"),
         "id": task_id(task.identifier),
@@ -269,7 +281,7 @@ def render_task(task: Task) -> str:
         "refs": list(references(task.refs)),
         "status": task_status(task.status),
         "updated_at": stored_time(task.updated_at, "updated_at"),
-        "version": FORMAT_VERSION,
+        "version": stored_version,
         "waiting_on_present": task.waiting_on is not None,
     }
     return _render(
@@ -343,7 +355,12 @@ def parse_task(markdown: str) -> Task:
         revision=revision,
     )
     _validate_task_state(task)
-    validate_review_references(task.refs, terminal=task.status in TERMINAL_TASK_STATUSES)
+    review = validate_review_references(task.refs, terminal=task.status in TERMINAL_TASK_STATUSES)
+    stored_version = meta.get("version")
+    if stored_version == FORMAT_VERSION and len(review.subject_task_ids) > 1:
+        raise ValidationError("task record version 1 supports at most one current review subject")
+    if stored_version == TASK_FORMAT_VERSION and len(review.subject_task_ids) <= 1:
+        raise ValidationError("task record version 2 requires multiple current review subjects")
     return task
 
 
@@ -595,10 +612,12 @@ def parse_review_references(values: tuple[str, ...] | list[str]) -> ReviewRefere
         if value.startswith("review-"):
             malformed.append(value)
     issues: list[str] = []
-    if len(subjects) > 1:
-        issues.append("review session has more than one current subject")
+    if len(set(subjects)) != len(subjects):
+        issues.append("review session has duplicate current subjects")
+    if len(subjects) > MAX_REVIEW_SUBJECTS:
+        issues.append(f"review session has more than {MAX_REVIEW_SUBJECTS} current subjects")
     if options and len(subjects) != 1:
-        issues.append("review options require exactly one current subject")
+        issues.append("legacy review options require exactly one current subject")
     elif options and any(option.subject_task_id != subjects[0] for option in options):
         issues.append("review option subject does not match the current review subject")
     coverage_ids = [value.task_id for value in coverages]
@@ -835,8 +854,10 @@ def _parse(
         raise ValidationError("record metadata is invalid JSON") from exc
     if not isinstance(metadata, dict) or metadata.get("kind") != expected_kind:
         raise ValidationError(f"expected a {expected_kind} record")
-    if metadata.get("version") != FORMAT_VERSION:
-        raise ValidationError(f"unsupported record version: {metadata.get('version')}")
+    supported_versions = TASK_FORMAT_VERSIONS if expected_kind == "task" else {FORMAT_VERSION}
+    stored_version = metadata.get("version")
+    if type(stored_version) is not int or stored_version not in supported_versions:
+        raise ValidationError(f"unsupported record version: {stored_version}")
 
     title_index = next((index for index, line in enumerate(lines_value[1:], 1) if line), -1)
     if title_index < 0 or not lines_value[title_index].startswith("# "):

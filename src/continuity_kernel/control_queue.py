@@ -37,8 +37,16 @@ from continuity_kernel.records import format_time, stored_time
 from continuity_kernel.vault_identity import parse_vault_manifest
 
 CONTROL_SCHEMA_VERSION: Final = 1
+EXPANDED_CONTROL_SCHEMA_VERSION: Final = 2
+CONTROL_SCHEMA_VERSIONS: Final = frozenset(
+    {CONTROL_SCHEMA_VERSION, EXPANDED_CONTROL_SCHEMA_VERSION}
+)
 MAX_QUEUE_BYTES: Final = 1024 * 1024
-MAX_CONTROL_TEXT_BYTES: Final = 4096
+MAX_CONTROL_TEXT_BYTES: Final = 4_096
+# A prepared Portfolio board may carry up to 25 independently answered rows.
+# The Bridge opts into this larger bound only after proving the exact active
+# review session; ordinary correction intents retain the narrow 4 KiB limit.
+MAX_REVIEW_CONTROL_TEXT_BYTES: Final = 24_000
 MAX_EVENTS: Final = 2_000
 MAX_GENERATIONS: Final = 1_024
 MAX_VAULT_MANIFEST_BYTES: Final = 64 * 1024
@@ -154,6 +162,7 @@ class ControlSnapshot:
 
 @dataclass(frozen=True)
 class _QueueHeader:
+    schema_version: int
     generation: int
     previous_revision: str | None
     disposition_head_revision: str | None
@@ -221,11 +230,18 @@ class ControlQueue:
         target_revision: object = None,
         expected_vault_id: object = None,
         expected_root_identity: tuple[int, int] | None = None,
+        max_choice_bytes: int = MAX_CONTROL_TEXT_BYTES,
         observed_at: datetime | None = None,
     ) -> ControlSnapshot:
         clean_kind = _control_kind(kind)
         clean_subject = _subject_reference(subject, clean_kind)
-        clean_choice = _bounded_text(choice, "choice", max_bytes=MAX_CONTROL_TEXT_BYTES)
+        if max_choice_bytes not in {MAX_CONTROL_TEXT_BYTES, MAX_REVIEW_CONTROL_TEXT_BYTES}:
+            raise ValidationError("control choice bound is unsupported")
+        if max_choice_bytes == MAX_REVIEW_CONTROL_TEXT_BYTES and not (
+            clean_kind is ControlKind.CORRECTION and clean_subject.startswith("record:task/")
+        ):
+            raise ValidationError("the larger control choice bound is review-correction only")
+        clean_choice = _bounded_text(choice, "choice", max_bytes=max_choice_bytes)
         clean_target = _optional_revision(target_revision)
         clean_expected = _revision(expected_revision, "expected_revision")
         clean_vault_id = (
@@ -281,8 +297,13 @@ class ControlQueue:
         if len(events) >= MAX_EVENTS:
             raise ValidationError("control queue reached its bounded event limit")
         event_time = observed_at or datetime.now(UTC)
+        event_schema_version = (
+            EXPANDED_CONTROL_SCHEMA_VERSION
+            if len(choice.encode("utf-8")) > MAX_CONTROL_TEXT_BYTES
+            else CONTROL_SCHEMA_VERSION
+        )
         event = ControlEvent(
-            schema_version=CONTROL_SCHEMA_VERSION,
+            schema_version=event_schema_version,
             event_id=str(uuid.uuid4()),
             kind=kind,
             subject=subject,
@@ -291,6 +312,10 @@ class ControlQueue:
             created_at=format_time(event_time),
         )
         after = _encode_queue(
+            schema_version=max(
+                header.schema_version if header is not None else CONTROL_SCHEMA_VERSION,
+                event_schema_version,
+            ),
             generation=generation,
             previous_revision=header.previous_revision if header is not None else None,
             disposition_head_revision=(
@@ -399,6 +424,7 @@ class ControlQueue:
             )
         rotated_at = format_time(observed_at or datetime.now(UTC))
         after = _encode_queue(
+            schema_version=header.schema_version,
             generation=generation + 1,
             previous_revision=before_revision,
             disposition_head_revision=None,
@@ -475,6 +501,7 @@ class ControlQueue:
         if header.disposition_head_revision != clean_expected_head:
             raise ConflictError("control queue disposition head binding changed")
         after = _encode_queue(
+            schema_version=header.schema_version,
             generation=header.generation,
             previous_revision=header.previous_revision,
             disposition_head_revision=clean_new_head,
@@ -761,7 +788,11 @@ def _parse_queue_document(
         raise ValidationError("control queue generation header has an unsupported shape")
     if header_payload.get("record_type") != "generation":
         raise ValidationError("control queue generation header has an unsupported record type")
-    if header_payload.get("schema_version") != CONTROL_SCHEMA_VERSION:
+    header_schema_version = header_payload.get("schema_version")
+    if (
+        type(header_schema_version) is not int
+        or header_schema_version not in CONTROL_SCHEMA_VERSIONS
+    ):
         raise ValidationError("control queue generation header has an unsupported version")
     generation = header_payload.get("generation")
     if (
@@ -804,6 +835,7 @@ def _parse_queue_document(
         raise ValidationError("control queue event digest does not match its stored events")
 
     header = _QueueHeader(
+        schema_version=header_schema_version,
         generation=generation,
         previous_revision=previous,
         disposition_head_revision=disposition_head_revision,
@@ -828,7 +860,11 @@ def _parse_queue_document(
             "target_revision",
         }:
             raise ValidationError(f"control queue event {number} has an unsupported shape")
-        if payload["schema_version"] != CONTROL_SCHEMA_VERSION:
+        event_schema_version = payload["schema_version"]
+        if (
+            type(event_schema_version) is not int
+            or event_schema_version not in CONTROL_SCHEMA_VERSIONS
+        ):
             raise ValidationError(f"control queue event {number} has an unsupported version")
         if payload["source"] != "bridge":
             raise ValidationError(f"control queue event {number} has an unsupported source")
@@ -846,34 +882,65 @@ def _parse_queue_document(
         except ValidationError as exc:
             raise ValidationError(f"control queue event {number} has an invalid timestamp") from exc
         kind = _control_kind(payload["kind"])
-        events.append(
-            ControlEvent(
-                schema_version=CONTROL_SCHEMA_VERSION,
-                event_id=event_id,
-                kind=kind,
-                subject=_subject_reference(payload["subject"], kind),
-                choice=_bounded_text(payload["choice"], "choice", max_bytes=MAX_CONTROL_TEXT_BYTES),
-                target_revision=_optional_revision(payload["target_revision"]),
-                created_at=created_at,
-            )
+        subject = _subject_reference(payload["subject"], kind)
+        expanded_review_event = (
+            event_schema_version == EXPANDED_CONTROL_SCHEMA_VERSION
+            and kind is ControlKind.CORRECTION
+            and subject.startswith("record:task/")
         )
+        max_choice_bytes = (
+            MAX_REVIEW_CONTROL_TEXT_BYTES if expanded_review_event else MAX_CONTROL_TEXT_BYTES
+        )
+        event = ControlEvent(
+            schema_version=event_schema_version,
+            event_id=event_id,
+            kind=kind,
+            subject=subject,
+            choice=_bounded_text(
+                payload["choice"],
+                "choice",
+                max_bytes=max_choice_bytes,
+            ),
+            target_revision=_optional_revision(payload["target_revision"]),
+            created_at=created_at,
+        )
+        if event_schema_version == EXPANDED_CONTROL_SCHEMA_VERSION and (
+            not expanded_review_event or len(event.choice.encode("utf-8")) <= MAX_CONTROL_TEXT_BYTES
+        ):
+            raise ValidationError(
+                f"control queue event {number} uses version 2 without an expanded review choice"
+            )
+        if _event_line(event) != raw:
+            raise ValidationError(f"control queue event {number} is not canonically encoded")
+        events.append(event)
         if len(events) > MAX_EVENTS:
             raise ValidationError("control queue exceeds its bounded event count")
     if len(events) != event_count:
         raise ValidationError("control queue event count does not match its header")
     if len({event.event_id for event in events}) != len(events):
         raise ValidationError("control queue contains duplicate event IDs")
+    if header_schema_version == CONTROL_SCHEMA_VERSION and any(
+        event.schema_version != CONTROL_SCHEMA_VERSION for event in events
+    ):
+        raise ValidationError("control queue version 1 generation contains a version 2 event")
     return header, tuple(events)
 
 
 def _encode_queue(
     *,
+    schema_version: int,
     generation: int,
     previous_revision: str | None,
     disposition_head_revision: str | None,
     opened_at: str,
     events: tuple[ControlEvent, ...],
 ) -> bytes:
+    if schema_version not in CONTROL_SCHEMA_VERSIONS:
+        raise ValidationError("control queue generation version is unsupported")
+    if schema_version == CONTROL_SCHEMA_VERSION and any(
+        event.schema_version != CONTROL_SCHEMA_VERSION for event in events
+    ):
+        raise ValidationError("control queue version 1 generation cannot encode version 2 events")
     if len(events) > MAX_EVENTS:
         raise ValidationError("control queue exceeds its bounded event count")
     event_bytes = b"".join(_event_line(event) for event in events)
@@ -885,7 +952,7 @@ def _encode_queue(
         "opened_at": opened_at,
         "previous_revision": previous_revision,
         "record_type": "generation",
-        "schema_version": CONTROL_SCHEMA_VERSION,
+        "schema_version": schema_version,
     }
     encoded = json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n"
     return encoded + event_bytes

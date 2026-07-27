@@ -23,6 +23,18 @@ temporary="$(mktemp -d "${TMPDIR:-/tmp}/gsv-install.XXXXXX")"
 staged=""
 backup=""
 preserve_backup=0
+previous_executable_is_compatible() {
+  previous="$1"
+  set +e
+  compatibility_output="$("$TARGET" --json rollback-check "$previous" 2>/dev/null)"
+  compatibility_code=$?
+  set -e
+  [ "$compatibility_code" -eq 0 ] || return 1
+  case "$compatibility_output" in
+    *'"ok":true'*'"compatible":true'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 cleanup() {
   rm -rf "$temporary"
   [ -z "$staged" ] || rm -f "$staged"
@@ -113,6 +125,18 @@ set +e
 "$TARGET" setup "$@"
 setup_status=$?
 set -e
+if [ "$setup_status" -eq 4 ]; then
+  if [ -n "$backup" ] && [ -e "$backup" ]; then
+    preserve_backup=1
+  fi
+  printf '\nInstalled GSV at %s, but the Bridge needs repair.\n' "$TARGET" >&2
+  printf '%s\n' "The candidate and committed Codex integration were kept; no executable rollback was attempted." >&2
+  if [ -n "$backup" ] && [ -e "$backup" ]; then
+    printf 'The previous executable remains staged at %s.\n' "$backup" >&2
+  fi
+  printf '%s\n' "Run gsv --json bridge status, then retry gsv bridge open." >&2
+  exit "$setup_status"
+fi
 if [ "$setup_status" -ne 0 ]; then
   set +e
   cleanup_output="$("$TARGET" --json bridge stop 2>/dev/null)"
@@ -134,6 +158,11 @@ if [ "$setup_status" -ne 0 ]; then
     exit "$setup_status"
   fi
   if [ -n "$backup" ] && [ -e "$backup" ]; then
+    if ! previous_executable_is_compatible "$backup"; then
+      preserve_backup=1
+      printf '%s\n' "GSV setup failed and the previous executable could not prove it can read the current vault and control ledger; no rollback was performed. The candidate remains installed and the previous executable remains staged at $backup." >&2
+      exit "$setup_status"
+    fi
     mv "$backup" "$TARGET"
   else
     rm -f "$TARGET"
@@ -155,5 +184,5 @@ case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *) printf 'Add %s to PATH to run gsv directly in future shells.\n' "$INSTALL_DIR" ;;
 esac
-printf '%s\n' "The Bridge is ready. Run gsv anytime to reopen it."
-printf '%s\n' "Restart Codex, open a fresh task, and ask: What do you remember?"
+printf '%s\n' "GSV setup completed. Run gsv to open or verify the Bridge."
+printf '%s\n' "Restart Codex, open one fresh task, and run \$gsv-onboard."

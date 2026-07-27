@@ -53,8 +53,6 @@ GUIDED_REVIEW_TOOL_NAMES: Final = frozenset(
         "gsv_portfolio_set",
         "gsv_entity_list",
         "gsv_entity_show",
-        "gsv_entity_create",
-        "gsv_entity_update",
         "gsv_thread_list",
         "gsv_thread_show",
         "gsv_thread_create",

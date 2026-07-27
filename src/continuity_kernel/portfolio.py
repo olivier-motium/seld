@@ -22,6 +22,7 @@ from continuity_kernel.records import (
     body_text,
     format_time,
     has_review_session_signal,
+    is_resident_pulse_task,
     parse_review_references,
     parse_time,
     task_id,
@@ -79,6 +80,7 @@ class ReviewInspection:
     session_task_id: str | None
     review_thread_revision: str | None
     current_subject_task_id: str | None
+    current_subject_task_ids: tuple[str, ...]
     current_coverage_task_ids: tuple[str, ...]
     revisit_task_ids: tuple[str, ...]
     uncovered_task_ids: tuple[str, ...]
@@ -419,11 +421,26 @@ def _inspect_review(
         if len(legacy_candidates) == 1:
             session = legacy_candidates[0]
 
-    excluded_session_id = session.identifier if session is not None and issue is None else None
+    # Every structural review-session task is transport state, never a life
+    # outcome. Exclude even degraded or legacy sessions so repair state cannot
+    # leak onto the decision board as another thing to review.
+    review_thread_task_ids = set(review_thread.task_ids) if review_thread is not None else set()
+    review_session_ids = {
+        task.identifier
+        for task in task_by_id.values()
+        if parse_review_references(task.refs).has_all_open_scope
+        and (
+            has_review_session_signal(task)
+            or task.identifier in review_thread_task_ids
+            or (session is not None and task.identifier == session.identifier)
+        )
+    }
     open_ids = {
         task.identifier
         for task in task_by_id.values()
-        if task.status not in TERMINAL_TASK_STATUSES and task.identifier != excluded_session_id
+        if task.status not in TERMINAL_TASK_STATUSES
+        and task.identifier not in review_session_ids
+        and not is_resident_pulse_task(task)
     }
     portfolio_order = [item.task_id for item in portfolio.items if item.task_id in open_ids]
     ordered_open = tuple((*portfolio_order, *sorted(open_ids - set(portfolio_order))))
@@ -450,6 +467,7 @@ def _inspect_review(
             session_task_id=session.identifier if session is not None else None,
             review_thread_revision=(review_thread.revision if review_thread is not None else None),
             current_subject_task_id=None,
+            current_subject_task_ids=(),
             current_coverage_task_ids=(),
             revisit_task_ids=(),
             uncovered_task_ids=ordered_open,
@@ -496,27 +514,23 @@ def _inspect_review(
             )
         )
 
-    subject_id = parsed.subject_task_ids[0] if len(parsed.subject_task_ids) == 1 else None
-    if subject_id is not None:
-        item = next((value for value in portfolio.items if value.task_id == subject_id), None)
+    subject_ids = parsed.subject_task_ids
+    for subject_id in subject_ids:
         task = task_by_id.get(subject_id)
         subject_current = bool(
-            subject_id in open_ids
-            and subject_id not in current_coverage
-            and item is not None
-            and task is not None
-            and item.task_revision == task.revision
-            and _portfolio_owner_is_current(item, owners)
+            subject_id in open_ids and subject_id not in current_coverage and task is not None
         )
         if not subject_current and issue is None:
-            issue = "review subject is absent, closed, covered, or anchored to stale truth"
+            issue = "review subject is absent, closed, or already covered on current truth"
+    current_subject_id = subject_ids[0] if len(subject_ids) == 1 else None
 
     return ReviewInspection(
         state=("paused" if parsed.paused else "active") if issue is None else "conflict",
         issue=issue,
         session_task_id=session.identifier,
         review_thread_revision=review_thread.revision,
-        current_subject_task_id=subject_id if issue is None else None,
+        current_subject_task_id=current_subject_id if issue is None else None,
+        current_subject_task_ids=subject_ids if issue is None else (),
         current_coverage_task_ids=tuple(
             identifier for identifier in ordered_open if identifier in current_coverage
         ),
@@ -571,18 +585,6 @@ def _coverage_staleness(
     ):
         return "covered task's WorkThread changed after it was checked"
     return None
-
-
-def _portfolio_owner_is_current(
-    item: PortfolioItem, owners: dict[str, tuple[WorkThread, ...]]
-) -> bool:
-    current = owners.get(item.task_id, ())
-    if len(current) > 1:
-        return False
-    owner = current[0] if current else None
-    if owner is None:
-        return item.work_thread_id is None and item.work_thread_revision is None
-    return item.work_thread_id == owner.identifier and item.work_thread_revision == owner.revision
 
 
 def _parse_item(value: object, *, format_version: int) -> PortfolioItem:

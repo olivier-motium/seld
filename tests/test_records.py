@@ -79,6 +79,100 @@ def test_task_round_trips_authored_rank_and_exact_active_hand() -> None:
     assert task.active_thread_id == "019f95fd-009e-7603-ab87-f9927cf31c4d"
 
 
+def test_task_versions_only_the_multi_subject_review_shape() -> None:
+    single = new_task(
+        identifier="single-subject-review",
+        title="Single-subject review",
+        outcome="Remain readable by the original task grammar.",
+        refs=(REVIEW_SCOPE_REF, "review-subject:task:first-outcome"),
+        observed_at=NOW,
+    )
+    multiple = new_task(
+        identifier="multi-subject-review",
+        title="Multi-subject review",
+        outcome="Carry one bounded prepared intervention set.",
+        refs=(
+            REVIEW_SCOPE_REF,
+            "review-subject:task:first-outcome",
+            "review-subject:task:second-outcome",
+        ),
+        observed_at=NOW,
+    )
+
+    single_stored = render_task(single)
+    multiple_stored = render_task(multiple)
+    assert '"version":1' in single_stored.splitlines()[0]
+    assert '"version":2' in multiple_stored.splitlines()[0]
+    assert parse_task(single_stored) == single
+    assert parse_task(multiple_stored) == multiple
+    assert (
+        '"version":1'
+        in render_entity(
+            new_entity(
+                identifier="system:record-version",
+                title="Record version",
+                entity_type="system",
+                summary="Entity grammar remains version one.",
+                observed_at=NOW,
+            )
+        ).splitlines()[0]
+    )
+    assert (
+        '"version":1'
+        in render_thread(
+            new_thread(
+                identifier="version-proof",
+                title="Version proof",
+                purpose="Keep the WorkThread grammar unchanged.",
+                summary="Only the expanded Task shape needs version two.",
+                observed_at=NOW,
+            )
+        ).splitlines()[0]
+    )
+
+
+@pytest.mark.parametrize(
+    ("stored_version", "subject_count", "message"),
+    (
+        (1, 2, "version 1 supports at most one"),
+        (2, 1, "version 2 requires multiple"),
+        (2, 26, "more than 25"),
+        (3, 2, "unsupported record version"),
+        (True, 1, "unsupported record version"),
+        (1.0, 1, "unsupported record version"),
+    ),
+)
+def test_task_version_and_review_subject_grammar_fail_closed(
+    stored_version: object,
+    subject_count: int,
+    message: str,
+) -> None:
+    refs = (
+        REVIEW_SCOPE_REF,
+        *(f"review-subject:task:outcome-{index}" for index in range(subject_count)),
+    )
+    base = new_task(
+        identifier="stored-review-version",
+        title="Stored review version",
+        outcome="Reject a version and shape mismatch.",
+        refs=(REVIEW_SCOPE_REF, "review-subject:task:seed-outcome"),
+        observed_at=NOW,
+    )
+    header, body = render_task(base).split("\n", 1)
+    metadata = json.loads(header.removeprefix("<!-- gsv:").removesuffix(" -->"))
+    metadata["version"] = stored_version
+    metadata["refs"] = list(refs)
+    malformed = (
+        "<!-- gsv:"
+        + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + " -->\n"
+        + body
+    )
+
+    with pytest.raises(ValidationError, match=message):
+        parse_task(malformed)
+
+
 @pytest.mark.parametrize(
     "reference",
     [

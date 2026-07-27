@@ -11,8 +11,11 @@
   explicit setup choices, approvals, corrections, and undo requests. A queued
   intent and its accept/reject disposition cannot author semantic canon or
   authorize an external action.
-- **Pulse** and **Shipyard** are operating roles with durable review boundaries
-  in `0.2.0`, not autonomous scheduler or self-modification services.
+- **Pulse** is one dedicated Codex task awakened by an app-native heartbeat.
+  The model reorients, reads bounded selected sources, and authors judgment.
+  It is not the deterministic `PulseController` and not a rules engine.
+- **Shipyard** is an operating role with durable review boundaries in `0.2.0`,
+  not an autonomous self-modification service.
 
 ## Kernel
 
@@ -22,18 +25,52 @@ Portfolio. `continuity_kernel.vault` owns validation, locking, atomic
 persistence, context rendering, backup, restore, and health checks. The CLI and
 dependency-free stdio MCP server are adapters over that same vault.
 
-The Culture-Grade branch also contains onboarding storage, source recipes and
-attestation validation, Pulse admission, scheduler planning, privacy screening,
-and migration modules. Unless a module is exposed through a documented public
-CLI/MCP path and proved through its installed user flow, it is foundation code,
-not a shipped capability. Bridge does not publish onboarding or host-readiness
-foundation state. Public onboarding/source mutation and validation, Pulse,
-scheduler, and migration interfaces remain unexposed.
+The Culture-Grade branch packages `gsv-onboard` and `gsv-pulse` skills over the
+existing document, Task, WorkThread, Portfolio, operation, and Bridge surfaces.
+It also contains onboarding storage, source recipes and attestation validation,
+deterministic Pulse admission, OS-scheduler planning, privacy screening, and
+migration modules. Unless a module is exposed through a documented public path
+and proved through its installed user flow, it is foundation code, not a
+shipped capability. Bridge does not publish onboarding or host-readiness
+foundation state. The onboarding/source mutation interfaces, deterministic
+Pulse controller, OS scheduler, and migration interfaces remain unexposed.
 
 Markdown in the vault is authoritative. Deterministic code may persist,
 validate, traverse, and render authored facts. It may not infer task meaning,
 priority, identity, ownership, thread membership, or completion from prose or
 activity.
+
+## Resident AI Pulse
+
+The public Pulse composition deliberately reuses ordinary GSV primitives:
+
+1. one structural `task:resident-pulse` is bound to one real Codex task UUID by
+   `system-role:resident-pulse`;
+2. one app-native `heartbeat` wakes that same Codex task on a ten-minute target
+   cadence;
+3. the `$gsv-pulse` skill freezes a bounded context and source window;
+4. the model reads selected connectors directly, treats their contents as
+   untrusted evidence, and makes the semantic judgment;
+5. justified Task, WorkThread, Entity, Direction, Portfolio, Mind, and NOW
+   changes use the existing native CAS surfaces and exact readback; and
+6. one wake may create at most one visible sustained-work Codex hand.
+
+The implemented deterministic substrate has only mechanical authority: validate
+the structural Pulse Task marker, bound its stored hand as one opaque identifier
+line, reject stale CAS, bound input, preserve content-free operation receipts,
+and prevent duplicate delivery. The skill performs the UUID comparison. Exact
+host-observed correlation with the current Codex task and a
+connector-write secret screen are still Gate 0 work, not present-tense kernel
+guarantees. It does not decide
+what matters, translate a source item into a task, rank work, curate memory, or
+write an orientation. The exact resident Pulse is the sole autonomous NOW
+writer.
+
+The structural Pulse task is transport identity, not a life outcome. Bridge
+and guided Portfolio review exclude it from commitment counts and open-outcome
+selection. Registration, one natural wake, connector use, and long-running
+reliability still require installed evidence; the packaged skill and tests do
+not close those gates. See [Resident AI Pulse](pulse.md).
 
 ## Codex integration
 
@@ -48,9 +85,19 @@ later requests cannot silently drift to a different vault.
 
 Installation is a staged transaction. Marketplace registration, plugin
 installation, and the managed `AGENTS.md` block are verified before setup
-starts the Bridge. A later setup failure rolls back only components introduced
-by that invocation. Existing or concurrently changed user components are left
-untouched.
+commits their stable ownership receipt and only then starts the Bridge. A
+pre-commit setup failure rolls back only components introduced by that
+invocation. A post-commit Bridge failure is an explicit installed repair state,
+not a trigger for substituting an older executable. Existing or concurrently
+changed user components are left untouched.
+
+Expanded persisted mechanics are versioned without encoding meaning: Task
+version 2 carries only a 2–25-subject review set, and control event/generation
+version 2 carries only an exact review correction above the version-1 4 KiB
+bound. Readers keep the version-1 grammar intact. An installer may restore a
+previous executable only after read-only status, doctor, and supported ledger
+probes prove stable identity and digest; there is no automatic semantic
+down-conversion.
 
 The macOS discovery implementation checks an explicit `GSV_CODEX`, `PATH`, and
 known Codex Desktop app bundles. Codex does not have to be on `PATH` when the
@@ -167,19 +214,35 @@ introduce a transcript database or a second task system:
    exact Direction, Task, and optional owning-WorkThread anchors.
 2. One ordinary nonterminal review-session Task belongs to exactly
    `thread:life-portfolio-review`, and that WorkThread focuses the session Task.
-   The Task carries one all-open scope, at most one exact subject, current
-   recommendation and question, and one exact Codex hand. `review-state:paused`
-   pauses that same session without clearing its subject or hand.
+   The Task carries one all-open scope, at most 25 exact current subjects, and
+   one exact Codex hand. `review-state:paused` pauses that same session without
+   clearing its subjects or hand. A legacy single-subject session may also
+   carry authored quick-option references; a prepared multi-subject session
+   keeps its questions and recommendations out of canon.
 3. Bridge projects those authored declarations. It never chooses the next Task,
    interprets an answer, derives rank from card position, or changes canon.
-   The current card includes authored Task/WorkThread state, exact evidence refs,
-   authored revision staleness, recommendation, choice consequences, and one
-   question.
+   A single-subject card may include authored Task/WorkThread state, exact
+   evidence refs, authored revision staleness, recommendation, choice
+   consequences, and one question. A prepared board comes only from a bounded
+   transient `bridge-sheet` envelope and is rendered only after deterministic
+   validation binds its exact subject set and Task anchors to the accepted
+   receipt's post-turn session revision. The agent normally surfaces 3-10 rows,
+   never more than 25, and only when each row has a concrete decision or bounded
+   Mind action now, at least two materially different durable choices, and a
+   changed fact, due point, contradiction, dependency, priority, bounded offer,
+   or grounded dissent that makes attention useful.
 4. A button or freeform answer appends one authenticated correction intent
    bound to the current review-session revision. A stale queue CAS preserves
-   the typed answer and requires a deliberate retry against the refreshed card.
-   An authored quick choice queues the exact standalone sentence shown on its
-   button; there is no hidden choice ID, payload, or different instruction.
+   the typed answer and requires a deliberate retry against the refreshed
+   board. A prepared board may submit only the answered subset in one bounded
+   intent; unanswered subjects mean nothing. **Edit batch** can explicitly pull
+   up to 25 exact open Task IDs into the next prepared set, but that selection is
+   navigation only: it changes no outcome or Portfolio judgment and adds no
+   coverage. Free-form guidance, Pause, and End remain available while a sheet
+   is prepared. Choices are keyed to the exact
+   receipt and session revision and are cleared when either changes. An
+   authored legacy quick choice queues the exact standalone sentence shown on
+   its button; there is no hidden choice ID, payload, or different instruction.
 5. When the local Codex capability check passes, the authenticated append
    creates and schedules one durable turn receipt. The browser's bounded
    review-turn endpoint is an idempotent trigger and recovery path for that
@@ -192,19 +255,24 @@ introduce a transcript database or a second task system:
    and pulses only after an actual receipt read. It says when the exact hand is
    known and makes clear that the user may leave without losing the durable
    request; it never displays a fabricated percentage or model-progress claim.
-6. The review agent reloads the operation, exact session, current subject,
-   owning WorkThread, decisive evidence, and one Portfolio inspection;
-   interprets the answer; applies only the explicit semantic decision through
-   native CAS; reads canonical truth back; then
-   accepts or rejects the receipt. Acceptance is acknowledgement, never the
+6. The review agent reloads the operation, exact session, every answered
+   subject, owning WorkThreads, decisive evidence, and one Portfolio
+   inspection; interprets each answer; applies only that row's explicit
+   semantic decision through a fresh native CAS; and reads it back before
+   moving to the next row. There is no batch transaction: a stale row fails
+   independently and must be re-prepared against current truth. The agent then
+   accepts or rejects the one receipt. Acceptance is acknowledgement, never the
    semantic write itself.
-7. Advancing replaces the exact subject and adds a revision-aware coverage ref
-   in the same fresh Task CAS. A Task or owning WorkThread change makes that
-   coverage stale and returns the outcome to the remaining scope. A newly open
-   outcome joins the scope. Checked never means resolved and never changes
-   Portfolio order mechanically.
-8. A successful turn may return one bounded final answer for transient Bridge
-   display before the browser reloads canon. The answer is never persisted.
+7. Advancing replaces the prepared subject set and adds revision-aware coverage
+   only for outcomes actually checked on current truth. Audited-but-hidden and
+   unanswered outcomes remain uncovered. A Task or owning WorkThread change
+   makes its row or coverage stale and returns the outcome to the remaining
+   scope. A newly open outcome joins the scope. Checked never means resolved
+   and never changes Portfolio order mechanically.
+8. A successful turn may return one bounded final answer plus a bounded
+   prepared sheet for transient Bridge display before the browser reloads
+   canon. Neither is persisted. A Bridge restart preserves canonical progress
+   but reports that the prepared questions must be regenerated.
    Safe pre-delivery failure may be retried. `delivery_uncertain` is terminal,
    disables replay, and offers the exact-hand link for reconciliation. When a
    terminal transport receipt still has a pending intent, Bridge also exposes
@@ -213,7 +281,14 @@ introduce a transcript database or a second task system:
 9. Ending a review clears the review WorkThread focus first, then terminalizes
    the session Task through fresh CAS as the final semantic step. The terminal
    Task retains only bounded scope and anchored coverage evidence; subject,
-   pause, hand, shadow, and future-work fields are cleared.
+   pause, hand, shadow, and future-work fields are cleared. Besides an explicit
+   End or complete anchored coverage, a fresh complete audit may close when no
+   open outcome passes all three intervention tests. That path adds no coverage
+   and returns only a compact by-reason account of the silent set.
+   The same rule applies at opening: START may return a terminal scoped session
+   without manufacturing a subject, but the deterministic verifier requires a
+   new or changed review Task owned by the review WorkThread with focus cleared
+   and no active navigation, hand, future-work fields, or added coverage.
 
 There is no transcript store, semantic queue executor, review database, or
 browser-side task policy. The same-hand transport is capability-gated: when the

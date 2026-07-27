@@ -3,6 +3,7 @@ import {
   appendControlIntent,
   controlSystemCopy,
   controlSystemStatus,
+  MAX_REVIEW_CONTROL_TEXT_BYTES,
   readReviewTurn,
   renderControlPanel,
   renderControlReviewActions,
@@ -64,6 +65,16 @@ let guidedReviewNoticeContext = null;
 let guidedReviewSendPending = false;
 let guidedReviewPollGeneration = 0;
 let guidedReviewActivePollEventId = null;
+let guidedReviewOverviewVisible = false;
+let guidedReviewPreparedFocus = 0;
+let guidedReviewPreparedBatch = {
+  drafts: new Map(),
+  editorOpen: false,
+  editorSelection: new Set(),
+  key: "",
+  picks: new Map(),
+};
+let guidedReviewPreparedRecovery = null;
 const guidedReviewRestoredPendingEvents = new Set();
 
 const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;
@@ -357,6 +368,10 @@ function renderCommitments(snapshot) {
     container.append(renderProjectionWarning(taskProjection, "work"));
   }
   container.append(renderGuidedReview(snapshot));
+  const reviewState = snapshot.portfolio?.review?.state;
+  if (["active", "paused"].includes(reviewState) && !guidedReviewOverviewVisible) {
+    return container;
+  }
   if (taskProjection.state === "complete" && snapshot.tasks.length === 0) {
     container.append(renderFirstRun(snapshot));
     return container;
@@ -389,6 +404,20 @@ function renderGuidedReview(snapshot) {
     ),
   );
   head.append(copy);
+  if (["active", "paused"].includes(review.state)) {
+    const overview = textElement(
+      "button",
+      "quiet-action guided-review-overview-toggle",
+      guidedReviewOverviewVisible ? "Return to review" : "Show all work",
+    );
+    overview.type = "button";
+    overview.setAttribute("aria-expanded", guidedReviewOverviewVisible ? "true" : "false");
+    overview.addEventListener("click", () => {
+      guidedReviewOverviewVisible = !guidedReviewOverviewVisible;
+      render();
+    });
+    head.append(overview);
+  }
   section.append(head);
   if (guidedReviewNotice) {
     const notice = element("p", "control-status guided-review-notice", {
@@ -451,6 +480,8 @@ function renderGuidedReview(snapshot) {
     );
     const delivery = renderGuidedReviewDelivery(review, snapshot.controls);
     if (delivery) empty.append(delivery);
+    const queuedRecovery = renderGuidedReviewQueuedRecovery(snapshot, review);
+    if (queuedRecovery) empty.append(queuedRecovery);
     if (
       review.state === "available" &&
       transport.enabled &&
@@ -575,6 +606,104 @@ function renderGuidedReview(snapshot) {
     section.append(card);
   }
 
+  const currentTurnReceipt = guidedReviewDelivery?.receipt || transport.event || null;
+  const preparedReceipt = currentTurnReceipt?.sheet?.length ? currentTurnReceipt : null;
+  const preparedSheet = normalizeGuidedReviewSheet(preparedReceipt?.sheet);
+  const preparedSubjects = [...(preparedReceipt?.subject_task_ids || [])].sort();
+  const sheetSubjects = preparedSheet.map((entry) => entry.task).sort();
+  const preparedSubjectsMatch = Boolean(
+    preparedSheet.length &&
+    JSON.stringify(preparedSubjects) === JSON.stringify(sheetSubjects),
+  );
+  const preparedSessionMatches = Boolean(
+    ["active", "paused"].includes(review.state) &&
+    review.session_revision &&
+    review.session_revision === preparedReceipt?.session_revision,
+  );
+  if (preparedSubjectsMatch && preparedSessionMatches) {
+    section.append(renderGuidedReviewPreparedBoard(
+      snapshot,
+      review,
+      preparedReceipt,
+      preparedSheet,
+    ));
+    if (review.state === "paused") {
+      section.append(renderGuidedReviewPausedPanel(snapshot, review));
+    }
+    const delivery = renderGuidedReviewDelivery(review, snapshot.controls);
+    if (delivery) section.append(delivery);
+    return section;
+  }
+  const retainedPreparedSetChanged = Boolean(
+    preparedSheet.length && (!preparedSubjectsMatch || !preparedSessionMatches),
+  );
+  if (retainedPreparedSetChanged && guidedReviewPreparedBatch.key) {
+    preserveGuidedReviewPreparedRecovery(preparedSheet);
+    guidedReviewPreparedBatch = {
+      drafts: new Map(),
+      editorOpen: false,
+      editorSelection: new Set(),
+      key: "",
+      picks: new Map(),
+    };
+  }
+  if (
+    retainedPreparedSetChanged ||
+    (
+      !preparedSheet.length &&
+      [
+        "canonical_state_unavailable",
+        "session_changed",
+        "subject_mismatch",
+        "turn_returned_no_answer",
+        "unavailable_after_restart",
+      ].includes(currentTurnReceipt?.sheet_state)
+    )
+  ) {
+    const unavailable = element("div", "guided-review-warning", { role: "status" });
+    const changed = retainedPreparedSetChanged || ["session_changed", "subject_mismatch"].includes(
+      currentTurnReceipt?.sheet_state,
+    );
+    unavailable.append(
+      textElement(
+        "strong",
+        "",
+        changed ? "This prepared set is no longer current" : "The prepared set is unavailable",
+      ),
+      textElement(
+        "p",
+        "",
+        currentTurnReceipt?.sheet_state === "turn_returned_no_answer"
+          ? "The exact review hand completed without a user-facing answer. GSV did not reuse output from an earlier turn; continue the same hand to prepare the current set."
+          : changed
+          ? "The review session changed after this receipt. GSV withheld the old questions and picks instead of rebinding them to the new session."
+          : "GSV does not persist model output as a hidden cache. Continue the exact review hand to prepare the current set again; the old answer will not be replayed.",
+      ),
+    );
+    const recovered = renderGuidedReviewPreparedRecovery();
+    if (recovered) unavailable.append(recovered);
+    const exactHand = retainedExactGuidedReviewHandUrl(review.hand_url);
+    if (exactHand) unavailable.append(exactHandFallback(exactHand));
+    section.append(unavailable);
+    const delivery = renderGuidedReviewDelivery(review, snapshot.controls);
+    if (delivery) section.append(delivery);
+    return section;
+  }
+  if (review.prepared && !review.pending_intent) {
+    const unavailable = element("div", "guided-review-warning", { role: "status" });
+    unavailable.append(
+      textElement("strong", "", "The prepared decisions are not available in this process"),
+      textElement(
+        "p",
+        "",
+        "GSV does not persist model output as a hidden preparation cache. Continue the exact review hand to regenerate a subject-bound board from current records.",
+      ),
+    );
+    const exactHand = retainedExactGuidedReviewHandUrl(review.hand_url);
+    if (exactHand) unavailable.append(exactHandFallback(exactHand));
+    section.append(unavailable);
+  }
+
   const delivery = renderGuidedReviewDelivery(review, snapshot.controls);
   if (delivery) {
     section.append(delivery);
@@ -617,6 +746,8 @@ function renderGuidedReview(snapshot) {
     );
     const pendingHandUrl = retainedExactGuidedReviewHandUrl(review.hand_url);
     if (pendingHandUrl) pending.append(exactHandFallback(pendingHandUrl));
+    const queuedRecovery = renderGuidedReviewQueuedRecovery(snapshot, review);
+    if (queuedRecovery) pending.append(queuedRecovery);
     if (guidedReviewDraft && !review.issue) {
       pending.append(guidedReviewDraftRecovery(
         "The review queue changed before this answer was saved. Your draft remains here; retry after the current receipt is resolved.",
@@ -627,41 +758,7 @@ function renderGuidedReview(snapshot) {
   }
 
   if (review.state === "paused") {
-    const paused = element("div", "guided-review-empty", { role: "status" });
-    paused.append(
-      textElement("strong", "", "Review paused at this exact outcome"),
-      textElement("p", "", "Resume continues the same durable session and Codex hand."),
-    );
-    if (
-      transport.enabled &&
-      transport.automatic_resume &&
-      snapshot.controls?.available &&
-      review.session_revision
-    ) {
-      const resume = textElement("button", "primary-action", "Resume review here");
-      const status = element("p", "control-status", {
-        "aria-live": "polite",
-        role: "status",
-      });
-      resume.type = "button";
-      resume.addEventListener("click", async () => {
-        const queued = await queueGuidedReviewIntent(
-          snapshot,
-          {
-            choice: "resume-guided-review",
-            kind: "correction",
-            subject: `record:task/${review.session.identifier}`,
-            target_revision: review.session_revision,
-          },
-          { handUrl: review.hand_url, status },
-        );
-        if (queued) status.textContent = "Resuming the exact review hand…";
-      });
-      paused.append(resume, status);
-    }
-    const pausedHandUrl = retainedExactGuidedReviewHandUrl(review.hand_url);
-    if (pausedHandUrl) paused.append(exactHandFallback(pausedHandUrl));
-    section.append(paused);
+    section.append(renderGuidedReviewPausedPanel(snapshot, review));
     return section;
   }
 
@@ -763,6 +860,566 @@ function renderGuidedReview(snapshot) {
   return section;
 }
 
+function normalizeGuidedReviewSheet(rawSheet) {
+  if (!Array.isArray(rawSheet) || !rawSheet.length || rawSheet.length > 25) return [];
+  const seen = new Set();
+  const entries = [];
+  for (const raw of rawSheet) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    const task = typeof raw.task === "string" ? raw.task : "";
+    const question = guidedReviewVisibleLine(raw.question);
+    const recommendation = guidedReviewVisibleLine(raw.recommendation);
+    const reasoning = guidedReviewVisibleLine(raw.reasoning, 600);
+    const dissent = guidedReviewOptionalLine(raw.dissent, 600);
+    const group = guidedReviewOptionalLine(raw.group);
+    const choices = normalizeGuidedReviewPreparedChoices(raw.choices);
+    if (
+      !/^[a-z0-9][a-z0-9-]{0,95}$/.test(task) || seen.has(task) || !question ||
+      !recommendation || !reasoning || dissent === null || group === null || !choices.length
+    ) return [];
+    seen.add(task);
+    entries.push({
+      anchor: typeof raw.anchor === "string" ? raw.anchor : "",
+      choices,
+      currentAnchor: typeof raw.current_anchor === "string" ? raw.current_anchor : "",
+      dissent,
+      group,
+      question,
+      reasoning,
+      recommendation,
+      stale: raw.stale === true,
+      task,
+    });
+  }
+  return entries;
+}
+
+function normalizeGuidedReviewPreparedChoices(rawChoices) {
+  if (!Array.isArray(rawChoices) || rawChoices.length < 2 || rawChoices.length > 5) return [];
+  const choices = [];
+  const seen = new Set();
+  let recommended = 0;
+  for (const raw of rawChoices) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    const answer = guidedReviewVisibleLine(raw.answer);
+    const effect = guidedReviewOptionalLine(raw.effect);
+    if (!answer || effect === null || typeof raw.recommended !== "boolean") return [];
+    const identity = answer.toLocaleLowerCase();
+    if (seen.has(identity)) return [];
+    seen.add(identity);
+    recommended += raw.recommended ? 1 : 0;
+    choices.push({ answer, effect, recommended: raw.recommended });
+  }
+  return recommended <= 1 ? choices : [];
+}
+
+function guidedReviewOptionalLine(value, limit = 200) {
+  if (value === undefined || value === "") return "";
+  return guidedReviewVisibleLine(value, limit) || null;
+}
+
+function guidedReviewVisibleLine(value, limit = 200) {
+  if (typeof value !== "string") return "";
+  const line = value.trim();
+  if (!line || [...line].length > limit || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(line)) return "";
+  return line;
+}
+
+function syncGuidedReviewPreparedBatch(receipt, sheet) {
+  const key = JSON.stringify([
+    receipt.event_id,
+    sheet.map((entry) => [entry.task, entry.anchor]),
+  ]);
+  if (key === guidedReviewPreparedBatch.key) return;
+  guidedReviewPreparedBatch = {
+    drafts: new Map(),
+    editorOpen: false,
+    editorSelection: new Set(sheet.map((entry) => entry.task)),
+    key,
+    picks: new Map(),
+  };
+  guidedReviewPreparedFocus = 0;
+}
+
+function preserveGuidedReviewPreparedRecovery(sheet) {
+  const recovered = sheet.flatMap((entry) => {
+    const draft = (guidedReviewPreparedBatch.drafts.get(entry.task) || "").trim();
+    const picked = guidedReviewPreparedBatch.picks.get(entry.task)?.answer || "";
+    const answer = draft || picked;
+    return answer ? [`task:${entry.task}\nUnsent answer: ${answer}`] : [];
+  });
+  if (!recovered.length) return;
+  guidedReviewPreparedRecovery = recovered.join("\n\n");
+}
+
+function renderGuidedReviewPreparedRecovery() {
+  if (!guidedReviewPreparedRecovery) return null;
+  const recovery = element("section", "guided-review-draft-recovery", { role: "status" });
+  const label = textElement(
+    "label",
+    "guided-review-label",
+    "Unsent prepared answers from the previous set",
+  );
+  const text = element("textarea", "control-input", { rows: "6" });
+  text.id = "guided-review-prepared-recovery";
+  text.readOnly = true;
+  text.value = guidedReviewPreparedRecovery;
+  label.htmlFor = text.id;
+  const dismiss = textElement("button", "quiet-action", "Dismiss recovered answers");
+  dismiss.type = "button";
+  dismiss.addEventListener("click", () => {
+    guidedReviewPreparedRecovery = null;
+    render();
+  });
+  recovery.append(
+    textElement("strong", "", "Your previous answers were not sent"),
+    textElement(
+      "p",
+      "",
+      "The review changed before the queue accepted them. GSV kept the wording below as plain recovery text and will not bind it to the refreshed set. Compare it with the current questions and choose again.",
+    ),
+    label,
+    text,
+    dismiss,
+  );
+  return recovery;
+}
+
+function restoreGuidedReviewPreparedFocus() {
+  window.queueMicrotask(() => {
+    document.querySelector('[aria-current="true"]')?.focus();
+  });
+}
+
+function restoreGuidedReviewBatchFocus(taskId) {
+  window.queueMicrotask(() => {
+    document.getElementById(`guided-review-batch-${taskId}`)?.focus();
+  });
+}
+
+function renderGuidedReviewPreparedBoard(snapshot, review, receipt, sheet) {
+  syncGuidedReviewPreparedBatch(receipt, sheet);
+  const board = element("section", "guided-review-prepared-board");
+  const tasks = new Map((snapshot.tasks || []).map((task) => [task.identifier, task]));
+  const form = element("form", "guided-review-prepared-form");
+  const head = element("div", "guided-review-prepared-head");
+  const headCopy = element("div");
+  headCopy.append(
+    textElement("p", "section-label", `${sheet.length} worked and waiting`),
+    textElement("h3", "", "Decisions that genuinely need you"),
+    textElement(
+      "p",
+      "",
+      "Answer any number. Only answered rows travel; silence about a row means nothing was decided.",
+    ),
+  );
+  const editBatch = textElement(
+    "button",
+    "quiet-action guided-review-edit-batch",
+    guidedReviewPreparedBatch.editorOpen ? "Close batch editor" : "Edit batch",
+  );
+  editBatch.type = "button";
+  editBatch.id = "guided-review-edit-batch";
+  editBatch.setAttribute("aria-expanded", guidedReviewPreparedBatch.editorOpen ? "true" : "false");
+  editBatch.addEventListener("click", () => {
+    guidedReviewPreparedBatch.editorOpen = !guidedReviewPreparedBatch.editorOpen;
+    render();
+    window.queueMicrotask(() => document.getElementById("guided-review-edit-batch")?.focus());
+  });
+  head.append(headCopy, editBatch);
+  form.append(head);
+  if (guidedReviewPreparedBatch.editorOpen) {
+    form.append(renderGuidedReviewBatchEditor(snapshot, review, form));
+  }
+  const list = element("div", "guided-review-prepared-list");
+  sheet.forEach((entry, entryIndex) => {
+    const task = tasks.get(entry.task);
+    const card = element("article", "guided-review-prepared-card");
+    card.dataset.preparedTask = entry.task;
+    card.tabIndex = entryIndex === guidedReviewPreparedFocus ? 0 : -1;
+    if (entryIndex === guidedReviewPreparedFocus) card.setAttribute("aria-current", "true");
+    if (entry.stale) card.classList.add("is-stale");
+    const heading = textElement("h4", "", task?.title || `task:${entry.task}`);
+    heading.id = `prepared-${entry.task}`;
+    card.setAttribute("aria-labelledby", heading.id);
+    const facts = element("div", "guided-review-prepared-facts");
+    if (entry.group) facts.append(textElement("span", "status-pill", entry.group));
+    if (entry.stale) {
+      facts.append(textElement("span", "guided-review-moved", "Moved since preparation"));
+    }
+    card.append(facts, heading);
+    if (task?.outcome) card.append(textElement("p", "guided-review-outcome", task.outcome));
+    card.append(
+      textElement("p", "guided-review-prepared-question", entry.question),
+      textElement("p", "guided-review-prepared-recommendation", entry.recommendation),
+      textElement("p", "guided-review-prepared-reasoning", entry.reasoning),
+    );
+    if (entry.dissent) {
+      const dissent = element("div", "guided-review-prepared-dissent");
+      dissent.append(
+        textElement("strong", "", "The Mind disagrees with you"),
+        textElement("p", "", entry.dissent),
+      );
+      card.append(dissent);
+    }
+    const choices = element("div", "guided-review-prepared-choices", {
+      "aria-label": `Prepared answers for ${task?.title || entry.task}`,
+      role: "group",
+    });
+    const picked = guidedReviewPreparedBatch.picks.get(entry.task)?.answer || "";
+    entry.choices.forEach((choice, index) => {
+      const button = element(
+        "button",
+        `guided-review-prepared-choice${choice.recommended ? " is-recommended" : ""}`
+          + `${picked === choice.answer ? " is-picked" : ""}`,
+      );
+      button.type = "button";
+      button.setAttribute("aria-pressed", picked === choice.answer ? "true" : "false");
+      button.append(
+        textElement("span", "guided-review-prepared-key", String(index + 1)),
+        textElement("span", "guided-review-prepared-answer", choice.answer),
+      );
+      if (choice.effect) {
+        button.append(textElement("span", "guided-review-prepared-effect", choice.effect));
+      }
+      button.addEventListener("click", () => {
+        guidedReviewPreparedBatch.picks.set(entry.task, {
+          answer: choice.answer,
+          effect: choice.effect,
+          stale: entry.stale,
+        });
+        guidedReviewPreparedBatch.drafts.delete(entry.task);
+        render();
+        restoreGuidedReviewPreparedFocus();
+      });
+      choices.append(button);
+    });
+    const label = textElement("label", "guided-review-prepared-own-label", "Or answer in your own words");
+    const own = element("textarea", "control-input guided-review-prepared-own", {
+      maxlength: "1000",
+      rows: "2",
+    });
+    own.id = `prepared-answer-${entry.task}`;
+    label.htmlFor = own.id;
+    own.value = guidedReviewPreparedBatch.drafts.get(entry.task) || "";
+    own.addEventListener("input", () => {
+      const answer = own.value;
+      guidedReviewPreparedBatch.drafts.set(entry.task, answer);
+      if (answer.trim()) {
+        guidedReviewPreparedBatch.picks.set(entry.task, {
+          answer: answer.trim(),
+          effect: "",
+          stale: entry.stale,
+        });
+      } else {
+        guidedReviewPreparedBatch.picks.delete(entry.task);
+      }
+      const answered = sheet.filter((item) =>
+        guidedReviewPreparedBatch.picks.has(item.task)
+      ).length;
+      status.textContent = `${answered} of ${sheet.length} answered. Unanswered rows will not be sent.`;
+    });
+    card.append(choices, label, own);
+    list.append(card);
+  });
+  const actions = element("div", "guided-review-prepared-actions");
+  const send = textElement("button", "primary-action", "Send answered decisions");
+  send.type = "submit";
+  const status = element("p", "control-status", { "aria-live": "polite", role: "status" });
+  const answered = sheet.filter((entry) => guidedReviewPreparedBatch.picks.has(entry.task)).length;
+  status.textContent = `${answered} of ${sheet.length} answered. Unanswered rows will not be sent.`;
+  actions.append(send, status);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const decisions = sheet.flatMap((entry) => {
+      const pick = guidedReviewPreparedBatch.picks.get(entry.task);
+      return pick ? [{ task: entry.task, ...pick, stale: entry.stale || pick.stale }] : [];
+    });
+    const choice = guidedReviewPreparedInstruction(decisions);
+    if (!choice) {
+      status.textContent = "Choose or write at least one answer first.";
+      return;
+    }
+    if (new TextEncoder().encode(choice).byteLength > MAX_REVIEW_CONTROL_TEXT_BYTES) {
+      status.textContent = "These answers exceed the 24,000-byte local limit. Shorten a free-form answer; nothing was sent.";
+      return;
+    }
+    await queueGuidedReviewIntent(
+      snapshot,
+      {
+        choice,
+        kind: "correction",
+        subject: `record:task/${review.session.identifier}`,
+        target_revision: review.session_revision,
+      },
+      {
+        form,
+        handUrl: review.hand_url,
+        maxBytes: MAX_REVIEW_CONTROL_TEXT_BYTES,
+        status,
+      },
+    );
+  });
+  form.addEventListener("keydown", (event) => {
+    if (event.target instanceof HTMLTextAreaElement) return;
+    if (["j", "ArrowDown", "k", "ArrowUp"].includes(event.key)) {
+      event.preventDefault();
+      const direction = ["j", "ArrowDown"].includes(event.key) ? 1 : -1;
+      guidedReviewPreparedFocus = Math.max(
+        0,
+        Math.min(sheet.length - 1, guidedReviewPreparedFocus + direction),
+      );
+      render();
+      restoreGuidedReviewPreparedFocus();
+      return;
+    }
+    const choiceNumber = Number.parseInt(event.key, 10);
+    if (choiceNumber >= 1 && choiceNumber <= 5) {
+      const focused = list.children[guidedReviewPreparedFocus];
+      const button = focused?.querySelectorAll(".guided-review-prepared-choice")[choiceNumber - 1];
+      if (button) {
+        event.preventDefault();
+        button.click();
+      }
+      return;
+    }
+    if (event.key === "Escape") {
+      const entry = sheet[guidedReviewPreparedFocus];
+      if (!entry) return;
+      event.preventDefault();
+      guidedReviewPreparedBatch.picks.delete(entry.task);
+      guidedReviewPreparedBatch.drafts.delete(entry.task);
+      render();
+      restoreGuidedReviewPreparedFocus();
+    }
+  });
+  form.append(list, actions, renderGuidedReviewPreparedSessionControls(snapshot, review, sheet, form));
+  if (review.state === "paused" || guidedReviewDeliveryBlocksInput()) {
+    setGuidedReviewControlsDisabled(form, true);
+  }
+  board.append(form);
+  return board;
+}
+
+function renderGuidedReviewBatchEditor(snapshot, review, form) {
+  const editor = element("section", "guided-review-batch-editor");
+  editor.append(
+    textElement("h4", "", "Choose the exact outcomes to prepare"),
+    textElement(
+      "p",
+      "",
+      "This only changes what the review brings forward next. Selecting an outcome does not change it, decide it, or mark it checked.",
+    ),
+  );
+  const status = element("p", "control-status", { "aria-live": "polite", role: "status" });
+  const openTasks = (snapshot.tasks || []).filter(
+    (task) => !["done", "dropped"].includes(task.status) && task.identifier !== review.session.identifier,
+  );
+  const options = element("div", "guided-review-batch-options", {
+    "aria-label": "Open outcomes available for this prepared set",
+    role: "group",
+  });
+  for (const task of openTasks) {
+    const label = element("label", "guided-review-batch-option");
+    const input = element("input");
+    input.type = "checkbox";
+    input.id = `guided-review-batch-${task.identifier}`;
+    input.checked = guidedReviewPreparedBatch.editorSelection.has(task.identifier);
+    input.addEventListener("change", () => {
+      if (input.checked && guidedReviewPreparedBatch.editorSelection.size >= 25) {
+        input.checked = false;
+        status.textContent = "One prepared set can contain at most 25 outcomes.";
+        return;
+      }
+      if (input.checked) guidedReviewPreparedBatch.editorSelection.add(task.identifier);
+      else guidedReviewPreparedBatch.editorSelection.delete(task.identifier);
+      render();
+      restoreGuidedReviewBatchFocus(task.identifier);
+    });
+    const copy = element("span");
+    copy.append(
+      textElement("strong", "", task.title),
+      textElement("span", "", task.outcome),
+    );
+    label.append(input, copy);
+    options.append(label);
+  }
+  const actions = element("div", "guided-review-batch-actions");
+  const prepare = textElement(
+    "button",
+    "primary-action",
+    `Prepare these ${guidedReviewPreparedBatch.editorSelection.size}`,
+  );
+  prepare.type = "button";
+  prepare.disabled = guidedReviewPreparedBatch.editorSelection.size === 0;
+  prepare.addEventListener("click", async () => {
+    const selected = openTasks
+      .map((task) => task.identifier)
+      .filter((identifier) => guidedReviewPreparedBatch.editorSelection.has(identifier));
+    const choice = guidedReviewEditBatchInstruction(selected);
+    if (!choice) {
+      status.textContent = "Choose at least one open outcome first.";
+      return;
+    }
+    await queueGuidedReviewIntent(
+      snapshot,
+      {
+        choice,
+        kind: "correction",
+        subject: `record:task/${review.session.identifier}`,
+        target_revision: review.session_revision,
+      },
+      {
+        conflictMessage: "The review queue changed before this batch request was saved. Your selected outcomes are still here; check the refreshed review, then retry.",
+        form,
+        handUrl: review.hand_url,
+        maxBytes: MAX_REVIEW_CONTROL_TEXT_BYTES,
+        status,
+      },
+    );
+  });
+  status.textContent = `${guidedReviewPreparedBatch.editorSelection.size} selected · 25 maximum`;
+  actions.append(prepare, status);
+  editor.append(options, actions);
+  return editor;
+}
+
+function renderGuidedReviewPausedPanel(snapshot, review) {
+  const transport = snapshot.guided_review_transport || {};
+  const paused = element("div", "guided-review-empty", { role: "status" });
+  paused.append(
+    textElement("strong", "", "Review paused at this exact set"),
+    textElement("p", "", "Resume continues the same durable session and Codex hand."),
+  );
+  if (
+    transport.enabled &&
+    transport.automatic_resume &&
+    snapshot.controls?.available &&
+    review.session_revision
+  ) {
+    const resume = textElement("button", "primary-action", "Resume review here");
+    const status = element("p", "control-status", {
+      "aria-live": "polite",
+      role: "status",
+    });
+    resume.type = "button";
+    resume.addEventListener("click", async () => {
+      const queued = await queueGuidedReviewIntent(
+        snapshot,
+        {
+          choice: "resume-guided-review",
+          kind: "correction",
+          subject: `record:task/${review.session.identifier}`,
+          target_revision: review.session_revision,
+        },
+        { handUrl: review.hand_url, status },
+      );
+      if (queued) status.textContent = "Resuming the exact review hand…";
+    });
+    paused.append(resume, status);
+  }
+  const pausedHandUrl = retainedExactGuidedReviewHandUrl(review.hand_url);
+  if (pausedHandUrl) paused.append(exactHandFallback(pausedHandUrl));
+  return paused;
+}
+
+function renderGuidedReviewPreparedSessionControls(snapshot, review, sheet, form) {
+  const controls = element("section", "guided-review-prepared-session");
+  const label = textElement("label", "guided-review-label", "Tell the Mind something about this set");
+  const input = element("textarea", "control-input", { maxlength: "4096", rows: "3" });
+  input.id = "guided-review-answer";
+  label.htmlFor = input.id;
+  input.value = guidedReviewDraft;
+  input.addEventListener("input", () => { guidedReviewDraft = input.value; });
+  const status = element("p", "control-status", { "aria-live": "polite", role: "status" });
+  const send = (choice, { clearDraft = false } = {}) => queueGuidedReviewIntent(
+    snapshot,
+    {
+      choice,
+      kind: "correction",
+      subject: `record:task/${review.session.identifier}`,
+      target_revision: review.session_revision,
+    },
+    {
+      form,
+      handUrl: review.hand_url,
+      maxBytes: MAX_REVIEW_CONTROL_TEXT_BYTES,
+      status,
+    },
+  ).then((queued) => {
+    if (queued && clearDraft) {
+      guidedReviewDraft = "";
+      input.value = "";
+    }
+    return queued;
+  });
+  const sendFreeform = textElement("button", "primary-action", "Send note and keep going");
+  sendFreeform.type = "button";
+  sendFreeform.addEventListener("click", async () => {
+    const choice = guidedReviewPreparedFreeformInstruction(guidedReviewDraft, sheet);
+    if (!choice) {
+      status.textContent = "Write a note first.";
+      input.focus();
+      return;
+    }
+    await send(choice, { clearDraft: true });
+  });
+  const sessionActions = element("div", "guided-review-session-actions", {
+    "aria-label": "Guided review session controls",
+    role: "group",
+  });
+  const pause = textElement("button", "quiet-action", "Pause here");
+  pause.type = "button";
+  pause.addEventListener("click", () => send(guidedReviewPreparedPauseInstruction(sheet)));
+  const end = textElement("button", "quiet-action", "End review");
+  end.type = "button";
+  end.addEventListener("click", () => send(guidedReviewPreparedEndInstruction(sheet)));
+  sessionActions.append(pause, end);
+  controls.append(label, input, sendFreeform, sessionActions, status);
+  return controls;
+}
+
+function guidedReviewPreparedInstruction(decisions) {
+  if (!Array.isArray(decisions) || !decisions.length) return "";
+  const rows = decisions.map((decision) => {
+    const effect = decision.effect
+      ? `\nThe consequence shown for that answer: ${decision.effect}`
+      : "";
+    const moved = decision.stale
+      ? "\nThis Task moved after preparation. Fresh-read it before applying anything, and say if the recommendation no longer holds."
+      : "";
+    return `task:${decision.task}\nMy answer: ${decision.answer}${effect}${moved}`;
+  });
+  return "For the authored review-scope:all-open session, I answered only these prepared decisions:\n\n"
+    + `${rows.join("\n\n")}\n\n`
+    + "Each answer is my explicit disposition for that one exact outcome. Any prepared outcome not named here remains undecided: do not infer, apply, or cover it. Handle each named outcome independently through fresh native CAS and readback; add current anchored coverage only after that exact disposition is durable. There is no group write: apply safe rows, retain stale or failed rows, and report each one that did not land instead of claiming the set succeeded. Then prepare the next intervention batch without repeating the opening scan.";
+}
+
+function guidedReviewEditBatchInstruction(taskIds) {
+  if (!Array.isArray(taskIds) || !taskIds.length || taskIds.length > 25) return "";
+  const rows = taskIds.map((identifier) => `task:${identifier}`).join("\n");
+  return "For the authored review-scope:all-open session, replace the prepared subject set with exactly these open outcomes:\n\n"
+    + `${rows}\n\n`
+    + "This selection is an explicit navigation request only. It is not a semantic disposition, does not change any Task, WorkThread, Direction, or Portfolio judgment, and must add no review coverage. Fresh-read every named outcome, reject any missing or terminal row, replace the subject refs through fresh review-session CAS, and prepare a new transient bridge-sheet for the safe current rows. An explicit pull may bring forward a row even when the silent intervention threshold would not have surfaced it. Every unselected or previously prepared outcome remains open and uncovered unless separately checked with me.";
+}
+
+function guidedReviewPreparedFreeformInstruction(answer, sheet) {
+  const value = typeof answer === "string" ? answer.trim() : "";
+  if (!value || !Array.isArray(sheet) || !sheet.length) return "";
+  const subjects = sheet.map((entry) => `task:${entry.task}`).join(", ");
+  return `For the current prepared review set (${subjects}), my free-form instruction is:\n${value}\n\nApply only what I explicitly said. Do not infer a decision for an unanswered row or add coverage merely because it was visible. Use fresh native CAS and readback for any justified semantic change, retain every undecided or failed row, then prepare the next useful intervention set.`;
+}
+
+function guidedReviewPreparedPauseInstruction(sheet) {
+  const subjects = sheet.map((entry) => `task:${entry.task}`).join(", ");
+  return `Pause this guided all-open review now at the current prepared set (${subjects}). Do not change or cover any outcome merely because I paused. Preserve the all-open scope, exact subject refs, current anchored coverage, review WorkThread focus, and this exact hand; add only review-state:paused through fresh review-session CAS and read it back.`;
+}
+
+function guidedReviewPreparedEndInstruction(sheet) {
+  const subjects = sheet.map((entry) => `task:${entry.task}`).join(", ");
+  return `End this guided all-open review now because I explicitly asked to stop. The current prepared set is ${subjects}. Do not change, complete, cover, or imply a decision about any outcome merely because the review ends. Through fresh CAS, first clear the review WorkThread focus, then terminalize only the bounded review-session Task and clear its subject refs, paused state, active hand, shadow refs, and future-work fields. Preserve all-open scope and existing anchored coverage as session provenance, read back the terminal state, and say plainly that unchecked outcomes remain open.`;
+}
+
 function appendReviewFact(list, label, value) {
   const fact = element("div");
   fact.append(textElement("dt", "", label), textElement("dd", "", value));
@@ -797,7 +1454,67 @@ function setGuidedReviewControlsDisabled(form, disabled) {
   form.setAttribute("aria-busy", disabled ? "true" : "false");
 }
 
-async function queueGuidedReviewIntent(snapshot, intent, { form = null, handUrl = null, status }) {
+function renderGuidedReviewQueuedRecovery(snapshot, review) {
+  if (guidedReviewDelivery?.receipt) return null;
+  const pending = review.pending_intent || review.pending_start;
+  const eventId = pending?.event_id;
+  if (!eventId) return null;
+  const transport = snapshot.guided_review_transport || {};
+  const isStart = review.pending_start?.event_id === eventId;
+  const canContinue = transport.enabled && (
+    isStart ? transport.automatic_start : transport.automatic_resume
+  );
+  if (!canContinue) return null;
+
+  const recovery = element("div", "guided-review-queued-recovery");
+  const button = textElement(
+    "button",
+    "primary-action",
+    isStart ? "Continue saved review start" : "Continue saved answer",
+  );
+  button.type = "button";
+  button.addEventListener("click", () => {
+    if (guidedReviewSendPending || guidedReviewActivePollEventId === eventId) return;
+    guidedReviewDelivery = {
+      checkedAt: null,
+      eventId,
+      handUrl: review.hand_url || null,
+      liveCheckedAt: null,
+      message: "This exact intent was already saved. GSV is continuing its existing receipt without appending or replaying it.",
+      pendingSeen: true,
+      queueRevision: snapshot.controls?.queue_revision || null,
+      resolvedAt: null,
+      startedAt: Date.now(),
+      receipt: {
+        event_id: eventId,
+        final_answer: null,
+        mode: isStart ? "start" : "resume",
+        reason_code: null,
+        retryable: false,
+        state: "pending",
+        terminal: false,
+        thread_id: review.active_thread_id || null,
+      },
+    };
+    render();
+    void continueGuidedReviewTurn(eventId, review.hand_url || null);
+  });
+  recovery.append(
+    button,
+    textElement(
+      "small",
+      "guided-review-support",
+      "Uses the already queued event ID. It does not append the answer again.",
+    ),
+  );
+  return recovery;
+}
+
+async function queueGuidedReviewIntent(
+  snapshot,
+  intent,
+  { conflictMessage = null, form = null, handUrl = null, maxBytes = 4096, status },
+) {
   if (guidedReviewSendPending) return false;
   guidedReviewSendPending = true;
   if (form) setGuidedReviewControlsDisabled(form, true);
@@ -805,7 +1522,7 @@ async function queueGuidedReviewIntent(snapshot, intent, { form = null, handUrl 
   guidedReviewNotice = "";
   guidedReviewNoticeContext = null;
   try {
-    const payload = await appendControlIntent(snapshot, bridgeToken, intent);
+    const payload = await appendControlIntent(snapshot, bridgeToken, intent, { maxBytes });
     const eventId = payload.event?.event_id;
     if (!eventId) throw new Error("The Bridge saved no exact review receipt.");
     guidedReviewDelivery = {
@@ -834,10 +1551,10 @@ async function queueGuidedReviewIntent(snapshot, intent, { form = null, handUrl 
     return true;
   } catch (error) {
     if (error.status === 409) {
-      guidedReviewNotice = "The review queue changed while you were answering. Your draft is still here; review the refreshed outcome, then retry.";
+      guidedReviewNotice = conflictMessage || "The review queue changed while you were answering. Your draft is still here; review the refreshed outcome, then retry.";
       const refreshed = await loadSnapshot({ quiet: true });
       if (!refreshed) {
-        guidedReviewNotice = "The review queue changed while you were answering. Your draft is still here; refresh current truth, then retry.";
+        guidedReviewNotice = conflictMessage || "The review queue changed while you were answering. Your draft is still here; refresh current truth, then retry.";
       }
       guidedReviewNoticeContext = guidedReviewContextFingerprint(state.snapshot);
       render();
@@ -852,8 +1569,13 @@ async function queueGuidedReviewIntent(snapshot, intent, { form = null, handUrl 
     return false;
   } finally {
     guidedReviewSendPending = false;
-    const currentForm = document.querySelector(".guided-review-form");
-    if (currentForm) setGuidedReviewControlsDisabled(currentForm, false);
+    const currentForm = document.querySelector(
+      ".guided-review-form, .guided-review-prepared-form",
+    );
+    if (currentForm) setGuidedReviewControlsDisabled(
+      currentForm,
+      guidedReviewDeliveryBlocksInput(),
+    );
   }
 }
 
@@ -1116,6 +1838,8 @@ function guidedReviewReceiptFingerprint(receipt) {
     receipt.state,
     receipt.thread_id,
     receipt.final_answer,
+    receipt.sheet,
+    receipt.subject_task_ids,
     receipt.reason_code,
     receipt.retryable,
     receipt.terminal,

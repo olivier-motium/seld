@@ -29,6 +29,7 @@ from continuity_kernel.records import (
     Record,
     Task,
     WorkThread,
+    is_resident_pulse_task,
     parse_entity,
     parse_task,
     parse_thread,
@@ -74,9 +75,10 @@ class _ObservedRecordFile:
 
 
 _NEW_MIND_PROMPT: Final = (
-    "Use $gsv-onboard to help me describe the context GSV should eventually use. First inspect "
-    "the installed GSV help and state clearly whether a durable onboarding surface exists. In "
-    "this foundation it does not: capture a proposal only, and do not claim sources are ready."
+    "Use $gsv-onboard to help me describe the context GSV should use. Persist only context I "
+    "explicitly accept through the supported Mind document CAS and read it back. This foundation "
+    "does not expose a durable OnboardingSession or readiness command: do not fabricate one or "
+    "claim any source is ready."
 )
 _NEW_HAND_PROMPT: Final = (
     "Start a new GSV hand. Read the installed GSV context and exact current records before "
@@ -89,43 +91,49 @@ _CONTROL_REVIEW_PROMPT: Final = (
     "canonical records, use provider tools, or take external action. If nothing is pending, say so."
 )
 _GUIDED_REVIEW_PROMPT: Final = (
-    "Start or resume exactly one finite all-open GSV Portfolio review. At opening, read Direction, "
-    "the complete authored Portfolio, every open Task, and relevant WorkThreads and Entities once. "
-    "On an ordinary answer, re-read only the exact session, current subject, owning WorkThread, "
-    "decisive evidence, and one current Portfolio inspection; do not repeat the opening scan or "
-    "repair unrelated drift before the next useful exchange. Use one "
-    "ordinary "
-    "nonterminal review-session Task owned only by thread:life-portfolio-review; that WorkThread "
-    "must contain and focus the session. Keep exactly one review-scope:all-open ref, at most one "
-    "review-subject:task:<id>, one exact active Codex hand, and review-state:paused only while the "
-    "user explicitly pauses. Store the raw Codex thread UUID only in active_thread_id, the GSV "
-    "WorkThread ID only in thread ownership and focus, and never add a codex-thread:* shadow ref. "
-    "A nonterminal current subject uses status=waiting, next_actor=human, a nonempty next_action "
-    "recommendation, and a nonempty waiting_on question. Present one exact authored outcome with "
-    "current Task and owning "
-    "WorkThread state, evidence and authored revision staleness, one grounded recommendation, "
-    "up to five complete standalone option consequences of at most 200 characters, each bound to "
-    "the exact current subject in its review-option ref, and one useful question. The exact "
-    "visible "
-    "consequence is the exact queued answer; never hide different "
-    "wording, IDs, defaults, or metadata behind it. Read only the exact pending Bridge "
-    "answer through gsv operation list. Interpret it yourself; apply only explicit semantic "
-    "decisions through fresh native Task and WorkThread CAS, Direction CAS when relevant, and "
-    "complete Portfolio CAS when affected, plus readback; then "
-    "acknowledge or reject the receipt with a result ref. Acceptance is acknowledgement, never the "
-    "semantic write. After an explicit answer or skip, anchor checked progress as "
-    "review-covered:task:<id>@<task-revision>, adding "
-    "|thread:<thread-id>@<thread-revision> when an owning WorkThread exists. Task or WorkThread "
-    "drift makes that coverage stale; revisit it, and include new open outcomes. Checked never "
-    "means resolved. The agent, not Bridge or Portfolio order, authors the next subject and option "
-    "consequences through fresh session CAS. On explicit pause, preserve subject, coverage, focus, "
-    "and the same hand. End only on explicit instruction or when every current open outcome has "
-    "current anchored coverage; then clear WorkThread focus first and use fresh Task CAS to "
-    "terminalize the session and clear the subject, paused state, active hand, every "
-    "codex-thread:* shadow ref, and future-work field as the final semantic step while retaining "
-    "scope and coverage evidence. "
-    "Do not infer meaning, end because of time or energy, take unapproved external action, or "
-    "create a transcript store."
+    "Start or resume one finite all-open GSV Portfolio review. At opening, read Direction, the "
+    "complete Portfolio, every open Task, and relevant WorkThreads and Entities once. Audit the "
+    "whole set silently. Surface a row only when all three intervention tests hold: there is a "
+    "concrete decision with a supported durable Task, WorkThread, or Portfolio effect available "
+    "now; at least two materially different "
+    "durable choices exist; and changed evidence, a due point, contradiction, dependency, "
+    "priority, bounded offer, or grounded dissent makes attention valuable now. Hide routine "
+    "active work, correct waits, deliberate parking, and keep/drop/skip ceremony. A normal "
+    "prepared set has 3-10 "
+    "rows and never more than 25. Audited but withheld outcomes remain uncovered; audited is not "
+    "checked with the user. An explicit Bridge batch selection may pull named open outcomes "
+    "outside that threshold, but it is navigation only and adds no semantic change or coverage. "
+    "Use one "
+    "ordinary nonterminal review-session Task owned and focused only by "
+    "thread:life-portfolio-review, one exact active Codex hand, exactly one "
+    "review-scope:all-open ref, and up to 25 review-subject:task:<id> refs naming the prepared "
+    "working set. Store the raw Codex thread UUID only in active_thread_id, the GSV WorkThread ID "
+    "only in ownership and focus, and never retain a codex-thread:* shadow ref. A nonterminal set "
+    "uses status=waiting, next_actor=human, next_action, and waiting_on; review-state:paused "
+    "exists "
+    "only on explicit pause. For every prepared outcome, fresh-read exact Task and owner truth, "
+    "author a question, recommendation, reasoning, optional dissent or group, and 2-5 complete "
+    "visible answers. End the final answer with exactly one bridge-sheet JSON envelope bound to "
+    "exactly the authored subject set and each Task's current updated_at anchor; do not persist "
+    "the "
+    "sheet as a cache. Bridge renders those words without inventing meaning. Read only the exact "
+    "pending Bridge event. Unanswered rows mean nothing. Apply each answered row independently "
+    "through fresh native Task and WorkThread CAS and complete Portfolio CAS when affected, "
+    "plus readback. There is no batch transaction: one stale or failed row cannot hide successful "
+    "rows. Add review-covered:task:<id>@<task-revision> and, for an owner, "
+    "|thread:<thread-id>@<thread-revision> only after that row's explicit disposition is "
+    "durable; checked never means resolved. Acknowledge or reject the exact receipt only after "
+    "readback; acknowledgement is not the semantic write. Preserve failed or unanswered rows and "
+    "include new open outcomes, and prepare the next intervention set without repeating the "
+    "opening scan. On explicit pause, "
+    "preserve subjects, coverage, focus, and the same hand. End explicitly, when every current "
+    "open outcome has current coverage, or when a fresh complete audit proves no outcome passes "
+    "all three intervention tests. That no-intervention path adds no coverage and gives a compact "
+    "by-reason account of what stayed silent, never a ledger dump. First clear review WorkThread "
+    "focus, then "
+    "terminalize the session and clear subjects, paused state, hand, shadow refs, and future-work "
+    "fields. Do not "
+    "infer meaning, end for time or energy, take unapproved external action, or store a transcript."
 )
 
 
@@ -178,7 +186,8 @@ def project_snapshot(
         "threads": thread_projection,
     }
     resolved_doctor = _merge_projection_doctor(resolved_doctor, projections)
-    task_records = tuple(cast(Task, item) for item in task_projection.records)
+    all_task_records = tuple(cast(Task, item) for item in task_projection.records)
+    task_records = tuple(task for task in all_task_records if not is_resident_pulse_task(task))
     thread_records = tuple(cast(WorkThread, item) for item in thread_projection.records)
     entity_records = tuple(cast(Entity, item) for item in entity_projection.records)
     tasks = []
@@ -217,7 +226,7 @@ def project_snapshot(
     )
     portfolio = _project_portfolio(
         vault,
-        tasks=task_records,
+        tasks=all_task_records,
         threads=thread_records,
         codex_ready=codex_ready,
         pending_controls=pending_controls,
@@ -318,10 +327,12 @@ def _project_portfolio(
             continue
         for task_id_value in candidate.task_ids:
             current_owners_by_task.setdefault(task_id_value, []).append(candidate)
-    projected_items = []
+    projected_items: list[dict[str, Any]] = []
     stale_count = 0
-    for position, item in enumerate(portfolio.items, 1):
+    for item in portfolio.items:
         task = task_by_id.get(item.task_id)
+        if task is not None and is_resident_pulse_task(task):
+            continue
         current_owners = tuple(
             sorted(
                 current_owners_by_task.get(item.task_id, []),
@@ -345,7 +356,7 @@ def _project_portfolio(
         projected_items.append(
             {
                 **item.__dict__,
-                "position": position,
+                "position": len(projected_items) + 1,
                 "stale": stale,
                 "task_stale": task_stale,
                 "task": record_dict(task) if task is not None else None,
@@ -369,6 +380,7 @@ def _project_portfolio(
         "pending_start": pending_start,
         "revisit_count": len(inspected_review.revisit_task_ids),
         "revisit_task_ids": list(inspected_review.revisit_task_ids),
+        "subject_task_ids": list(inspected_review.current_subject_task_ids),
         "start_target_revision": portfolio.revision,
         "start_url": start_url,
         "state": inspected_review.state,
@@ -421,6 +433,23 @@ def _project_portfolio(
         subject_id = inspected_review.current_subject_task_id
         subject_matches = [item for item in projected_items if item["task_id"] == subject_id]
         subject = dict(subject_matches[0]) if len(subject_matches) == 1 else None
+        if subject is None and subject_id is not None and (task := task_by_id.get(subject_id)):
+            current_owners = tuple(
+                sorted(
+                    current_owners_by_task.get(subject_id, []),
+                    key=lambda value: value.identifier,
+                )
+            )
+            thread = current_owners[0] if len(current_owners) == 1 else None
+            subject = {
+                "position": None,
+                "stale": False,
+                "task": record_dict(task),
+                "task_id": subject_id,
+                "task_stale": False,
+                "thread_stale": False,
+                "work_thread": record_dict(thread) if thread is not None else None,
+            }
         if subject is not None and subject.get("task") is not None:
             task_refs = [
                 ref for ref in subject["task"].get("refs", []) if not ref.startswith("review-")
@@ -454,6 +483,7 @@ def _project_portfolio(
                     and not pending_intents
                     and not pending_starts
                 ),
+                "prepared": len(inspected_review.current_subject_task_ids) > 1,
                 "hand_url": (f"codex://threads/{active_thread_id}" if active_thread_id else None),
                 "issue": issue,
                 "pending_intent": (pending_intents[0] if len(pending_intents) == 1 else None),

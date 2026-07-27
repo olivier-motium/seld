@@ -59,6 +59,8 @@ from continuity_kernel.codex_turn_transport import (
 )
 from continuity_kernel.config import data_dir
 from continuity_kernel.control_queue import (
+    MAX_CONTROL_TEXT_BYTES,
+    MAX_REVIEW_CONTROL_TEXT_BYTES,
     ControlEvent,
     ControlKind,
     ControlQueue,
@@ -80,7 +82,7 @@ from continuity_kernel.vault import Vault
 LOOPBACK_HOST: Final = "127.0.0.1"
 DEFAULT_PORT: Final = 0
 MAX_TARGET_LENGTH: Final = 4_096
-MAX_CONTROL_BODY_BYTES: Final = 16 * 1_024
+MAX_CONTROL_BODY_BYTES: Final = 160 * 1_024
 MAX_STATIC_BYTES: Final = 4 * 1024 * 1024
 MAX_STATE_BYTES: Final = 64 * 1024
 STATE_VERSION: Final = 1
@@ -308,6 +310,9 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         if context is None:
             return None
         receipt = self.turn_transport.submit(context)
+        observed = self.turn_transport.snapshot(receipt.event_id).get("event")
+        if isinstance(observed, dict) and observed.get("event_id") == receipt.event_id:
+            return cast(dict[str, Any], observed)
         return receipt.public()
 
     def _require_current_vault_identity(self) -> None:
@@ -569,8 +574,11 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 expected_vault_id=self.bridge.vault_id,
                 expected_root_identity=self.bridge.vault_root_identity,
             )
+            review_intent = False
             if pre_append_snapshot is not None:
-                _validate_guided_review_intent(payload, pre_append_snapshot, operations)
+                review_intent = _validate_guided_review_intent(
+                    payload, pre_append_snapshot, operations
+                )
             snapshot = ControlQueue(self.bridge.vault.root).append(
                 kind=payload.get("kind"),
                 subject=payload.get("subject"),
@@ -579,6 +587,13 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 target_revision=payload.get("target_revision"),
                 expected_vault_id=self.bridge.vault_id,
                 expected_root_identity=self.bridge.vault_root_identity,
+                max_choice_bytes=(
+                    MAX_REVIEW_CONTROL_TEXT_BYTES
+                    if review_intent
+                    and isinstance(payload.get("subject"), str)
+                    and cast(str, payload["subject"]).startswith("record:task/")
+                    else MAX_CONTROL_TEXT_BYTES
+                ),
             )
             event = snapshot.events[-1]
             self.bridge._require_current_vault_identity()
@@ -924,19 +939,19 @@ def _validate_guided_review_intent(
     payload: dict[str, Any],
     snapshot: dict[str, Any] | None,
     operations: OperationSnapshot,
-) -> None:
+) -> bool:
     if snapshot is None:
         raise ConflictError("guided-review state is unavailable; reload before continuing")
     subject = payload.get("subject")
     portfolio = snapshot.get("portfolio")
     if not isinstance(portfolio, dict) or not isinstance(portfolio.get("revision"), str):
         if subject != START_REVIEW_SUBJECT:
-            return
+            return False
         raise ConflictError("the complete Portfolio is unavailable; reload before continuing")
     review = portfolio.get("review")
     if not isinstance(review, dict):
         if subject != START_REVIEW_SUBJECT:
-            return
+            return False
         raise ConflictError("guided-review state changed; reload before continuing")
     if subject == START_REVIEW_SUBJECT:
         if (
@@ -955,11 +970,13 @@ def _validate_guided_review_intent(
             raise ConflictError(
                 "a guided review start is already queued; wait for its exact receipt"
             )
-        return
+        return True
     session = review.get("session")
     session_id = session.get("identifier") if isinstance(session, dict) else None
     if not isinstance(session_id, str) or subject != f"record:task/{session_id}":
-        return
+        return False
+    if payload.get("kind") != ControlKind.CORRECTION.value:
+        return False
     review_state = review.get("state")
     if review.get("issue") or review_state not in {"active", "paused"}:
         raise ConflictError("the guided review needs repair; reload current truth before answering")
@@ -979,6 +996,7 @@ def _validate_guided_review_intent(
             "an answer for this exact guided review step is already queued; "
             "wait for its disposition"
         )
+    return True
 
 
 def _guided_review_turn_context(

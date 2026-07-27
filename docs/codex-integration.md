@@ -43,12 +43,15 @@ this is an evidence switch, not a consumer release claim.
    dispositions the event. Both paths ignore user configuration, use a
    read-only shell sandbox with no approval prompts, and configure only the
    required vault-bound GSV MCP server for semantic writes. The foundation
-   profile pins `gpt-5.6-sol`, low reasoning effort, and priority service for
-   this bounded interactive review only. That exact model/tier combination is
-   source-configured but remains a provider and clean-Plus release gate.
+   requests high reasoning effort but otherwise uses the user's Codex
+   subscription defaults. A test operator may supply a validated model or
+   service-tier override through `GSV_GUIDED_REVIEW_MODEL` and
+   `GSV_GUIDED_REVIEW_SERVICE_TIER`; neither override is a consumer default or
+   proof of provider support.
 4. `GET /api/v1/review-turn?event_id=<uuid>` reports only that event. There is no
    transport-history list. The browser polls it until a terminal state, may show
-   the bounded final answer in memory, and then reloads canonical state.
+   the bounded final answer and prepared decision sheet in memory, and then
+   reloads canonical state.
 
 For START, the JSONL reader publishes a validated `thread.started` UUID into the
 content-free running receipt as soon as Codex emits it, before the first model
@@ -56,12 +59,43 @@ turn completes. Bridge may therefore expose the exact hand while the initial
 review is still working. A conflicting or malformed emitted ID remains a
 terminal no-replay failure; it never creates a replacement hand.
 
+The prepared sheet is not canon. It is accepted only when it names exactly the
+current subject set, uses current Task anchors, and is bound to the accepted
+receipt's post-turn review-session revision. The browser may submit any
+answered subset as one bounded intent. Codex applies each named row through its
+own fresh Task or owning-WorkThread CAS and readback; there is no hidden batch
+transaction, and unanswered rows mean nothing. A regenerated session revision
+invalidates every pick even when the subject IDs are unchanged. Restart keeps
+the canonical session, queue, and disposition but honestly loses the transient
+sheet and its unsubmitted picks.
+
+The Mind normally prepares 3-10 consequential interventions and never more than
+25. A row appears only when a concrete decision with a supported durable Task,
+WorkThread, or Portfolio effect is available now, at least two materially different durable choices exist, and a
+changed fact, due point, contradiction, dependency, priority, bounded offer, or
+grounded dissent makes attention useful. Bridge's Edit-batch request may name up
+to 25 exact open Task IDs outside that threshold. The coordinator treats that
+list only as navigation: it replaces the prepared subject set through session
+CAS, writes no outcome semantics, and adds no coverage. Free-form guidance,
+Pause, and End use the same exact authenticated receipt path.
+
+If the opening complete audit finds no qualifying intervention, START does not
+invent a row. Its binding turn may accept a terminal review-session result only
+when the exact scoped Task is new or changed from the opening context, belongs
+to `thread:life-portfolio-review`, that WorkThread has cleared focus, and the
+Task retains no subject, pause, active hand, shadow ref, future-work field, or
+new coverage. The final answer is then a compact by-reason account with no
+`bridge-sheet`.
+
 Triggering the same event is idempotent. A failure proven to occur before
 delivery is `failed_safe` and may be retried deliberately. Once delivery may
 have occurred, the receipt becomes `delivery_uncertain`; Bridge will not replay
-the answer and directs the person to the exact hand to reconcile it. A Bridge
-restart retains queue/disposition/canonical truth but intentionally loses the
-transient final answer.
+the answer and directs the person to the exact hand to reconcile it. Recovery
+re-binds the canonical record context and confirms that the exact event is
+still pending before any spawn. Canonical drift or an existing disposition
+fails the recovery closed; an unrelated later queue append does not strand an
+otherwise unchanged pending event. A Bridge restart retains queue/disposition/canonical truth
+but intentionally loses the transient final answer and prepared sheet.
 
 If either START process has already emitted a hand but terminates before the
 review-session Task or WorkThread is committed, the receipt retains that exact
@@ -83,6 +117,26 @@ and GSV plugin are installed. The README install link omits `path` because it
 opens a new task before a checkout or vault path can be assumed.
 
 GSV does not use a legacy launch-route fallback.
+
+## Resident Pulse task
+
+The resident Pulse uses the ordinary app-native Codex task and skill surfaces,
+not the guided-review subprocess transport and not the unexposed deterministic
+`PulseController` or scheduler planner. Registration creates exactly one
+dedicated Codex task, binds its real UUID to structural
+`task:resident-pulse`, and—after a manual proof and fresh approval—targets that
+same task with one app `heartbeat` on the ten-minute target cadence.
+
+Each wake loads `$gsv-pulse`. The model freezes a bounded context and selected
+source window, makes semantic judgments, and writes through the existing GSV
+MCP CAS/readback tools. Mechanical code can validate structural markers,
+revisions, bounds, content-free receipts, and no-replay behavior. The skill
+performs the current-task comparison; host-observed correlation and a
+connector-write privacy screen remain unproven gates. Mechanical code cannot
+decide what a message means, create work from age alone, rank the Portfolio, or author NOW.
+The structural Pulse task is excluded from Bridge commitment counts and guided
+review. A source-tree package test does not prove registration or a natural
+provider-backed wake; those remain open in the release ledger.
 
 ## Version-bounded verification
 

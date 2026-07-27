@@ -27,6 +27,7 @@ from continuity_kernel.errors import (
     ValidationError,
 )
 from continuity_kernel.migration import FoundationMigration
+from continuity_kernel.records import new_task, render_task
 from continuity_kernel.vault import BACKUP_MANIFEST, Vault
 from continuity_kernel.vault_identity import REQUIRED_VAULT_DIRECTORIES
 
@@ -106,6 +107,29 @@ def test_backup_verify_restore_and_logical_equivalence(vault: Vault, tmp_path: P
     assert restored["digest"] == vault.logical_digest()
     assert Vault(target).doctor().healthy
     assert all((target / relative).is_dir() for relative in REQUIRED_VAULT_DIRECTORIES)
+
+
+def test_restore_refuses_legacy_duplicate_live_hand_before_publication(
+    vault: Vault, tmp_path: Path
+) -> None:
+    exact_hand = "019f95fd-009e-7603-ab87-f9927cf31c4d"
+    for identifier in ("legacy-first-owner", "legacy-second-owner"):
+        task = new_task(
+            identifier=identifier,
+            title=identifier.replace("-", " ").title(),
+            outcome="Keep restored task ownership unambiguous.",
+            status="doing",
+            next_actor="agent",
+            active_thread_id=exact_hand,
+        )
+        (vault.root / "tasks" / f"{identifier}.md").write_text(render_task(task), encoding="utf-8")
+    backup = Path(vault.create_backup(tmp_path / "legacy-duplicate-hand.zip")["backup"])
+    target = tmp_path / "must-not-publish"
+
+    with pytest.raises(ValidationError, match="multiple nonterminal tasks"):
+        Vault.restore_backup(backup, target)
+
+    assert not target.exists()
 
 
 def test_tampered_backup_cannot_be_restored(vault: Vault, tmp_path: Path) -> None:

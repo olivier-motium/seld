@@ -293,7 +293,21 @@ def test_posix_reinstall_failure_restores_previous_binary(tmp_path: Path) -> Non
     install_dir = tmp_path / "bin"
     install_dir.mkdir()
     target = install_dir / "gsv"
-    old = b"#!/bin/sh\nprintf 'old binary\\n'\n"
+    old = b"""#!/bin/sh
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "status" ]; then
+  printf '{"ok":true,"result":{"digest":"stable","vault_id":"synthetic"}}\\n'
+  exit 0
+fi
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "doctor" ]; then
+  printf '{"ok":true,"result":{"healthy":true}}\\n'
+  exit 0
+fi
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "operation" ] && [ "${3:-}" = "list" ]; then
+  printf '{"ok":true,"result":{"pending":[]}}\\n'
+  exit 0
+fi
+printf 'old binary\\n'
+"""
     target.write_bytes(old)
     target.chmod(0o755)
     candidate = tmp_path / "candidate"
@@ -305,6 +319,10 @@ if [ "${1:-}" = "--version" ]; then
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
   printf '{"ok":true,"result":{"running":false,"stopped":false}}\\n'
+  exit 0
+fi
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "rollback-check" ]; then
+  printf '{"ok":true,"result":{"compatible":true}}\\n'
   exit 0
 fi
 if [ "${1:-}" = "setup" ]; then
@@ -351,6 +369,18 @@ def test_posix_failed_upgrade_restarts_previously_live_bridge(tmp_path: Path) ->
     target = install_dir / "gsv"
     restarted = tmp_path / "restarted"
     old = f"""#!/bin/sh
+if [ "${{1:-}}" = "--json" ] && [ "${{2:-}}" = "status" ]; then
+  printf '{{"ok":true,"result":{{"digest":"stable","vault_id":"synthetic"}}}}\\n'
+  exit 0
+fi
+if [ "${{1:-}}" = "--json" ] && [ "${{2:-}}" = "doctor" ]; then
+  printf '{{"ok":true,"result":{{"healthy":true}}}}\\n'
+  exit 0
+fi
+if [ "${{1:-}}" = "--json" ] && [ "${{2:-}}" = "operation" ] && [ "${{3:-}}" = "list" ]; then
+  printf '{{"ok":true,"result":{{"pending":[]}}}}\\n'
+  exit 0
+fi
 if [ "${{1:-}}" = "--json" ] && [ "${{2:-}}" = "bridge" ] && [ "${{3:-}}" = "open" ]; then
   printf 'restarted\\n' > {restarted}
   printf '{{"ok":true,"result":{{"running":true}}}}\\n'
@@ -378,6 +408,10 @@ if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; 
   else
     printf '{"ok":true,"result":{"running":false,"stopped":false}}\\n'
   fi
+  exit 0
+fi
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "rollback-check" ]; then
+  printf '{"ok":true,"result":{"compatible":true}}\\n'
   exit 0
 fi
 if [ "${1:-}" = "setup" ]; then
@@ -413,6 +447,143 @@ exit 2
     assert restarted.read_text(encoding="utf-8") == "restarted\n"
     assert stop_count.read_text(encoding="utf-8") == "2\n"
     assert not list(install_dir.glob(".gsv.*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer test")
+def test_posix_failed_upgrade_keeps_candidate_when_previous_reader_is_incompatible(
+    tmp_path: Path,
+) -> None:
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+    target = install_dir / "gsv"
+    old = b"""#!/bin/sh
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "status" ]; then
+  printf '{"ok":true,"result":{"digest":"stable","vault_id":"synthetic"}}\\n'
+  exit 0
+fi
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "doctor" ]; then
+  printf '{"ok":false,"error":"unsupported task record version 2"}\\n'
+  exit 3
+fi
+exit 2
+"""
+    target.write_bytes(old)
+    target.chmod(0o755)
+    candidate = tmp_path / "candidate"
+    candidate.write_text(
+        """#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  printf 'gsv 0.2.0\\n'
+  exit 0
+fi
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
+  printf '{"ok":true,"result":{"running":false,"stopped":false}}\\n'
+  exit 0
+fi
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "rollback-check" ]; then
+  printf '{"ok":true,"result":{"compatible":false,"reason_code":"previous_reader_probe_failed"}}\\n'
+  exit 0
+fi
+if [ "${1:-}" = "setup" ]; then
+  exit 42
+fi
+exit 2
+""",
+        encoding="utf-8",
+    )
+    candidate.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GSV_BINARY": str(candidate),
+            "GSV_BINARY_SHA256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            "GSV_BIN_DIR": str(install_dir),
+            "HOME": str(tmp_path / "home"),
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", str(ROOT / "scripts/install.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode == 42
+    assert target.read_bytes() == candidate.read_bytes()
+    backups = list(install_dir.glob(".gsv.previous.*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == old
+    assert "could not prove it can read" in result.stderr
+    assert "no rollback was performed" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer test")
+def test_posix_post_commit_bridge_failure_keeps_candidate_and_recovery_binary(
+    tmp_path: Path,
+) -> None:
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+    target = install_dir / "gsv"
+    old = b"#!/bin/sh\nprintf 'old binary\\n'\n"
+    target.write_bytes(old)
+    target.chmod(0o755)
+    compatibility_log = tmp_path / "compatibility.log"
+    candidate = tmp_path / "candidate"
+    candidate.write_text(
+        """#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  printf 'gsv 0.2.0\\n'
+  exit 0
+fi
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
+  printf '{"ok":true,"result":{"running":false,"stopped":false}}\\n'
+  exit 0
+fi
+if [ "${1:-}" = "--json" ] && [ "${2:-}" = "rollback-check" ]; then
+  printf 'unexpected\\n' > "$GSV_TEST_COMPAT"
+  exit 99
+fi
+if [ "${1:-}" = "setup" ]; then
+  printf 'Bridge repair required\\n' >&2
+  exit 4
+fi
+exit 2
+""",
+        encoding="utf-8",
+    )
+    candidate.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GSV_BINARY": str(candidate),
+            "GSV_BINARY_SHA256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            "GSV_BIN_DIR": str(install_dir),
+            "GSV_TEST_COMPAT": str(compatibility_log),
+            "HOME": str(tmp_path / "home"),
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", str(ROOT / "scripts/install.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode == 4
+    assert target.read_bytes() == candidate.read_bytes()
+    backups = list(install_dir.glob(".gsv.previous.*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == old
+    assert not compatibility_log.exists()
+    assert "Bridge needs repair" in result.stderr
+    assert "no executable rollback was attempted" in result.stderr
+    assert "The Bridge is ready" not in result.stdout
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer test")
@@ -716,15 +887,16 @@ def test_uninstallers_do_not_depend_on_jq_for_cleanup_decisions() -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell executable rollback needs Windows")
-def test_powershell_reinstall_failure_restores_previous_binary(tmp_path: Path) -> None:
+@pytest.mark.parametrize("setup_exit", (4, 42))
+def test_powershell_distinguishes_post_commit_repair_from_rollback(
+    tmp_path: Path, setup_exit: int
+) -> None:
     powershell = shutil.which("pwsh") or shutil.which("powershell")
     if powershell is None:
         pytest.skip("PowerShell is not installed on this runner")
     install_dir = tmp_path / "bin"
     install_dir.mkdir()
     target = install_dir / "gsv.exe"
-    old = b"synthetic previous executable"
-    target.write_bytes(old)
     dotnet = shutil.which("dotnet")
     if dotnet is None:
         pytest.skip("the Windows runner has no .NET SDK for the executable fixture")
@@ -748,9 +920,28 @@ def test_powershell_reinstall_failure_restores_previous_binary(tmp_path: Path) -
     source.write_text(
         r"""
 using System;
+using System.IO;
 
 public static class Candidate {
     public static int Main(string[] args) {
+        var executable = Path.GetFileName(Environment.ProcessPath ?? "");
+        var previous = executable.StartsWith(".gsv.previous.", StringComparison.OrdinalIgnoreCase);
+        if (args.Length == 3 && args[0] == "--json" && args[1] == "rollback-check") {
+            var log = Environment.GetEnvironmentVariable("GSV_TEST_COMPAT")!;
+            File.AppendAllText(log, "rollback-check\n");
+            Console.WriteLine("{\"ok\":true,\"result\":{\"compatible\":true}}");
+            return 0;
+        }
+        if (previous && args.Length == 2 && args[0] == "--json" && args[1] == "status") {
+            File.AppendAllText(Environment.GetEnvironmentVariable("GSV_TEST_COMPAT")!, "status\n");
+            Console.WriteLine("{\"ok\":true,\"result\":{\"digest\":\"stable\",\"vault_id\":\"synthetic\"}}");
+            return 0;
+        }
+        if (previous && args.Length == 2 && args[0] == "--json" && args[1] == "doctor") {
+            File.AppendAllText(Environment.GetEnvironmentVariable("GSV_TEST_COMPAT")!, "doctor\n");
+            Console.WriteLine("{\"ok\":true,\"result\":{\"healthy\":true}}");
+            return 0;
+        }
         if (args.Length == 1 && args[0] == "--version") {
             Console.WriteLine("gsv 0.2.0");
             return 0;
@@ -760,7 +951,7 @@ public static class Candidate {
             return 0;
         }
         if (args.Length >= 1 && args[0] == "setup") {
-            return 42;
+            return int.Parse(Environment.GetEnvironmentVariable("GSV_TEST_SETUP_EXIT")!);
         }
         return 2;
     }
@@ -790,6 +981,9 @@ public static class Candidate {
     )
     candidate = publish / "candidate.exe"
     assert candidate.is_file()
+    old = candidate.read_bytes()
+    target.write_bytes(old)
+    compatibility_log = tmp_path / "compatibility.log"
     fake_tools = tmp_path / "tools"
     fake_tools.mkdir()
     (fake_tools / "codex.cmd").write_text("@exit /b 0\n", encoding="ascii")
@@ -799,6 +993,8 @@ public static class Candidate {
             "GSV_BINARY": str(candidate),
             "GSV_BINARY_SHA256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
             "GSV_BIN_DIR": str(install_dir),
+            "GSV_TEST_COMPAT": str(compatibility_log),
+            "GSV_TEST_SETUP_EXIT": str(setup_exit),
             "PATH": f"{fake_tools}{os.pathsep}{environment['PATH']}",
         }
     )
@@ -812,9 +1008,16 @@ public static class Candidate {
         timeout=60,
     )
 
-    assert result.returncode != 0
+    assert result.returncode == setup_exit
     assert target.read_bytes() == old, result.stderr
-    assert not list(install_dir.glob(".gsv.*"))
+    if setup_exit == 4:
+        assert not compatibility_log.exists()
+        assert len(list(install_dir.glob(".gsv.previous.*"))) == 1
+        assert "Bridge needs repair" in result.stderr
+        assert "The Bridge is ready" not in result.stdout
+    else:
+        assert compatibility_log.read_text(encoding="utf-8").splitlines() == ["rollback-check"]
+        assert not list(install_dir.glob(".gsv.*"))
 
 
 def test_history_privacy_scan_flags_oversized_blob(

@@ -54,9 +54,16 @@ Invoke-WebRequest `
 The installer downloads the pinned platform artifact and `.sha256`, verifies
 the binary, and stages it in the target directory. On upgrade, the staged
 candidate stops only a Bridge whose authenticated live identity matches its
-owner-only receipt before replacing the old binary. If setup fails, it stops
-any candidate Bridge, restores the old binary, and best-effort restarts a
-previously live Bridge. A failed restart is reported explicitly.
+owner-only receipt before replacing the old binary. Setup commits the verified
+Codex integration receipt before starting Bridge. A later Bridge-start failure
+returns the distinct installed-repair exit status `4`, keeps the candidate and
+committed integration, preserves any previous executable as recovery evidence,
+and never prints that Bridge is ready. It does not trigger executable rollback.
+If setup fails before that commit, the installer stops any candidate
+Bridge and restores the old executable only after that exact executable proves,
+through read-only status, doctor, and supported control-ledger reads, that it
+can read the current state without drift. Otherwise the candidate remains in
+place and the previous executable is preserved as named recovery evidence.
 
 ## What setup changes
 
@@ -78,6 +85,11 @@ Only after the integration transaction commits does it ask the default browser
 to open the private Bridge session. Browser launch is best-effort: an
 `OSError` or browser error returns `browser_opened: false`, keeps setup
 committed, and prints `run gsv` as the next step.
+
+After a healthy first setup, restart Codex, open one fresh task, and run
+`$gsv-onboard`. The skill gathers context in conversation and persists only
+accepted Mind material through document CAS; this foundation does not expose a
+durable OnboardingSession or connector-readiness command.
 
 ## Verify first run
 
@@ -120,12 +132,20 @@ PID is alive but authenticated health is temporarily unavailable, upgrade
 aborts without replacing the executable or deleting the receipt; retry after
 checking `gsv bridge status` or `gsv bridge stop`.
 
-Setup is idempotent and integration rollback removes only components added by
-the failed invocation. Binary rollback restores the old executable and attempts
-to restore its prior Bridge lifecycle. If a new ownership receipt becomes
-visible but its write reports failure, first install removes only those exact
-new bytes; an upgrade restores and durability-checks the exact prior receipt.
-A concurrent or unrelated user change is left untouched.
+Setup is idempotent and pre-commit integration rollback removes only components
+added by the failed invocation. A compatible binary rollback restores the old
+executable and attempts to restore its prior Bridge lifecycle. If a new
+ownership receipt becomes visible but its write reports failure, first install
+removes only those exact new bytes; an upgrade restores and durability-checks
+the exact prior receipt. A concurrent or unrelated user change is left
+untouched.
+
+Executable rollback is not a data down-migration. Multi-subject review Tasks
+and review answers above 4 KiB use explicit version-2 stored shapes; an older
+reader must reject those shapes rather than reinterpret or truncate them. GSV
+never restores a vault snapshot merely to make an old executable start. Manual
+downgrades are unsupported unless that exact older executable first proves it
+can read the current vault and control ledger.
 
 Back up the vault before any future release that announces a format migration:
 

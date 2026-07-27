@@ -169,6 +169,13 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
 
     first = integration.install_codex(vault=vault, codex_home=home)
     generated_marketplace = Path(first.marketplace_root)
+    plugin_manifest = json.loads(
+        (generated_marketplace / "plugins/gsv/.codex-plugin/plugin.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "onboarding" in plugin_manifest["interface"]["defaultPrompt"][0].casefold()
+    assert "$gsv-onboard" in agents.read_text(encoding="utf-8")
     onboard = generated_marketplace / "plugins/gsv/skills/gsv-onboard"
     assert (onboard / "SKILL.md").is_file()
     assert (onboard / "agents/openai.yaml").is_file()
@@ -177,6 +184,12 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
         "connector-readiness.md",
         "context-intake.md",
         "recovery.md",
+    }
+    pulse = generated_marketplace / "plugins/gsv/skills/gsv-pulse"
+    assert (pulse / "SKILL.md").is_file()
+    assert {path.name for path in (pulse / "references").iterdir() if path.is_file()} == {
+        "registration.md",
+        "source-acquisition.md",
     }
     assert not (home / "AGENTS.md.gsv-backup").exists()
     second = integration.install_codex(vault=vault, codex_home=home)

@@ -30,6 +30,7 @@ from continuity_kernel.portfolio import (
 )
 from continuity_kernel.records import (
     MAX_REVIEW_OPTIONS,
+    MAX_REVIEW_SUBJECTS,
     REVIEW_PAUSED_REF,
     REVIEW_SCOPE_REF,
     REVIEW_WORK_THREAD_ID,
@@ -326,15 +327,43 @@ def test_review_options_are_bound_to_the_current_subject() -> None:
         validate_review_references((REVIEW_SCOPE_REF, stale))
 
 
-def test_review_navigation_rejects_ambiguous_subject_coverage_and_missing_scope() -> None:
-    with pytest.raises(ValidationError, match="more than one current subject"):
+def test_review_navigation_accepts_a_bounded_prepared_subject_set() -> None:
+    parsed = validate_review_references(
+        (
+            REVIEW_SCOPE_REF,
+            "review-subject:task:first-outcome",
+            "review-subject:task:second-outcome",
+        )
+    )
+    assert parsed.subject_task_ids == ("first-outcome", "second-outcome")
+
+    with pytest.raises(ValidationError, match=f"more than {MAX_REVIEW_SUBJECTS}"):
+        validate_review_references(
+            (
+                REVIEW_SCOPE_REF,
+                *(
+                    f"review-subject:task:outcome-{index}"
+                    for index in range(MAX_REVIEW_SUBJECTS + 1)
+                ),
+            )
+        )
+
+    with pytest.raises(ValidationError, match="legacy review options require exactly one"):
         validate_review_references(
             (
                 REVIEW_SCOPE_REF,
                 "review-subject:task:first-outcome",
                 "review-subject:task:second-outcome",
+                review_option_ref(
+                    intent="keep",
+                    subject_task_id="first-outcome",
+                    consequence="Keep the first outcome as authored.",
+                ),
             )
         )
+
+
+def test_review_navigation_rejects_ambiguous_coverage_and_missing_scope() -> None:
 
     with pytest.raises(ValidationError, match="conflicting coverage anchors"):
         validate_review_references(
@@ -537,7 +566,6 @@ def test_exact_coverage_reenters_after_task_or_owner_revision_changes(vault: Vau
     changed_task_reason = changed_task.coverages[0].reason
     assert changed_task_reason is not None
     assert "task changed" in changed_task_reason
-
     # Re-anchor task coverage, then prove a WorkThread-only change also revisits it.
     session = vault.update_task(
         session.identifier,
@@ -562,6 +590,42 @@ def test_exact_coverage_reenters_after_task_or_owner_revision_changes(vault: Vau
     changed_thread_reason = changed_thread.coverages[0].reason
     assert changed_thread_reason is not None
     assert "WorkThread changed" in changed_thread_reason
+
+
+def test_prepared_subject_drift_is_per_row_not_a_whole_session_conflict(vault: Vault) -> None:
+    seeded = _seed(vault)
+    session = seeded["session"]
+    assert isinstance(session, Task)
+    session = vault.update_task(
+        session.identifier,
+        expected_revision=session.revision,
+        remove_refs=tuple(
+            ref
+            for ref in session.refs
+            if ref.startswith("review-subject:") or ref.startswith("review-option:")
+        ),
+        add_refs=(
+            "review-subject:task:first-outcome",
+            "review-subject:task:second-outcome",
+        ),
+    )
+
+    prepared = vault.inspect_portfolio().review
+    assert prepared.state == "active"
+    assert prepared.current_subject_task_id is None
+    assert prepared.current_subject_task_ids == ("first-outcome", "second-outcome")
+
+    first = seeded["first"]
+    assert isinstance(first, Task)
+    vault.update_task(
+        first.identifier,
+        expected_revision=first.revision,
+        next_action="This exact row moved after the prepared judgment.",
+    )
+    moved = vault.inspect_portfolio()
+    assert moved.review.state == "active"
+    assert moved.review.current_subject_task_ids == ("first-outcome", "second-outcome")
+    assert moved.stale_portfolio_task_ids == ("first-outcome",)
 
 
 def test_no_thread_coverage_becomes_stale_when_an_owner_is_added(vault: Vault) -> None:
@@ -740,7 +804,7 @@ def test_bdac8f7_review_session_requires_and_accepts_exact_cas_migration(
     assert inspected.state == "conflict"
     assert inspected.session_task_id == session.identifier
     assert "migration" in (inspected.issue or "")
-    assert session.identifier in inspected.open_task_ids
+    assert session.identifier not in inspected.open_task_ids
     assert outcome.identifier in inspected.open_task_ids
 
     with pytest.raises(ConflictError, match="record changed"):

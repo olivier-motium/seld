@@ -74,10 +74,10 @@ def test_guided_review_deep_link_fallback_matches_installed_skill_contract() -> 
         "review-state:paused",
         "review-covered:task:<id>@<task-revision>",
         "|thread:<thread-id>@<thread-revision>",
-        "direction cas when relevant",
+        "supported durable task, workthread, or portfolio effect",
         "complete portfolio cas when affected",
         "new open outcomes",
-        "active hand",
+        "active codex hand",
         "workthread focus",
         "raw codex thread uuid",
         "active_thread_id",
@@ -390,9 +390,11 @@ def test_snapshot_projects_one_exact_guided_review_subject_without_inference(
     assert checked["checked_count"] == 1
     assert checked["checked_current_count"] == 1
     assert vault.get_task(first.identifier).status == "ready"
-    assert checked["state"] == "conflict"
+    assert checked["state"] == "active"
     assert checked["actionable"] is False
-    assert "stale" in checked["issue"].casefold()
+    assert checked["subject"]["staleness"] == [
+        "The Task changed after this Portfolio judgment was authored."
+    ]
 
 
 def test_snapshot_reenters_changed_coverage_and_includes_new_open_outcomes(
@@ -564,8 +566,11 @@ def test_snapshot_marks_a_new_workthread_owner_as_stale_and_nonactionable(
     assert drifted["stale_count"] == 1
     assert drifted["items"][0]["thread_stale"] is True
     assert drifted["items"][0]["work_thread"]["identifier"] == gained_owner.identifier
-    assert drifted["review"]["state"] == "conflict"
+    assert drifted["review"]["state"] == "active"
     assert drifted["review"]["actionable"] is False
+    assert drifted["review"]["subject"]["staleness"] == [
+        "The owning WorkThread changed after this Portfolio judgment was authored."
+    ]
 
 
 def test_snapshot_never_exposes_review_controls_across_inspection_race(
@@ -670,7 +675,10 @@ def test_snapshot_exposes_mind_shaping_only_for_a_proven_empty_ledger(vault: Vau
     assert (mind_link.scheme, mind_link.netloc) == ("codex", "new")
     assert (hand_link.scheme, hand_link.netloc) == ("codex", "new")
     assert parse_qs(mind_link.query)["path"] == [str(vault.root)]
-    assert "$gsv-onboard" in parse_qs(mind_link.query)["prompt"][0]
+    mind_prompt = parse_qs(mind_link.query)["prompt"][0]
+    assert "$gsv-onboard" in mind_prompt
+    assert "Mind document CAS" in mind_prompt
+    assert "does not expose a durable OnboardingSession" in mind_prompt
     assert parse_qs(hand_link.query)["originUrl"] == [bridge.REPOSITORY_URL]
 
 

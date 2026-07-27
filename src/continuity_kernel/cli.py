@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shlex
+import subprocess
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -46,6 +47,9 @@ from continuity_kernel.portfolio import (
 )
 from continuity_kernel.records import record_dict
 from continuity_kernel.vault import Vault, doctor_dict
+
+ROLLBACK_PROBE_TIMEOUT_SECONDS = 5
+ROLLBACK_PROBE_MAX_OUTPUT_BYTES = 64 * 1024
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -107,31 +111,47 @@ def _dispatch(args: argparse.Namespace) -> Any:
         integration = None
         bridge = None
         try:
-            if args.no_codex:
-                if not args.no_bridge:
-                    bridge = open_bridge(vault, open_browser=False)
-            else:
+            if not args.no_codex:
                 with install_codex_transaction(
                     vault=vault_path, codex_home=Path(args.codex_home)
                 ) as staged:
                     integration = asdict(staged)
-                    if not args.no_bridge:
-                        bridge = open_bridge(vault, open_browser=False)
-            if bridge is not None and not args.no_browser:
+        except Exception as exc:
+            rollback_error = restore_config(previous_config, expected=installed_config)
+            if rollback_error is not None:
+                raise SetupError(f"{exc}; {rollback_error}") from exc
+            raise
+        # The stable Codex ownership receipt is committed before a resident
+        # surface can start.  A Bridge failure is therefore an operational
+        # repair state, not a reason to roll back a compatible installation or
+        # expose a half-committed plugin to a running process.
+        if not args.no_bridge:
+            try:
+                bridge = open_bridge(vault, open_browser=False)
+            except Exception as exc:
+                # open_bridge owns cleanup for a child it starts.  A failure
+                # may instead describe an already-running Bridge for another
+                # vault, which setup must never stop implicitly.
+                bridge = {
+                    "available": False,
+                    "browser_opened": False,
+                    "error": str(exc),
+                    "running": False,
+                    "started": False,
+                }
+        if bridge is not None and bridge.get("running") and not args.no_browser:
+            try:
                 browser_opened = open_bridge_in_browser(vault)
                 bridge = {**bridge, "browser_opened": browser_opened}
-        except Exception as exc:
-            cleanup_error: Exception | None = None
-            if bridge is not None and bridge.get("started"):
-                try:
-                    stop_bridge()
-                except Exception as stop_exc:
-                    cleanup_error = stop_exc
-            rollback_error = restore_config(previous_config, expected=installed_config)
-            details = [str(item) for item in (cleanup_error, rollback_error) if item]
-            if details:
-                raise SetupError(f"{exc}; {'; '.join(details)}") from exc
-            raise
+            except Exception as exc:
+                # Browser launch is a best-effort presentation step after the
+                # installation receipt is committed and the Bridge is live.
+                # Preserve that working state and surface a manual-open path.
+                bridge = {
+                    **bridge,
+                    "browser_error": str(exc),
+                    "browser_opened": False,
+                }
         return {
             "bridge": bridge,
             "codex": integration,
@@ -154,6 +174,9 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return result
     if args.command == "demo":
         return run_demo(Path(args.output).expanduser().resolve() if args.output else None)
+    if args.command == "rollback-check":
+        vault = Vault(resolve_vault(explicit_vault))
+        return _rollback_compatibility(vault, Path(args.previous_executable))
     if args.command == "codex":
         home = Path(args.codex_home).expanduser().resolve()
         if args.codex_command == "install":
@@ -263,6 +286,16 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
         return None
     if args.command == "setup" and result.get("setup_complete") is False:
         return 3, "GSV setup stopped because the vault is unhealthy; follow result.next."
+    if (
+        args.command == "setup"
+        and result.get("setup_complete") is True
+        and isinstance(result.get("bridge"), dict)
+        and result["bridge"].get("running") is False
+    ):
+        return (
+            4,
+            "GSV installation committed, but the Bridge needs repair; follow result.next.",
+        )
     if args.command == "doctor" and result.get("healthy") is False:
         return 3, "GSV doctor found unresolved integrity issues; follow result.issues."
     if (
@@ -324,6 +357,12 @@ def _setup_next(
     steps: list[str] = []
     if no_bridge:
         steps.append("The Bridge was not started.")
+    elif bridge is not None and bridge.get("running") is False:
+        steps.append(
+            "GSV and its Codex integration are installed, but the Bridge did not start. "
+            "Inspect `gsv --json bridge status`, then retry `gsv bridge open`; no older "
+            "executable was substituted."
+        )
     elif no_browser:
         steps.append("The Bridge is running locally; run `gsv` when you want to open it.")
     elif bridge is not None and bridge.get("browser_opened") is True:
@@ -337,7 +376,10 @@ def _setup_next(
             "Codex hand to load this vault."
         )
     else:
-        steps.append("Restart Codex, then open a fresh task and ask: What do you remember?")
+        steps.append(
+            "Restart Codex, open one fresh task, and run `$gsv-onboard` to describe your "
+            "world and verify only the sources you choose."
+        )
     return " ".join(steps)
 
 
@@ -771,7 +813,113 @@ def _parser() -> argparse.ArgumentParser:
     mcp_serve = mcp_commands.add_parser("serve")
     mcp_serve.add_argument("--profile", choices=(GUIDED_REVIEW_PROFILE,))
     mcp_serve.add_argument("--event-id")
+    rollback_check = commands.add_parser("rollback-check", help=argparse.SUPPRESS)
+    rollback_check.add_argument("previous_executable")
     return parser
+
+
+def _rollback_compatibility(vault: Vault, previous_executable: Path) -> dict[str, Any]:
+    """Prove an older executable can read current bytes without changing them."""
+
+    candidate = previous_executable.expanduser()
+    if candidate.is_symlink() or not candidate.is_file():
+        return {"compatible": False, "reason_code": "previous_executable_unavailable"}
+    candidate = candidate.resolve()
+    try:
+        metadata_before = os.lstat(vault.root)
+        identity = vault.identity()
+        digest_before = vault.logical_digest()
+    except (ContinuityError, OSError, UnicodeError, ValueError):
+        return {"compatible": False, "reason_code": "current_vault_unavailable"}
+    environment = os.environ.copy()
+    # Keep the old doctor's optional Codex inspection bounded and local.  Its
+    # own executable will reject plugin commands immediately; vault health is
+    # the evidence this probe needs.
+    environment["GSV_CODEX"] = str(candidate)
+    commands: list[tuple[str, ...]] = [("status",), ("doctor",)]
+    if CONTROL_STORE_SUPPORTED:
+        commands.append(("operation", "list"))
+    commands.append(("status",))
+    observed: list[dict[str, Any]] = []
+    for command in commands:
+        result = _run_previous_json(
+            candidate,
+            vault.root,
+            command,
+            environment=environment,
+        )
+        if result is None:
+            return {
+                "compatible": False,
+                "reason_code": "previous_reader_probe_failed",
+            }
+        observed.append(result)
+    status_before = observed[0].get("result")
+    doctor = observed[1].get("result")
+    status_after = observed[-1].get("result")
+    if (
+        not isinstance(status_before, dict)
+        or not isinstance(doctor, dict)
+        or not isinstance(status_after, dict)
+        or doctor.get("healthy") is not True
+        or status_before.get("vault_id") != identity["vault_id"]
+        or status_after.get("vault_id") != identity["vault_id"]
+        or status_before.get("digest") != digest_before
+        or status_after.get("digest") != digest_before
+    ):
+        return {"compatible": False, "reason_code": "previous_reader_state_mismatch"}
+    try:
+        metadata_after = os.lstat(vault.root)
+        digest_after = vault.logical_digest()
+    except (ContinuityError, OSError, UnicodeError, ValueError):
+        return {"compatible": False, "reason_code": "current_vault_recheck_failed"}
+    if (int(metadata_before.st_dev), int(metadata_before.st_ino)) != (
+        int(metadata_after.st_dev),
+        int(metadata_after.st_ino),
+    ) or digest_after != digest_before:
+        return {"compatible": False, "reason_code": "vault_changed_during_probe"}
+    return {
+        "compatible": True,
+        "digest": digest_before,
+        "reason_code": None,
+        "vault_id": identity["vault_id"],
+    }
+
+
+def _run_previous_json(
+    executable: Path,
+    vault_root: Path,
+    command: tuple[str, ...],
+    *,
+    environment: dict[str, str],
+) -> dict[str, Any] | None:
+    try:
+        completed = subprocess.run(
+            [
+                str(executable),
+                "--json",
+                "--vault",
+                str(vault_root),
+                *command,
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=ROLLBACK_PROBE_TIMEOUT_SECONDS,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0 or len(completed.stdout) > ROLLBACK_PROBE_MAX_OUTPUT_BYTES:
+        return None
+    try:
+        payload = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return None
+    return payload
 
 
 def _task_create_arguments(parser: argparse.ArgumentParser) -> None:

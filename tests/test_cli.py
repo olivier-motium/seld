@@ -221,7 +221,7 @@ def test_setup_failure_preserves_a_concurrent_configuration_change(
     assert configured.vault_path == concurrent.resolve()
 
 
-def test_setup_restores_configuration_even_when_bridge_cleanup_also_fails(
+def test_setup_keeps_committed_configuration_when_browser_launch_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     existing = tmp_path / "existing-vault"
@@ -239,19 +239,22 @@ def test_setup_restores_configuration_even_when_bridge_cleanup_also_fails(
         "open_bridge_in_browser",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(SetupError("browser stage failed")),
     )
-    monkeypatch.setattr(
-        cli,
-        "stop_bridge",
-        lambda: (_ for _ in ()).throw(SetupError("bridge cleanup failed")),
-    )
+    stopped: list[bool] = []
+    monkeypatch.setattr(cli, "stop_bridge", lambda: stopped.append(True))
 
-    result = cli.main(["--vault", str(requested), "setup", "--no-codex"])
+    result = cli.main(["--json", "--vault", str(requested), "setup", "--no-codex"])
+    output = json.loads(capsys.readouterr().out)["result"]
 
-    assert result == 2
-    assert "browser stage failed; bridge cleanup failed" in capsys.readouterr().err
-    restored = load_config()
-    assert restored is not None
-    assert restored.vault_path == existing.resolve()
+    assert result == 0
+    assert output["setup_complete"] is True
+    assert output["bridge"]["running"] is True
+    assert output["bridge"]["browser_opened"] is False
+    assert output["bridge"]["browser_error"] == "browser stage failed"
+    assert "run `gsv` to open it" in output["next"]
+    assert stopped == []
+    committed = load_config()
+    assert committed is not None
+    assert committed.vault_path == requested.resolve()
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
@@ -343,8 +346,10 @@ def test_setup_next_text_matches_every_feature_flag_combination() -> None:
                 if no_codex:
                     assert "Codex integration was skipped" in message
                     assert "Restart Codex" not in message
+                    assert "$gsv-onboard" not in message
                 else:
                     assert "Restart Codex" in message
+                    assert "$gsv-onboard" in message
                     assert "Codex integration was skipped" not in message
                 if no_bridge:
                     assert "The Bridge was not started" in message
@@ -434,8 +439,146 @@ def test_successful_setup_starts_bridge_after_codex_check_and_opens_after_commit
     output = json.loads(capsys.readouterr().out)
 
     assert result == 0
-    assert events == ["codex-ready", "bridge-started", "codex-committed", "browser-opened"]
+    assert events == ["codex-ready", "codex-committed", "bridge-started", "browser-opened"]
     assert output["result"]["bridge"]["browser_opened"] is True
+
+
+def test_setup_keeps_committed_integration_and_reports_bridge_start_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    events: list[str] = []
+
+    @contextmanager
+    def staged_install(**_: object) -> Iterator[CodexInstallResult]:
+        events.append("codex-ready")
+        yield CodexInstallResult(
+            codex_home=str(tmp_path / "codex"),
+            marketplace="gsv-local",
+            marketplace_root=str(tmp_path / "marketplace"),
+            plugin="gsv@gsv-local",
+            plugin_installed=True,
+            instructions_installed=True,
+            backup=None,
+        )
+        events.append("codex-committed")
+
+    def fail_bridge(*_args: object, **_kwargs: object) -> dict[str, object]:
+        events.append("bridge-failed")
+        raise OSError("injected Bridge start failure")
+
+    monkeypatch.setattr(cli, "install_codex_transaction", staged_install)
+    monkeypatch.setattr(cli, "open_bridge", fail_bridge)
+    stopped: list[bool] = []
+    monkeypatch.setattr(cli, "stop_bridge", lambda: stopped.append(True))
+
+    vault_path = tmp_path / "vault"
+    result = cli.main(["--json", "--vault", str(vault_path), "setup"])
+    output = json.loads(capsys.readouterr().out)["result"]
+
+    assert result == 4
+    assert events == ["codex-ready", "codex-committed", "bridge-failed"]
+    assert stopped == []
+    assert output["setup_complete"] is True
+    assert output["bridge"]["running"] is False
+    assert output["bridge"]["error"] == "injected Bridge start failure"
+    assert "did not start" in output["next"]
+    assert load_config() is not None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="synthetic prior executable is a POSIX script")
+def test_rollback_check_proves_stable_exact_vault_and_control_reads(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Rollback compatibility")
+    vault_id = str(vault.identity()["vault_id"])
+    digest = vault.logical_digest()
+    previous = tmp_path / "previous-gsv"
+    previous.write_text(
+        f"""#!/bin/sh
+case "${{4:-}}" in
+  status) printf '%s\\n' '{{"ok":true,"result":{{"vault_id":"{vault_id}","digest":"{digest}"}}}}' ;;
+  doctor) printf '%s\\n' '{{"ok":true,"result":{{"healthy":true,"vault_id":"{vault_id}"}}}}' ;;
+  operation) printf '%s\\n' '{{"ok":true,"result":{{"pending":[],"decided":[]}}}}' ;;
+  *) exit 2 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    previous.chmod(0o755)
+
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault.root),
+                "rollback-check",
+                str(previous),
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)["result"]
+    assert result == {
+        "compatible": True,
+        "digest": digest,
+        "reason_code": None,
+        "vault_id": vault_id,
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="synthetic prior executable is a POSIX script")
+@pytest.mark.parametrize("failure", ("incompatible", "malformed", "drift", "timeout"))
+def test_rollback_check_fails_closed_on_old_reader_or_probe_ambiguity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name=f"Rollback {failure}")
+    vault_id = str(vault.identity()["vault_id"])
+    digest = vault.logical_digest()
+    counter = tmp_path / "status-count"
+    previous = tmp_path / "previous-gsv"
+    if failure == "timeout":
+        body = "sleep 1\n"
+        monkeypatch.setattr(cli, "ROLLBACK_PROBE_TIMEOUT_SECONDS", 0.05)
+    elif failure == "malformed":
+        body = "printf 'not-json\\n'\n"
+    elif failure == "incompatible":
+        body = """case "${4:-}" in
+  status) printf '{"ok":true,"result":{"vault_id":"wrong","digest":"wrong"}}\\n' ;;
+  doctor) printf '{"ok":false,"error":"unsupported task record version 2"}\\n'; exit 3 ;;
+  operation) printf '{"ok":true,"result":{"pending":[]}}\\n' ;;
+esac
+"""
+    else:
+        monkeypatch.setenv("GSV_TEST_STATUS_COUNT", str(counter))
+        body = f"""case "${{4:-}}" in
+  status)
+    count=0
+    [ ! -f "$GSV_TEST_STATUS_COUNT" ] || count="$(cat "$GSV_TEST_STATUS_COUNT")"
+    count=$((count + 1))
+    printf '%s\\n' "$count" > "$GSV_TEST_STATUS_COUNT"
+    observed='{digest}'
+    [ "$count" -eq 1 ] || observed='{"f" * 64}'
+    printf '{{"ok":true,"result":{{"vault_id":"{vault_id}","digest":"%s"}}}}\\n' "$observed"
+    ;;
+  doctor) printf '{{"ok":true,"result":{{"healthy":true}}}}\\n' ;;
+  operation) printf '{{"ok":true,"result":{{"pending":[]}}}}\\n' ;;
+esac
+"""
+    previous.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    previous.chmod(0o755)
+
+    result = cli._rollback_compatibility(vault, previous)
+
+    assert result["compatible"] is False
+    assert result["reason_code"] in {
+        "previous_reader_probe_failed",
+        "previous_reader_state_mismatch",
+    }
 
 
 def test_setup_keeps_committed_install_when_browser_open_raises(

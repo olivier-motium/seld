@@ -19,6 +19,7 @@
     "category": "Developer Tools",
     "capabilities": ["Read", "Write"],
     "defaultPrompt": [
+      "Start or resume GSV onboarding and help me describe my world",
       "Show me what this GSV vault currently knows",
       "Create a durable task for this outcome",
       "Prepare a handoff for my next Codex session"

@@ -140,6 +140,8 @@ def test_guided_review_profile_lists_and_dispatches_only_its_explicit_tools(
         "gsv_doctor",
         "gsv_document_show",
         "gsv_document_update",
+        "gsv_entity_create",
+        "gsv_entity_update",
         "gsv_operation_archive_closed",
         "gsv_portfolio_migrate_review_session",
     }

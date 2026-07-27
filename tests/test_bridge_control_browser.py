@@ -23,7 +23,12 @@ from continuity_kernel.codex_turn_transport import (
 )
 from continuity_kernel.operations import OperationLedger
 from continuity_kernel.portfolio import ABSENT_PORTFOLIO_REVISION, portfolio_item
-from continuity_kernel.records import format_time, review_coverage_ref, review_option_ref
+from continuity_kernel.records import (
+    REVIEW_PAUSED_REF,
+    format_time,
+    review_coverage_ref,
+    review_option_ref,
+)
 from continuity_kernel.vault import Vault, doctor_dict
 
 sync_playwright = pytest.importorskip("playwright.sync_api").sync_playwright
@@ -210,6 +215,180 @@ class SemanticReviewTransport:
         return receipt
 
 
+class PreparedBoardTransport(SemanticReviewTransport):
+    """Prepare two receipt-bound rows, then regenerate the same set safely."""
+
+    def __init__(self, vault: Vault) -> None:
+        super().__init__(vault)
+        self.sheets: dict[str, list[dict[str, Any]]] = {}
+        self.batch_choices: list[str] = []
+
+    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+        snapshot = super().snapshot(event_id)
+        event = snapshot.get("event")
+        if isinstance(event, dict) and event_id in self.sheets:
+            event.update(
+                {
+                    "sheet": self.sheets[event_id],
+                    "sheet_state": "ready",
+                    "subject_task_ids": ["next-outcome", "third-outcome"],
+                }
+            )
+        return snapshot
+
+    def submit(self, context: TurnContext) -> TurnReceipt:
+        exact = context.validated()
+        existing = self.receipts.get(exact.event_id)
+        if existing is not None:
+            return existing
+        operation = OperationLedger(self.vault.root).snapshot()
+        event = next(value for value in operation.pending if value.event_id == exact.event_id)
+        self.submit_count += 1
+        session = self.vault.get_task("review-session")
+        refreshed = False
+        if self.submit_count == 1:
+            first = self.vault.get_task("exact-outcome")
+            removed = tuple(
+                ref
+                for ref in session.refs
+                if ref.startswith("review-subject:") or ref.startswith("review-option:")
+            )
+            advanced = self.vault.update_task(
+                session.identifier,
+                expected_revision=session.revision,
+                remove_refs=removed,
+                add_refs=(
+                    review_coverage_ref(
+                        task_id_value=first.identifier,
+                        task_revision=first.revision,
+                    ),
+                    "review-subject:task:next-outcome",
+                    "review-subject:task:third-outcome",
+                ),
+                next_action="Review the two consequential prepared decisions.",
+                waiting_on="Which of these exact outcomes should change?",
+            )
+            headline = "Two exact decisions genuinely need you."
+        elif event.choice.startswith("Pause this guided all-open review"):
+            advanced = self.vault.update_task(
+                session.identifier,
+                expected_revision=session.revision,
+                add_refs=(REVIEW_PAUSED_REF,),
+            )
+            headline = "The exact prepared review is paused."
+        elif event.choice == "resume-guided-review":
+            advanced = self.vault.update_task(
+                session.identifier,
+                expected_revision=session.revision,
+                remove_refs=(REVIEW_PAUSED_REF,),
+            )
+            headline = "The exact prepared review resumed."
+        else:
+            self.batch_choices.append(event.choice)
+            refreshed = True
+            advanced = self.vault.update_task(
+                session.identifier,
+                expected_revision=session.revision,
+                next_action="The same subject set was re-prepared after one row could not land.",
+                waiting_on="Choose against the refreshed questions, not the previous receipt.",
+            )
+            headline = "One answer could not land, so I refreshed the exact set."
+        current = OperationLedger(self.vault.root).snapshot()
+        OperationLedger(self.vault.root).decide(
+            event_id=event.event_id,
+            decision="accepted",
+            actor_ref=f"codex:{REVIEW_HAND_ID}",
+            reason_code="prepared-board-readback-complete",
+            expected_queue_revision=current.queue_revision,
+            expected_disposition_revision=current.disposition_revision,
+            result_ref=f"task:{advanced.identifier}/{advanced.revision}",
+        )
+        now = format_time(datetime.now(UTC))
+        receipt = TurnReceipt(
+            schema_version=TRANSPORT_SCHEMA_VERSION,
+            event_id=exact.event_id,
+            mode=exact.mode,
+            state=TurnState.COMPLETED,
+            attempt=1,
+            vault_id=str(self.vault.identity()["vault_id"]),
+            context_hash=exact.context_hash,
+            queue_revision=exact.queue_revision,
+            target_revision=exact.target_revision,
+            thread_id=REVIEW_HAND_ID,
+            owner_instance_id=None,
+            decision="accepted",
+            result_ref=f"task:{advanced.identifier}/{advanced.revision}",
+            canonical_revision=advanced.revision,
+            result_context_hash=exact.context_hash,
+            reason_code=None,
+            created_at=now,
+            updated_at=now,
+        )
+        second = self.vault.get_task("next-outcome")
+        third = self.vault.get_task("third-outcome")
+        self.sheets[event.event_id] = [
+            {
+                "task": second.identifier,
+                "anchor": second.updated_at,
+                "current_anchor": second.updated_at,
+                "question": (
+                    "Does the refreshed dependency still deserve priority?"
+                    if refreshed
+                    else "Should this dependency stay ahead of the third outcome?"
+                ),
+                "recommendation": "Keep the dependency visible and name the next local proof.",
+                "reasoning": (
+                    "It gates the other prepared outcome without authorizing external action."
+                ),
+                "choices": [
+                    {
+                        "answer": "Keep this first and name the local proof.",
+                        "effect": "The dependent outcome stays explicitly behind it.",
+                        "recommended": True,
+                    },
+                    {
+                        "answer": "Move it behind the third outcome.",
+                        "effect": "The authored order changes, but both remain open.",
+                        "recommended": False,
+                    },
+                ],
+                "dissent": (
+                    "Deferring this again would preserve the blockage rather than the option."
+                ),
+                "group": "One dependency chain",
+                "stale": False,
+            },
+            {
+                "task": third.identifier,
+                "anchor": third.updated_at,
+                "current_anchor": third.updated_at,
+                "question": "Should this remain behind the dependency?",
+                "recommendation": "Keep it open without pretending it is next.",
+                "reasoning": (
+                    "It still matters, but the first prepared outcome controls its timing."
+                ),
+                "choices": [
+                    {
+                        "answer": "Keep it open behind the dependency.",
+                        "effect": "No other record changes.",
+                        "recommended": True,
+                    },
+                    {
+                        "answer": "Make this the first prepared outcome.",
+                        "effect": "The authored order changes.",
+                        "recommended": False,
+                    },
+                ],
+                "dissent": "",
+                "group": "One dependency chain",
+                "stale": False,
+            },
+        ]
+        self.receipts[event.event_id] = receipt
+        self.answers[event.event_id] = headline
+        return receipt
+
+
 class NeverSubmittedTransport:
     def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
         del event_id
@@ -229,6 +408,39 @@ class NeverSubmittedTransport:
     def submit(self, context: TurnContext) -> TurnReceipt:
         del context
         raise AssertionError("stale queue CAS must fail before transport submission")
+
+
+class QueuedRecoveryTransport(NeverSubmittedTransport):
+    """Prove a queued event can acquire its first receipt after Bridge restarts."""
+
+    def __init__(self, vault: Vault) -> None:
+        self.vault = vault
+        self.submit_count = 0
+
+    def submit(self, context: TurnContext) -> TurnReceipt:
+        exact = context.validated()
+        self.submit_count += 1
+        now = format_time(datetime.now(UTC))
+        return TurnReceipt(
+            schema_version=TRANSPORT_SCHEMA_VERSION,
+            event_id=exact.event_id,
+            mode=exact.mode,
+            state=TurnState.FAILED_SAFE,
+            attempt=1,
+            vault_id=str(self.vault.identity()["vault_id"]),
+            context_hash=exact.context_hash,
+            queue_revision=exact.queue_revision,
+            target_revision=exact.target_revision,
+            thread_id=exact.active_thread_id,
+            owner_instance_id=None,
+            decision=None,
+            result_ref=None,
+            canonical_revision=None,
+            result_context_hash=None,
+            reason_code="pre_dispatch_failure",
+            created_at=now,
+            updated_at=now,
+        )
 
 
 class ReceiptCapacityTransport(NeverSubmittedTransport):
@@ -531,6 +743,102 @@ def test_browser_start_and_resume_stale_cas_notice_survives_refresh(
                     "() => !document.querySelector('.guided-review-notice')",
                     timeout=5_000,
                 )
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_browser_continues_one_saved_review_answer_when_receipt_is_missing(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Queued review receipt recovery")
+    outcome = vault.create_task(
+        identifier="exact-outcome",
+        title="Exact outcome",
+        outcome="Keep one saved answer recoverable across a Bridge crash window.",
+        status="ready",
+        next_actor="human",
+    )
+    session = vault.create_task(
+        identifier="review-session",
+        title="Review every open outcome",
+        outcome="Check every exact outcome without replaying an answer.",
+        status="waiting",
+        next_actor="human",
+        next_action="Continue the exact saved answer.",
+        waiting_on="Should this outcome remain current?",
+        active_thread_id=REVIEW_HAND_ID,
+        refs=("review-scope:all-open", "review-subject:task:exact-outcome"),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Finite Portfolio reviews",
+        purpose="Own only bounded all-open review sessions.",
+        summary="One exact review session has a saved answer.",
+        status="active",
+        next_move="Continue the already queued event.",
+        focus_task_id=session.identifier,
+        task_ids=(session.identifier,),
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="One exact open outcome.",
+        items=(
+            portfolio_item(
+                task_id_value=outcome.identifier,
+                task_revision=outcome.revision,
+                stance="needs-human",
+                reason="The saved answer must remain recoverable without replay.",
+            ),
+        ),
+    )
+    ledger = OperationLedger(vault.root)
+    current = ledger.snapshot()
+    queued = ledger.queue.append(
+        kind="correction",
+        subject=f"record:task/{session.identifier}",
+        choice="Keep this exact saved answer and do not append it again.",
+        target_revision=session.revision,
+        expected_revision=current.queue_revision,
+    )
+    event_id = queued.events[-1].event_id
+    transport = QueuedRecoveryTransport(vault)
+    static_resource = files("continuity_kernel") / "resources/bridge"
+
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            turn_transport=transport,
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"height": 844, "width": 390})
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
+                page.locator('[data-view="commitments"]').press("Enter")
+
+                page.get_by_role("button", name="Continue saved answer").click()
+                page.get_by_text("The turn did not start", exact=True).wait_for(timeout=5_000)
+                assert transport.submit_count == 1
+                assert [event.event_id for event in ledger.snapshot().pending] == [event_id]
+                assert page.get_by_role("button", name="Retry this exact turn").is_visible()
                 browser.close()
         finally:
             server.shutdown()
@@ -1184,6 +1492,294 @@ def test_browser_guided_review_runs_semantic_cas_and_survives_fresh_process(
             fresh_server.server_close()
             fresh_thread.join(timeout=5)
             assert not fresh_thread.is_alive()
+
+
+def test_browser_prepared_board_batches_only_answered_rows_and_clears_on_new_receipt(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Prepared intervention board")
+    first = vault.create_task(
+        identifier="exact-outcome",
+        title="Opening outcome",
+        outcome="Open the intervention-driven review.",
+        status="ready",
+        next_actor="human",
+    )
+    second = vault.create_task(
+        identifier="next-outcome",
+        title="Dependency decision",
+        outcome="Choose whether this stays ahead of the dependent outcome.",
+        status="ready",
+        next_actor="human",
+    )
+    third = vault.create_task(
+        identifier="third-outcome",
+        title="Dependent decision",
+        outcome="Choose its place without pretending it is resolved.",
+        status="ready",
+        next_actor="human",
+    )
+    session = vault.create_task(
+        identifier="review-session",
+        title="Review every open outcome",
+        outcome="Surface only consequential interventions.",
+        status="waiting",
+        next_actor="human",
+        next_action="Open the first exact review exchange.",
+        waiting_on="Should the intervention review begin?",
+        active_thread_id=REVIEW_HAND_ID,
+        refs=(
+            "review-scope:all-open",
+            "review-subject:task:exact-outcome",
+            review_option_ref(
+                intent="act-next",
+                subject_task_id="exact-outcome",
+                consequence="Prepare only the consequential decisions that need me.",
+            ),
+        ),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Finite Portfolio reviews",
+        purpose="Own only bounded all-open review sessions.",
+        summary="One exact review session is active.",
+        status="active",
+        focus_task_id=session.identifier,
+        task_ids=(session.identifier,),
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="Three exact open outcomes.",
+        items=tuple(
+            portfolio_item(
+                task_id_value=task.identifier,
+                task_revision=task.revision,
+                stance="needs-human",
+                reason="The prepared board must preserve this exact decision boundary.",
+            )
+            for task in (first, second, third)
+        ),
+    )
+    transport = PreparedBoardTransport(vault)
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            turn_transport=transport,
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"height": 844, "width": 390})
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
+                page.locator('[data-view="commitments"]').press("Enter")
+                page.get_by_role("button", name="Do / next").click()
+                page.get_by_role("heading", name="Decisions that genuinely need you").wait_for(
+                    timeout=5_000
+                )
+
+                assert page.get_by_text("The Mind disagrees with you", exact=True).is_visible()
+                assert page.get_by_role("heading", name="Open work", exact=True).count() == 0
+                assert page.get_by_label("Tell the Mind something about this set").is_visible()
+                assert page.get_by_role("button", name="Pause here", exact=True).is_visible()
+                assert page.get_by_role("button", name="End review", exact=True).is_visible()
+                assert page.locator("body").evaluate(
+                    "element => element.scrollWidth <= document.documentElement.clientWidth"
+                )
+
+                page.get_by_role("button", name="Edit batch", exact=True).click()
+                opening_box = page.get_by_role("checkbox", name="Opening outcome", exact=False)
+                dependency_box = page.get_by_role(
+                    "checkbox", name="Dependency decision", exact=False
+                )
+                dependent_box = page.get_by_role("checkbox", name="Dependent decision", exact=False)
+                assert not opening_box.is_checked()
+                assert dependency_box.is_checked()
+                assert dependent_box.is_checked()
+                dependent_box.uncheck()
+                assert (
+                    page.evaluate("document.activeElement.id")
+                    == "guided-review-batch-third-outcome"
+                )
+                opening_box.check()
+                assert (
+                    page.evaluate("document.activeElement.id")
+                    == "guided-review-batch-exact-outcome"
+                )
+                pulled: list[str] = []
+
+                def fail_batch_pull(route: Any) -> None:
+                    payload = route.request.post_data_json
+                    pulled.append(payload["choice"])
+                    route.fulfill(
+                        body='{"error":"injected batch-editor storage failure"}',
+                        content_type="application/json",
+                        status=503,
+                    )
+
+                page.route("**/api/v1/control", fail_batch_pull, times=1)
+                page.get_by_role("button", name="Prepare these 2", exact=True).click()
+                page.get_by_text("injected batch-editor storage failure", exact=True).wait_for()
+                assert opening_box.is_checked()
+                assert dependency_box.is_checked()
+                assert not dependent_box.is_checked()
+                assert len(pulled) == 1
+                assert "task:exact-outcome" in pulled[0]
+                assert "task:next-outcome" in pulled[0]
+                assert "task:third-outcome" not in pulled[0]
+                assert "navigation request only" in pulled[0]
+                assert "add no review coverage" in pulled[0]
+                page.get_by_role("button", name="Close batch editor", exact=True).click()
+
+                session_controls: list[str] = []
+
+                def fail_session_control(route: Any) -> None:
+                    payload = route.request.post_data_json
+                    session_controls.append(payload["choice"])
+                    route.fulfill(
+                        body='{"error":"injected prepared-session storage failure"}',
+                        content_type="application/json",
+                        status=503,
+                    )
+
+                page.route("**/api/v1/control", fail_session_control, times=3)
+                session_note = page.get_by_label("Tell the Mind something about this set")
+                session_note.fill("The dependency changed; reassess only what this affects.")
+                page.get_by_role("button", name="Send note and keep going", exact=True).click()
+                assert len(session_controls) == 1
+                assert "task:next-outcome, task:third-outcome" in session_controls[0]
+                assert "Do not infer a decision for an unanswered row" in session_controls[0]
+                assert session_note.input_value().startswith("The dependency changed")
+                page.get_by_role("button", name="Pause here", exact=True).click()
+                assert len(session_controls) == 2
+                assert "Do not change or cover any outcome" in session_controls[1]
+                page.get_by_role("button", name="End review", exact=True).click()
+                assert len(session_controls) == 3
+                assert "unchecked outcomes remain open" in session_controls[2]
+
+                page.get_by_role("button", name="Pause here", exact=True).click()
+                resume = page.get_by_role("button", name="Resume review here", exact=True)
+                resume.wait_for(timeout=5_000)
+                assert page.locator(".guided-review-prepared-form button:enabled").count() == 0
+                assert resume.is_enabled()
+                resume.click()
+                enabled_choices = page.locator(".guided-review-prepared-choice:enabled")
+                enabled_choices.first.wait_for(timeout=5_000)
+                assert enabled_choices.count() >= 2
+
+                first_card = page.locator('[data-prepared-task="next-outcome"]')
+                first_card.get_by_role(
+                    "button", name="Keep this first and name the local proof.", exact=False
+                ).click()
+                assert first_card.locator('[aria-pressed="true"]').count() == 1
+
+                page.get_by_role("button", name="Show all work").click()
+                page.locator(".commitment-grid").wait_for()
+                assert page.locator(".task-card").count() >= 3
+                page.get_by_role("button", name="Return to review").click()
+                assert first_card.locator('[aria-pressed="true"]').count() == 1
+
+                first_card.focus()
+                first_card.press("2")
+                assert (
+                    page.evaluate("document.activeElement?.dataset?.preparedTask") == "next-outcome"
+                )
+                assert (
+                    first_card.get_by_role(
+                        "button", name="Move it behind the third outcome.", exact=False
+                    ).get_attribute("aria-pressed")
+                    == "true"
+                )
+                page.keyboard.press("1")
+                assert (
+                    page.evaluate("document.activeElement?.dataset?.preparedTask") == "next-outcome"
+                )
+                page.route(
+                    "**/api/v1/control",
+                    lambda route: route.fulfill(
+                        body='{"error":"injected prepared-board storage failure"}',
+                        content_type="application/json",
+                        status=503,
+                    ),
+                    times=1,
+                )
+                page.get_by_role("button", name="Send answered decisions").click()
+                page.get_by_text("injected prepared-board storage failure", exact=True).wait_for()
+                assert first_card.locator('[aria-pressed="true"]').count() == 1
+                assert page.get_by_role("button", name="Send answered decisions").is_enabled()
+                page.get_by_role("button", name="Send answered decisions").click()
+
+                page.get_by_text(
+                    "Does the refreshed dependency still deserve priority?", exact=True
+                ).wait_for(timeout=5_000)
+                assert len(transport.batch_choices) == 1
+                assert "task:next-outcome" in transport.batch_choices[0]
+                assert "Keep this first and name the local proof." in transport.batch_choices[0]
+                assert "task:third-outcome" not in transport.batch_choices[0]
+                assert (
+                    page.locator('.guided-review-prepared-choice[aria-pressed="true"]').count() == 0
+                )
+                recovered_answer = (
+                    "Keep the dependency visible, but do not move the dependent outcome yet."
+                )
+                refreshed_card = page.locator('[data-prepared-task="next-outcome"]')
+                refreshed_card.get_by_label("Or answer in your own words").fill(recovered_answer)
+
+                def stale_prepared_session(route: Any) -> None:
+                    current_session = vault.get_task("review-session")
+                    vault.update_task(
+                        current_session.identifier,
+                        expected_revision=current_session.revision,
+                        next_action="Out-of-band session change invalidates the retained sheet.",
+                    )
+                    route.fulfill(
+                        body='{"error":"review session changed; reload"}',
+                        content_type="application/json",
+                        status=409,
+                    )
+
+                page.route("**/api/v1/control", stale_prepared_session, times=1)
+                page.get_by_role("button", name="Send answered decisions").click()
+                page.get_by_text("This prepared set is no longer current", exact=True).wait_for(
+                    timeout=5_000
+                )
+                recovery = page.get_by_label(
+                    "Unsent prepared answers from the previous set", exact=True
+                )
+                assert recovered_answer in recovery.input_value()
+                assert "task:next-outcome" in recovery.input_value()
+                assert page.get_by_text(
+                    "will not bind it to the refreshed set", exact=False
+                ).is_visible()
+                notice = page.locator(".guided-review-notice")
+                assert "queue changed" in notice.text_content().casefold()
+                assert "retry" in notice.text_content().casefold()
+                assert (
+                    page.get_by_role(
+                        "heading", name="Decisions that genuinely need you", exact=True
+                    ).count()
+                    == 0
+                )
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
 
 
 def test_browser_keeps_active_delivery_until_post_disposition_completion(

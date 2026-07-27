@@ -1,5 +1,6 @@
 let correctionDraft = "";
 const MAX_CONTROL_TEXT_BYTES = 4096;
+export const MAX_REVIEW_CONTROL_TEXT_BYTES = 24000;
 
 export function renderControlPanel(snapshot, { bridgeToken, currentControls, refresh }) {
   const controls = snapshot.controls || {};
@@ -198,16 +199,21 @@ export function controlSystemStatus(snapshot) {
   return snapshot.controls.pending ? "Review needed" : "Ready";
 }
 
-export async function appendControlIntent(snapshot, bridgeToken, intent) {
+export async function appendControlIntent(
+  snapshot,
+  bridgeToken,
+  intent,
+  { maxBytes = MAX_CONTROL_TEXT_BYTES } = {},
+) {
   if (!bridgeToken || !snapshot.controls?.available || !snapshot.controls.queue_revision) {
     throw new Error("The local Bridge intent queue is not ready.");
   }
   if (
     typeof intent.choice !== "string" ||
-    new TextEncoder().encode(intent.choice).byteLength > MAX_CONTROL_TEXT_BYTES
+    new TextEncoder().encode(intent.choice).byteLength > maxBytes
   ) {
     const error = new Error(
-      "This queued request is longer than the 4,096-byte local limit. Shorten it and retry; nothing was sent.",
+      `This queued request is longer than the ${maxBytes.toLocaleString("en-US")}-byte local limit. Shorten it and retry; nothing was sent.`,
     );
     error.status = 400;
     throw error;

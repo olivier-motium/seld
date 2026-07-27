@@ -182,6 +182,32 @@
     min-height: 54px;
   }
 
+  .guided-review-prepared-card {
+    padding: 14px;
+  }
+
+  .guided-review-prepared-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .guided-review-prepared-choice {
+    min-height: 54px;
+  }
+
+  .guided-review-prepared-actions,
+  .guided-review-prepared-actions .primary-action,
+  .guided-review-batch-actions,
+  .guided-review-batch-actions .primary-action,
+  .guided-review-edit-batch,
+  .guided-review-overview-toggle {
+    width: 100%;
+  }
+
+  .guided-review-prepared-session > .primary-action {
+    width: 100%;
+  }
+
   .guided-review-session-actions {
     align-items: stretch;
     flex-direction: column;

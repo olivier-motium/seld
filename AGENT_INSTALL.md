@@ -48,8 +48,12 @@ private Bridge open.
    The installer selects the platform asset, downloads its checksum, verifies
    SHA-256, and stages the candidate beside the target. On upgrade it stops
    only an identity-verified Bridge before replacement. If setup fails, it
-   restores the previous executable and attempts to restart a previously live
-   Bridge. Report any degraded rollback instead of claiming success.
+   restores the previous executable only when that exact binary proves it can
+   read the unchanged current vault and control ledger, then attempts to
+   restart a previously live Bridge. If compatibility is unproven, keep the
+   candidate installed and preserve the previous binary as named recovery
+   evidence. A post-commit Bridge failure is an installed repair state: do not
+   roll back or claim the Bridge is ready.
 5. Use the installed absolute path if the install directory is not already on
    `PATH`:
 
@@ -68,9 +72,12 @@ private Bridge open.
    crash-artifact recovery, and equivalent backup/restore digests.
 7. Run `gsv` once if the Bridge did not open automatically. Browser launch is
    best-effort and is not allowed to roll back a verified setup.
-8. Ask the user to restart Codex after first setup. Report the installed
-   version, binary path, doctor result, demo result, Bridge state, and any
-   unavailable or unvalidated platform claim.
+8. Ask the user to restart Codex after first setup, open one fresh task, and run
+   `$gsv-onboard`. Report the installed version, binary path, doctor result,
+   demo result, Bridge state, and any unavailable or unvalidated platform
+   claim. Onboarding keeps context gathering in the AI conversation; never
+   invent a durable onboarding session or mark a connector ready without a
+   supported verified surface.
 
 ## What setup may change
 

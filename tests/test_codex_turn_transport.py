@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -15,10 +16,11 @@ from typing import Any, cast
 import pytest
 
 from continuity_kernel import codex_turn_transport as transport_module
+from continuity_kernel.bridge import _snapshot_revision_inputs, bridge_snapshot
 from continuity_kernel.codex_turn_transport import (
-    GUIDED_REVIEW_MODEL,
+    GUIDED_REVIEW_MODEL_ENV,
     GUIDED_REVIEW_REASONING_EFFORT,
-    GUIDED_REVIEW_SERVICE_TIER,
+    GUIDED_REVIEW_SERVICE_TIER_ENV,
     CodexTurnCoordinator,
     ProcessResult,
     ReceiptCapacityError,
@@ -36,10 +38,15 @@ from continuity_kernel.control_queue import (
 )
 from continuity_kernel.direction import ABSENT_DIRECTION_REVISION, direction_aim
 from continuity_kernel.errors import ValidationError
-from continuity_kernel.operations import OperationLedger
+from continuity_kernel.operations import OperationLedger, capture_operation_binding
 from continuity_kernel.portfolio import ABSENT_PORTFOLIO_REVISION, portfolio_item
-from continuity_kernel.records import REVIEW_SCOPE_REF, REVIEW_WORK_THREAD_ID
-from continuity_kernel.vault import Vault
+from continuity_kernel.records import (
+    RESIDENT_PULSE_REF,
+    RESIDENT_PULSE_TASK_ID,
+    REVIEW_SCOPE_REF,
+    REVIEW_WORK_THREAD_ID,
+)
+from continuity_kernel.vault import Vault, doctor_dict
 
 pytestmark = pytest.mark.skipif(
     os.name == "nt", reason="secure directory-pinned control storage is POSIX-only foundation"
@@ -409,8 +416,27 @@ def test_resume_uses_exact_isolated_codex_hand_and_persists_only_content_free_re
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Resume transport")
     seeded = _seed_active(vault)
+    pulse = vault.create_task(
+        identifier=RESIDENT_PULSE_TASK_ID,
+        title="Resident Pulse",
+        outcome="Keep the Mind current without becoming a review outcome.",
+        status="doing",
+        next_actor="agent",
+        active_thread_id=OTHER_THREAD_ID,
+        refs=(RESIDENT_PULSE_REF,),
+    )
     secret_choice = "keep this visible SECRET-CHOICE-DO-NOT-PERSIST-IN-RECEIPT"
     event, context = _queue_resume(vault, seeded["session"], choice=secret_choice)
+    projected_revisions = _snapshot_revision_inputs(
+        bridge_snapshot(
+            vault,
+            doctor=doctor_dict(vault.doctor()),
+            integration={"available": True, "ready": True},
+        )
+    )
+    context = replace(context, canonical_revisions=projected_revisions)
+    assert context.canonical_revisions == canonical_revision_inputs(vault)
+    assert (f"task:{pulse.identifier}", pulse.revision) not in context.canonical_revisions
 
     def apply_and_acknowledge() -> None:
         current = vault.get_task(seeded["session"].identifier)
@@ -430,6 +456,8 @@ def test_resume_uses_exact_isolated_codex_hand_and_persists_only_content_free_re
         _Action(_success_output(answer="Transient model answer"), apply_and_acknowledge)
     )
     monkeypatch.setenv("SECRET_PROVIDER_TOKEN", "must-not-reach-worker")
+    monkeypatch.setenv(GUIDED_REVIEW_MODEL_ENV, "gpt-public-review")
+    monkeypatch.setenv(GUIDED_REVIEW_SERVICE_TIER_ENV, "priority")
     coordinator = _coordinator(vault, runner)
     coordinator.submit(context)
     receipt = _wait_for(coordinator, event.event_id, TurnState.COMPLETED)
@@ -454,9 +482,9 @@ def test_resume_uses_exact_isolated_codex_hand_and_persists_only_content_free_re
         "image_generation",
     ):
         assert ["--disable", feature] == argv[argv.index(feature) - 1 : argv.index(feature) + 1]
-    assert argv[argv.index("--model") + 1] == GUIDED_REVIEW_MODEL
+    assert argv[argv.index("--model") + 1] == "gpt-public-review"
     assert f'model_reasoning_effort="{GUIDED_REVIEW_REASONING_EFFORT}"' in argv
-    assert f'service_tier="{GUIDED_REVIEW_SERVICE_TIER}"' in argv
+    assert 'service_tier="priority"' in argv
     mcp_args_value = next(value for value in argv if value.startswith("mcp_servers.gsv.args="))
     assert json.loads(mcp_args_value.split("=", 1)[1])[-6:] == [
         "mcp",
@@ -467,18 +495,21 @@ def test_resume_uses_exact_isolated_codex_hand_and_persists_only_content_free_re
         event.event_id,
     ]
     assert b"exact current review-session Task" in prompt
-    assert b"current subject Task" in prompt
+    assert b"every exact subject named in answered rows" in prompt
+    assert b"There is no batch transaction" in prompt
     assert b"one current Portfolio inspection" in prompt
     assert b"do not repeat the opening" in prompt
-    assert b"only one next outcome" in prompt
-    assert b"up to five complete standalone review-option" in prompt
-    assert b"subject ID matches that exact subject" in prompt
+    assert b"prepare the next intervention set, normally 3-10" in prompt
+    assert b"explicit Bridge batch pull" in prompt
+    assert b"add no coverage from selection alone" in prompt
+    assert b"Unanswered subjects mean nothing" in prompt
+    assert b"current anchored coverage" in prompt
     assert b"raw UUID" in prompt
     assert b"codex-thread:* shadow ref" in prompt
     assert b"Before either nonterminal or terminal acceptance" in prompt
     assert b"status=waiting and next_actor=human" in prompt
-    assert b"nonempty next_action recommendation" in prompt
-    assert b"nonempty waiting_on question" in prompt
+    assert b"nonempty waiting_on field describing the prepared set" in prompt
+    assert b"bridge-sheet envelope" in prompt
     assert b"clear the review WorkThread focus" in prompt
     assert b"terminalize the session" in prompt
     assert b"final semantic step" in prompt
@@ -499,7 +530,79 @@ def test_resume_uses_exact_isolated_codex_hand_and_persists_only_content_free_re
     restarted = _coordinator(vault, _FakeRunner(), instance_id=OTHER_INSTANCE_ID)
     restarted_receipt = restarted.receipt(event.event_id)
     assert restarted_receipt == receipt
-    assert restarted.snapshot(event.event_id)["event"]["final_answer"] is None
+    restarted_public = restarted.snapshot(event.event_id)["event"]
+    assert restarted_public["final_answer"] is None
+    assert restarted_public["sheet_state"] == "unavailable_after_restart"
+
+
+def test_prepared_sheet_is_bound_to_the_receipt_post_turn_session_revision(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Prepared receipt binding")
+    seeded = _seed_active(vault)
+    event, context = _queue_resume(vault, seeded["session"])
+    sheet_answer = (
+        "One exact decision needs you.\n```bridge-sheet\n"
+        + json.dumps(
+            {
+                "v": 1,
+                "entries": [
+                    {
+                        "task": seeded["outcome"].identifier,
+                        "anchor": seeded["outcome"].updated_at,
+                        "question": "Should this remain open?",
+                        "recommendation": "Keep it open and make the next action concrete.",
+                        "reasoning": (
+                            "The dependency remains current and no other outcome replaces it."
+                        ),
+                        "choices": ["Keep it open.", "Defer it explicitly."],
+                    }
+                ],
+            },
+            separators=(",", ":"),
+        )
+        + "\n```"
+    )
+
+    def apply_and_acknowledge() -> None:
+        current = vault.get_task(seeded["session"].identifier)
+        changed = vault.update_task(
+            current.identifier,
+            expected_revision=current.revision,
+            next_action="Review the one prepared decision.",
+        )
+        _decide(
+            vault,
+            event.event_id,
+            decision="accepted",
+            result_ref=f"task:{changed.identifier}/{changed.revision}",
+        )
+
+    coordinator = _coordinator(
+        vault,
+        _FakeRunner(_Action(_success_output(answer=sheet_answer), apply_and_acknowledge)),
+    )
+    coordinator.submit(context)
+    _wait_for(coordinator, event.event_id, TurnState.COMPLETED)
+
+    public = coordinator.snapshot(event.event_id)["event"]
+    assert public["final_answer"] == "One exact decision needs you."
+    assert public["sheet_state"] == "ready"
+    assert public["subject_task_ids"] == [seeded["outcome"].identifier]
+    assert public["sheet"][0]["task"] == seeded["outcome"].identifier
+    result_revision = public["session_revision"]
+
+    current = vault.get_task(seeded["session"].identifier)
+    advanced = vault.update_task(
+        current.identifier,
+        expected_revision=current.revision,
+        next_action="A regenerated same-subject batch has different framing.",
+    )
+    assert advanced.revision != result_revision
+    stale_public = coordinator.snapshot(event.event_id)["event"]
+    assert stale_public["sheet_state"] == "session_changed"
+    assert "sheet" not in stale_public
 
 
 @pytest.mark.parametrize(
@@ -837,16 +940,21 @@ def test_initial_start_uses_canonical_review_focus_despite_unowned_scope_mistag(
     assert b"thread:life-portfolio-review" in first_prompt
     assert b"thread:life-portfolio-review" in second_prompt
     assert b"current Direction" in first_prompt
-    assert b"complete Portfolio and all open Tasks" in first_prompt
-    assert b"exact relevant WorkThreads and entities" in first_prompt
-    assert b"Present only one exact current outcome" in first_prompt
+    assert b"supported durable Task, WorkThread, or Portfolio effect" in first_prompt
+    assert b"bounded Mind action" not in first_prompt
+    assert b"complete Portfolio, every open Task" in first_prompt
+    assert b"Normally prepare 3-10 rows and never more than 25" in first_prompt
+    assert b"when all three tests hold" in first_prompt
+    assert b"terminal fenced bridge-sheet JSON" in second_prompt
+    assert b"relevant WorkThreads and entities" in first_prompt
+    assert b"one review-subject:task:<id> ref for each consequential" in first_prompt
     assert b"omit active_thread_id on create" in first_prompt
     assert b"clear_active_thread_id when repairing" in first_prompt
     assert b"Never put the GSV WorkThread ID in that field" in first_prompt
     assert b"never invent or retain a codex-thread:* ref" in first_prompt
     assert b"status=waiting with next_actor=human" in first_prompt
     assert THREAD_ID.encode() in second_prompt
-    assert b"Call gsv_task_update" in second_prompt
+    assert b"call gsv_task_update" in second_prompt
     assert f"raw UUID {THREAD_ID}".encode() in second_prompt
     assert b"remove_refs for every codex-thread:* shadow ref" in second_prompt
     assert b"active_thread_id, status, next_actor, next_action, waiting_on, refs" in second_prompt
@@ -980,9 +1088,9 @@ def test_start_canary_shape_with_workthread_hand_shadow_ref_and_no_question_is_u
     assert receipt.reason_code == "semantic_result_unverified"
 
 
-def test_start_accepted_result_cannot_terminalize_the_new_review_session(tmp_path: Path) -> None:
+def test_start_may_terminalize_when_fresh_audit_finds_no_intervention(tmp_path: Path) -> None:
     vault = Vault(tmp_path / "vault")
-    vault.initialize(name="Invalid terminal start")
+    vault.initialize(name="No-intervention terminal start")
     event, context = _queue_start(vault)
 
     def create_session() -> None:
@@ -1000,7 +1108,7 @@ def test_start_accepted_result_cannot_terminalize_the_new_review_session(tmp_pat
             identifier=REVIEW_WORK_THREAD_ID,
             title="Life Portfolio review",
             purpose="Carry one finite all-open review.",
-            summary="The review session should remain open after START.",
+            summary="The opening audit may prove that nothing needs the user.",
             focus_task_id=session.identifier,
             task_ids=(session.identifier,),
         )
@@ -1028,11 +1136,175 @@ def test_start_accepted_result_cannot_terminalize_the_new_review_session(tmp_pat
             result_ref=f"task:{terminal.identifier}/{terminal.revision}",
         )
 
+    runner = _FakeRunner(
+        _Action(_success_output(), create_session),
+        _Action(_success_output(), terminalize_and_acknowledge),
+    )
+    coordinator = _coordinator(vault, runner)
+    coordinator.submit(context)
+
+    receipt = _wait_for(coordinator, event.event_id, TurnState.COMPLETED)
+    assert receipt.decision == "accepted"
+    terminal = vault.get_task("portfolio-review-session")
+    assert terminal.status == "done"
+    assert terminal.refs == (REVIEW_SCOPE_REF,)
+    assert vault.get_thread(REVIEW_WORK_THREAD_ID).focus_task_id is None
+    assert vault.inspect_portfolio().review.current_coverage_task_ids == ()
+    assert b"If no open outcome passes all three tests" in runner.spawns[0][1]
+    assert b"do not bind the hand or emit a sheet" in runner.spawns[1][1]
+
+
+def test_terminal_result_rejects_residual_nonterminal_review_session(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Reject residual review session")
+    event, context = _queue_start(vault)
+
+    def create_sessions() -> None:
+        session = vault.create_task(
+            identifier="portfolio-review-session",
+            title="Review every open outcome",
+            outcome="Finish only when no other review session remains.",
+            status="waiting",
+            next_actor="human",
+            next_action="Present the exact intervention.",
+            waiting_on="What should change?",
+            refs=(REVIEW_SCOPE_REF, "review-subject:task:start-outcome"),
+        )
+        vault.create_thread(
+            identifier=REVIEW_WORK_THREAD_ID,
+            title="Life Portfolio review",
+            purpose="Carry one finite all-open review.",
+            summary="A residual session must block terminal acceptance.",
+            focus_task_id=session.identifier,
+            task_ids=(session.identifier,),
+        )
+
+    def terminalize_one_and_acknowledge() -> None:
+        session = vault.get_task("portfolio-review-session")
+        review_thread = vault.get_thread(REVIEW_WORK_THREAD_ID)
+        vault.update_thread(
+            review_thread.identifier,
+            expected_revision=review_thread.revision,
+            clear_focus_task=True,
+        )
+        terminal = vault.update_task(
+            session.identifier,
+            expected_revision=session.revision,
+            status="done",
+            clear_next_actor=True,
+            clear_next_action=True,
+            clear_waiting_on=True,
+        )
+        residual = vault.create_task(
+            identifier="residual-review-session",
+            title="Residual review session",
+            outcome="Remain visible as a conflicting second review session.",
+            status="waiting",
+            next_actor="human",
+            next_action="Repair the duplicate session.",
+            waiting_on="Which session is canonical?",
+            refs=(REVIEW_SCOPE_REF, "review-subject:task:start-outcome"),
+        )
+        vault.update_thread(
+            review_thread.identifier,
+            expected_revision=vault.get_thread(review_thread.identifier).revision,
+            clear_focus_task=True,
+            task_ids=(session.identifier, residual.identifier),
+        )
+        _decide(
+            vault,
+            event.event_id,
+            decision="accepted",
+            result_ref=f"task:{terminal.identifier}/{terminal.revision}",
+        )
+
+    coordinator = _coordinator(
+        vault,
+        _FakeRunner(
+            _Action(_success_output(), create_sessions),
+            _Action(_success_output(), terminalize_one_and_acknowledge),
+        ),
+    )
+    coordinator.submit(context)
+
+    receipt = _wait_for(coordinator, event.event_id, TurnState.DELIVERY_UNCERTAIN)
+    assert receipt.reason_code == "semantic_result_unverified"
+    assert vault.get_task("residual-review-session").status == "waiting"
+
+
+def test_transient_final_answers_have_a_fixed_memory_bound(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Bounded transient answers")
+    coordinator = _coordinator(vault, _FakeRunner())
+
+    event_ids = [str(uuid.UUID(int=index + 1)) for index in range(40)]
+    for index, event_id in enumerate(event_ids):
+        coordinator._remember_final(event_id, f"answer-{index}")
+
+    assert len(coordinator._final_answers) == transport_module.MAX_IN_MEMORY_FINAL_ANSWERS
+    assert event_ids[0] not in coordinator._final_answers
+    assert coordinator._final_answers[event_ids[-1]] == "answer-39"
+
+
+def test_start_terminal_result_must_name_changed_scoped_owned_review_task(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Reject unrelated terminal start result")
+    event, context = _queue_start(vault)
+
+    def create_session() -> None:
+        session = vault.create_task(
+            identifier="portfolio-review-session",
+            title="Review every open outcome",
+            outcome="Check only interventions that genuinely need the user.",
+            status="waiting",
+            next_actor="human",
+            next_action="Present the exact intervention.",
+            waiting_on="What should change?",
+            refs=(REVIEW_SCOPE_REF, "review-subject:task:start-outcome"),
+        )
+        vault.create_thread(
+            identifier=REVIEW_WORK_THREAD_ID,
+            title="Life Portfolio review",
+            purpose="Carry one finite all-open review.",
+            summary="The review is active.",
+            focus_task_id=session.identifier,
+            task_ids=(session.identifier,),
+        )
+
+    def acknowledge_unrelated_terminal_task() -> None:
+        session = vault.get_task("portfolio-review-session")
+        review_thread = vault.get_thread(REVIEW_WORK_THREAD_ID)
+        vault.update_thread(
+            review_thread.identifier,
+            expected_revision=review_thread.revision,
+            clear_focus_task=True,
+        )
+        vault.update_task(
+            session.identifier,
+            expected_revision=session.revision,
+            status="done",
+            clear_next_actor=True,
+            clear_next_action=True,
+            clear_waiting_on=True,
+        )
+        unrelated = vault.create_task(
+            identifier="unrelated-terminal",
+            title="Unrelated terminal Task",
+            outcome="Remain outside the guided review receipt.",
+            status="done",
+        )
+        _decide(
+            vault,
+            event.event_id,
+            decision="accepted",
+            result_ref=f"task:{unrelated.identifier}/{unrelated.revision}",
+        )
+
     coordinator = _coordinator(
         vault,
         _FakeRunner(
             _Action(_success_output(), create_session),
-            _Action(_success_output(), terminalize_and_acknowledge),
+            _Action(_success_output(), acknowledge_unrelated_terminal_task),
         ),
     )
     coordinator.submit(context)
@@ -1140,6 +1412,85 @@ def test_interrupted_initial_start_keeps_emitted_hand_without_replay(
     assert restarted.receipt(event.event_id) == uncertain
     restarted.submit(context)
     assert restarted_runner.spawns == []
+
+
+def test_message_less_binding_turn_never_reuses_the_opening_turn_answer(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Phase-owned start answer")
+    event, context = _queue_start(vault)
+    outcome = vault.get_task("start-outcome")
+    opening_answer = (
+        "Opening prose that must not survive the binding turn.\n```bridge-sheet\n"
+        + json.dumps(
+            {
+                "v": 1,
+                "entries": [
+                    {
+                        "task": outcome.identifier,
+                        "anchor": outcome.updated_at,
+                        "question": "Could this stale opening answer look current?",
+                        "recommendation": "Never reuse it across phases.",
+                        "reasoning": "The binding turn owns the public result.",
+                        "choices": ["Keep it phase-owned.", "Return no prepared set."],
+                    }
+                ],
+            },
+            separators=(",", ":"),
+        )
+        + "\n```"
+    )
+
+    def create_session() -> None:
+        session = vault.create_task(
+            identifier="portfolio-review-session",
+            title="Review every open outcome",
+            outcome="Check every open outcome without reusing opening prose.",
+            status="waiting",
+            next_actor="human",
+            next_action="Bind the exact review hand.",
+            waiting_on="What genuinely needs a decision?",
+            refs=(REVIEW_SCOPE_REF, "review-subject:task:start-outcome"),
+        )
+        vault.create_thread(
+            identifier=REVIEW_WORK_THREAD_ID,
+            title="Life Portfolio review",
+            purpose="Carry one finite all-open review.",
+            summary="The review awaits its exact hand binding.",
+            focus_task_id=session.identifier,
+            task_ids=(session.identifier,),
+        )
+
+    def bind_and_acknowledge() -> None:
+        session = vault.get_task("portfolio-review-session")
+        bound = vault.update_task(
+            session.identifier,
+            expected_revision=session.revision,
+            active_thread_id=THREAD_ID,
+        )
+        _decide(
+            vault,
+            event.event_id,
+            decision="accepted",
+            result_ref=f"task:{bound.identifier}/{bound.revision}",
+        )
+
+    runner = _FakeRunner(
+        _Action(_success_output(answer=opening_answer), create_session),
+        _Action(
+            ProcessResult(returncode=0, stdout=_jsonl({"type": "turn.completed"})),
+            bind_and_acknowledge,
+        ),
+    )
+    coordinator = _coordinator(vault, runner)
+    coordinator.submit(context)
+    _wait_for(coordinator, event.event_id, TurnState.COMPLETED)
+
+    public = coordinator.snapshot(event.event_id)["event"]
+    assert public["final_answer"] is None
+    assert public["sheet_state"] == "turn_returned_no_answer"
+    assert "sheet" not in public
 
 
 def test_started_initial_process_without_recoverable_hand_is_never_replayed(
@@ -1683,6 +2034,54 @@ def test_rejection_completes_only_when_canonical_revision_set_is_unchanged(tmp_p
     )
     unsafe.submit(changed_context)
     assert _wait_for(unsafe, changed_event.event_id, TurnState.DELIVERY_UNCERTAIN)
+
+
+@pytest.mark.parametrize("decision", ["accepted", "rejected"])
+def test_semantic_result_rejects_physical_vault_binding_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+) -> None:
+    vault = Vault(tmp_path / decision)
+    vault.initialize(name=f"Binding drift during {decision}")
+    seeded = _seed_active(vault)
+    event, context = _queue_resume(vault, seeded["session"])
+
+    def disposition() -> None:
+        result_ref = None
+        if decision == "accepted":
+            current = vault.get_task(seeded["session"].identifier)
+            changed = vault.update_task(
+                current.identifier,
+                expected_revision=current.revision,
+                next_action="The semantic change landed before binding drift was detected.",
+            )
+            result_ref = f"task:{changed.identifier}/{changed.revision}"
+        _decide(vault, event.event_id, decision=decision, result_ref=result_ref)
+
+    actual = capture_operation_binding(vault.root)
+    captures = 0
+
+    def drifting_binding(_vault_root: Path | str) -> Any:
+        nonlocal captures
+        captures += 1
+        if captures == 1:
+            return actual
+        return replace(
+            actual,
+            root_identity=(actual.root_identity[0], actual.root_identity[1] + 1),
+        )
+
+    monkeypatch.setattr(transport_module, "capture_operation_binding", drifting_binding)
+    coordinator = _coordinator(
+        vault,
+        _FakeRunner(_Action(_success_output(), disposition)),
+    )
+    coordinator.submit(context)
+
+    receipt = _wait_for(coordinator, event.event_id, TurnState.DELIVERY_UNCERTAIN)
+    assert receipt.reason_code == "semantic_result_unverified"
+    assert captures == 2
 
 
 @pytest.mark.parametrize("record_kind", ["direction", "entity"])

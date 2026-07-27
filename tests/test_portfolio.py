@@ -125,6 +125,43 @@ def test_vault_portfolio_requires_complete_open_set_and_exact_cas(vault: Vault) 
         )
 
 
+def test_bare_thread_owned_review_session_never_becomes_a_review_subject(vault: Vault) -> None:
+    outcome = vault.create_task(
+        identifier="real-outcome",
+        title="Real outcome",
+        outcome="Remain visible in the authored life portfolio.",
+        status="ready",
+        next_actor="human",
+    )
+    review = vault.create_task(
+        identifier="bare-review-session",
+        title="Review every outcome",
+        outcome="Carry one finite review without becoming a life outcome.",
+        status="doing",
+        next_actor="agent",
+        refs=("review-scope:all-open",),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Review the current Portfolio",
+        purpose="Carry one finite all-open review session.",
+        summary="The exact review session is being prepared.",
+        focus_task_id=review.identifier,
+        task_ids=(review.identifier,),
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="Only the real life outcome belongs here.",
+        items=(_item(outcome.identifier, outcome.revision),),
+    )
+
+    inspection = vault.inspect_portfolio()
+
+    assert inspection.review.session_task_id == review.identifier
+    assert inspection.review.open_task_ids == (outcome.identifier,)
+    assert inspection.review.uncovered_task_ids == (outcome.identifier,)
+
+
 def test_portfolio_rejects_duplicate_tasks_and_noncanonical_revision() -> None:
     item = _item("one-outcome", "a" * 64)
 
