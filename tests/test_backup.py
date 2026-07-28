@@ -871,12 +871,20 @@ def test_backup_excludes_only_exact_host_local_migration_tombstone_markers(
     def legacy_marker(parent: Path, name: str, relative: str) -> Path:
         staging = parent / f".{name}.gsv-remove-staging.quarantine"
         staging.mkdir()
-        metadata = os.lstat(staging)
+        # The retired migration recorded ownership only after publishing its
+        # create-stage at the canonical path.  On Windows, that first move can
+        # change the path-reported file index, so recording the staging
+        # identity would fabricate a marker the migration itself never wrote.
+        owned = parent / name
+        staging.rename(owned)
+        metadata = os.lstat(owned)
         token = sha256_bytes(
             f"culture-grade-foundation-v1\0{relative}\0{metadata.st_dev}\0{metadata.st_ino}".encode()
         )[:24]
         quarantine = parent / f".{name}.gsv-remove-{token}.quarantine"
-        staging.rename(quarantine)
+        owned.rename(quarantine)
+        moved = os.lstat(quarantine)
+        assert (moved.st_dev, moved.st_ino) == (metadata.st_dev, metadata.st_ino)
         marker = quarantine.with_suffix(".marker")
         marker.write_text(
             json.dumps(

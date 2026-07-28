@@ -202,7 +202,8 @@ def test_candidate_version_is_consistent_across_runtime_installers_and_lock() ->
     )
 
 
-def test_unpublished_prebuilt_platforms_fail_before_network(tmp_path: Path) -> None:
+@pytest.mark.skipif(os.name == "nt", reason="executes the POSIX installer through /bin/sh")
+def test_unpublished_linux_prebuilt_fails_before_network(tmp_path: Path) -> None:
     tools = tmp_path / "tools"
     tools.mkdir()
     marker = tmp_path / "network-called"
@@ -233,6 +234,9 @@ def test_unpublished_prebuilt_platforms_fail_before_network(tmp_path: Path) -> N
     assert result.returncode == 2
     assert "does not publish a Linux prebuilt yet" in result.stderr
     assert not marker.exists()
+
+
+def test_unpublished_windows_prebuilt_fails_before_network() -> None:
     powershell = (ROOT / "scripts/install.ps1").read_text(encoding="utf-8")
     assert powershell.index("if (-not $env:GSV_BINARY)") < powershell.index("Invoke-WebRequest")
 

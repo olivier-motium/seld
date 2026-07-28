@@ -507,7 +507,7 @@ def _stored_absolute_path(value: object, label: str) -> str:
 def _relative_path(value: str) -> Path:
     text = _bounded_text(value, "relative_path")
     candidate = Path(text)
-    if candidate.is_absolute() or not candidate.parts:
+    if candidate.is_absolute() or candidate.anchor or not candidate.parts:
         raise ValidationError("relative_path must name one path beneath the granted root")
     if any(part in {"", ".", ".."} for part in candidate.parts):
         raise ValidationError("relative_path cannot contain empty, dot, or parent components")

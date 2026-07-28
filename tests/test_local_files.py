@@ -4,7 +4,7 @@ import json
 import os
 import stat
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import pytest
@@ -520,6 +520,26 @@ def test_local_file_reader_requires_relative_path_beneath_grant(
 
     with pytest.raises(ValidationError, match=message):
         store.read(grant_id=grant_id, relative_path=relative_path)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "/etc/passwd",
+        r"\Windows\System32\drivers\etc\hosts",
+        r"C:\Windows\System32\drivers\etc\hosts",
+        r"C:Windows\System32\drivers\etc\hosts",
+        r"\\server\share\note.txt",
+    ),
+)
+def test_local_file_reader_rejects_windows_anchored_path_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+) -> None:
+    monkeypatch.setattr(local_files_module, "Path", PureWindowsPath)
+
+    with pytest.raises(ValidationError, match="relative_path must name one path"):
+        local_files_module._relative_path(relative_path)
 
 
 def test_local_file_grant_rejects_unavailable_symlink_and_protected_roots(
