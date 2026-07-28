@@ -29,7 +29,7 @@ Do not force replacement when an unrelated program owns the existing `gsv`
 command. Check `command -v gsv` first and resolve that collision explicitly.
 
 The source-install command was exercised against the frozen 0.3.0 implementation
-candidate at commit `1729b07837d0d5922b81a3bcdb7cd37cebfdc83d` on 2026-07-28. It
+candidate at commit `ebaa3f32c855bf667d91280ba4117d63e5b4e513` on 2026-07-28. It
 built and installed `gsv==0.3.0`, exposed the CLI from a fresh isolated tool
 directory, returned a healthy `gsv doctor` result, and completed `gsv demo` with
 fresh-process resume, stale-write rejection, interrupted-write recovery, and

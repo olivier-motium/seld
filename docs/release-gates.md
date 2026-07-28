@@ -55,7 +55,7 @@ current comparison, and exact candidate behind that position.
 ## Exact source evidence
 
 On 2026-07-28, the 0.3.0 implementation candidate at commit
-`1729b07837d0d5922b81a3bcdb7cd37cebfdc83d` was installed from its frozen
+`ebaa3f32c855bf667d91280ba4117d63e5b4e513` was installed from its frozen
 source tree into fresh isolated `UV_TOOL_DIR` and `UV_TOOL_BIN_DIR` locations.
 The installed executable reported `0.3.0`, exposed the CLI, completed `gsv
 demo`, and returned a healthy `gsv doctor` result with:
@@ -66,13 +66,12 @@ demo`, and returned a healthy `gsv doctor` result with:
 - backup verification; and
 - logical restore equivalence.
 
-The same frozen commit passed `make check` with 889 tests passed and 4 skipped,
+The same frozen commit passed `make check` with 892 tests passed and 4 skipped,
 strict mypy, Ruff, 82% branch coverage, and a zero-finding privacy scan. Its
 browser matrix passed 22 Chromium checks across desktop, mobile, high contrast,
 forced colors, reduced motion, same-origin enforcement, stale-CAS recovery, and
 unavailable-state recovery. The package build, standalone build, and installed
-end-to-end suite also passed; the installed standalone binary had SHA-256
-`1e6d88d1b4a3d310e39a0d1fd2b6de58c21345a92fa0c4172729dc2a08a60e65`.
+end-to-end suite also passed directly from that commit.
 
 This proves the 0.3.0 source-install, browser, package, privacy, and synthetic
 continuity paths on macOS for those exact implementation bytes. The rows above
