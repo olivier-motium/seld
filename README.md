@@ -332,8 +332,17 @@ Remove only the ChatGPT app integration while keeping the executable:
 gsv codex uninstall
 ```
 
-Release uninstallers remove Seld-owned integration and executable files while
-preserving records, configuration, backups, and unrelated app data:
+For the supported `uv` install, stop the Bridge, remove Seld's ChatGPT app
+integration, and then remove the managed tool environment:
+
+```bash
+gsv bridge stop
+gsv codex uninstall
+uv tool uninstall gsv
+```
+
+Only run the release uninstaller when Seld came from a checksummed prebuilt
+binary:
 
 ```bash
 sh scripts/uninstall.sh

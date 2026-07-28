@@ -333,7 +333,12 @@ class TurnRunner(Protocol):
 class TurnTransport(Protocol):
     """Small Bridge injection seam used by deterministic HTTP tests."""
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]: ...
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]: ...
 
     def receipt(self, event_id: object) -> TurnReceipt | None: ...
 
@@ -579,14 +584,21 @@ class CodexTurnCoordinator:
                 self._capability_at = time.monotonic()
             return self._capability
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
-        capability = self.capability()
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
         event = None
         if event_id is not None:
             receipt = self.receipt(event_id)
             if receipt is not None:
                 event = self._public_receipt(receipt)
-        return {**capability.public(), "event": event}
+        result: dict[str, Any] = {"event": event}
+        if include_capability:
+            result = {**self.capability().public(), **result}
+        return result
 
     def receipt(self, event_id: object) -> TurnReceipt | None:
         clean_event_id = _canonical_uuid(event_id, "event ID")

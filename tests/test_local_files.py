@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 from datetime import UTC, datetime
@@ -100,6 +101,7 @@ def test_local_file_grant_returns_one_safe_file_transiently(
     ("relative_path", "content", "reason"),
     [
         ("notes.txt", b"password: this-is-a-real-password-value", "content-screen"),
+        ("router.txt", b"router password=hunter2", "content-screen"),
         (
             "remote.txt",
             b"url = https://alice:" + b"short-pass@example.com/org/repo.git\n",
@@ -108,7 +110,7 @@ def test_local_file_grant_returns_one_safe_file_transiently(
         ("large.txt", b"a" * (MAX_SCREEN_BYTES + 1), "content-screen"),
         ("binary.txt", b"\xff\xfeordinary", "non-utf8-content"),
     ],
-    ids=("secret", "credential-uri", "oversize", "non-utf8"),
+    ids=("secret", "short-password", "credential-uri", "oversize", "non-utf8"),
 )
 def test_local_file_reader_withholds_quarantined_content(
     tmp_path: Path,
@@ -222,8 +224,10 @@ def test_local_file_grant_is_bound_to_exact_vault_identity_and_path(
         vault_root=second_vault.root,
         vault_id=second_vault.identity()["vault_id"],
     )
+    moved_root = tmp_path / "restored-elsewhere"
+    moved_root.mkdir()
     moved_same_identity = LocalFileGrantStore(
-        vault_root=tmp_path / "restored-elsewhere",
+        vault_root=moved_root,
         vault_id=first_vault.identity()["vault_id"],
     )
 
@@ -231,6 +235,70 @@ def test_local_file_grant_is_bound_to_exact_vault_identity_and_path(
         second.read(grant_id=grant_id, relative_path="note.txt")
     with pytest.raises(NotFoundError, match="not found for this vault"):
         moved_same_identity.read(grant_id=grant_id, relative_path="note.txt")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory identity semantics")
+def test_same_path_vault_restore_requires_a_new_local_file_grant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, _ = _grant_store(tmp_path, monkeypatch)
+    selected_root = tmp_path / "selected"
+    selected_root.mkdir()
+    (selected_root / "note.txt").write_text("private context", encoding="utf-8")
+    selected = _select_local_files(vault)
+    grant_id = vault.grant_local_file_root(selected_root)["grant"]["grant_id"]
+    current = _record_local_success(vault, expected_revision=str(selected["revision"]))
+    assert current["sources"][0]["freshness"] == "current"
+
+    backup = Path(vault.create_backup(tmp_path / "same-path-restore.zip")["backup"])
+    original_root = vault.root
+    original_root.rename(tmp_path / "retired-vault")
+    Vault.restore_backup(backup, original_root)
+
+    restored = Vault(original_root)
+    assert restored.identity()["vault_id"] == vault.identity()["vault_id"]
+    assert restored.list_local_file_grants()["grants"] == []
+    assert restored.source_status()["sources"][0]["freshness"] == "needs_revalidation"
+    with pytest.raises(NotFoundError, match="not found for this vault"):
+        restored.read_local_file(grant_id=grant_id, relative_path="note.txt")
+
+    replacement_grant = restored.grant_local_file_root(selected_root)["grant"]["grant_id"]
+    assert replacement_grant != grant_id
+    assert (
+        restored.read_local_file(
+            grant_id=replacement_grant,
+            relative_path="note.txt",
+        )["content"]
+        == "private context"
+    )
+
+
+def test_legacy_unbound_local_file_grants_are_invalidated_on_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, store = _grant_store(tmp_path, monkeypatch)
+    selected_root = tmp_path / "selected"
+    selected_root.mkdir()
+    grant_id = store.create(selected_root)["grant"]["grant_id"]
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    payload["format_version"] = 1
+    for grant in payload["grants"]:
+        grant.pop("vault_device")
+        grant.pop("vault_inode")
+    store.path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    store.path.chmod(0o600)
+
+    restarted = LocalFileGrantStore(vault_root=store.vault_root, vault_id=store.vault_id)
+    assert restarted.list()["grants"] == []
+    with pytest.raises(NotFoundError, match="not found for this vault"):
+        restarted.read(grant_id=grant_id, relative_path="note.txt")
+
+    replacement = restarted.create(selected_root)
+    assert replacement["created"] is True
+    assert replacement["grant"]["grant_id"] != grant_id
+    assert json.loads(store.path.read_text(encoding="utf-8"))["format_version"] == 2
 
 
 def test_local_file_grant_revoke_is_durable_and_idempotent_creation(

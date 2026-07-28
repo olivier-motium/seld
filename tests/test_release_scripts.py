@@ -743,6 +743,34 @@ def test_posix_uninstaller_removes_binary_only_after_verified_cleanup(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX uninstaller test")
+def test_posix_release_uninstaller_rejects_managed_tool_shim(tmp_path: Path) -> None:
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+    managed_binary = tmp_path / "uv-tools" / "gsv"
+    managed_binary.parent.mkdir()
+    _write_uninstall_fixture(managed_binary)
+    target = install_dir / "gsv"
+    target.symlink_to(managed_binary)
+    environment = os.environ.copy()
+    environment["GSV_BIN_DIR"] = str(install_dir)
+
+    result = subprocess.run(
+        ["/bin/sh", str(ROOT / "scripts/uninstall.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode == 2
+    assert target.is_symlink()
+    assert managed_binary.exists()
+    assert "uv tool uninstall gsv" in result.stderr
+    assert "shim was kept" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX uninstaller test")
 @pytest.mark.parametrize("output_mode", ["compact", "pretty"])
 def test_posix_uninstaller_keeps_binary_until_recovery_evidence_is_retired(
     tmp_path: Path,

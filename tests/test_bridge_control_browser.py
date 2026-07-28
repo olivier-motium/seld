@@ -82,7 +82,12 @@ class SemanticReviewTransport:
         self.receipts[exact.event_id] = receipt
         return receipt
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
         receipt = self.receipts.get(event_id) if event_id is not None else None
         return {
             "automatic_resume": True,
@@ -223,8 +228,13 @@ class PreparedBoardTransport(SemanticReviewTransport):
         self.sheets: dict[str, list[dict[str, Any]]] = {}
         self.batch_choices: list[str] = []
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
-        snapshot = super().snapshot(event_id)
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
+        snapshot = super().snapshot(event_id, include_capability=include_capability)
         event = snapshot.get("event")
         if isinstance(event, dict) and event_id in self.sheets:
             sheet = self.sheets[event_id]
@@ -451,7 +461,12 @@ class PreparedBoardTransport(SemanticReviewTransport):
 
 
 class NeverSubmittedTransport:
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
         del event_id
         return {
             "automatic_resume": True,
@@ -525,7 +540,12 @@ class DeliveryUncertainTransport:
         self.thread_id = thread_id
         self.submit_count = 0
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
         receipt = self.receipts.get(event_id) if event_id is not None else None
         return {
             "automatic_resume": True,
@@ -631,7 +651,12 @@ class DispositionBeforeCompletionTransport(SemanticReviewTransport):
         self.receipts[completed.event_id] = running
         return running
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
         receipt = self.receipts.get(event_id) if event_id is not None else None
         if (
             receipt is not None

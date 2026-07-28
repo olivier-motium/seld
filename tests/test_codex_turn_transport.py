@@ -1975,9 +1975,9 @@ def test_restart_converts_in_flight_receipt_to_delivery_uncertain_without_replay
 
     second_runner = _FakeRunner()
     restarted = _coordinator(vault, second_runner, instance_id=OTHER_INSTANCE_ID)
-    recovered = restarted.receipt(event.event_id)
-    assert recovered is not None
-    assert recovered.state is TurnState.DELIVERY_UNCERTAIN
+    public = restarted.snapshot(event.event_id, include_capability=False)
+    assert public["event"]["state"] == TurnState.DELIVERY_UNCERTAIN.value
+    assert second_runner.probes == []
     restarted.submit(context)
     assert second_runner.spawns == []
     release.set()

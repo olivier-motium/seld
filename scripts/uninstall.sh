@@ -4,6 +4,11 @@ set -eu
 INSTALL_DIR="${GSV_BIN_DIR:-${HOME}/.local/bin}"
 TARGET="${INSTALL_DIR}/gsv"
 
+if [ -L "$TARGET" ]; then
+  printf '%s\n' "This is a managed tool shim. Run 'gsv bridge stop', 'gsv codex uninstall', then 'uv tool uninstall gsv'. The shim was kept." >&2
+  exit 2
+fi
+
 if [ ! -x "$TARGET" ]; then
   printf 'GSV executable not found at %s\n' "$TARGET" >&2
   exit 2

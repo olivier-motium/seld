@@ -126,11 +126,14 @@ host or recipe version presents retained coverage as `needs_revalidation`
 until a new bounded read succeeds.
 
 Local-file grants are deliberately absent from the portable vault. Their
-owner-only host record binds each opaque grant ID to one exact vault path and
-directory identity. `SOURCES.md` stores only the hash of the reader and current
-grant set. Creating, revoking, replacing, or invalidating a grant therefore
-changes that hash and makes retained local-file coverage
-`needs_revalidation`; no local path is written into `SOURCES.md` or a backup.
+owner-only host record binds each opaque grant ID to one exact vault ID, vault
+path, vault-directory identity, and selected-directory identity. Restoring or
+replacing a vault at the same path therefore requires a new grant. Version-1
+host grants lacked the vault-directory binding and are invalidated on upgrade.
+`SOURCES.md` stores only the hash of the reader and current grant set. Creating,
+revoking, replacing, or invalidating a grant changes that hash and makes
+retained local-file coverage `needs_revalidation`; no local path is written
+into `SOURCES.md` or a backup.
 
 ## Guided review references
 

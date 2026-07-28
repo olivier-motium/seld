@@ -21,9 +21,9 @@
 - MCP requests are bounded, validated, and mapped to the same kernel as the
   CLI.
 - Selecting the `local_files` source grants no path. Directory authority stays
-  in an owner-only host record bound to one vault and root; grant changes make
-  earlier source proof require revalidation, and MCP cannot create or revoke a
-  grant.
+  in an owner-only host record bound to one exact vault-directory identity and
+  selected root; grant changes or same-path vault replacement make earlier
+  source proof require revalidation, and MCP cannot create or revoke a grant.
 - A loopback caller without the current per-launch bearer cannot read the
   Bridge snapshot or health identity.
 - A stale, forged, or PID-reused Bridge receipt cannot cause Seld to signal an

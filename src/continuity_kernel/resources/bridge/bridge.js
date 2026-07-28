@@ -100,6 +100,7 @@ const guidedReviewRestoredPendingEvents = new Set();
 
 const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;
 const GUIDED_REVIEW_POLL_LIMIT = 680;
+const GUIDED_REVIEW_SNAPSHOT_POLL_EVERY = 4;
 const GUIDED_REVIEW_DISPOSITION_GRACE_MS = 2_250;
 
 const guidedReviewOptionLabels = {
@@ -143,7 +144,9 @@ window.addEventListener("keydown", (event) => {
 });
 
 loadSnapshot();
-window.setInterval(() => loadSnapshot({ quiet: true }), 10_000);
+window.setInterval(() => {
+  if (guidedReviewActivePollEventId === null) void loadSnapshot({ quiet: true });
+}, 10_000);
 window.setInterval(updateLiveLabels, 1_000);
 
 async function loadSnapshot({ quiet = false } = {}) {
@@ -179,12 +182,16 @@ async function loadSnapshot({ quiet = false } = {}) {
       guidedReviewNoticeContext = null;
     }
     const review = snapshot.portfolio?.review || {};
-    syncGuidedReviewDelivery(
-      snapshot.guided_review_transport?.event,
-      review.hand_url,
-      review,
-      snapshot.controls,
-    );
+    if (guidedReviewActivePollEventId === null) {
+      syncGuidedReviewDelivery(
+        snapshot.guided_review_transport?.event,
+        review.hand_url,
+        review,
+        snapshot.controls,
+      );
+    } else {
+      reconcileActiveGuidedReviewDisposition(review, snapshot.controls);
+    }
     state.lastSuccessAt = Date.now();
     setConnectionState(state.snapshot.doctor.healthy ? "healthy" : "partial");
     if (snapshotChanged) {
@@ -1599,6 +1606,10 @@ async function continueGuidedReviewTurn(eventId, handUrl) {
         await finishGuidedReviewDelivery(currentReceipt);
         return;
       }
+      if ((attempt + 1) % GUIDED_REVIEW_SNAPSHOT_POLL_EVERY === 0) {
+        await loadSnapshot({ quiet: true });
+        if (generation !== guidedReviewPollGeneration) return;
+      }
     }
     updateGuidedReviewMessage(
       "The review task is still working. Seld will not resend your answer; open the same ChatGPT task if you need to inspect it now.",
@@ -1707,6 +1718,47 @@ function updateGuidedReviewMessage(message) {
   render();
 }
 
+function reconcileActiveGuidedReviewDisposition(review, controls) {
+  const delivery = guidedReviewDelivery;
+  const current = delivery?.receipt;
+  if (!current?.event_id || guidedReviewActivePollEventId !== current.event_id) return;
+  const pendingEventIds = [review?.pending_intent?.event_id, review?.pending_start?.event_id]
+    .filter(Boolean);
+  if (pendingEventIds.includes(current.event_id)) {
+    guidedReviewDelivery = { ...delivery, pendingSeen: true, resolvedAt: null };
+    return;
+  }
+  const observedQueuedRevision =
+    delivery.queueRevision && controls?.queue_revision === delivery.queueRevision;
+  const resolvedVisible = [...(controls?.items || []), ...(controls?.history || [])].some(
+    (item) =>
+      item?.event?.event_id === current.event_id &&
+      ["accepted", "rejected"].includes(item?.status),
+  );
+  if (
+    current.state === "completed" ||
+    review?.state === "unavailable" ||
+    controls?.available !== true ||
+    !(delivery.pendingSeen === true || observedQueuedRevision || resolvedVisible) ||
+    delivery.resolvedAt
+  ) return;
+  const resolvedAt = Date.now();
+  guidedReviewDelivery = { ...delivery, resolvedAt };
+  window.setTimeout(() => {
+    const latest = guidedReviewDelivery;
+    if (
+      latest?.eventId !== current.event_id ||
+      latest.receipt?.state === "completed" ||
+      latest.resolvedAt !== resolvedAt ||
+      Date.now() - resolvedAt < GUIDED_REVIEW_DISPOSITION_GRACE_MS
+    ) return;
+    guidedReviewPollGeneration += 1;
+    guidedReviewActivePollEventId = null;
+    guidedReviewDelivery = null;
+    render();
+  }, GUIDED_REVIEW_DISPOSITION_GRACE_MS);
+}
+
 function syncGuidedReviewDelivery(receipt, handUrl, review, controls) {
   if (!receipt?.event_id) {
     const current = guidedReviewDelivery?.receipt;
@@ -1731,30 +1783,6 @@ function syncGuidedReviewDelivery(receipt, handUrl, review, controls) {
       controls?.available === true &&
       (guidedReviewDelivery?.pendingSeen === true || observedQueuedRevision || resolvedVisible)
     ) {
-      if (guidedReviewActivePollEventId === current.event_id) {
-        if (!guidedReviewDelivery.resolvedAt) {
-          const resolvedAt = Date.now();
-          guidedReviewDelivery = { ...guidedReviewDelivery, resolvedAt };
-          window.setTimeout(() => {
-            const delivery = guidedReviewDelivery;
-            if (
-              delivery?.eventId !== current.event_id ||
-              delivery.receipt?.state === "completed" ||
-              delivery.resolvedAt !== resolvedAt ||
-              Date.now() - resolvedAt < GUIDED_REVIEW_DISPOSITION_GRACE_MS
-            ) return;
-            guidedReviewPollGeneration += 1;
-            guidedReviewActivePollEventId = null;
-            guidedReviewDelivery = null;
-            render();
-          }, GUIDED_REVIEW_DISPOSITION_GRACE_MS);
-          return;
-        }
-        if (
-          Date.now() - guidedReviewDelivery.resolvedAt <
-          GUIDED_REVIEW_DISPOSITION_GRACE_MS
-        ) return;
-      }
       guidedReviewPollGeneration += 1;
       guidedReviewActivePollEventId = null;
       guidedReviewDelivery = null;

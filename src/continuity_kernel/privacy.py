@@ -71,7 +71,9 @@ _EXCLUDED_NAMES: Final = frozenset(
         "secrets.json",
     }
 )
-_SECRET_NAME: Final = re.compile(r"(?:^|\.)(?:credential|credentials|secret|secrets)(?:\.|$)")
+_SECRET_NAME: Final = re.compile(
+    r"(?:^|\.)(?:credential|credentials|password|passwords|secret|secrets)(?:\.|$)"
+)
 _CODEX_CREDENTIAL_CONTAINERS: Final = frozenset({".codex", ".openai", "openai"})
 _CODEX_CREDENTIAL_ARTIFACT: Final = re.compile(r"^(?:auth(?:\.jsonl?)?|.+[-_.]auth(?:\.jsonl?)?)$")
 _POSIX_SYSTEM_ROOTS: Final = frozenset(
@@ -98,7 +100,7 @@ _SECRET_PATTERNS: Final = (
         re.compile(
             rb"(?i)(?<![A-Za-z0-9_-])(?:[\"']?)(?:api[_-]?key|client[_-]?secret|access[_-]?token|"
             rb"refresh[_-]?token|id[_-]?token|password|secret|token)(?:[\"']?)\s*[:=]\s*"
-            rb"(?:[\"']?)[^\s\"',;}]{12,}(?:[\"']?)"
+            rb"(?:[\"']?)[^\s\"',;}]+(?:[\"']?)"
         ),
     ),
     (

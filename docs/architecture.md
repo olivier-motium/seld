@@ -44,12 +44,13 @@ never parses provider content or decides what it means.
 
 Local-file access uses a separate host-local authority store. Selecting the
 logical source grants no directory access. Grant and revoke are explicit CLI
-operations bound to one exact vault and root; MCP can list current grants and
-read one named relative path but cannot create authority. The reader pins the
-root identity, refuses links and path escape, avoids cloud placeholders, and
-passes content through the privacy screen. The portable source ledger retains
-only a fingerprint of the current grant set, so any grant change makes earlier
-coverage require a new bounded read.
+operations bound to one exact vault directory and selected root; MCP can list
+current grants and read one named relative path but cannot create authority.
+Replacing or restoring the vault at the same path invalidates the grant. The
+reader pins both directory identities, refuses links and path escape, avoids
+cloud placeholders, and passes content through the privacy screen. The portable
+source ledger retains only a fingerprint of the current grant set, so any grant
+change makes earlier coverage require a new bounded read.
 
 The packaged `gsv-onboard` and `gsv-pulse` skills compose document, Task,
 WorkThread, Portfolio, source, operation, and Bridge surfaces. Deterministic

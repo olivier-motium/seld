@@ -28,6 +28,7 @@ from continuity_kernel.privacy import (
         "project/runtime.secrets.yaml",
         "browser/Cookies",
         "notes/secrets.json",
+        "notes/passwords.txt",
         "Library/Application Support/1Password/account.json",
         "Library/Application Support/Bitwarden/data.json",
         ".git-credentials",
@@ -166,6 +167,7 @@ def test_macos_file_provider_content_stays_metadata_only_without_residency_proof
         (b"-----BEGIN " + b"PRIVATE KEY-----\nabc", "private-key"),
         (b"token = gh" + b"p_abcdefghijklmnopqrstuvwxyz123456", "github-token"),
         (b"password: this-is-a-real-password-value", "credential-assignment"),
+        (b"router password=hunter2", "credential-assignment"),
         (
             b'{"access_token": "sk-' + b'proj-this-is-a-quoted-json-credential"}',
             "credential-assignment",

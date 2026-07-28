@@ -224,16 +224,32 @@ browser-test dependencies rather than the minimal public tool.
 
 ## Removal
 
-`gsv codex uninstall` removes `gsv`-owned Codex integration while keeping the
-executable. The release uninstall script first stops only a Bridge instance
-whose live health identity matches its owner-only receipt. It removes the
-executable only after both the active integration and receipt-bound recovery
-catalog are retired.
+For the supported `uv` source install, remove the running surface, owned
+ChatGPT app integration, and managed tool environment in that order:
 
-Both paths preserve the vault, configuration, backups, unrelated Codex
-instructions, marketplaces, and plugins. Neither Codex status nor uninstall
-requires a readable vault configuration. Delete the vault or config only as a
-separate, deliberate user-data operation.
+```bash
+gsv bridge stop
+gsv codex uninstall
+uv tool uninstall gsv
+```
+
+Do not run the final command until `gsv codex uninstall` reports complete
+cleanup. If it retains recovery evidence, follow its exact retry instruction
+first so the executable remains available for verified cleanup.
+
+The release uninstall script is only for a checksummed prebuilt binary. It
+first stops a Bridge instance whose live health identity matches its owner-only
+receipt, then removes the executable after the active integration and
+receipt-bound recovery catalog are retired:
+
+```bash
+sh scripts/uninstall.sh
+```
+
+Both removal paths preserve the vault, configuration, backups, unrelated
+Codex instructions, marketplaces, and plugins. Neither Codex status nor
+uninstall requires a readable vault configuration. Delete the vault or config
+only as a separate, deliberate user-data operation.
 
 If the Codex executable is unavailable, a command times out, or final provider
 verification fails, cleanup is explicitly partial. The uninstaller may remove

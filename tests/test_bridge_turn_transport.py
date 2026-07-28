@@ -51,9 +51,16 @@ class _FakeTransport:
         self.receipts: dict[str, TurnReceipt] = {}
         self.contexts: list[TurnContext] = []
         self.snapshot_event_ids: list[str | None] = []
+        self.snapshot_capability_flags: list[bool] = []
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
         self.snapshot_event_ids.append(event_id)
+        self.snapshot_capability_flags.append(include_capability)
         receipt = self.receipts.get(event_id or "")
         return {
             "automatic_resume": True,
@@ -347,6 +354,8 @@ def test_authenticated_control_append_triggers_exact_event_and_poll_is_non_enume
             polled = json.loads(response.read())
         assert polled["transport"]["event_id"] == event_id
         assert polled["transport"]["final_answer"] is None
+        assert transport.snapshot_event_ids[-1] == event_id
+        assert transport.snapshot_capability_flags[-1] is False
 
         snapshot_calls = list(transport.snapshot_event_ids)
         head = Request(

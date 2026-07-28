@@ -14,7 +14,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from continuity_kernel.atomic import atomic_write, exclusive_lock, read_regular_file, sha256_bytes
 from continuity_kernel.config import data_dir
@@ -31,7 +31,8 @@ from continuity_kernel.vault_identity import canonical_vault_id
 LOCAL_FILE_SOURCE_ID: Final = "local_files"
 LOCAL_FILE_READER_TOOL: Final = "gsv_local_file_read"
 LOCAL_FILE_READ_CAPABILITY: Final = get_recipe(LOCAL_FILE_SOURCE_ID).read_capability
-LOCAL_FILE_GRANT_FORMAT_VERSION: Final = 1
+LOCAL_FILE_GRANT_FORMAT_VERSION: Final = 2
+_LEGACY_LOCAL_FILE_GRANT_FORMAT_VERSION: Final = 1
 MAX_LOCAL_PATH_BYTES: Final = 16 * 1024
 MAX_LOCAL_GRANTS: Final = 128
 MAX_LOCAL_GRANT_STORE_BYTES: Final = 512 * 1024
@@ -42,10 +43,13 @@ _GRANT_KEYS: Final = frozenset(
         "grant_id",
         "inode",
         "root",
+        "vault_device",
         "vault_id",
+        "vault_inode",
         "vault_root",
     }
 )
+_LEGACY_GRANT_KEYS: Final = _GRANT_KEYS - {"vault_device", "vault_inode"}
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,8 @@ class LocalFileGrant:
     grant_id: str
     vault_id: str
     vault_root: str
+    vault_device: int
+    vault_inode: int
     root: str
     device: int
     inode: int
@@ -78,7 +84,9 @@ class LocalFileGrantStore:
         root = Path(vault_root).expanduser()
         if not root.is_absolute():
             raise ValidationError("local-file grants require an absolute vault root")
-        self.vault_root = str(root.resolve())
+        canonical_root, vault_identity = _real_directory(root, "vault root")
+        self.vault_root = str(canonical_root)
+        self.vault_device, self.vault_inode = vault_identity
         self.vault_id = canonical_vault_id(vault_id)
         self.storage_root = data_dir() / "local-file-authority"
         self.path = self.storage_root / "local-file-grants.json"
@@ -104,6 +112,8 @@ class LocalFileGrantStore:
                 grant_id=str(uuid.uuid4()),
                 vault_id=self.vault_id,
                 vault_root=self.vault_root,
+                vault_device=self.vault_device,
+                vault_inode=self.vault_inode,
                 root=str(root),
                 device=identity[0],
                 inode=identity[1],
@@ -151,6 +161,8 @@ class LocalFileGrantStore:
                 {
                     "grants": entries,
                     "vault_id": self.vault_id,
+                    "vault_device": self.vault_device,
+                    "vault_inode": self.vault_inode,
                     "vault_root": self.vault_root,
                 },
                 ensure_ascii=False,
@@ -206,7 +218,15 @@ class LocalFileGrantStore:
             return _read_granted_file(grant=grant, relative=relative)
 
     def _belongs(self, grant: LocalFileGrant) -> bool:
-        return grant.vault_id == self.vault_id and grant.vault_root == self.vault_root
+        return (
+            grant.vault_id == self.vault_id
+            and grant.vault_root == self.vault_root
+            and (grant.vault_device, grant.vault_inode) == (self.vault_device, self.vault_inode)
+            and _directory_matches(
+                self.vault_root,
+                expected=(self.vault_device, self.vault_inode),
+            )
+        )
 
     def _locked(self) -> Any:
         _prepare_private_storage(self.storage_root)
@@ -225,14 +245,26 @@ class LocalFileGrantStore:
             payload = json.loads(encoded.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise ValidationError("Seld local-file grant store is invalid") from exc
+        format_version = payload.get("format_version") if isinstance(payload, dict) else None
         if (
             not isinstance(payload, dict)
             or set(payload) != {"format_version", "grants"}
-            or payload.get("format_version") != LOCAL_FILE_GRANT_FORMAT_VERSION
+            or format_version
+            not in {
+                _LEGACY_LOCAL_FILE_GRANT_FORMAT_VERSION,
+                LOCAL_FILE_GRANT_FORMAT_VERSION,
+            }
             or not isinstance(payload.get("grants"), list)
             or len(payload["grants"]) > MAX_LOCAL_GRANTS
         ):
             raise ValidationError("Seld local-file grant store has an unsupported shape")
+        if format_version == _LEGACY_LOCAL_FILE_GRANT_FORMAT_VERSION:
+            # Version 1 did not bind authority to the vault directory object. Validate
+            # its shape, then expose no authority; the next explicit grant rewrites
+            # the host-local store in version 2.
+            for value in payload["grants"]:
+                _validate_legacy_grant(value)
+            return ()
         grants = tuple(_grant_from_value(value) for value in payload["grants"])
         if len({grant.grant_id for grant in grants}) != len(grants):
             raise ValidationError("Seld local-file grant store contains duplicate IDs")
@@ -339,6 +371,35 @@ def _grant_root(value: Path | str) -> tuple[Path, tuple[int, int]]:
     return canonical, _identity(resolved)
 
 
+def _real_directory(value: Path, label: str) -> tuple[Path, tuple[int, int]]:
+    try:
+        listed = os.lstat(value)
+        canonical = value.resolve(strict=True)
+        resolved = os.stat(canonical, follow_symlinks=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValidationError(f"local-file {label} is unavailable") from exc
+    if (
+        _is_link_or_reparse(listed)
+        or not stat.S_ISDIR(listed.st_mode)
+        or not stat.S_ISDIR(resolved.st_mode)
+        or _identity(listed) != _identity(resolved)
+    ):
+        raise ValidationError(f"local-file {label} must be one stable real directory")
+    return canonical, _identity(resolved)
+
+
+def _directory_matches(value: str, *, expected: tuple[int, int]) -> bool:
+    try:
+        metadata = os.lstat(value)
+    except OSError:
+        return False
+    return (
+        not _is_link_or_reparse(metadata)
+        and stat.S_ISDIR(metadata.st_mode)
+        and _identity(metadata) == expected
+    )
+
+
 def _root_matches(grant: LocalFileGrant) -> bool:
     try:
         metadata = os.lstat(grant.root)
@@ -382,8 +443,13 @@ def _grant_from_value(value: object) -> LocalFileGrant:
         raise ValidationError("Seld local-file grant has an unsupported shape")
     device = value.get("device")
     inode = value.get("inode")
+    vault_device = value.get("vault_device")
+    vault_inode = value.get("vault_inode")
     created_at = value.get("created_at")
-    if type(device) is not int or device < 0 or type(inode) is not int or inode < 0:
+    if any(
+        type(identity) is not int or identity < 0
+        for identity in (device, inode, vault_device, vault_inode)
+    ):
         raise ValidationError("Seld local-file grant has an invalid root identity")
     if not isinstance(created_at, str):
         raise ValidationError("Seld local-file grant has an invalid creation time")
@@ -391,11 +457,30 @@ def _grant_from_value(value: object) -> LocalFileGrant:
         grant_id=_grant_id(value.get("grant_id")),
         vault_id=canonical_vault_id(value.get("vault_id")),
         vault_root=_stored_absolute_path(value.get("vault_root"), "vault root"),
+        vault_device=cast(int, vault_device),
+        vault_inode=cast(int, vault_inode),
         root=_stored_absolute_path(value.get("root"), "selected root"),
-        device=device,
-        inode=inode,
+        device=cast(int, device),
+        inode=cast(int, inode),
         created_at=stored_time(created_at, "local-file grant creation time"),
     )
+
+
+def _validate_legacy_grant(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != _LEGACY_GRANT_KEYS:
+        raise ValidationError("Seld local-file grant has an unsupported shape")
+    device = value.get("device")
+    inode = value.get("inode")
+    created_at = value.get("created_at")
+    if type(device) is not int or device < 0 or type(inode) is not int or inode < 0:
+        raise ValidationError("Seld local-file grant has an invalid root identity")
+    if not isinstance(created_at, str):
+        raise ValidationError("Seld local-file grant has an invalid creation time")
+    _grant_id(value.get("grant_id"))
+    canonical_vault_id(value.get("vault_id"))
+    _stored_absolute_path(value.get("vault_root"), "vault root")
+    _stored_absolute_path(value.get("root"), "selected root")
+    stored_time(created_at, "local-file grant creation time")
 
 
 def _grant_id(value: object) -> str:

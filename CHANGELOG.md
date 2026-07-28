@@ -36,8 +36,9 @@ decision loop.
   `gsv_source_*` MCP surfaces: explicit selection, content-free AI-attested
   read/failure receipts, stale-CAS protection, account continuity, and
   fresh-process Bridge visibility.
-- Add the private, read-only Bridge for current orientation, commitments, and
-  storylines, including authenticated loopback access and responsive states.
+- Add the private Bridge with read-only record views plus bounded intent and
+  review-turn routes, including authenticated loopback access and responsive
+  states.
 - Make live-Bridge upgrades quiesce before executable replacement and restore
   the previous Bridge best-effort on rollback.
 - Make bare `gsv` open the configured Bridge and make setup install Codex

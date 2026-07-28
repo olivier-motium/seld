@@ -669,7 +669,10 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 TurnState.PENDING,
                 TurnState.FAILED_SAFE,
             }:
-                transport = self.bridge.turn_transport.snapshot(existing.event_id)["event"]
+                transport = self.bridge.turn_transport.snapshot(
+                    existing.event_id,
+                    include_capability=False,
+                )["event"]
             else:
                 self.bridge._require_current_vault_identity()
                 operations = OperationLedger(self.bridge.vault.root).snapshot(
@@ -743,7 +746,10 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            transport = self.bridge.turn_transport.snapshot(values["event_id"][0])["event"]
+            transport = self.bridge.turn_transport.snapshot(
+                values["event_id"][0],
+                include_capability=False,
+            )["event"]
         except ControlStorageError:
             self._error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
