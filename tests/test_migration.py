@@ -249,6 +249,7 @@ def test_migration_empty_control_directory_supports_first_queue_round_trip(
     assert ControlQueue(vault.root).snapshot() == appended
 
 
+@pytest.mark.skipif(os.name == "nt", reason="exact lock identity proof is POSIX-only")
 def test_concurrent_apply_serializes_backup_and_receipt_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

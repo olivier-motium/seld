@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -196,6 +197,7 @@ def test_receipt_separates_mechanical_cpu_from_cognitive_wall_clock(tmp_path: Pa
     assert receipt.whole_mind_max_staleness_seconds == 24 * 60 * 60
 
 
+@pytest.mark.skipif(os.name == "nt", reason="exact lock identity proof is POSIX-only")
 def test_global_single_flight_has_one_winner_across_controller_instances(tmp_path: Path) -> None:
     root = tmp_path / "pulse"
 

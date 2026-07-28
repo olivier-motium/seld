@@ -1859,7 +1859,9 @@ def test_browser_keeps_active_delivery_until_post_disposition_completion(
             ),
         ),
     )
-    transport = DispositionBeforeCompletionTransport(vault)
+    # Keep a deterministic observable disposition-before-completion window even
+    # when the accelerated background snapshot loop runs faster on hosted CI.
+    transport = DispositionBeforeCompletionTransport(vault, running_reads=10)
     ledger = OperationLedger(vault.root)
     static_resource = files("continuity_kernel") / "resources/bridge"
 

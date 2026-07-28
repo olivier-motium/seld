@@ -55,6 +55,24 @@ changes across sources without acting outward on its own.*
 
 While you were away, Seld kept up.
 
+## What caught up looks like
+
+These are representative launch workflows, not additions to the currently
+proven connector list:
+
+- An email says an order still has not shipped. Seld links it to the matching
+  Shopify order, prepares the reply, and lays out the cancellation, reorder,
+  and refund paths. Nothing is changed or sent until you approve the move.
+- A large order exceeds one site's capacity. Staffing and a second site make it
+  feasible, so Seld proposes an allocation. When a later WhatsApp message
+  changes who is available, the proposed allocation changes before you commit.
+- Delivery notes generated from Google Sheets keep improving because Seld
+  remembers the human corrections. The next batch starts from what people
+  actually fixed, not the same generic template.
+
+In each case, Seld catches up across the relevant record, prepares the
+consequential action, and waits for approval.
+
 ## The Rundown
 
 Seld brings decisions to you one at a time. Each item says where the situation

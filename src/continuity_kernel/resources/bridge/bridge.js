@@ -1536,7 +1536,9 @@ async function queueGuidedReviewIntent(
       eventId,
       handUrl,
       liveCheckedAt: null,
-      message: "Your exact answer is saved locally once. You can leave this view; the review keeps its place.",
+      message: payload.transport
+        ? null
+        : "Your exact answer is saved locally once. You can leave this view; the review keeps its place.",
       pendingSeen: false,
       queueRevision: payload.revision || null,
       resolvedAt: null,
@@ -2053,7 +2055,9 @@ function guidedReviewStateCopy(receipt) {
     return "GSV proved the turn was not delivered, so this exact receipt is safe to retry.";
   }
   if (receipt.state === "delivery_uncertain") {
-    return "GSV will not replay an answer that Codex may already have received.";
+    return receipt.thread_id
+      ? "GSV cannot prove whether Codex received this answer. It will not resend it; reconcile the exact hand and canonical records."
+      : "GSV cannot recover the Codex hand for this turn. It will not resend it; inspect recent Codex tasks and canonical records before deciding what to do.";
   }
   return "The queued receipt remains local. Continue in the exact hand or repair the installed capability.";
 }
