@@ -2,7 +2,7 @@
 
 - Assessment: `resident-personal-operations/v1`
 - Evaluated: 2026-07-28
-- Seld: `0.3.0` at `ebaa3f32c855bf667d91280ba4117d63e5b4e513`
+- Seld: `0.3.0` at `d0a17d871c45eb216f63a5f8f6041ef6e1b34ef3`
 - OpenClaw source snapshot: [`da5820b39c09b857bb2411fda247ebea9456211c`](https://github.com/openclaw/openclaw/tree/da5820b39c09b857bb2411fda247ebea9456211c)
 - Hermes Agent source snapshot: [`f228e145ba35cbbf785eded2021ae6682285b91b`](https://github.com/NousResearch/hermes-agent/tree/f228e145ba35cbbf785eded2021ae6682285b91b)
 

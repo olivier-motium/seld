@@ -55,7 +55,7 @@ current comparison, and exact candidate behind that position.
 ## Exact source evidence
 
 On 2026-07-28, the 0.3.0 implementation candidate at commit
-`ebaa3f32c855bf667d91280ba4117d63e5b4e513` was installed from its frozen
+`d0a17d871c45eb216f63a5f8f6041ef6e1b34ef3` was installed from its frozen
 source tree into fresh isolated `UV_TOOL_DIR` and `UV_TOOL_BIN_DIR` locations.
 The installed executable reported `0.3.0`, exposed the CLI, completed `gsv
 demo`, and returned a healthy `gsv doctor` result with:
