@@ -55,7 +55,7 @@ current comparison, and exact candidate behind that position.
 ## Exact source evidence
 
 On 2026-07-28, the 0.3.0 implementation candidate at commit
-`d0a17d871c45eb216f63a5f8f6041ef6e1b34ef3` was installed from its frozen
+`e1269abedd8f48a05e1bb6df0adac6639c5d7f2d` was installed from its frozen
 source tree into fresh isolated `UV_TOOL_DIR` and `UV_TOOL_BIN_DIR` locations.
 The installed executable reported `0.3.0`, exposed the CLI, completed `gsv
 demo`, and returned a healthy `gsv doctor` result with:
@@ -66,7 +66,7 @@ demo`, and returned a healthy `gsv doctor` result with:
 - backup verification; and
 - logical restore equivalence.
 
-The same frozen commit passed `make check` with 892 tests passed and 4 skipped,
+The same frozen commit passed `make check` with 898 tests passed and 4 skipped,
 strict mypy, Ruff, 82% branch coverage, and a zero-finding privacy scan. Its
 browser matrix passed 22 Chromium checks across desktop, mobile, high contrast,
 forced colors, reduced motion, same-origin enforcement, stale-CAS recovery, and
