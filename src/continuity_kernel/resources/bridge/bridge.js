@@ -1698,7 +1698,7 @@ function updateGuidedReviewReceipt(receipt, handUrl, expectedEventId = null) {
       selectedReceipt.state === "running" && exactGuidedReviewHandUrl(selectedReceipt.thread_id)
         ? Date.now()
         : null,
-    message: guidedReviewDelivery?.message || null,
+    message: stateChanged ? null : guidedReviewDelivery?.message || null,
     pendingSeen: guidedReviewDelivery?.pendingSeen || false,
     queueRevision: guidedReviewDelivery?.queueRevision || null,
     resolvedAt: guidedReviewDelivery?.resolvedAt || null,
