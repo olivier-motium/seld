@@ -1,6 +1,6 @@
 """Fail-closed, transient prepared decisions for Bridge Portfolio review.
 
-The exact Codex hand authors this bounded envelope in its final answer.  GSV
+The exact ChatGPT hand authors this bounded envelope in its final answer. Seld
 validates and renders it, but never persists the provider body or a preparation
 cache.  Durable authority remains the review-session subject refs, canonical
 Task records, the append-only control queue, and per-row CAS/readback.

@@ -13,6 +13,10 @@ $InstallDir = if ($env:GSV_BIN_DIR) {
 }
 $Target = Join-Path $InstallDir "gsv.exe"
 
+if (-not $env:GSV_BINARY) {
+    throw "Seld does not publish a Windows prebuilt yet. Windows support is coming."
+}
+
 $Architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
     "X64" { "x86_64" }
     # Windows ARM64 uses the x64 asset through emulation; hosted E2E must validate it.
@@ -36,10 +40,10 @@ function Invoke-VerifiedBridgeStop {
     try {
         $Payload = ($Raw | Out-String) | ConvertFrom-Json
     } catch {
-        throw "The staged GSV executable returned an invalid Bridge stop result."
+        throw "The staged Seld executable returned an invalid Bridge stop result."
     }
     if (-not $Payload.ok) {
-        throw "The staged GSV executable did not confirm its Bridge stop result."
+        throw "The staged Seld executable did not confirm its Bridge stop result."
     }
     return $Payload.result
 }
@@ -92,7 +96,7 @@ try {
 
     $Actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Download).Hash.ToLowerInvariant()
     if ($Actual -ne $Expected) {
-        throw "GSV artifact checksum verification failed."
+        throw "Seld artifact checksum verification failed."
     }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -104,11 +108,11 @@ try {
         Copy-Item -LiteralPath $Download -Destination $Staged
         & $Staged --version | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            throw "The staged GSV executable did not pass its version preflight."
+            throw "The staged Seld executable did not pass its version preflight."
         }
         if (Test-Path -LiteralPath $Target) {
             if ((Get-Item -LiteralPath $Target).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-                throw "Refusing to replace a reparse-point GSV target: $Target"
+                throw "Refusing to replace a reparse-point Seld target: $Target"
             }
             $Backup = Join-Path $InstallDir (".gsv.previous." + [guid]::NewGuid() + ".exe")
             $PriorStop = Invoke-VerifiedBridgeStop -Executable $Staged
@@ -126,7 +130,7 @@ try {
             $RepairRequired = $true
             $RetainedBackup = $Backup
         } elseif ($SetupStatus -ne 0) {
-            throw "GSV setup failed with exit code $SetupStatus."
+            throw "Seld setup failed with exit code $SetupStatus."
         }
         if (-not $RepairRequired -and $Backup -and (Test-Path -LiteralPath $Backup)) {
             Remove-Item -LiteralPath $Backup -Force
@@ -143,14 +147,14 @@ try {
         }
         if ($InstalledNew -and -not $RollbackSafe) {
             if ($Backup) {
-                throw "GSV setup failed and its Bridge stop could not be verified; the previous executable remains staged at $Backup. Original error: $($Failure.Exception.Message)"
+                throw "Seld setup failed and its Bridge stop could not be verified; the previous executable remains staged at $Backup. Original error: $($Failure.Exception.Message)"
             }
-            throw "GSV setup failed and its Bridge stop could not be verified; the candidate executable was left in place. Original error: $($Failure.Exception.Message)"
+            throw "Seld setup failed and its Bridge stop could not be verified; the candidate executable was left in place. Original error: $($Failure.Exception.Message)"
         }
         if ($InstalledNew) {
             if ($Backup -and (Test-Path -LiteralPath $Backup)) {
                 if (-not (Test-PreviousExecutableCompatibility -Executable $Backup)) {
-                    throw "GSV setup failed and the previous executable could not prove it can read the current vault; no rollback was performed. The candidate remains installed and the previous executable remains staged at $Backup. Original error: $($Failure.Exception.Message)"
+                    throw "Seld setup failed and the previous executable could not prove it can read the current vault; no rollback was performed. The candidate remains installed and the previous executable remains staged at $Backup. Original error: $($Failure.Exception.Message)"
                 }
                 if (Test-Path -LiteralPath $Target) {
                     $FailedCandidate = Join-Path $InstallDir (".gsv.failed." + [guid]::NewGuid() + ".exe")
@@ -171,7 +175,7 @@ try {
         }
         if ($SetupStatus -and $SetupStatus -ne 4) {
             [Console]::Error.WriteLine(
-                "GSV setup failed; the previous executable was restored when a compatible backup was available."
+                "Seld setup failed; the previous executable was restored when a compatible backup was available."
             )
             exit $SetupStatus
         }
@@ -183,14 +187,14 @@ try {
     Remove-Item -LiteralPath $Temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "Installed GSV at $Target"
+Write-Host "Installed Seld at $Target"
 if ($RepairRequired) {
-    [Console]::Error.WriteLine("GSV and its Codex integration were installed, but the Bridge needs repair. No executable rollback was attempted.")
+    [Console]::Error.WriteLine("Seld and its ChatGPT integration were installed, but the Bridge needs repair. No executable rollback was attempted.")
     if ($RetainedBackup -and (Test-Path -LiteralPath $RetainedBackup)) {
         [Console]::Error.WriteLine("The previous executable remains staged at $RetainedBackup.")
     }
     [Console]::Error.WriteLine("Run gsv --json bridge status, then retry gsv bridge open.")
     exit 4
 }
-Write-Host "GSV setup completed. Run gsv to open or verify the Bridge."
-Write-Host "Restart Codex, open one fresh task, and run `$gsv-onboard."
+Write-Host "Seld setup completed. Run gsv to open or verify the Bridge."
+Write-Host "Restart the ChatGPT desktop app, open one fresh task, and run `$gsv-onboard."

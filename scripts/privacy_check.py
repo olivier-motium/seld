@@ -17,8 +17,57 @@ from pathlib import Path
 from typing import Any
 
 MAX_SCAN_BYTES = 64 * 1024 * 1024
+MAX_REPOSITORY_FILE_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 10_000
 PYINSTALLER_COOKIE_MAGIC = b"MEI\x0c\x0b\x0a\x0b\x0e"
+ALLOWED_REPOSITORY_BINARY_PATHS = frozenset(
+    {
+        "src/continuity_kernel/resources/bridge/fonts/nunito-sans-var.woff2",
+        "src/continuity_kernel/resources/bridge/fonts/nunito-var.woff2",
+    }
+)
+BINARY_MAGICS = (
+    b"\x89PNG\r\n\x1a\n",
+    b"\xff\xd8\xff",
+    b"GIF87a",
+    b"GIF89a",
+    b"%PDF-",
+    b"PK\x03\x04",
+    b"\x1f\x8b",
+    b"wOFF",
+    b"wOF2",
+    b"\x7fELF",
+    b"MZ",
+)
+BINARY_SUFFIXES = frozenset(
+    {
+        ".7z",
+        ".avif",
+        ".bin",
+        ".bz2",
+        ".dmg",
+        ".exe",
+        ".gif",
+        ".gz",
+        ".heic",
+        ".icns",
+        ".ico",
+        ".jpeg",
+        ".jpg",
+        ".mov",
+        ".mp4",
+        ".pdf",
+        ".png",
+        ".pyc",
+        ".tar",
+        ".tgz",
+        ".webp",
+        ".woff",
+        ".woff2",
+        ".xz",
+        ".zip",
+    }
+)
 EXCLUDED_DIRECTORIES = {
     ".git",
     ".mypy_cache",
@@ -65,6 +114,7 @@ def main() -> int:
     root = args.root.expanduser().resolve()
     patterns = (*PATTERNS, *_private_term_patterns())
     findings, scanned = scan_tree(root, patterns)
+    findings.extend(scan_repository_artifact_policy(root))
     for artifact in args.artifact:
         target = artifact.expanduser().resolve()
         if target.is_dir():
@@ -123,6 +173,36 @@ def scan_path(
         if pattern.search(content)
     ]
     return findings, 1
+
+
+def scan_repository_artifact_policy(root: Path) -> list[Finding]:
+    """Reject repository noise while allowing only the two licensed Seld fonts."""
+
+    findings: list[Finding] = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if path.name in EXCLUDED_FILENAMES:
+            continue
+        if any(part in EXCLUDED_DIRECTORIES for part in relative.parts):
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        display = relative.as_posix()
+        size = path.stat().st_size
+        if size > MAX_REPOSITORY_FILE_BYTES:
+            findings.append(Finding(display, "repository-file-oversized"))
+            continue
+        content = path.read_bytes()
+        if (
+            path.suffix.lower() in BINARY_SUFFIXES or _looks_binary(content)
+        ) and display not in ALLOWED_REPOSITORY_BINARY_PATHS:
+            findings.append(Finding(display, "repository-binary-not-allowed"))
+    return findings
+
+
+def _looks_binary(content: bytes) -> bool:
+    sample = content[:8_192]
+    return b"\0" in sample or any(sample.startswith(magic) for magic in BINARY_MAGICS)
 
 
 def scan_artifact_tree(

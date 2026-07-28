@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and smoke-test one self-contained GSV executable."""
+"""Build and smoke-test one self-contained Seld executable."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class _RejectRedirects(HTTPRedirectHandler):
         raise HTTPError(
             request.full_url,
             code,
-            "GSV refuses redirects during the frozen Bridge smoke test",
+            "Seld refuses redirects during the frozen Bridge smoke test",
             headers,
             file_pointer,
         )

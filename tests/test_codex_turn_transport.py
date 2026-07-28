@@ -950,7 +950,7 @@ def test_initial_start_uses_canonical_review_focus_despite_unowned_scope_mistag(
     assert b"one review-subject:task:<id> ref for each consequential" in first_prompt
     assert b"omit active_thread_id on create" in first_prompt
     assert b"clear_active_thread_id when repairing" in first_prompt
-    assert b"Never put the GSV WorkThread ID in that field" in first_prompt
+    assert b"Never put the Seld WorkThread ID in that field" in first_prompt
     assert b"never invent or retain a codex-thread:* ref" in first_prompt
     assert b"status=waiting with next_actor=human" in first_prompt
     assert THREAD_ID.encode() in second_prompt

@@ -14,7 +14,7 @@ Use plain language and adapt the wording to the conversation:
 4. What should Seld never read, retain, or bring into another context?
 5. What may it do locally and reversibly, and what must always wait for an
    exact approval?
-6. What should the first proof be: a local source-zero result, one connected
+6. What should the first proof be: a useful result from your local Seld record, one connected
    source, or a bounded cross-source view?
 
 Do not ask the person to paste credentials, tokens, account identifiers, or

@@ -538,7 +538,7 @@ BOOLEAN = {"type": "boolean"}
 TASK_ACTIVE_THREAD_ID = {
     "description": (
         "Opaque active Codex hand identifier. In guided review this must be the raw Codex thread "
-        "UUID, never a GSV WorkThread ID such as thread:life-portfolio-review; omit it until the "
+        "UUID, never a Seld WorkThread ID such as thread:life-portfolio-review; omit it until the "
         "Codex UUID is known."
     ),
     "type": "string",
@@ -546,7 +546,7 @@ TASK_ACTIVE_THREAD_ID = {
 TASK_REFS = {
     "description": (
         "Task navigation or evidence references. Never use a codex-thread:* reference as a "
-        "substitute for active_thread_id or for ownership by a GSV WorkThread."
+        "substitute for active_thread_id or for ownership by a Seld WorkThread."
     ),
     "items": {"type": "string"},
     "type": "array",

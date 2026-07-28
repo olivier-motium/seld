@@ -627,7 +627,7 @@ def test_recovery_only_retry_reports_reappeared_managed_block_without_changing_h
     assert retried["local_cleanup_verified"] is False
     assert retried["manual_review_required"] is True
     assert retried["local_cleanup_error"] == (
-        f"the GSV managed instruction block reappeared after uninstall: {agents}"
+        f"the Seld managed instruction block reappeared after uninstall: {agents}"
     )
     assert retried["marketplace_files_path"] == str(next(iter(retained_before)))
     assert retried["marketplace_files_state"] == "retained"
@@ -3571,7 +3571,7 @@ def test_uninstall_rejects_duplicate_owned_provider_identities_before_mutation(
     assert removed["next"] == (
         "The Codex provider state is ambiguous: Codex returned duplicate "
         f"{identity!r} identities in {context}; provider state was left unchanged. "
-        "Inspect and remove the duplicate GSV registration explicitly, then re-run "
+        "Inspect and remove the duplicate Seld registration explicitly, then re-run "
         "`gsv codex uninstall`."
     )
     assert "points to" not in removed["next"]

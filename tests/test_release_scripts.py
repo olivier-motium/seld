@@ -202,6 +202,41 @@ def test_candidate_version_is_consistent_across_runtime_installers_and_lock() ->
     )
 
 
+def test_unpublished_prebuilt_platforms_fail_before_network(tmp_path: Path) -> None:
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    marker = tmp_path / "network-called"
+    (tools / "uname").write_text(
+        '#!/bin/sh\nif [ "${1:-}" = "-s" ]; then printf "Linux\\n"; else printf "x86_64\\n"; fi\n',
+        encoding="utf-8",
+    )
+    (tools / "uname").chmod(0o755)
+    (tools / "curl").write_text(
+        '#!/bin/sh\nprintf called > "$GSV_TEST_NETWORK_MARKER"\nexit 1\n',
+        encoding="utf-8",
+    )
+    (tools / "curl").chmod(0o755)
+    environment = os.environ.copy()
+    environment.pop("GSV_BINARY", None)
+    environment["GSV_TEST_NETWORK_MARKER"] = str(marker)
+    environment["PATH"] = f"{tools}{os.pathsep}{environment['PATH']}"
+
+    result = subprocess.run(
+        ["/bin/sh", str(ROOT / "scripts/install.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode == 2
+    assert "does not publish a Linux prebuilt yet" in result.stderr
+    assert not marker.exists()
+    powershell = (ROOT / "scripts/install.ps1").read_text(encoding="utf-8")
+    assert powershell.index("if (-not $env:GSV_BINARY)") < powershell.index("Invoke-WebRequest")
+
+
 def test_release_claims_match_the_no_generated_visual_artifact_policy() -> None:
     artifact_suffixes = frozenset({".gif", ".jpeg", ".jpg", ".mov", ".mp4", ".png", ".webp"})
     ignored_roots = frozenset(
@@ -218,6 +253,30 @@ def test_release_claims_match_the_no_generated_visual_artifact_policy() -> None:
         )
 
     assert artifacts == []
+
+
+def test_repository_artifact_policy_allows_only_the_licensed_fonts(tmp_path: Path) -> None:
+    allowed = tmp_path / "src/continuity_kernel/resources/bridge/fonts/nunito-var.woff2"
+    allowed.parent.mkdir(parents=True)
+    allowed.write_bytes(b"wOF2\0licensed-font")
+    screenshot = tmp_path / "review.png"
+    screenshot.write_bytes(b"\x89PNG\r\n\x1a\nsynthetic")
+
+    assert privacy_check.scan_repository_artifact_policy(tmp_path) == [
+        privacy_check.Finding("review.png", "repository-binary-not-allowed")
+    ]
+
+
+def test_repository_artifact_policy_rejects_large_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = tmp_path / "review.log"
+    report.write_text("too much generated output", encoding="utf-8")
+    monkeypatch.setattr(privacy_check, "MAX_REPOSITORY_FILE_BYTES", 8)
+
+    assert privacy_check.scan_repository_artifact_policy(tmp_path) == [
+        privacy_check.Finding("review.log", "repository-file-oversized")
+    ]
     assert "README visuals" not in (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
 
@@ -731,7 +790,7 @@ def test_posix_uninstaller_removes_binary_only_after_verified_cleanup(
     assert result.returncode == expected_status
     if expected_status == 0:
         assert not target.exists()
-        assert "verified GSV-owned integration" in result.stdout
+        assert "verified Seld-owned integration" in result.stdout
     else:
         assert target.exists()
         if cleanup_status:
@@ -886,7 +945,7 @@ def test_powershell_uninstaller_removes_binary_only_after_verified_cleanup(
     if bridge_status == 0 and cleanup_status == 0 and output_mode == "compact":
         assert result.returncode == 0, result.stderr
         assert not target.exists()
-        assert "verified GSV-owned integration" in result.stdout
+        assert "verified Seld-owned integration" in result.stdout
     else:
         assert result.returncode != 0
         assert target.exists()

@@ -4,7 +4,6 @@ import pytest
 
 from continuity_kernel.errors import ValidationError
 from continuity_kernel.source_recipes import (
-    RECIPE_SET_VERSION,
     RECIPES,
     get_recipe,
     list_recipes,
@@ -37,7 +36,7 @@ def test_supported_source_set_is_explicit_and_versioned() -> None:
         "teams",
         "whatsapp",
     }
-    assert all(recipe.recipe_version == RECIPE_SET_VERSION for recipe in RECIPES.values())
+    assert {recipe.recipe_version for recipe in RECIPES.values()} == {"1"}
     assert all(recipe.read_limit > 0 for recipe in RECIPES.values())
     assert all(recipe.proof_ttl.total_seconds() > 0 for recipe in RECIPES.values())
 

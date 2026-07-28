@@ -289,7 +289,7 @@ def test_task_schema_distinguishes_codex_hand_from_gsv_workthread_without_narrow
         description = active_hand["description"]
         assert active_hand["type"] == "string"
         assert "raw Codex thread UUID" in description
-        assert "never a GSV WorkThread ID" in description
+        assert "never a Seld WorkThread ID" in description
         assert "pattern" not in active_hand and "format" not in active_hand
 
     update_properties = tools["gsv_task_update"]["inputSchema"]["properties"]

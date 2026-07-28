@@ -13,8 +13,6 @@ from typing import Any, Final
 
 from continuity_kernel.errors import ValidationError
 
-RECIPE_SET_VERSION: Final = "2026-07-28.2"
-
 
 @dataclass(frozen=True)
 class SourceRecipe:
@@ -40,6 +38,7 @@ def _recipe(
     source: str,
     label: str,
     *,
+    version: str,
     identity: str | None,
     read: str,
     limit: int = 25,
@@ -49,7 +48,7 @@ def _recipe(
     return SourceRecipe(
         source=source,
         label=label,
-        recipe_version=RECIPE_SET_VERSION,
+        recipe_version=version,
         identity_capability=identity,
         read_capability=read,
         read_limit=limit,
@@ -67,6 +66,7 @@ RECIPES: Final = {
         _recipe(
             "gsv",
             "Seld on this computer",
+            version="1",
             identity="gsv.vault.identity",
             read="gsv.context.bounded_read",
             ttl_hours=24 * 30,
@@ -74,6 +74,7 @@ RECIPES: Final = {
         _recipe(
             "codex_activity",
             "ChatGPT activity",
+            version="1",
             identity="codex.account.identity",
             read="codex.activity.bounded_read",
             ttl_hours=24,
@@ -81,12 +82,14 @@ RECIPES: Final = {
         _recipe(
             "gmail",
             "Gmail",
+            version="1",
             identity="google.mail.identity",
             read="google.mail.recent_read",
         ),
         _recipe(
             "google_calendar",
             "Google Calendar",
+            version="1",
             identity="google.calendar.identity",
             read="google.calendar.window_read",
             future_coverage_hours=24 * 60,
@@ -94,24 +97,28 @@ RECIPES: Final = {
         _recipe(
             "google_drive",
             "Google Drive",
+            version="1",
             identity="google.drive.identity",
             read="google.drive.recent_read",
         ),
         _recipe(
             "google_sheets",
             "Google Sheets",
+            version="1",
             identity="google.drive.identity",
             read="google.sheets.recent_read",
         ),
         _recipe(
             "outlook_mail",
             "Outlook Mail",
+            version="1",
             identity="microsoft.mail.identity",
             read="microsoft.mail.recent_read",
         ),
         _recipe(
             "outlook_calendar",
             "Outlook Calendar",
+            version="1",
             identity="microsoft.calendar.identity",
             read="microsoft.calendar.window_read",
             future_coverage_hours=24 * 60,
@@ -119,60 +126,70 @@ RECIPES: Final = {
         _recipe(
             "slack",
             "Slack",
+            version="1",
             identity="slack.workspace.identity",
             read="slack.messages.recent_read",
         ),
         _recipe(
             "teams",
             "Microsoft Teams",
+            version="1",
             identity="microsoft.teams.identity",
             read="microsoft.teams.recent_read",
         ),
         _recipe(
             "github",
             "GitHub",
+            version="1",
             identity="github.account.identity",
             read="github.activity.recent_read",
         ),
         _recipe(
             "asana",
             "Asana",
+            version="1",
             identity="asana.workspace.identity",
             read="asana.work.recent_read",
         ),
         _recipe(
             "atlassian",
             "Atlassian",
+            version="1",
             identity="atlassian.site.identity",
             read="atlassian.work.recent_read",
         ),
         _recipe(
             "box",
             "Box",
+            version="1",
             identity="box.account.identity",
             read="box.files.recent_read",
         ),
         _recipe(
             "figma",
             "Figma",
+            version="1",
             identity="figma.account.identity",
             read="figma.files.recent_read",
         ),
         _recipe(
             "notion",
             "Notion",
+            version="1",
             identity="notion.workspace.identity",
             read="notion.pages.recent_read",
         ),
         _recipe(
             "sharepoint",
             "SharePoint",
+            version="1",
             identity="microsoft.sharepoint.identity",
             read="microsoft.sharepoint.recent_read",
         ),
         _recipe(
             "local_files",
             "Files you choose",
+            version="1",
             identity=None,
             read="local.files.bounded_read",
             limit=100,
@@ -181,6 +198,7 @@ RECIPES: Final = {
         _recipe(
             "apple_messages",
             "Apple Messages",
+            version="1",
             identity="apple.messages.identity",
             read="apple.messages.recent_read",
             ttl_hours=6,
@@ -188,6 +206,7 @@ RECIPES: Final = {
         _recipe(
             "shopify",
             "Shopify",
+            version="1",
             identity="shopify.store.identity",
             read="shopify.orders.recent_read",
             limit=50,
@@ -196,6 +215,7 @@ RECIPES: Final = {
         _recipe(
             "instagram",
             "Instagram",
+            version="1",
             identity="meta.instagram.identity",
             read="meta.instagram.activity.recent_read",
             ttl_hours=6,
@@ -203,6 +223,7 @@ RECIPES: Final = {
         _recipe(
             "screen_context",
             "Optional screen context",
+            version="1",
             identity=None,
             read="local.screen.derived_context_read",
             ttl_hours=6,
@@ -210,6 +231,7 @@ RECIPES: Final = {
         _recipe(
             "whatsapp",
             "WhatsApp",
+            version="1",
             identity="wacli.account.identity",
             read="wacli.messages.recent_read",
             ttl_hours=6,

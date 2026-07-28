@@ -46,9 +46,9 @@ LEGACY_REPAIR_MARKER: Final = b'{"format_version":1,"purpose":"gsv-uninstall-rep
 LEGACY_REPAIR_MARKER_NAME: Final = ".gsv-uninstall-repair.json"
 
 MANAGED_BLOCK = f"""{BLOCK_START}
-## GSV
+## Seld
 
-For substantive work, use the installed GSV plugin to load a bounded
+For substantive work, use the installed Seld plugin to load a bounded
 context pack before relying on conversational memory. Keep durable outcomes in
 exact task, entity, and work-thread records. Read a record immediately before
 mutation and use its compare-and-swap revision. A session ending never proves
@@ -292,7 +292,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
     marketplace_files_present = marketplace_root.exists() or marketplace_root.is_symlink()
     if not prior_receipt and (managed_instructions_present or marketplace_files_present):
         raise SetupError(
-            "GSV integration files are not owned by a valid receipt; left them unchanged. "
+            "Seld integration files are not owned by a valid receipt; left them unchanged. "
             "Restore the matching receipt or inspect and remove the interrupted installation "
             "before retrying."
         )
@@ -305,7 +305,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
                 if transition.get(key) is not None
             ]
             raise SetupError(
-                "A prior GSV install transition needs recovery before another install. "
+                "A prior Seld install transition needs recovery before another install. "
                 f"Tracked paths: {', '.join(tracked)}. Run `gsv codex uninstall` or inspect "
                 "those exact paths; nothing was changed."
             )
@@ -322,16 +322,16 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
             prior_marketplace = _inspect_owned_marketplace(prior_receipt)
             if prior_marketplace.state is not _MarketplaceCleanupState.VERIFIED_PRESENT:
                 raise SetupError(
-                    "The receipt-owned GSV marketplace is missing, changed, or only partly "
+                    "The receipt-owned Seld marketplace is missing, changed, or only partly "
                     "present. Run `gsv codex uninstall` or inspect the retained ownership "
                     "state before reinstalling."
                 )
             prior_marketplace_manifest = prior_marketplace.manifest
             if prior_marketplace_manifest is None:  # pragma: no cover - state invariant
-                raise SetupError("The receipt-owned GSV marketplace has no verified manifest")
+                raise SetupError("The receipt-owned Seld marketplace has no verified manifest")
         elif marketplace_files_present:
             raise SetupError(
-                "A recovery-only GSV receipt exists while the public marketplace path is present; "
+                "A recovery-only Seld receipt exists while the public marketplace path is present; "
                 "inspect both before retrying installation."
             )
     executable = _codex_executable()
@@ -349,7 +349,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
         )
     if existing is not None and not bool(prior_receipt.get("marketplace_owned")):
         raise SetupError(
-            "A pre-existing GSV marketplace is not owned by this installer; "
+            "A pre-existing Seld marketplace is not owned by this installer; "
             "left it unchanged. Remove it explicitly before installing this copy."
         )
     plugins = _run_json(executable, ["plugin", "list", "--json"], home)
@@ -362,12 +362,12 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
     plugin_installed = plugin_entry is not None and plugin_entry.get("enabled") is True
     if plugin_entry is not None and not plugin_installed:
         raise SetupError(
-            "The receipt-owned GSV plugin is disabled; no setup state was changed. Enable or "
+            "The receipt-owned Seld plugin is disabled; no setup state was changed. Enable or "
             "remove that exact plugin explicitly, then re-run setup."
         )
     if plugin_installed and not bool(prior_receipt.get("plugin_owned")):
         raise SetupError(
-            "A pre-existing GSV plugin is not owned by this installer; "
+            "A pre-existing Seld plugin is not owned by this installer; "
             "left it unchanged. Remove it explicitly before installing this copy."
         )
     prepared_marketplace = _marketplace_contents(vault, runtime=None)
@@ -410,7 +410,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
         raise SetupError(
             "The Codex recovery catalog has no room for a reversible replacement and later "
             "uninstall; no integration state was changed. Inspect and remove at least one "
-            "exact retained recovery path, then re-run setup so GSV can compact the catalog."
+            "exact retained recovery path, then re-run setup so Seld can compact the catalog."
         )
     marketplace_add_attempted = False
     plugin_add_attempted = False
@@ -476,7 +476,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
         instruction_change = _install_instructions(home)
         status = codex_status(codex_home=home)
         if not status["plugin_installed"] or not status["instructions_installed"]:
-            raise SetupError("Codex did not report the GSV integration as installed")
+            raise SetupError("ChatGPT did not report the Seld integration as installed")
         result = CodexInstallResult(
             codex_home=str(home),
             marketplace=MARKETPLACE_NAME,
@@ -1030,7 +1030,7 @@ def _uninstall_codex_locked(home: Path) -> UninstallResult:
     next_actions: list[str] = []
     if instruction_error is not None:
         next_actions.append(
-            f"Inspect {home / 'AGENTS.md'}; GSV could not safely remove its managed block. "
+            f"Inspect {home / 'AGENTS.md'}; Seld could not safely remove its managed block. "
             "After resolving or confirming the change, re-run `gsv codex uninstall`."
         )
     if cleanup_capacity_error is not None:
@@ -1052,14 +1052,14 @@ def _uninstall_codex_locked(home: Path) -> UninstallResult:
         )
     elif not marketplace_files.safe:
         next_actions.append(
-            "Inspect the recorded GSV marketplace files; they changed or could not be "
+            "Inspect the recorded Seld marketplace files; they changed or could not be "
             "verified and were left untouched. After resolving or confirming the change, "
             "re-run `gsv codex uninstall`."
         )
     if provider_ambiguity_error is not None:
         next_actions.append(
             "The Codex provider state is ambiguous: "
-            f"{provider_ambiguity_error}. Inspect and remove the duplicate GSV registration "
+            f"{provider_ambiguity_error}. Inspect and remove the duplicate Seld registration "
             "explicitly, then re-run `gsv codex uninstall`."
         )
     elif provider_manual_review:
@@ -1563,7 +1563,7 @@ def _recovery_only_uninstall(home: Path, snapshot: _ReceiptSnapshot) -> Uninstal
         managed_instructions_absent = not _instructions_installed(home)
         if not managed_instructions_absent:
             raise ConflictError(
-                "the GSV managed instruction block reappeared after uninstall: "
+                "the Seld managed instruction block reappeared after uninstall: "
                 f"{home / 'AGENTS.md'}"
             )
         retained_records = _reconcile_cleanup_pending(snapshot.payload, root=root)
@@ -1674,7 +1674,7 @@ def _missing_receipt_result(home: Path, evidence: _UnownedIntegrationEvidence) -
         "instructions_removed": False,
         "integration_removed": False,
         "local_cleanup_error": (
-            "the ownership receipt is missing while GSV integration evidence remains"
+            "the ownership receipt is missing while Seld integration evidence remains"
         ),
         "local_cleanup_verified": False,
         "manual_review_required": True,
@@ -1684,7 +1684,7 @@ def _missing_receipt_result(home: Path, evidence: _UnownedIntegrationEvidence) -
         "marketplace_removed": None,
         "next": (
             f"Inspect {detail}. Restore the matching ownership receipt from a trusted "
-            "backup, or verify and remove the GSV plugin, marketplace registration, "
+            "backup, or verify and remove the Seld plugin, marketplace registration, "
             "generated files, and managed instruction block explicitly. Then re-run "
             "`gsv codex uninstall`."
         ),
@@ -1800,14 +1800,15 @@ def _remove_owned_registrations(
         registered_root = marketplace_entry.get("root")
         if not isinstance(marketplace_root, str) or not isinstance(registered_root, str):
             raise _ProviderOwnershipError(
-                "The GSV marketplace registration has no verifiable owned root; left it registered",
+                "The Seld marketplace registration has no verifiable owned root; "
+                "left it registered",
                 recorded_root=(marketplace_root if isinstance(marketplace_root, str) else None),
                 registered_root=(registered_root if isinstance(registered_root, str) else None),
             )
         registration_matches = _provider_root_matches(registered_root, Path(marketplace_root))
         if not registration_matches:
             raise _ProviderOwnershipError(
-                "The GSV marketplace registration points somewhere other than the owned "
+                "The Seld marketplace registration points somewhere other than the owned "
                 "receipt; left it registered",
                 recorded_root=marketplace_root,
                 registered_root=registered_root,
@@ -1846,7 +1847,7 @@ def _remove_owned_registrations(
         is not None
     )
     if (plugin_owned and plugin_remains) or (marketplace_owned and marketplace_remains):
-        raise SetupError("Codex still reports GSV-owned integration after uninstall")
+        raise SetupError("ChatGPT still reports Seld-owned integration after uninstall")
     return _ProviderCleanup(
         marketplace_removed=marketplace_owned and marketplace_present,
         plugin_removed=plugin_owned and plugin_present,
@@ -3416,13 +3417,13 @@ def _instruction_block_bounds(content: str) -> tuple[int, int] | None:
     if starts == 0 and ends == 0:
         return None
     if starts != ends:
-        raise ValidationError("Codex instructions contain an incomplete GSV managed block")
+        raise ValidationError("ChatGPT instructions contain an incomplete Seld managed block")
     if starts != 1:
-        raise ValidationError("Codex instructions contain multiple or nested GSV managed blocks")
+        raise ValidationError("ChatGPT instructions contain multiple or nested Seld managed blocks")
     start = content.index(BLOCK_START)
     closing = content.index(BLOCK_END)
     if closing < start:
-        raise ValidationError("Codex instructions contain a reversed GSV managed block")
+        raise ValidationError("ChatGPT instructions contain a reversed Seld managed block")
     return start, closing + len(BLOCK_END)
 
 
@@ -3635,7 +3636,7 @@ def _resume_provider_repair_tree(root: Path, transition: dict[str, Any]) -> None
 
     if expected_manifest != _legacy_repair_manifest():
         raise SetupError(
-            "the recorded provider repair template is unavailable in this GSV version; "
+            "the recorded provider repair template is unavailable in this Seld version; "
             "restore the matching binary or a complete receipt-bound repair tree"
         )
 
