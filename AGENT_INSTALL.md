@@ -1,17 +1,18 @@
-# Install GSV with an agent
+# Install Seld with an agent
 
 ## Outcome
 
-Install the verified standalone GSV artifact for this machine, preserve all
-existing GSV and Codex state, prove the local continuity path, and leave the
-private Bridge open.
+Install the verified standalone Seld artifact for this machine, preserve all
+existing Seld and Codex state, prove that durable work survives a fresh
+process, and leave the private Bridge open so the user can begin context-first
+onboarding. The shipped executable and command remain named `gsv`.
 
 ## Non-negotiable boundaries
 
 - Never use `sudo` or request an account, credential, or security-setting
   change.
-- Never delete or replace GSV user data or unrelated/unowned Codex state. The
-  verified installer may transactionally upgrade GSV-owned executable and
+- Never delete or replace Seld user data or unrelated/unowned Codex state. The
+  verified installer may transactionally upgrade `gsv`-owned executable and
   integration components only when it can preserve or roll them back.
 - Never treat a source checkout, Python environment, or hand-built binary as a
   consumer release unless the user explicitly asks for maintainer validation.
@@ -28,7 +29,7 @@ private Bridge open.
 2. Read the candidate status in `README.md` and the current version in
    `pyproject.toml`. Continue only when that exact version has a published
    release with an asset and `.sha256` file matching this OS and architecture.
-3. Confirm Codex is installed. GSV checks the `codex` command and, on validated
+3. Confirm Codex is installed. Seld checks the `codex` command and, on validated
    macOS builds, the Codex Desktop app bundle. Do not modify `PATH` merely to
    make discovery pass.
 4. From a temporary or existing checkout, run the repository installer:
@@ -81,11 +82,11 @@ private Bridge open.
 
 ## What setup may change
 
-Setup may create a default `~/GSV` vault when no existing GSV config selects a
-vault. It may also create a local GSV marketplace, install the GSV plugin, add
-one bounded managed block to Codex's `AGENTS.md`, and write GSV-owned config and
-receipts. The transaction preserves pre-existing content and rolls back only
-components added by that invocation.
+Setup may create a default `~/GSV` records folder when no existing Seld config
+selects one. It may also create a local marketplace for Seld, install the
+bundled `gsv` plugin, add one bounded managed block to Codex's `AGENTS.md`, and
+write `gsv`-owned config and receipts. The transaction preserves pre-existing
+content and rolls back only components added by that invocation.
 
 The Bridge binds to loopback on an ephemeral port. Its private snapshot API
 requires a per-launch bearer capability stored in an owner-only local state

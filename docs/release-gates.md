@@ -13,11 +13,11 @@ development tree, or a rebuilt binary do not transfer to a changed candidate.
 | Gate | Evidence required for promotion | Current status |
 | --- | --- | --- |
 | Bounded foundation round trip | An authenticated Bridge intent survives the queue CAS boundary, is read and accepted or rejected through both supported CLI and MCP surfaces, and its disposition remains visible from a fresh process. Rejected Origin/bearer, stale CAS, bounded-queue recovery, and restart persistence are exercised. | **Open — POSIX-only foundation.** Secure directory-pinned storage is available on macOS/Linux; the Windows operation commands and tools are not advertised, Bridge writes fail closed, and canonical reads remain available. |
-| Guided review same-hand transport | On the exact installed candidate and a clean Plus-class account, a Bridge answer uses the user's supported Codex subscription defaults, resumes the exact authored Codex hand through the restricted GSV-only MCP profile, applies each answered prepared row with independent CAS/readback, dispositions the receipt, returns a bounded receipt-bound sheet to Bridge, and preserves canonical progress after a fresh Bridge process without pretending the transient sheet survived. Safe failure, concurrent submit, stale target or row, killed turn, restart recovery, same-subject regeneration, and no-replay `delivery_uncertain` paths pass without provider, Computer Use, or external-action tools. | **Open — source-tree tests only.** Installed-candidate, clean-Plus-account, provider entitlement, and platform proof are absent. |
+| Guided review same-hand transport | On the exact installed candidate and a clean Plus-class account, a Bridge answer uses the user's supported Codex subscription defaults, resumes the exact authored Codex hand through the restricted `gsv`-only MCP profile, applies each answered prepared row with independent CAS/readback, dispositions the receipt, returns a bounded receipt-bound sheet to Bridge, and preserves canonical progress after a fresh Bridge process without pretending the transient sheet survived. Safe failure, concurrent submit, stale target or row, killed turn, restart recovery, same-subject regeneration, and no-replay `delivery_uncertain` paths pass without provider, Computer Use, or external-action tools. | **Open — source-tree tests only.** Installed-candidate, clean-Plus-account, provider entitlement, and platform proof are absent. |
 | Gate 0: product premise | A clean ChatGPT Plus-class account proves one app-native heartbeat waking the exact dedicated resident Pulse task, AI execution with selected plugin tools, host-observed structured tool results, structural Computer Use exclusion, and canonical CAS/readback without a duplicate hand. | **Open — unproven.** The packaged skill, model narration, mocks, an interactive task, and deterministic scheduler tests are not substitutes for a natural installed wake. |
-| Clean-machine installation | The exact signed candidate installs transactionally on a clean host, preserves existing Codex and GSV data, passes health checks, and rolls back on failure. | **Open — unproven.** No clean-machine evidence exists for this candidate. |
+| Clean-machine installation | The exact signed candidate installs transactionally on a clean host, preserves existing Codex and Seld data, passes health checks, and rolls back on failure. | **Open — unproven.** No clean-machine evidence exists for this candidate. |
 | Upgrade and executable compatibility | Upgrade from the exact prior release proves Codex integration commits before Bridge starts, an honest post-commit Bridge-repair result that keeps the candidate, safe rollback when current bytes remain readable, and fail-closed retention of the candidate plus recovery binary after either a version-2 Task or control event makes the prior reader incompatible. No vault snapshot, truncation, or automatic down-migration is used. | **Open — source tests only.** The versioned readers and installer probes have local coverage; exact prior-release and installed-platform evidence are absent. |
-| Provider-backed continuity | A user-authenticated, isolated Codex home produces an actual model-backed response in a fresh Codex task and continues from durable GSV state without copied credentials or transcript state. | **Open — no qualifying evidence.** A real existing-account source-tree canary ran, but it did not use an isolated Codex home or installed candidate. |
+| Provider-backed continuity | A user-authenticated, isolated Codex home produces an actual model-backed response in a fresh Codex task and continues from durable Seld state without copied credentials or transcript state. | **Open — no qualifying evidence.** A real existing-account source-tree canary ran, but it did not use an isolated Codex home or installed candidate. |
 | Source connectors | Each promoted connector proves the exact identity and scope, one bounded real read in a fresh task, the resident AI Pulse reading the same logical capability, and a current host-observed receipt. | **Open — unproven.** Recipes, validators, mocks, configuration, authentication screens, and model narration are insufficient. The host receipt proves delivery facts, not semantic meaning. |
 | Cross-platform installed path | The same exact candidate passes install, upgrade, backup, restore, uninstall, Bridge, resident heartbeat, and fresh-Codex-task continuity checks on macOS arm64, macOS x86_64, and Windows x86_64. | **Open — unproven.** Predecessor local macOS Apple Silicon evidence does not promote this candidate or another target. |
 | Platform signing | macOS artifacts pass Developer ID signing and Apple notarization; Windows artifacts pass Authenticode signing. | **Open — absent.** GitHub provenance and SHA-256 checksums are useful but are not platform signing. |
@@ -31,7 +31,7 @@ On 2026-07-25, an authenticated real Codex CLI canary loaded source from base
 commit `bdac8f704a14b9f7f68ab35d4765d3120d868104` with pre-documentation Git
 index tree `7bf719b657e1baaa7d3163ee31af7959f76a514a`. HEAD alone is not the
 executed candidate identity. The provider phase ran from 12:57:35 to 13:02:00
-CEST on macOS 26.2 arm64 with GSV 0.2.0 and Codex CLI 0.145.0. Against a
+CEST on macOS 26.2 arm64 with Seld 0.2.0 and Codex CLI 0.145.0. Against a
 synthetic vault, the canary rejected wrong bearer and Origin, rejected stale CAS
 without changing the queue, completed START's two Codex invocations, completed
 one same-hand answer with semantic readback and disposition, and proved restart
@@ -119,7 +119,7 @@ the applicable gate.
 Keep the packet privacy-safe and independently checkable. Record:
 
 - exact commit, tag, asset name, and binary SHA-256;
-- operating system, architecture, GSV version, and Codex version;
+- operating system, architecture, Seld version, and Codex version;
 - start and end timestamps;
 - expected and observed resident heartbeat wakes when applicable;
 - pass, failure, interruption, and recovery outcomes; and
@@ -140,6 +140,6 @@ Until every required row passes, describe the 1.0 product as **Unreleased** and
 the relevant capability as **foundation-gated**. The bounded local round trip
 may be reported with its exact evidence, but it does not imply consumer-grade
 onboarding, live sources, Pulse autonomy, scheduled operation, or clean-machine
-support. Do not claim that GSV 1.0 is always-on, autonomous, available
+support. Do not claim that Seld 1.0 is always-on, autonomous, available
 everywhere, a proven Jarvis-like system, or a proven replacement for OpenClaw,
 Hermes Agent, or another product.

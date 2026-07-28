@@ -1,5 +1,10 @@
 # Changelog
 
+The product was renamed from GSV to Seld during the unreleased `0.2.0` cycle.
+The `gsv` command, package, plugin and skill identifiers, `GSV_*` environment
+variables, existing data paths, and historical `0.1.0` entries retain their
+original names for compatibility.
+
 ## 0.2.0 - Unreleased
 
 - Add authored whole-life Direction and a complete ordered Portfolio whose
@@ -12,7 +17,7 @@
   bounded generations, durable CLI/MCP accept or reject dispositions, and
   archival only after every live intent is decided. Disposition acknowledges an
   intent; it never approves or executes an external action.
-- Add the event-bound, GSV-only MCP profile and same-hand Codex review-turn
+- Add the event-bound, `gsv`-only MCP profile and same-hand Codex review-turn
   transport. The transport is off by default and remains foundation-gated while
   installed-candidate, clean-account, platform, signing, and soak gates are
   open.

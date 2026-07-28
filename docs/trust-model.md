@@ -13,7 +13,7 @@
   an incomplete final-path archive while falling back from hard links.
 - A failed install does not replace the last working executable or remove
   pre-existing Codex components.
-- Uninstall removes only expected GSV-owned integration and preserves vault,
+- Uninstall removes only expected `gsv`-owned integration and preserves the records folder,
   configuration, backups, and unrelated Codex state.
 - Marketplace replacement and uninstall recheck an atomically isolated tree;
   lifecycle trees are retained under receipt-bound paths, never recursively or
@@ -22,7 +22,7 @@
   CLI.
 - A loopback caller without the current per-launch bearer cannot read the
   Bridge snapshot or health identity.
-- A stale, forged, or PID-reused Bridge receipt cannot cause GSV to signal an
+- A stale, forged, or PID-reused Bridge receipt cannot cause Seld to signal an
   unrelated process.
 - A stale Bridge control writer cannot append against a newer queue revision,
   and a Bridge control event cannot directly author or replace semantic canon.
@@ -40,7 +40,7 @@
 
 Every Bridge launch creates a random bearer capability and instance identity.
 The owner-only state receipt stores the token with mode `0600` where POSIX
-permissions apply. GSV normalizes the Bridge application-data directory to
+permissions apply. Seld normalizes the Bridge application-data directory to
 `0700` and its diagnostic log to `0600` on POSIX, and refuses a symbolic-link
 or non-regular log path. The browser receives the token after `#`, moves it
 into session storage, and strips it from the address before API requests.
@@ -99,9 +99,9 @@ state.
 
 ## Assumptions
 
-GSV trusts the local operating-system account, the installed Codex command it
+Seld trusts the local operating-system account, the installed Codex command it
 discovers, and the executable the user chose to run. File locks coordinate
-cooperating GSV processes; they do not defend against a hostile same-user
+cooperating Seld processes; they do not defend against a hostile same-user
 process.
 
 Durability and lock behavior assume a local filesystem with ordinary host OS

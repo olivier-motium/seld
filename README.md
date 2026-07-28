@@ -1,99 +1,132 @@
-# GSV
+# Seld
 
-## Turn Codex into the AI that manages your life.
+## Seld, your AI chief of staff.
 
-GSV 1.0 is being built to bring your email, messages, calendars, files, GitHub
-work, and Codex activity into one current picture of your life. It is meant to
-keep track of people, projects, promises, decisions, waiting-fors, and what
-needs attention next. Codex remains the reasoning engine. The local Bridge
-shows durable GSV records and the exact work Codex can continue. This foundation
-also contains a source-tested, capability-gated prepared Portfolio review driven
-by your explicit answers; its automatic same-hand transport is not enabled for
-consumer installs until the installed Codex gate passes.
+Your life is split across email, WhatsApp, Slack, Teams, calendars, files,
+GitHub, and a growing list of Codex tasks. Each tool sees one slice. Seld gives
+Codex a durable, local model of the whole situation: the people who matter,
+projects in motion, promises you made, decisions already taken, and what needs
+you next.
 
-Your canonical GSV records are readable files on your computer. There is no GSV
-account, hosted database, telemetry service, or second chat app.
+Ask for the **Rundown** and Seld walks through what is still open, one item at a
+time, with the next move already written. You can act, change the plan, defer
+it, close it, or tell Seld its recommendation is wrong. The decision stays with
+the outcome instead of disappearing into the conversation.
 
-> **This repository contains the public continuity kernel, not the 1.0
-> replacement product.** The current foundation branch implements one bounded
-> Bridge-intent round trip and packages context-first onboarding plus one
-> resident AI Pulse contract. Pulse is a dedicated Codex task awakened by an
-> app-native heartbeat: the model reads bounded sources, judges what matters,
-> and authors canonical changes. The implemented kernel validates the
-> structural Pulse marker, CAS, bounded content-free receipts, and no-replay;
-> exact app-task correlation and connector-write privacy screening remain
-> unproven gates. The older onboarding,
-> source-readiness, Pulse-admission, and scheduler-planning classes remain inert
-> foundation code. Every Plus-account, connector, clean-machine, signing,
-> platform, and soak gate remains open. [See the exact release
-> gates](docs/release-gates.md).
+Bridge is the home screen. Pulse gives the system recurring awareness. Codex
+does the reasoning and the work. Seld keeps the memory and operating state in
+readable files on your computer, so a task can end without taking its context
+with it. The 1.0 release target runs on a ChatGPT Plus-class plan without a
+separate API key. There is no Seld account, hosted database, telemetry service,
+or second chat app.
 
-## What GSV 1.0 is for
+## How Seld manages a life
 
-The 1.0 product is intended to give Codex a durable model of the parts of your
-life you choose to share:
+The 1.0 product is designed around one repeating loop:
 
-- **What you care about:** current direction, priorities, constraints, and
-  routines.
-- **What is happening:** active work, personal obligations, decisions, people,
-  and longer-running situations.
-- **What changed:** bounded evidence from connected sources, including honest
-  gaps when a source is stale or unavailable.
-- **What happens next:** the next actor, exact continuation, approval boundary,
-  and one active Codex hand for each real outcome.
+1. **Understand your world.** Onboarding starts with your goals, obligations,
+   relationships, boundaries, and preferred way of working.
+2. **Read the places where life happens.** The AI uses the email, messaging,
+   calendar, file, GitHub, and screen sources you explicitly choose.
+3. **Keep one current model.** Seld maintains people, projects, commitments,
+   decisions, unresolved situations, source coverage, and the next actor.
+4. **Notice what changed.** One resident Pulse task revisits bounded evidence,
+   connects it to the existing model, and decides whether anything deserves
+   attention.
+5. **Bring you the decision.** Bridge shows the small set of things that need
+   you. Your answer continues in the exact Codex task that owns the outcome.
 
-Bridge follows one simple authority contract: **the browser presents and
-captures; the agent judges; native records remain truth**. Its authenticated
-control route can queue an explicit guided-review answer, setup choice,
-approval, correction, or undo request. A CLI or MCP agent reads that receipt,
-authors any justified Task, WorkThread, and complete Portfolio changes through
-fresh compare-and-swap writes, reads them back, and only then accepts or rejects
-the receipt. Disposition itself does not execute the request, authorize an
-external action, change semantic records, or mark work complete. This control
-lane currently requires secure directory-pinned storage available on macOS and
-Linux; Windows fails closed while canonical Bridge reads stay available.
+This is useful long after a message has been read. Seld remembers why a task
+exists, which evidence changed it, what has already been decided, and where the
+work should resume. Bridge should be able to answer five practical questions at
+any time: What needs me? Why now? What changed? Who acts next? Where does the
+work continue?
 
-## Why cross-source context matters
+## One real cross-source result
 
-In the private resident workflow that informs this product, an invoice
-follow-up looked overdue because documents mentioned in WhatsApp were missing
-from the local package. Teams showed that those documents had already been
-sent. The resident GSV cancelled the duplicate chase and changed the next
-action to reconcile the received files. This is product evidence from the
-private workflow, not proof that the public build currently connects WhatsApp
-or Teams.
+In the private resident system that informs Seld, an invoice follow-up appeared
+overdue because documents discussed in WhatsApp were missing from the local
+package. Teams showed that the documents had already been sent. Seld cancelled
+the duplicate chase, changed the next action, and carried the correction into
+the exact Codex task reconciling the files.
 
-A mailbox-only assistant would have kept chasing. A chat summary would have
-lost the correction later. GSV carried the decision, evidence references, and
-new next action into the exact Codex task doing the work.
+The value came from connecting the sources and preserving the decision. The
+mailbox alone had an incomplete story, and a chat summary would not have become
+durable operating state. This is evidence from the private resident workflow,
+not proof that the current public build connects WhatsApp or Teams.
 
 The same model applies to ordinary work:
 
-| Situation | What GSV keeps current |
+| Situation | What stays current |
 | --- | --- |
-| A dentist appointment is discussed by email and appears on the calendar. | The commitment, date, open preparation, and whether anything still needs a reply. |
-| A recruiter asks for a CV while another thread contains role constraints. | The person, role, latest approved document, constraints, and exact reply task. |
-| A family commitment conflicts with a project deadline. | Both commitments, the constraint, the decision, and who needs to act next. |
-| A release fails in Codex and continues in a fresh task. | The real outcome, failure evidence, decision already made, and exact next check. |
+| A dentist appointment is discussed by email and appears on the calendar. | The commitment, date, preparation, and whether anyone still needs a reply. |
+| A recruiter asks for a CV while another thread contains role constraints. | The person, role, approved document, constraints, and exact reply task. |
+| A family commitment conflicts with a project deadline. | Both commitments, the decision, and who needs to act next. |
+| A release fails in Codex and continues in a fresh task. | The outcome, failure evidence, prior decision, and exact next check. |
 
-## Why GSV 1.0 aims to replace OpenClaw or Hermes
+## What Seld keeps between Codex tasks
+
+- **Direction:** what you are trying to change, what matters now, and the
+  boundaries the system must respect.
+- **A complete Portfolio:** every open outcome, its current state, priority,
+  next actor, and next action.
+- **People and projects:** canonical records that connect conversations,
+  documents, decisions, and ongoing work without copying whole inboxes.
+- **Living situations:** longer-running threads that preserve why something is
+  happening and how the evidence has changed.
+- **Current awareness:** what was observed, which sources were covered, what is
+  uncertain, and when the view needs refreshing.
+- **Exact continuity:** one active Codex hand for each real outcome, with a
+  safe continuation when that hand finishes, crashes, or is replaced.
+
+## Replacing OpenClaw or Hermes?
 
 [OpenClaw](https://docs.openclaw.ai/) and
 [Hermes Agent](https://hermes-agent.nousresearch.com/docs/) are capable local,
 proactive agent systems. They support memory, schedules, messaging, tools, and
-Codex execution. GSV 1.0 is designed for a different daily setup: native Codex
-stays the conversation and execution surface, while GSV maintains an explicit
-whole-life operating model around it.
+Codex execution. Seld is for people who want Codex itself to become the resident
+AI they use to run work and life.
 
-That model includes Direction, Portfolio, commitments, canonical people and
-projects, ongoing WorkThreads, source freshness, the next actor, and exact
-Codex-task continuity. Messages and files become bounded evidence for authored
-claims and references that a later session can inspect directly.
+Seld's distinction is its operating model. It keeps an explicit Direction,
+complete Portfolio, commitments, canonical people and projects, longer-running
+situations, source freshness, the next actor, and exact Codex-task continuity.
+Messages and files supply bounded evidence for that model.
 
-The replacement case is for people who want Codex to be the app they live in
-and one local Mind to manage work and life across sources. Until the release
-ledger passes, the public build remains a continuity kernel rather than a
-proven OpenClaw or Hermes replacement.
+You keep talking and working in Codex. Bridge gives you the current view of
+your life, and Pulse keeps that view from going stale. The records stay on your
+computer and remain inspectable without Seld running.
+
+## The intelligence stays in the AI
+
+Seld does not turn an old email, changed file, or due date into a task through a
+fixed rule. Codex reads the bounded evidence in context and decides what it
+means: whether two records describe the same person, whether a commitment has
+changed, whether something deserves attention, and what the next action should
+be.
+
+Deterministic code has a smaller job. It authenticates the local Bridge,
+protects revisions, bounds inputs, records delivery facts, prevents replay, and
+supports recovery. It cannot decide priority, completion, relationships,
+memory worthiness, or the meaning of a message.
+
+## Current public status
+
+> **This repository contains the public continuity kernel, not the finished
+> 1.0 replacement product.** It implements durable local records, the Bridge
+> intent and review loop, context-first onboarding instructions, and the
+> resident AI Pulse contract. Clean-account connector use, natural app-native
+> Pulse wakes, signing, supported-platform installation, and daily-use soaks
+> remain open. [See the exact release gates](docs/release-gates.md).
+
+The replacement claim ships only when the installed product proves those
+paths. Until then, the public build is foundation code for the product
+described above.
+
+**Name and compatibility:** Seld is the product name. This foundation keeps the
+existing `gsv` command, package, plugin and skill identifiers, `GSV_*`
+environment variables, `~/GSV` default records folder, and repository URL. The
+rename changes the public brand and documentation, not those technical
+interfaces.
 
 ## What is proven, and what is only foundation code
 
@@ -137,7 +170,7 @@ proof until those paths have passed their release gates.
 
 ## On your computer
 
-GSV stores its records in `~/GSV` by default. They are normal Markdown files,
+Seld stores its records in `~/GSV` by default. They are normal Markdown files,
 so Git, `grep`, backup tools, and optional local search tools can inspect them.
 The dashboard listens only on your computer. Its read views cannot change
 semantic records. The one control endpoint can append a CAS-protected setup
@@ -145,10 +178,10 @@ choice, approval, correction, or undo request for later disposition. Accepting
 or rejecting that receipt acknowledges the intent; it does not apply it.
 Browser activity never decides what a task means or marks work complete.
 
-GSV has no hosted service, database server, embedding model, API key, cloud
+Seld has no hosted service, database server, embedding model, API key, cloud
 sync, or deterministic semantic worker. The target resident loop relies on a
-Codex app heartbeat waking the AI task; it is not an embedded GSV daemon. These
-limits describe GSV itself; Codex has separate processing and account
+Codex app heartbeat waking the AI task; it is not an embedded Seld daemon. These
+limits describe Seld itself; Codex has separate processing and account
 boundaries.
 
 ## Release status
@@ -167,7 +200,7 @@ Once a matching `0.2.0` build is published, give Codex this instruction:
 
 > Open https://github.com/olivier-motium/gsv and read `AGENT_INSTALL.md`.
 > Install the verified release for this computer without replacing existing
-> GSV or Codex data. Open GSV, then help me restart Codex and begin
+> Seld or Codex data. Open Seld, then help me restart Codex and begin
 > `$gsv-onboard` in one fresh task. If no matching verified release exists,
 > stop and tell me.
 
@@ -182,13 +215,13 @@ path while `0.2.0` remains unreleased.
 
 ## See the recovery proof
 
-Run GSV with no arguments to open the dashboard:
+Run Seld with no arguments to open the dashboard:
 
 ```bash
 gsv
 ```
 
-Run the isolated proof without reading your real GSV files:
+Run the isolated proof without reading your real Seld files:
 
 ```bash
 gsv demo
@@ -226,7 +259,7 @@ gsv backup restore /path/to/gsv-backup.zip /path/to/restored-gsv
 ```
 
 Restore verifies files before publishing them and never silently switches your
-active GSV folder. See [Installation](docs/installation.md) for the complete
+active Seld records folder. See [Installation](docs/installation.md) for the complete
 backup and restore contract.
 
 ## Remove it
@@ -237,8 +270,8 @@ Remove only the Codex integration while keeping the executable:
 gsv codex uninstall
 ```
 
-Release uninstallers remove GSV-owned integration and executable files while
-preserving your GSV folder, configuration, backups, and unrelated Codex data:
+Release uninstallers remove `gsv`-owned integration and executable files while
+preserving your Seld records folder, configuration, backups, and unrelated Codex data:
 
 ```bash
 sh scripts/uninstall.sh
@@ -277,6 +310,6 @@ uv run python scripts/verify_bridge_browser.py
 uv run python scripts/privacy_check.py .
 ```
 
-`make` is an optional developer convenience. GSV is licensed under Apache-2.0.
+`make` is an optional developer convenience. Seld is licensed under Apache-2.0.
 Contributions use the Developer Certificate of Origin described in
 [CONTRIBUTING.md](CONTRIBUTING.md).

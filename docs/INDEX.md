@@ -1,5 +1,19 @@
 # Documentation
 
+Seld turns Codex into a resident AI for the parts of life and work a person
+chooses to connect. It keeps one local, inspectable model of people, projects,
+commitments, decisions, source coverage, and next actions; Bridge presents that
+model, Pulse keeps it current, and Codex remains the reasoning and execution
+surface.
+
+Seld is the public product name. The current command, package, plugin and skill
+identifiers remain `gsv`, and `GSV_*` environment variables and existing data
+paths remain unchanged for compatibility.
+
+Start with the [Product contract](product-contract.md) for the product people
+experience. The remaining documents explain how that promise is implemented,
+bounded, tested, and promoted without turning mechanical code into the mind.
+
 - [Product contract](product-contract.md): the outcome, product hierarchy,
   first useful journey, and consumer acceptance criteria.
 - [Installation](installation.md): supported consumer and developer paths,

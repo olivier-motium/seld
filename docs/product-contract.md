@@ -1,10 +1,34 @@
-# GSV product contract
+# Seld product contract
 
-> **The agent is not the thread.**
+Seld gives Codex a durable understanding of the parts of life and work a person
+chooses to share. It connects evidence from messages, calendars, files, source
+control, and Codex activity to one current model of people, projects,
+commitments, decisions, and next actions. Bridge shows what needs attention.
+Pulse revisits the model. Codex reasons and acts.
 
-GSV gives one resident agent a user-owned home above temporary model turns and
-Codex tasks. A task can finish, crash, or be replaced without silently
-finishing, duplicating, or orphaning the outcome it was carrying.
+The result should feel like one resident AI managing ongoing situations across
+many conversations. A Codex task can finish, crash, or be replaced without
+silently finishing, duplicating, or orphaning the outcome it was carrying.
+
+> **The agent is not the task.** Seld owns the durable context; Codex tasks are
+> replaceable hands.
+
+## What the product delivers
+
+- A current briefing grounded in the person's chosen sources, with unknown and
+  stale areas shown honestly.
+- A complete view of open outcomes across personal and professional life,
+  grounded in more than the latest inbox or chat.
+- Cross-source correction when one channel contains only part of the story.
+- Durable decisions and exact continuations that survive the Codex task that
+  produced them.
+- A small, user-driven review of the outcomes that genuinely need a decision.
+
+The consumer name for that review is the **Rundown**. Seld presents one current
+outcome or a small prepared set, explains why it needs attention, and proposes
+the next move. The person can act, reshape, defer, close, or disagree. Each
+answer applies only to the named outcome and remains anchored to current
+records.
 
 This document describes the product contract. This repository contains the
 public continuity kernel. The Culture-Grade branch adds one bounded
@@ -15,14 +39,16 @@ wakes, and the 1.0 replacement claim remain foundation-gated in
 
 ## Product hierarchy
 
-- **GSV** is the user-owned vehicle: local state, recovery, and the protocol.
+- **Seld** is the user-owned local layer: durable state, recovery, and the
+  protocol.
 - **Mind** is the durable, authored point of view. It owns meaning and judgment.
-- **Codex hands** are replaceable execution episodes. They do work; they are not
+- **Codex tasks** are replaceable execution hands. They do work; they are not
   identity or durable truth.
 - **Pulse** is one dedicated Codex AI task performing a discrete, bounded wake
   and reorientation, never a rules engine or claim of continuous consciousness.
-- **Bridge** is the human surface for current orientation, commitments,
-  storylines, system health, and a user-driven review of every open outcome.
+- **Bridge** is the home screen for current orientation, commitments,
+  longer-running situations, system health, and a user-driven review of open
+  outcomes.
 - **Shipyard** is bounded self-improvement under the same evidence and approval
   rules as other consequential work.
 
@@ -37,7 +63,7 @@ self-modifying daemon.
 
 These are release acceptance steps, not claims about the current branch:
 
-1. A person gives the repository URL to Codex and asks it to install GSV.
+1. A person gives the repository URL to Codex and asks it to install Seld.
 2. The agent selects the native release for the current platform, verifies its
    checksum, runs the reversible setup, and opens the Bridge.
 3. The Bridge shows the local Mind, current orientation, and durable work. An
@@ -45,8 +71,9 @@ These are release acceptance steps, not claims about the current branch:
    first Mind-shaping task in Codex. A vault with only done or dropped work says
    `All clear`, preserves every closed record, and offers a genuinely new hand;
    it never pretends to be a first run.
-4. `Work through every open outcome` starts or resumes one finite review Task
-   and exact Codex hand. Bridge normally presents 3-10 consequential rows and
+4. The Rundown, currently labeled `Work through every open outcome` in Bridge,
+   starts or resumes one finite review Task and exact Codex hand. Bridge
+   normally presents 3-10 consequential rows and
    never more than 25. Each row carries its current Task and storyline state,
    authored revision staleness, recommendation, reasoning, and 2-5 complete
    answer choices. The user may answer any subset, edit the prepared batch,
@@ -103,7 +130,7 @@ These are release acceptance steps, not claims about the current branch:
   repository, release, demo, or Bridge.
 - Installation preserves unrelated Codex configuration and uninstall preserves
   user data.
-- GSV does not claim continuous consciousness, a connector marketplace, cloud
+- Seld does not claim continuous consciousness, a connector marketplace, cloud
   sync, or model-independent continuity until those properties are directly
   tested.
 

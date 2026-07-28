@@ -48,7 +48,7 @@ New task IDs also reject Windows-reserved basenames such as `con`, `nul`,
 `com1`, and `lpt1`. A pre-0.2 vault that already contains one of those task IDs
 remains readable on its source platform, but its backup is intentionally not
 portable. Rename that task and update explicit references on the source
-platform before creating a cross-platform backup; GSV never silently rewrites
+platform before creating a cross-platform backup; Seld never silently rewrites
 an existing record identity.
 
 ## Bounds
@@ -179,9 +179,9 @@ record fits. The final rendered string is never repaired by raw slicing.
 
 ## Journal
 
-`journal/events.jsonl` is a bounded, append-only audit aid for successful GSV
+`journal/events.jsonl` is a bounded, append-only audit aid for successful Seld
 mutations. Markdown remains authoritative. A caught append failure has an
-explicit restored, committed, or unknown outcome; GSV rolls canonical bytes
+explicit restored, committed, or unknown outcome; Seld rolls canonical bytes
 back only after the journal is known restored. The journal is not a multi-file
 transaction log and can lag canonical Markdown if the process or operating
 system dies in the narrow interval between the two durable writes. `gsv doctor

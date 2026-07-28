@@ -1,5 +1,10 @@
 # Installation
 
+Installing Seld adds the local Bridge, bundled `gsv` plugin, skills, and durable
+records to Codex. It preserves existing Codex configuration and Seld data,
+creates no Seld cloud account, and can be removed without deleting the
+person's records. The executable and command remain named `gsv`.
+
 ## Current release status
 
 `0.2.0` is Unreleased and the repository is private. No public `0.2.0` binary
@@ -22,7 +27,7 @@ checksum is unavailable.
 
 ## Consumer prerequisites
 
-GSV needs an installed Codex command surface. The macOS discovery code checks
+Seld needs an installed Codex command surface. The macOS discovery code checks
 `GSV_CODEX`, `PATH`, and the installed Codex Desktop app bundle; Codex
 does not need to be added to `PATH` when that bundle contains the command.
 Source-level discovery behavior is not a support claim until the exact artifact
@@ -71,10 +76,10 @@ place and the previous executable is preserved as named recovery evidence.
 - Windows executable: `%LOCALAPPDATA%\GSV\bin\gsv.exe`
 - Default vault, only when no configured vault exists: `${HOME}/GSV`
 - Codex home: `${CODEX_HOME}` or `${HOME}/.codex`
-- A generated local marketplace under GSV's application-data directory
-- The GSV Codex plugin and one bounded managed block in Codex's `AGENTS.md`
+- A generated local marketplace under Seld's application-data directory
+- The bundled `gsv` Codex plugin and one bounded managed block in Codex's `AGENTS.md`
 - An ownership receipt and config file pointing to the vault
-- A private Bridge state receipt in GSV's application-data directory
+- A private Bridge state receipt in Seld's application-data directory
 - A private Bridge log in that same directory
 
 Set `GSV_BIN_DIR`, `GSV_VAULT`, `GSV_CONFIG_DIR`, `GSV_DATA_DIR`, or
@@ -142,7 +147,7 @@ untouched.
 
 Executable rollback is not a data down-migration. Multi-subject review Tasks
 and review answers above 4 KiB use explicit version-2 stored shapes; an older
-reader must reject those shapes rather than reinterpret or truncate them. GSV
+reader must reject those shapes rather than reinterpret or truncate them. Seld
 never restores a vault snapshot merely to make an old executable start. Manual
 downgrades are unsupported unless that exact older executable first proves it
 can read the current vault and control ledger.
@@ -156,11 +161,11 @@ gsv backup verify /path/to/backup.zip
 
 Default backup names include a random suffix and are published without
 replacing an existing path. Explicit output paths must be absent, and paths
-inside the vault are accepted only below its owned `backups/` directory. GSV
+inside the records folder are accepted only below its owned `backups/` directory. Seld
 identifies the vault and owned backup directory by filesystem identity, so case
 or Unicode aliases cannot bypass that policy. It excludes only exact
-GSV-writer temporary names; legitimate files that merely contain `.tmp-` are
-included. GSV fails closed when it cannot enumerate every source entry or
+`gsv`-writer temporary names; legitimate files that merely contain `.tmp-` are
+included. Seld fails closed when it cannot enumerate every source entry or
 encounters a symlink or other special file. Publication uses a hard link when
 available and otherwise a platform atomic no-replace move of the complete
 same-directory stage. It never streams partial bytes into the final path and
@@ -187,7 +192,7 @@ Restore reads one pinned archive, writes into a private sibling stage, compares
 the staged regular files with the manifest, and runs doctor before publication.
 The target must be absent or an empty real directory. On success the result
 reports `published: true` and `durability_confirmed: true`. If the final rename
-is visible but its directory sync fails, GSV returns a nonzero committed-state
+is visible but its directory sync fails, Seld returns a nonzero committed-state
 error naming the published target and the exact doctor command; it does not
 pretend the target stayed untouched or retry over it. A prior empty target that
 cannot be removed after publication is preserved and reported as a cleanup
@@ -223,7 +228,7 @@ consumer artifact installs on a clean machine.
 
 ## Removal
 
-`gsv codex uninstall` removes GSV-owned Codex integration while keeping the
+`gsv codex uninstall` removes `gsv`-owned Codex integration while keeping the
 executable. The release uninstall script first stops only a Bridge instance
 whose live health identity matches its owner-only receipt. It removes the
 executable only after both the active integration and receipt-bound recovery
@@ -243,10 +248,10 @@ executable and owner-only receipt for the printed retry command, and returns a
 nonzero retry exit without requiring `jq` or another JSON parser.
 
 A valid older receipt whose generated marketplace is already missing is handled
-automatically: GSV first records a unique repair transition, builds a packaged,
+automatically: Seld first records a unique repair transition, builds a packaged,
 digest-checked removal scaffold at that receipt-bound path, and lets Codex
 remove and verify the live registrations. Immediately after provider
-verification GSV checkpoints that phase and one exact no-replace quarantine
+verification Seld checkpoints that phase and one exact no-replace quarantine
 path. Cleanup moves the public tree there and retains it as immutable recovery
 evidence; it never recursively or manifest-deletes lifecycle trees. The active
 integration can therefore be completely removed while the result separately
@@ -279,7 +284,7 @@ treated as proof of complete cleanup.
 The recovery scaffold's exact path and manifest are durable before its first
 directory appears. Each file and nested directory is synchronized, and the
 complete tree is published without replacement before any provider call.
-Duplicate GSV plugin IDs or marketplace names are provider ambiguity: GSV
+Duplicate `gsv` plugin IDs or marketplace names are provider ambiguity: Seld
 performs no add or remove action and asks for explicit inspection.
 
 A changed, unreadable, symlinked, or out-of-bound generated marketplace is left

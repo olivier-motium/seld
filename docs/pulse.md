@@ -1,9 +1,13 @@
 # Resident AI Pulse
 
-GSV's resident Pulse is a short AI cognition episode in one dedicated Codex
-task. An app-native heartbeat wakes that same task. The model reads current GSV
-context and selected sources, decides what matters, and authors any justified
-canonical change through the normal GSV MCP tools.
+Pulse is what keeps Seld from becoming a folder of old notes. On each bounded
+wake, one dedicated Codex task reads the current local model and selected
+sources, connects new evidence to ongoing situations, and decides whether
+anything should change. It may update the current orientation, surface one
+decision, continue one outcome, or stay quiet.
+
+An app-native heartbeat wakes that same task. Any justified canonical change
+uses the normal `gsv` MCP compare-and-swap tools and exact readback.
 
 It is deliberately not a deterministic rules engine. The classes in
 `continuity_kernel.pulse` and `continuity_kernel.scheduler` are unexposed
@@ -12,7 +16,7 @@ NOW, or drive the public resident loop.
 
 ## The reusable primitives
 
-The public Pulse uses the same small primitives as an interactive GSV hand:
+The public Pulse uses the same small primitives as an interactive Seld hand:
 
 1. `task:resident-pulse` plus `system-role:resident-pulse` identify the one
    structural Pulse task and bind its real Codex UUID.
@@ -41,7 +45,7 @@ The current public kernel may:
 - preserve content-free queue and delivery facts; and
 - prevent duplicate delivery or replay after uncertain execution.
 
-The Codex app—not GSV's kernel—targets the task with its heartbeat. The skill
+The Codex app—not Seld's kernel—targets the task with its heartbeat. The skill
 compares the current task UUID with the stored binding, but host-observed
 correlation is not yet an implemented or installed-proven kernel seam. The
 foundation privacy scanner is likewise not on connector-to-canon writes yet;
@@ -59,11 +63,11 @@ Tasks, relevant WorkThreads and Entities, NOW, and the current Bridge operation
 queue. It freezes that evidence. New inputs wait for the next wake.
 
 For each selected due source, the model performs at most one bounded recent
-read, normally no more than five high-signal items. GSV does not copy raw
+read, normally no more than five high-signal items. Seld does not copy raw
 provider bodies into the vault; Codex and the provider retain their own
 processing and retention boundaries. Only a small derived claim, stable
 non-sensitive reference, observation time, coverage boundary, and uncertainty
-may enter GSV canon.
+may enter Seld's canonical records.
 
 At seven elapsed minutes the task starts no new acquisition. At eight minutes
 it stops acquiring and completes only the smallest honest judgment and readback

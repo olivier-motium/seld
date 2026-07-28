@@ -1,9 +1,15 @@
 # Onboarding
 
-GSV 1.0 onboarding is designed to start with the person's life, not a
-connector checklist. It first establishes what should become easier, which
-contexts must remain separate, what the system must never retain, and what a
-useful first result would be. Sources come after that context is understood.
+Seld gets useful when it understands what the person is trying to manage. The
+first conversation therefore covers the week ahead, active projects,
+obligations, important people, routines, constraints, and what must not be
+forgotten. It also establishes what Seld may read, retain, interrupt about, or
+act on.
+
+Only then does Seld recommend sources. Email, messages, calendars, files, GitHub,
+and optional screen context supply evidence for the person's model. The first
+useful result is a grounded orientation: what matters now, what may be slipping,
+what changed, and what remains unknown.
 
 > **Current status:** The packaged `$gsv-onboard` skill can collect context,
 > persist accepted Mind context through document CAS, guide one selected
@@ -37,9 +43,9 @@ can resume without interpreting chat prose:
 
 | Phase | Target milestone |
 | --- | --- |
-| `codex_substrate` | Verify the exact local GSV and Codex substrate before collecting personal context. |
+| `codex_substrate` | Verify the exact local Seld and Codex substrate before collecting personal context. |
 | `privacy_and_context_capture` | Agree what matters, what remains separate, what may be retained, and the action boundary. |
-| `source_selection` | Keep mandatory GSV source zero and choose the smallest useful external source set. |
+| `source_selection` | Keep mandatory Seld source zero and choose the smallest useful external source set. |
 | `enablement_wait` | Wait for user-owned plugin, authentication, permission, or policy work without pretending it is ready. |
 | `fresh_task_verification` | Prove the required tool and durable onboarding state in a fresh Codex task. |
 | `context_synthesis` | Synthesize only accepted context and currently attested evidence, with uncertainty and provenance. |
@@ -72,7 +78,7 @@ one compact batch:
 1. What should feel easier in two weeks?
 2. Which two or three parts of life or work matter most now?
 3. Which people, projects, or promises must not be dropped?
-4. What should GSV never read or retain?
+4. What should Seld never read or retain?
 5. Which local, reversible actions are acceptable, and which actions always
    require exact approval?
 6. Should the first proof be local-only, based on one source, or a bounded

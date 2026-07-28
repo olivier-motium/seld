@@ -1,6 +1,6 @@
 # Codex integration evidence
 
-## What GSV uses
+## What Seld uses
 
 The Bridge creates new-task links with this shape:
 
@@ -8,12 +8,12 @@ The Bridge creates new-task links with this shape:
 codex://new?prompt=<encoded>&originUrl=<encoded>&path=<encoded>
 ```
 
-Every link includes an encoded prompt, the GSV repository as `originUrl`, and
+Every link includes an encoded prompt, the Seld repository as `originUrl`, and
 the resolved local vault as `path`. The Bridge distinguishes three actions:
 
 - `new_mind_url` exists only when the Tasks section is completely inspected and
   contains zero records. Its prompt starts the first Mind-shaping hand.
-- `new_hand_url` starts an established, generic GSV hand. Its prompt contains no
+- `new_hand_url` starts an established, generic Seld hand. Its prompt contains no
   task identifier, resume language, or first-run language.
 - a task `codex_url` resumes one exact commitment and therefore exists only for
   nonterminal tasks. Done and dropped records never receive one.
@@ -42,7 +42,7 @@ this is an evidence switch, not a consumer release claim.
    second bind-resume turn writes that exact ID to the review-session Task and
    dispositions the event. Both paths ignore user configuration, use a
    read-only shell sandbox with no approval prompts, and configure only the
-   required vault-bound GSV MCP server for semantic writes. The foundation
+   required vault-bound `gsv` MCP server for semantic writes. The foundation
    requests high reasoning effort but otherwise uses the user's Codex
    subscription defaults. A test operator may supply a validated model or
    service-tier override through `GSV_GUIDED_REVIEW_MODEL` and
@@ -113,10 +113,10 @@ or app-native provider path; those rows remain open in the release ledger.
 The top bar, all-clear state, and terminal-task inspector use `new_hand_url`;
 only the true first-run panel uses `new_mind_url`. The Bridge emits none of
 these links until Codex discovery succeeds and both the managed instructions
-and GSV plugin are installed. The README install link omits `path` because it
+and bundled `gsv` plugin are installed. The README install link omits `path` because it
 opens a new task before a checkout or vault path can be assumed.
 
-GSV does not use a legacy launch-route fallback.
+Seld does not use a legacy launch-route fallback.
 
 ## Resident Pulse task
 
@@ -128,7 +128,7 @@ dedicated Codex task, binds its real UUID to structural
 same task with one app `heartbeat` on the ten-minute target cadence.
 
 Each wake loads `$gsv-pulse`. The model freezes a bounded context and selected
-source window, makes semantic judgments, and writes through the existing GSV
+source window, makes semantic judgments, and writes through the existing `gsv`
 MCP CAS/readback tools. Mechanical code can validate structural markers,
 revisions, bounds, content-free receipts, and no-replay behavior. The skill
 performs the current-task comparison; host-observed correlation and a
@@ -152,7 +152,7 @@ Observed read-only on 2026-07-22:
 
 The parser in that exact installed bundle routes host `new` to its new-task
 parser and reads `prompt`, `originUrl`, and `path`. It rejects the route only
-when all three are absent. This validates GSV's link shape for that installed
+when all three are absent. This validates Seld's link shape for that installed
 version without launching or submitting a task.
 
 This is not an evergreen Codex API guarantee. Recheck the installed bundle or

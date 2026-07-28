@@ -1,15 +1,25 @@
 # Architecture
 
+Seld has one product loop. The AI reads bounded context from the sources a person
+selected, relates it to durable local records, authors any justified change
+through compare-and-swap writes, and presents the current result in Bridge.
+When work is needed, one exact Codex task carries the outcome. Pulse repeats the
+same reasoning loop on a bounded heartbeat; it does not replace the model with
+rules.
+
+The architecture exists to keep that intelligence useful and safe. Mechanical
+code owns identity, storage, bounds, receipts, privacy, and recovery. The AI
+owns meaning, priority, relationships, memory judgment, and what happens next.
+
 ## Product hierarchy
 
-- **GSV** is the local vehicle: the vault, persistence protocol, recovery, and
-  adapters.
+- **Seld** is the local continuity layer: the records, persistence protocol,
+  recovery, and adapters.
 - **Mind** is the authored point of view in durable documents and records.
-- **Hands** are replaceable MCP or Codex execution episodes using the same
-  kernel.
-- **Bridge** is the human read surface plus a narrow append-only queue for
+- **Codex tasks** are replaceable execution hands using the same kernel.
+- **Bridge** is the human home screen plus a narrow append-only queue for
   explicit setup choices, approvals, corrections, and undo requests. A queued
-  intent and its accept/reject disposition cannot author semantic canon or
+  intent and its accept/reject disposition cannot write semantic records or
   authorize an external action.
 - **Pulse** is one dedicated Codex task awakened by an app-native heartbeat.
   The model reorients, reads bounded selected sources, and authors judgment.
@@ -42,7 +52,7 @@ activity.
 
 ## Resident AI Pulse
 
-The public Pulse composition deliberately reuses ordinary GSV primitives:
+The public Pulse composition deliberately reuses ordinary Seld primitives:
 
 1. one structural `task:resident-pulse` is bound to one real Codex task UUID by
    `system-role:resident-pulse`;
@@ -74,7 +84,8 @@ not close those gates. See [Resident AI Pulse](pulse.md).
 
 ## Codex integration
 
-Setup generates a per-Codex-home local marketplace containing the GSV plugin,
+Setup generates a per-Codex-home local marketplace containing the bundled
+`gsv` plugin,
 MCP manifest, and skill. The manifest points directly to the standalone
 executable for release installs, or to the active module launcher for source
 installs.
@@ -118,7 +129,7 @@ do not require vault access. The Bridge rejects cross-origin requests, every
 write outside its single bounded control endpoint, path traversal, symlinked
 assets, and oversized assets.
 
-Stop is fail-closed. GSV signals a receipt PID only when the live authenticated
+Stop is fail-closed. Seld signals a receipt PID only when the live authenticated
 health response matches the same instance, PID, port, and vault. A stale,
 forged, or PID-reused receipt with a concrete mismatch is removed without
 signaling the process. A concrete refusal on the validated loopback port also
@@ -159,7 +170,7 @@ the explicit CLI status command's full-vault logical digest.
 
 1. A caller reads an exact record and receives its SHA-256 revision.
 2. The caller submits an update with that revision.
-3. GSV takes the appropriate cross-process lock and re-reads the record.
+3. Seld takes the appropriate cross-process lock and re-reads the record.
 4. A mismatched revision is rejected as a stale write.
 5. Valid content is written to a same-directory temporary file, flushed, and
    atomically replaced.
@@ -168,7 +179,7 @@ the explicit CLI status command's full-vault logical digest.
 
 This is deliberately not described as a multi-file transaction. For ordinary
 reported append failures, the append primitive first restores the journal to
-its exact previous length. GSV then restores the exact previous canonical bytes
+its exact previous length. Seld then restores the exact previous canonical bytes
 or removes an invocation-owned create, but only while the current bytes still
 match that invocation. A post-fsync cleanup failure is reported as committed;
 unknown journal state or failed canonical recovery is reported as degraded and
@@ -248,7 +259,7 @@ introduce a transcript database or a second task system:
    review-turn endpoint is an idempotent trigger and recovery path for that
    exact event ID. START first creates a Codex hand, then immediately resumes it
    to bind the emitted UUID; later answers resume the authored hand once. Every
-   invocation uses the required vault-bound GSV MCP server and exposes no
+   invocation uses the required vault-bound `gsv` MCP server and exposes no
    provider, Computer Use, shell-write, or external-action tools. The browser
    polls only that event ID. Its wait card distinguishes locally saved,
    delivery confirmation, and running states, advances elapsed time locally,
@@ -340,10 +351,10 @@ transaction and require the documented stop-plus-setup activation step.
 
 ## Ownership and recovery
 
-The vault and backups are user data. GSV never deletes them during Codex
+The records folder and backups are user data. Seld never deletes them during Codex
 uninstall. The generated marketplace, plugin registration, managed instruction
 block, Bridge receipt, and installation receipt are integration state. Removal
-touches only expected content recorded as GSV-owned. Uninstall snapshots the
+touches only expected content recorded as `gsv`-owned. Uninstall snapshots the
 exact managed instruction bytes and verifies the marketplace digest before
 provider mutation, keeps the marketplace manifest present while Codex removes
 and verifies its registrations, then rechecks and isolates the local state. Any
