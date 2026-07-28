@@ -889,7 +889,7 @@ def test_backup_excludes_only_exact_host_local_migration_tombstone_markers(
         moved = os.lstat(quarantine)
         assert (moved.st_dev, moved.st_ino) == (metadata.st_dev, metadata.st_ino)
         marker = quarantine.with_suffix(".marker")
-        marker.write_text(
+        marker_bytes = (
             json.dumps(
                 {
                     "device": metadata.st_dev,
@@ -900,8 +900,18 @@ def test_backup_excludes_only_exact_host_local_migration_tombstone_markers(
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            + "\n",
-            encoding="utf-8",
+            + "\n"
+        ).encode("utf-8")
+        # The retired writer used os.write with canonical LF bytes. Text-mode
+        # writes translate that terminator to CRLF on Windows and no longer
+        # represent a marker the backup scanner is allowed to trust.
+        marker_stage = marker.with_name(f".{marker.name}.gsv-stage-fixture")
+        marker_stage.write_bytes(marker_bytes)
+        atomic_module.durable_publish_new(marker_stage, marker)
+        assert not marker_stage.exists()
+        assert marker.read_bytes() == marker_bytes
+        assert vault_backup_module._is_owned_migration_tombstone_marker(
+            marker, marker.relative_to(vault.root).as_posix()
         )
         return marker
 
