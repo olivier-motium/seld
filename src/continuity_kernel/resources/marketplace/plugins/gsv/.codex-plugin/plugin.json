@@ -1,0 +1,29 @@
+{
+  "name": "gsv",
+  "version": "0.2.0",
+  "description": "Durable local context, tasks, entities, and work threads for Codex.",
+  "author": {
+    "name": "GSV contributors"
+  },
+  "homepage": "https://github.com/olivier-motium/seld",
+  "repository": "https://github.com/olivier-motium/seld",
+  "license": "Apache-2.0",
+  "keywords": ["agents", "codex", "gsv", "local-first", "memory"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "GSV",
+    "shortDescription": "Carry grounded context across Codex sessions",
+    "longDescription": "Local-first durable context for coding agents, with inspectable Markdown, exact records, compare-and-swap writes, and portable backup and restore.",
+    "developerName": "GSV contributors",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Start or resume GSV onboarding and help me describe my world",
+      "Show me what this GSV vault currently knows",
+      "Create a durable task for this outcome",
+      "Prepare a handoff for my next Codex session"
+    ],
+    "screenshots": []
+  }
+}

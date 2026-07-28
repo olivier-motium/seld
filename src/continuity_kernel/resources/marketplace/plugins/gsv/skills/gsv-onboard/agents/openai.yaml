@@ -1,0 +1,4 @@
+interface:
+  display_name: "GSV onboarding"
+  short_description: "Capture context and verify available setup"
+  default_prompt: "Use $gsv-onboard to capture what matters to me and show which setup and continuity steps this installed GSV can actually prove."

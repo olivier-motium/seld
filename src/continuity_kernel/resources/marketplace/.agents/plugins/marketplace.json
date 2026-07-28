@@ -1,0 +1,21 @@
+{
+  "name": "gsv-local",
+  "interface": {
+    "displayName": "GSV"
+  },
+  "plugins": [
+    {
+      "name": "gsv",
+      "source": {
+        "source": "local",
+        "path": "./plugins/gsv"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
+

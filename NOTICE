@@ -1,0 +1,17 @@
+GSV
+Copyright 2026 GSV contributors
+
+This product includes software developed by GSV contributors.
+
+The Bridge includes adapted working and searching canvas modes from
+thinking-orbs 0.1.1, Copyright (c) 2026 Jakub Antalik, under the MIT License.
+The reviewed npm tarball has SHA-1
+`a9fea3b816e76bb750efc969cff4ccf94d529bd5` and SHA-512 integrity
+`sha512-nLvLTGJtk74K13MmP7XiRdzFiQx7UsoZAIyBZNgXyl7Q3h2mdz0r3eKn9LCsuzb3DGOVjwDvMhtnAkIqJJRVQA==`;
+the source commit is `382be79c472cd600277f01e14f98f8c0ee18dcb0`.
+The Bridge port has no React or Node runtime dependency. The full MIT text is
+packaged with the Bridge.
+
+Navigation and action icons are adapted from Lucide, Copyright (c) 2026
+Lucide Icons and Contributors, under the ISC License. The full license text is
+packaged with the Bridge.

@@ -1,0 +1,230 @@
+@media (max-width: 980px) {
+  :root {
+    --rail-width: 212px;
+  }
+
+  .main {
+    width: min(100% - 40px, 920px);
+  }
+
+  .orientation {
+    grid-template-columns: 156px minmax(0, 1fr);
+  }
+
+  .commitment-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .recovery-panel,
+  .control-panel,
+  .recovery-panel.is-compact {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+
+  .task-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .shell {
+    display: block;
+  }
+
+  .rail {
+    width: min(280px, 84vw);
+    transform: translateX(-105%);
+    transition: transform 180ms ease;
+  }
+
+  .rail.is-open {
+    transform: translateX(0);
+  }
+
+  .workspace {
+    min-width: 0;
+  }
+
+  .topbar {
+    height: 58px;
+    justify-content: space-between;
+    padding: 0 14px;
+  }
+
+  .menu-button {
+    display: grid;
+    place-items: center;
+  }
+
+  .local-status {
+    margin-left: auto;
+  }
+
+  .codex-link {
+    min-height: 34px;
+    padding: 0 12px;
+  }
+
+  .main {
+    width: calc(100% - 28px);
+    padding: 30px 0 64px;
+    scroll-margin-top: 72px;
+  }
+
+  .page-heading {
+    padding-bottom: 20px;
+  }
+
+  .view {
+    padding-top: 12px;
+  }
+
+  .orientation {
+    grid-template-columns: 1fr;
+    gap: 16px;
+    padding: 18px;
+  }
+
+  .orientation-kicker {
+    padding: 0 0 16px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .continuity-line {
+    grid-template-columns: 1fr 1fr;
+    gap: 0;
+    padding: 0;
+  }
+
+  .continuity-stage,
+  .continuity-stage:first-child,
+  .continuity-stage:last-child {
+    min-height: 94px;
+    padding: 16px;
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .continuity-stage:nth-child(even) {
+    border-right: 0;
+  }
+
+  .continuity-stage:nth-last-child(-n + 2) {
+    border-bottom: 0;
+  }
+
+  .task-list {
+    grid-template-columns: 1fr;
+  }
+
+  .empty-state,
+  .unavailable-state {
+    grid-template-columns: 1fr;
+  }
+
+  .storyline,
+  .system-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .system-state {
+    text-align: left;
+  }
+
+  .mind-layout {
+    grid-template-columns: 1fr;
+    gap: 28px;
+  }
+
+  .guided-review-current,
+  .guided-review-judgment {
+    grid-template-columns: 1fr;
+  }
+
+  .mind-side {
+    padding: 20px 0 0;
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+}
+
+@media (max-width: 440px) {
+  #local-status-copy {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .connection-notice {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .guided-review {
+    padding: 18px 16px;
+    border-radius: 18px;
+  }
+
+  .guided-review-intents {
+    grid-template-columns: 1fr;
+  }
+
+  .guided-review-option {
+    min-height: 54px;
+  }
+
+  .guided-review-prepared-card {
+    padding: 14px;
+  }
+
+  .guided-review-prepared-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .guided-review-prepared-choice {
+    min-height: 54px;
+  }
+
+  .guided-review-prepared-actions,
+  .guided-review-prepared-actions .primary-action,
+  .guided-review-batch-actions,
+  .guided-review-batch-actions .primary-action,
+  .guided-review-edit-batch,
+  .guided-review-overview-toggle {
+    width: 100%;
+  }
+
+  .guided-review-prepared-session > .primary-action {
+    width: 100%;
+  }
+
+  .guided-review-session-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .guided-review-session-actions .quiet-action {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

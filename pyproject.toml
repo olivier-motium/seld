@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gsv"
+version = "0.2.0"
+description = "An ambient AI chief of staff that stays caught up across the sources you choose"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Seld contributors" }]
+keywords = ["agents", "chief-of-staff", "codex", "gsv", "local-first", "mcp", "seld"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2.2",
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.11",
+]
+browser-test = [
+  "playwright>=1.52,<2",
+]
+release = [
+  "pyinstaller>=6.11,<7",
+]
+
+[project.scripts]
+gsv = "continuity_kernel.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/olivier-motium/seld"
+Issues = "https://github.com/olivier-motium/seld/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/continuity_kernel"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["continuity_kernel"]
+
+[[tool.mypy.overrides]]
+module = "playwright.*"
+ignore_missing_imports = true
+
+[tool.coverage.run]
+branch = true
+source = ["continuity_kernel"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
