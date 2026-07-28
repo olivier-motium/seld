@@ -27,6 +27,13 @@ from scripts.e2e_clean_install import _require_native_codex
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_standalone_smoke_does_not_discover_the_host_codex(tmp_path: Path) -> None:
+    environment = build_standalone._isolated_environment(tmp_path, tmp_path / "vault")
+
+    assert environment["GSV_CODEX"] == str(tmp_path / "missing-codex")
+    assert not Path(environment["GSV_CODEX"]).exists()
+
+
 @pytest.mark.parametrize("module", [build_standalone, e2e_clean_install])
 def test_release_bridge_http_disables_proxies_for_exact_loopback(
     module: Any, monkeypatch: pytest.MonkeyPatch

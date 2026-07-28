@@ -280,6 +280,7 @@ def _isolated_environment(root: Path, vault: Path) -> dict[str, str]:
             "APPDATA": str(config),
             "CODEX_HOME": str(codex_home),
             "GSV_CONFIG_DIR": str(config),
+            "GSV_CODEX": str(root / "missing-codex"),
             "GSV_DATA_DIR": str(data),
             "GSV_VAULT": str(vault),
             "HOME": str(home),
