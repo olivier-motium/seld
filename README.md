@@ -28,9 +28,10 @@ record.
 
 ## State-of-the-art design for resident personal operations
 
-Yes. Seld is state of the art for resident personal operations.
+Yes, Seld is state of the art for resident personal operations because it
+handles the whole job as one coherent system.
 
-Resident personal operations is the job of keeping a person's real work and
+That job is keeping a person's real work and
 life current across many sources, understanding what changed in context, and
 turning that change into a manageable set of decisions. Seld handles this as one
 operating loop. Direction and Portfolio establish what matters; one local

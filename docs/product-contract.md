@@ -51,10 +51,11 @@ prebuilt binaries, additional platforms, uptime, and comparative results.
   Seld knows** exposes authored direction and Mind context, and **System**
   keeps health, recovery, and local controls explicit.
 In `0.3.0`, Pulse is an AI operating role over the same local records and
-approval boundaries. Mechanical Pulse-admission,
-scheduler-planning, and canary classes are safety helpers, never the product's
-intelligence. Shipyard remains an operating convention for separately reviewed
-self-improvement work; Seld does not ship a self-modifying daemon.
+approval boundaries. Local code protects identity, privacy, bounds,
+compare-and-swap writes, recovery, and replay; it does not decide what Pulse
+means or what it should do. Shipyard remains an operating convention for
+separately reviewed self-improvement work; Seld does not ship a self-modifying
+daemon.
 
 ## First useful journey
 

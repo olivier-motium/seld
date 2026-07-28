@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from continuity_kernel.errors import ValidationError
-from continuity_kernel.pulse import MECHANICAL_PULSE_PROFILE
 from continuity_kernel.source_recipes import (
     RECIPE_SET_VERSION,
     RECIPES,
@@ -86,9 +85,7 @@ def test_source_zero_has_long_lived_local_capabilities() -> None:
     assert source_zero.proof_ttl.days == 30
 
 
-def test_pulse_profile_structurally_forbids_computer_use_and_mutation() -> None:
-    assert "computer_use" in MECHANICAL_PULSE_PROFILE.forbidden
-    assert "external_action" in MECHANICAL_PULSE_PROFILE.forbidden
+def test_source_recipes_expose_reads_not_sends() -> None:
     assert all("send" not in recipe.read_capability for recipe in RECIPES.values())
 
 

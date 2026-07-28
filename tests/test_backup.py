@@ -26,7 +26,6 @@ from continuity_kernel.errors import (
     PersistenceError,
     ValidationError,
 )
-from continuity_kernel.migration import FoundationMigration
 from continuity_kernel.records import new_task, render_task
 from continuity_kernel.vault import BACKUP_MANIFEST, Vault
 from continuity_kernel.vault_identity import REQUIRED_VAULT_DIRECTORIES
@@ -869,11 +868,36 @@ def test_backup_with_crash_leftover_foundation_temps_restores_cleanly(
 def test_backup_excludes_only_exact_host_local_migration_tombstone_markers(
     vault: Vault, tmp_path: Path
 ) -> None:
-    migration = FoundationMigration(vault)
-    applied = migration.apply()
-    migration.rollback(expected_revision=applied.revision)
-    exact_markers = tuple(vault.root.glob(".onboarding.gsv-remove-*.marker")) + tuple(
-        (vault.root / ".gsv").glob(".*.gsv-remove-*.marker")
+    def legacy_marker(parent: Path, name: str, relative: str) -> Path:
+        staging = parent / f".{name}.gsv-remove-staging.quarantine"
+        staging.mkdir()
+        metadata = os.lstat(staging)
+        token = sha256_bytes(
+            f"culture-grade-foundation-v1\0{relative}\0{metadata.st_dev}\0{metadata.st_ino}".encode()
+        )[:24]
+        quarantine = parent / f".{name}.gsv-remove-{token}.quarantine"
+        staging.rename(quarantine)
+        marker = quarantine.with_suffix(".marker")
+        marker.write_text(
+            json.dumps(
+                {
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "migration_id": "culture-grade-foundation-v1",
+                    "relative_path": relative,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return marker
+
+    exact_markers = (
+        legacy_marker(vault.root, "onboarding", "onboarding"),
+        legacy_marker(vault.root / ".gsv", "control", ".gsv/control"),
+        legacy_marker(vault.root / ".gsv", "migrations", ".gsv/migrations"),
     )
     assert len(exact_markers) == 3
     lookalike = vault.root / ".onboarding.gsv-remove-000000000000000000000000.marker"

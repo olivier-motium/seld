@@ -122,8 +122,7 @@ Seld does not use a legacy launch-route fallback.
 ## Resident Pulse task
 
 The resident Pulse uses the ordinary app-native ChatGPT task and skill surfaces,
-not the guided-review subprocess transport and not the unexposed deterministic
-`PulseController` or scheduler planner. Registration creates exactly one
+not the guided-review subprocess transport. Registration creates exactly one
 dedicated ChatGPT task, binds its real UUID to structural
 `task:resident-pulse` and, after a manual proof and fresh approval, targets that
 same task with one app `heartbeat` on the ten-minute target cadence.

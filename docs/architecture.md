@@ -23,7 +23,7 @@ owns meaning, priority, relationships, memory judgment, and what happens next.
   authorize an external action.
 - **Pulse** is one dedicated ChatGPT task awakened by an app-native heartbeat.
   The model reorients, reads bounded selected sources, and authors judgment.
-  It is not the deterministic `PulseController` and not a rules engine.
+  It is not a rules engine.
 
 ## Kernel
 
@@ -53,9 +53,9 @@ coverage require a new bounded read.
 
 The packaged `gsv-onboard` and `gsv-pulse` skills compose document, Task,
 WorkThread, Portfolio, source, operation, and Bridge surfaces. Deterministic
-Pulse admission, scheduler planning, privacy screening, and migration modules
-remain bounded safety helpers. A helper that is not exposed in a documented
-user flow is not used as evidence for that flow.
+code on those paths protects identity, privacy, bounds, compare-and-swap writes,
+recovery, and replay safety. Seld ships no second rules-based onboarding,
+Pulse, scheduler, or migration control plane.
 
 Markdown in the vault is authoritative. Deterministic code may persist,
 validate, traverse, and render authored facts. It may not infer task meaning,

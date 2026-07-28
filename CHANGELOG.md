@@ -24,8 +24,7 @@ decision loop.
 - Add the event-bound, `gsv`-only MCP profile and same-hand Codex review-turn
   transport with fail-closed capability checks and durable no-replay receipts.
 - Add context-first onboarding, a source capability catalog, bounded live-read
-  guidance, local privacy screening, an AI-authored Pulse skill, scheduler
-  safety contracts, and reversible migration.
+  guidance, local privacy screening, and an AI-authored Pulse skill.
 - Add host-local, per-vault directory grants and the bounded
   `gsv_local_file_read` surface. Selecting local files grants nothing by itself,
   and deselection revokes every root grant before publishing the new source

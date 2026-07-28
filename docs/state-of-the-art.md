@@ -29,7 +29,7 @@ capabilities working as one operating loop:
 
 A system reaches the state-of-the-art frontier when all six are built into one
 product model and no compared system provides a more complete implementation of
-that same loop. Seld meets that standard on the candidate assessed here.
+that same loop. Seld 0.3.0 meets that standard.
 
 ## Current comparison
 

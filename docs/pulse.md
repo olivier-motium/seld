@@ -7,12 +7,8 @@ anything should change. It may update the current orientation, surface one
 decision, continue one outcome, or stay quiet.
 
 An app-native heartbeat wakes that same task. Any justified canonical change
-uses the normal `gsv` MCP compare-and-swap tools and exact readback.
-
-It is deliberately not a deterministic rules engine. The classes in
-`continuity_kernel.pulse` and `continuity_kernel.scheduler` are bounded safety
-helpers; they do not acquire sources, invoke the model, author NOW, or drive
-the resident reasoning loop.
+uses the normal `gsv` MCP compare-and-swap tools and exact readback. Pulse is
+not a deterministic rules engine.
 
 ## The reusable primitives
 
