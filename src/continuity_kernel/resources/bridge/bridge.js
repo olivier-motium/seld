@@ -62,6 +62,8 @@ let guidedReviewDraft = "";
 let guidedReviewDelivery = null;
 let guidedReviewNotice = "";
 let guidedReviewNoticeContext = null;
+let snapshotAppliedSequence = 0;
+let snapshotRequestSequence = 0;
 let guidedReviewSendPending = false;
 let guidedReviewPollGeneration = 0;
 let guidedReviewActivePollEventId = null;
@@ -126,6 +128,7 @@ window.setInterval(() => loadSnapshot({ quiet: true }), 10_000);
 window.setInterval(updateLiveLabels, 1_000);
 
 async function loadSnapshot({ quiet = false } = {}) {
+  const requestSequence = ++snapshotRequestSequence;
   if (!quiet) {
     ui.view.setAttribute("aria-busy", "true");
     showConnectionOrb("searching", "Reading local GSV");
@@ -142,6 +145,8 @@ async function loadSnapshot({ quiet = false } = {}) {
       throw new Error(`Bridge returned ${response.status}`);
     }
     const snapshot = await response.json();
+    if (requestSequence < snapshotAppliedSequence) return true;
+    snapshotAppliedSequence = requestSequence;
     const snapshotSignature = JSON.stringify(snapshot);
     const snapshotChanged = snapshotSignature !== state.snapshotSignature;
     state.snapshot = snapshot;
@@ -167,6 +172,7 @@ async function loadSnapshot({ quiet = false } = {}) {
     scheduleIntegrationRefresh(snapshot);
     return true;
   } catch (error) {
+    if (requestSequence < snapshotAppliedSequence) return true;
     const message = connectionMessage(error);
     if (state.snapshot) {
       setConnectionState("stale", `${message} Showing the last local snapshot.`);
@@ -1783,7 +1789,7 @@ function syncGuidedReviewDelivery(receipt, handUrl, review, controls) {
     eventId: receipt.event_id,
     handUrl: handUrl || guidedReviewDelivery?.handUrl || null,
     liveCheckedAt:
-      receipt.state === "running" && exactGuidedReviewHandUrl(receipt.thread_id)
+      selectedReceipt.state === "running" && exactGuidedReviewHandUrl(selectedReceipt.thread_id)
         ? Date.now()
         : null,
     message: stateChanged ? null : guidedReviewDelivery?.message || null,
