@@ -2174,6 +2174,10 @@ def test_browser_keeps_active_delivery_until_post_disposition_completion(
                 )
                 assert page.get_by_text("Seld is working", exact=True).is_visible()
 
+                page.wait_for_timeout(2_750)
+                assert page.get_by_text("Seld is working", exact=True).is_visible()
+                assert page.get_by_role("button", name="Do / next").count() == 0
+
                 transport.release_completion()
                 page.get_by_text("ChatGPT replied", exact=True).wait_for(timeout=5_000)
                 assert page.get_by_text(

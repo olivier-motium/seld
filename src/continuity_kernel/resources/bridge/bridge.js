@@ -1718,6 +1718,17 @@ function updateGuidedReviewMessage(message) {
   render();
 }
 
+function guidedReviewDispositionIsOutOfBand(controls, receipt) {
+  if (!receipt?.event_id || !receipt?.thread_id) return false;
+  const resolved = [...(controls?.items || []), ...(controls?.history || [])].find(
+    (item) =>
+      item?.event?.event_id === receipt.event_id &&
+      ["accepted", "rejected"].includes(item?.status),
+  );
+  const actorRef = resolved?.disposition?.actor_ref;
+  return typeof actorRef === "string" && actorRef !== `codex:${receipt.thread_id}`;
+}
+
 function reconcileActiveGuidedReviewDisposition(review, controls) {
   const delivery = guidedReviewDelivery;
   const current = delivery?.receipt;
@@ -1728,18 +1739,12 @@ function reconcileActiveGuidedReviewDisposition(review, controls) {
     guidedReviewDelivery = { ...delivery, pendingSeen: true, resolvedAt: null };
     return;
   }
-  const observedQueuedRevision =
-    delivery.queueRevision && controls?.queue_revision === delivery.queueRevision;
-  const resolvedVisible = [...(controls?.items || []), ...(controls?.history || [])].some(
-    (item) =>
-      item?.event?.event_id === current.event_id &&
-      ["accepted", "rejected"].includes(item?.status),
-  );
+  const resolvedOutOfBand = guidedReviewDispositionIsOutOfBand(controls, current);
   if (
     current.state === "completed" ||
     review?.state === "unavailable" ||
     controls?.available !== true ||
-    !(delivery.pendingSeen === true || observedQueuedRevision || resolvedVisible) ||
+    !resolvedOutOfBand ||
     delivery.resolvedAt
   ) return;
   const resolvedAt = Date.now();
@@ -1768,20 +1773,13 @@ function syncGuidedReviewDelivery(receipt, handUrl, review, controls) {
       guidedReviewDelivery = { ...guidedReviewDelivery, pendingSeen: true };
       return;
     }
-    const observedQueuedRevision =
-      guidedReviewDelivery?.queueRevision &&
-      controls?.queue_revision === guidedReviewDelivery.queueRevision;
-    const resolvedVisible = [...(controls?.items || []), ...(controls?.history || [])].some(
-      (item) =>
-        item?.event?.event_id === current?.event_id &&
-        ["accepted", "rejected"].includes(item?.status),
-    );
+    const resolvedOutOfBand = guidedReviewDispositionIsOutOfBand(controls, current);
     if (
       current?.event_id &&
       current.state !== "completed" &&
       review?.state !== "unavailable" &&
       controls?.available === true &&
-      (guidedReviewDelivery?.pendingSeen === true || observedQueuedRevision || resolvedVisible)
+      resolvedOutOfBand
     ) {
       guidedReviewPollGeneration += 1;
       guidedReviewActivePollEventId = null;
