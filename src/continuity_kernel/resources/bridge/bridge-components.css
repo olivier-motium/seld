@@ -1212,7 +1212,7 @@ button.storyline:hover {
 }
 
 .close-button {
-  flex: 0 0 32px;
+  flex: 0 0 44px;
   width: 44px;
   height: 44px;
   border: var(--border-width) solid var(--seld-border-control);

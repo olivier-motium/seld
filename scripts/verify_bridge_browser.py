@@ -245,6 +245,9 @@ def _verify_browser(browser: Browser, url: str) -> dict[str, bool]:
         raise RuntimeError("the Atlas commitment is not uniquely addressable")
     atlas.click()
     page.locator("#inspector.is-open").wait_for()
+    close_box = page.locator("#close-inspector").bounding_box()
+    if close_box is None or close_box["width"] < 44 or close_box["height"] < 44:
+        raise RuntimeError(f"the inspector close target is smaller than 44px: {close_box}")
     if not page.locator("#inspector-foot").is_visible():
         raise RuntimeError("the commitment inspector lost its continuation action")
     try:
