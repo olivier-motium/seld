@@ -27,6 +27,13 @@ from scripts.e2e_clean_install import _require_native_codex
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_standalone_smoke_does_not_discover_the_host_codex(tmp_path: Path) -> None:
+    environment = build_standalone._isolated_environment(tmp_path, tmp_path / "vault")
+
+    assert environment["GSV_CODEX"] == str(tmp_path / "missing-codex")
+    assert not Path(environment["GSV_CODEX"]).exists()
+
+
 @pytest.mark.parametrize("module", [build_standalone, e2e_clean_install])
 def test_release_bridge_http_disables_proxies_for_exact_loopback(
     module: Any, monkeypatch: pytest.MonkeyPatch
@@ -185,7 +192,7 @@ def test_candidate_version_is_consistent_across_runtime_installers_and_lock() ->
     lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     locked_gsv = next(package for package in lock["package"] if package["name"] == "gsv")
 
-    assert project["project"]["version"] == __version__ == "0.2.0"
+    assert project["project"]["version"] == __version__ == "0.3.0"
     assert locked_gsv["version"] == __version__
     assert f"GSV_VERSION:-{__version__}" in (ROOT / "scripts/install.sh").read_text(
         encoding="utf-8"
@@ -193,6 +200,45 @@ def test_candidate_version_is_consistent_across_runtime_installers_and_lock() ->
     assert f'else {{ "{__version__}" }}' in (ROOT / "scripts/install.ps1").read_text(
         encoding="utf-8"
     )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="executes the POSIX installer through /bin/sh")
+def test_unpublished_linux_prebuilt_fails_before_network(tmp_path: Path) -> None:
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    marker = tmp_path / "network-called"
+    (tools / "uname").write_text(
+        '#!/bin/sh\nif [ "${1:-}" = "-s" ]; then printf "Linux\\n"; else printf "x86_64\\n"; fi\n',
+        encoding="utf-8",
+    )
+    (tools / "uname").chmod(0o755)
+    (tools / "curl").write_text(
+        '#!/bin/sh\nprintf called > "$GSV_TEST_NETWORK_MARKER"\nexit 1\n',
+        encoding="utf-8",
+    )
+    (tools / "curl").chmod(0o755)
+    environment = os.environ.copy()
+    environment.pop("GSV_BINARY", None)
+    environment["GSV_TEST_NETWORK_MARKER"] = str(marker)
+    environment["PATH"] = f"{tools}{os.pathsep}{environment['PATH']}"
+
+    result = subprocess.run(
+        ["/bin/sh", str(ROOT / "scripts/install.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode == 2
+    assert "does not publish a Linux prebuilt yet" in result.stderr
+    assert not marker.exists()
+
+
+def test_unpublished_windows_prebuilt_fails_before_network() -> None:
+    powershell = (ROOT / "scripts/install.ps1").read_text(encoding="utf-8")
+    assert powershell.index("if (-not $env:GSV_BINARY)") < powershell.index("Invoke-WebRequest")
 
 
 def test_release_claims_match_the_no_generated_visual_artifact_policy() -> None:
@@ -211,6 +257,30 @@ def test_release_claims_match_the_no_generated_visual_artifact_policy() -> None:
         )
 
     assert artifacts == []
+
+
+def test_repository_artifact_policy_allows_only_the_licensed_fonts(tmp_path: Path) -> None:
+    allowed = tmp_path / "src/continuity_kernel/resources/bridge/fonts/nunito-var.woff2"
+    allowed.parent.mkdir(parents=True)
+    allowed.write_bytes(b"wOF2\0licensed-font")
+    screenshot = tmp_path / "review.png"
+    screenshot.write_bytes(b"\x89PNG\r\n\x1a\nsynthetic")
+
+    assert privacy_check.scan_repository_artifact_policy(tmp_path) == [
+        privacy_check.Finding("review.png", "repository-binary-not-allowed")
+    ]
+
+
+def test_repository_artifact_policy_rejects_large_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = tmp_path / "review.log"
+    report.write_text("too much generated output", encoding="utf-8")
+    monkeypatch.setattr(privacy_check, "MAX_REPOSITORY_FILE_BYTES", 8)
+
+    assert privacy_check.scan_repository_artifact_policy(tmp_path) == [
+        privacy_check.Finding("review.log", "repository-file-oversized")
+    ]
     assert "README visuals" not in (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
 
@@ -314,7 +384,7 @@ printf 'old binary\\n'
     candidate.write_text(
         """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'gsv 0.2.0\\n'
+  printf 'gsv 0.3.0\\n'
   exit 0
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
@@ -395,7 +465,7 @@ printf 'old binary\\n'
     candidate.write_text(
         """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'gsv 0.2.0\\n'
+  printf 'gsv 0.3.0\\n'
   exit 0
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
@@ -473,7 +543,7 @@ exit 2
     candidate.write_text(
         """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'gsv 0.2.0\\n'
+  printf 'gsv 0.3.0\\n'
   exit 0
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
@@ -535,7 +605,7 @@ def test_posix_post_commit_bridge_failure_keeps_candidate_and_recovery_binary(
     candidate.write_text(
         """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'gsv 0.2.0\\n'
+  printf 'gsv 0.3.0\\n'
   exit 0
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
@@ -590,7 +660,7 @@ exit 2
 def test_posix_install_primitive_failure_removes_staged_file(tmp_path: Path) -> None:
     install_dir = tmp_path / "bin"
     candidate = tmp_path / "candidate"
-    candidate.write_text("#!/bin/sh\nprintf 'gsv 0.2.0\\n'\n", encoding="utf-8")
+    candidate.write_text("#!/bin/sh\nprintf 'gsv 0.3.0\\n'\n", encoding="utf-8")
     candidate.chmod(0o755)
     fake_tools = tmp_path / "tools"
     fake_tools.mkdir()
@@ -638,7 +708,7 @@ def test_posix_rollback_preserves_backup_when_stop_result_is_invalid(tmp_path: P
     candidate.write_text(
         """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'gsv 0.2.0\n'
+  printf 'gsv 0.3.0\n'
   exit 0
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
@@ -724,7 +794,7 @@ def test_posix_uninstaller_removes_binary_only_after_verified_cleanup(
     assert result.returncode == expected_status
     if expected_status == 0:
         assert not target.exists()
-        assert "verified GSV-owned integration" in result.stdout
+        assert "verified Seld-owned integration" in result.stdout
     else:
         assert target.exists()
         if cleanup_status:
@@ -733,6 +803,34 @@ def test_posix_uninstaller_removes_binary_only_after_verified_cleanup(
         else:
             assert "Bridge could not be stopped" in result.stderr
             assert "executable was kept" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX uninstaller test")
+def test_posix_release_uninstaller_rejects_managed_tool_shim(tmp_path: Path) -> None:
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+    managed_binary = tmp_path / "uv-tools" / "gsv"
+    managed_binary.parent.mkdir()
+    _write_uninstall_fixture(managed_binary)
+    target = install_dir / "gsv"
+    target.symlink_to(managed_binary)
+    environment = os.environ.copy()
+    environment["GSV_BIN_DIR"] = str(install_dir)
+
+    result = subprocess.run(
+        ["/bin/sh", str(ROOT / "scripts/uninstall.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode == 2
+    assert target.is_symlink()
+    assert managed_binary.exists()
+    assert "uv tool uninstall gsv" in result.stderr
+    assert "shim was kept" in result.stderr
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX uninstaller test")
@@ -851,7 +949,7 @@ def test_powershell_uninstaller_removes_binary_only_after_verified_cleanup(
     if bridge_status == 0 and cleanup_status == 0 and output_mode == "compact":
         assert result.returncode == 0, result.stderr
         assert not target.exists()
-        assert "verified GSV-owned integration" in result.stdout
+        assert "verified Seld-owned integration" in result.stdout
     else:
         assert result.returncode != 0
         assert target.exists()
@@ -943,7 +1041,7 @@ public static class Candidate {
             return 0;
         }
         if (args.Length == 1 && args[0] == "--version") {
-            Console.WriteLine("gsv 0.2.0");
+            Console.WriteLine("gsv 0.3.0");
             return 0;
         }
         if (args.Length == 3 && args[0] == "--json" && args[1] == "bridge" && args[2] == "stop") {

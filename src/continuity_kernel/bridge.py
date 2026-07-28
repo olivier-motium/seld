@@ -1,4 +1,4 @@
-"""The Bridge: a loopback view plus narrow control queue for one GSV vault."""
+"""The Bridge: a loopback view plus narrow control queue for one Seld vault."""
 
 from __future__ import annotations
 
@@ -105,6 +105,7 @@ _MIME_TYPES: Final = {
     ".json": "application/json; charset=utf-8",
     ".png": "image/png",
     ".svg": "image/svg+xml",
+    ".woff2": "font/woff2",
 }
 
 
@@ -373,7 +374,7 @@ class BridgeHTTPServer(ThreadingHTTPServer):
             refreshed = {
                 "available": False,
                 "checking": False,
-                "error": f"Codex integration check failed: {type(exc).__name__}",
+                "error": f"ChatGPT connection check failed: {type(exc).__name__}",
                 "instructions_installed": False,
                 "plugin_installed": False,
             }
@@ -513,7 +514,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         except (ContinuityError, OSError, UnicodeError, ValueError):
             self._error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                "The local GSV vault is unavailable",
+                "The local Seld record is unavailable",
                 head_only=head_only,
             )
 
@@ -567,7 +568,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 except (ContinuityError, OSError, UnicodeError, ValueError):
                     self._error(
                         HTTPStatus.SERVICE_UNAVAILABLE,
-                        "The local GSV vault is unavailable",
+                        "The local Seld record is unavailable",
                     )
                     return
             operations = OperationLedger(self.bridge.vault.root).snapshot(
@@ -603,14 +604,14 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         except (MutationCommittedError, DegradedIntegrityError):
             self._error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                "The control queue may have changed, but GSV could not confirm its durable "
+                "The control queue may have changed, but Seld could not confirm its durable "
                 "result. Reload the queue before retrying",
             )
             return
         except (ControlStorageError, OSError):
             self._error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                "The private Bridge control queue is unavailable; canonical reads remain usable",
+                "The private Bridge correction queue is unavailable; local reads remain usable",
             )
             return
         except ValidationError as exc:
@@ -668,7 +669,10 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 TurnState.PENDING,
                 TurnState.FAILED_SAFE,
             }:
-                transport = self.bridge.turn_transport.snapshot(existing.event_id)["event"]
+                transport = self.bridge.turn_transport.snapshot(
+                    existing.event_id,
+                    include_capability=False,
+                )["event"]
             else:
                 self.bridge._require_current_vault_identity()
                 operations = OperationLedger(self.bridge.vault.root).snapshot(
@@ -742,7 +746,10 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            transport = self.bridge.turn_transport.snapshot(values["event_id"][0])["event"]
+            transport = self.bridge.turn_transport.snapshot(
+                values["event_id"][0],
+                include_capability=False,
+            )["event"]
         except ControlStorageError:
             self._error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -989,7 +996,7 @@ def _validate_guided_review_intent(
         raise ConflictError("the guided-review step changed; reload before retrying this answer")
     if not is_canonical_uuid(review.get("active_thread_id")):
         raise ConflictError(
-            "the guided review hand is not an exact Codex task UUID; repair it before answering"
+            "the ChatGPT task linked to this review is invalid; repair it before answering"
         )
     if any(event.subject == subject for event in operations.pending):
         raise ConflictError(
@@ -1186,7 +1193,7 @@ def serve_bridge(
         if lifecycle_lock_acquired:
             raise
         raise SetupError(
-            "Another GSV Bridge process already owns this local runtime. "
+            "Another Seld Bridge process already owns this local runtime. "
             "Use `gsv bridge status` or `gsv bridge stop` before starting another one."
         ) from exc
 
@@ -1206,7 +1213,7 @@ def open_bridge(vault: Vault, *, open_browser: bool = True) -> dict[str, Any]:
         if current_running and current is not None:
             if Path(current.vault).resolve() != vault.root:
                 raise SetupError(
-                    "The Bridge is already running for another GSV vault. "
+                    "The Bridge is already running for another Seld record. "
                     "Run `gsv bridge stop` before switching vaults."
                 )
             if not _health_matches_vault(current_health, vault):
@@ -1322,7 +1329,7 @@ def _bridge_status_locked() -> dict[str, Any]:
 
 
 def stop_bridge() -> dict[str, Any]:
-    """Stop only the process named by the GSV-owned Bridge receipt."""
+    """Stop only the process named by the Seld-owned Bridge receipt."""
 
     root = _private_runtime_dir()
     with exclusive_lock(root / "bridge.lock", timeout=BRIDGE_LOCK_TIMEOUT):
@@ -1506,7 +1513,7 @@ class _RejectRedirects(HTTPRedirectHandler):
         raise HTTPError(
             request.full_url,
             code,
-            "GSV refuses redirects for authenticated loopback requests",
+            "Seld refuses redirects for authenticated loopback requests",
             headers,
             file_pointer,
         )

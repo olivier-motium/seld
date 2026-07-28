@@ -1,7 +1,7 @@
 # Context intake
 
 Start here before provider login or connector setup. The purpose is to learn
-what a useful private GSV would do for this person, not to collect a complete
+what a useful private Seld would do for this person, not to collect a complete
 biography.
 
 ## Ask one compact batch
@@ -11,10 +11,10 @@ Use plain language and adapt the wording to the conversation:
 1. What should feel noticeably easier two weeks from now?
 2. Which two or three parts of life or work matter most right now?
 3. Which people, projects, or promises must not be dropped?
-4. What should GSV never read, retain, or bring into another context?
+4. What should Seld never read, retain, or bring into another context?
 5. What may it do locally and reversibly, and what must always wait for an
    exact approval?
-6. What should the first proof be: a local source-zero result, one connected
+6. What should the first proof be: a useful result from your local Seld record, one connected
    source, or a bounded cross-source view?
 
 Do not ask the person to paste credentials, tokens, account identifiers, or
@@ -41,6 +41,7 @@ When a supported canonical mutation surface exists, store the smallest useful
 derived statement and a stable reference when one is needed. Do not persist raw
 inboxes, transcripts, screenshots, or provider bodies as onboarding context.
 
-Completing intake does not make onboarding ready. The current foundation has no
-public onboarding doctor or source workflow, so conversational intake must be
-reported as non-durable unless another supported surface proves otherwise.
+Finish intake only after the person accepts the reflected context and the exact
+`MIND.md` CAS/readback proves it durable. A source choice stays a permission
+boundary; it does not imply that source was read until the live verification
+step succeeds.

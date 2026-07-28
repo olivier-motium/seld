@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -13,6 +14,8 @@ import pytest
 from continuity_kernel import mcp_server
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED, EMPTY_REVISION, ControlQueue
 from continuity_kernel.operations import OperationLedger
+from continuity_kernel.records import format_time
+from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
 from continuity_kernel.vault import Vault
 
 
@@ -250,6 +253,8 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         "gsv_entity_list",
         "gsv_entity_show",
         "gsv_entity_update",
+        "gsv_local_file_grant_list",
+        "gsv_local_file_read",
         "gsv_operation_accept",
         "gsv_operation_archive_closed",
         "gsv_operation_list",
@@ -259,6 +264,9 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         "gsv_portfolio_set",
         "gsv_portfolio_show",
         "gsv_status",
+        "gsv_source_list",
+        "gsv_source_record",
+        "gsv_source_select",
         "gsv_task_create",
         "gsv_task_list",
         "gsv_task_show",
@@ -281,12 +289,143 @@ def test_task_schema_distinguishes_codex_hand_from_gsv_workthread_without_narrow
         description = active_hand["description"]
         assert active_hand["type"] == "string"
         assert "raw Codex thread UUID" in description
-        assert "never a GSV WorkThread ID" in description
+        assert "never a Seld WorkThread ID" in description
         assert "pattern" not in active_hand and "format" not in active_hand
 
     update_properties = tools["gsv_task_update"]["inputSchema"]["properties"]
     assert "codex-thread:*" in update_properties["add_refs"]["description"]
     assert "codex-thread:*" in update_properties["remove_refs"]["description"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure descriptor-pinned reads are POSIX-only")
+def test_mcp_local_file_read_returns_safe_content_without_vault_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host-data"))
+    vault_path = tmp_path / "local-file-vault"
+    vault = Vault(vault_path)
+    vault.initialize(name="MCP local file")
+    selected_sources = vault.select_sources(
+        expected_revision=ABSENT_SOURCE_REVISION,
+        sources=("local_files",),
+    )
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    (selected / "note.txt").write_text("Prepare the invoice reply.", encoding="utf-8")
+    (selected / "private-note.txt").write_text(
+        "password: this-is-a-real-password-value",
+        encoding="utf-8",
+    )
+    grant_id = vault.grant_local_file_root(selected)["grant"]["grant_id"]
+    before = vault.logical_digest()
+    monkeypatch.setenv("GSV_VAULT", str(vault_path))
+
+    process = _start(vault_path)
+    try:
+        _exchange(process, "initialize", 1)
+        grants = _exchange(
+            process,
+            "tools/call",
+            2,
+            {"name": "gsv_local_file_grant_list", "arguments": {}},
+        )["result"]["structuredContent"]
+        safe = _exchange(
+            process,
+            "tools/call",
+            3,
+            {
+                "name": "gsv_local_file_read",
+                "arguments": {"grant_id": grant_id, "relative_path": "note.txt"},
+            },
+        )["result"]["structuredContent"]
+        quarantined = _exchange(
+            process,
+            "tools/call",
+            4,
+            {
+                "name": "gsv_local_file_read",
+                "arguments": {"grant_id": grant_id, "relative_path": "private-note.txt"},
+            },
+        )["result"]["structuredContent"]
+        arbitrary_root = _exchange(
+            process,
+            "tools/call",
+            5,
+            {
+                "name": "gsv_local_file_read",
+                "arguments": {"relative_path": "note.txt", "selected_root": str(selected)},
+            },
+        )
+    finally:
+        _close(process)
+
+    assert grants["source_selected"] is True
+    assert set(grants) == {"grants", "source_selected"}
+    assert [item["grant_id"] for item in grants["grants"]] == [grant_id]
+    assert set(grants["grants"][0]) == {
+        "created_at",
+        "current",
+        "grant_id",
+        "selected_root",
+    }
+    assert safe["content"] == "Prepare the invoice reply."
+    assert safe["tool_binding"] == "gsv_local_file_read"
+    assert safe["transient"] is True
+    assert quarantined["decision"] == "quarantine"
+    assert "content" not in quarantined
+    assert arbitrary_root["result"]["isError"] is True
+    assert "grant_id must be a non-empty string" in arbitrary_root["result"]["content"][0]["text"]
+    assert Vault(vault_path).logical_digest() == before
+
+    observed = vault.record_source_observation(
+        expected_revision=selected_sources["revision"],
+        source_id="local_files",
+        actor_ref="codex:fresh-process-local-file-proof",
+        result="success",
+        covered_through=format_time(datetime.now(UTC)),
+        completeness="complete",
+        tool_binding="gsv_local_file_read",
+    )
+    assert observed["sources"][0]["freshness"] == "current"
+
+    vault.revoke_local_file_grant(grant_id)
+    restarted = _start(vault_path)
+    try:
+        _exchange(restarted, "initialize", 1)
+        after_revoke = _exchange(
+            restarted,
+            "tools/call",
+            2,
+            {"name": "gsv_local_file_grant_list", "arguments": {}},
+        )["result"]["structuredContent"]
+        rejected = _exchange(
+            restarted,
+            "tools/call",
+            3,
+            {
+                "name": "gsv_local_file_read",
+                "arguments": {"grant_id": grant_id, "relative_path": "note.txt"},
+            },
+        )
+        source_after_revoke = _exchange(
+            restarted,
+            "tools/call",
+            4,
+            {"name": "gsv_source_list", "arguments": {}},
+        )["result"]["structuredContent"]
+    finally:
+        _close(restarted)
+
+    assert after_revoke["grants"] == []
+    assert source_after_revoke["state"]["sources"][0]["freshness"] == ("needs_revalidation")
+    assert rejected["result"]["isError"] is True
+    assert "not found for this vault" in rejected["result"]["content"][0]["text"]
+
+    vault.select_sources(expected_revision=vault.get_source_snapshot().revision, sources=())
+    after_deselect = _direct_call("gsv_local_file_grant_list", {})["result"]["structuredContent"]
+    assert after_deselect["grants"] == []
+    assert after_deselect["source_selected"] is False
 
 
 def test_mcp_authors_and_reads_complete_portfolio(tmp_path: Path) -> None:
@@ -664,8 +803,27 @@ def test_direct_protocol_surface_exercises_all_record_types(
             "expected_revision": now["revision"],
         },
     )["result"]["structuredContent"]
+    source_catalog = _direct_call("gsv_source_list", {})["result"]["structuredContent"]
+    selected_sources = _direct_call(
+        "gsv_source_select",
+        {"expected_revision": source_catalog["state"]["revision"], "sources": ["gmail"]},
+    )["result"]["structuredContent"]
+    recorded_source = _direct_call(
+        "gsv_source_record",
+        {
+            "account_binding": "workspace:test-account",
+            "actor_ref": "direct-mcp-task",
+            "completeness": "complete",
+            "covered_through": "2026-07-28T10:00:00Z",
+            "expected_revision": selected_sources["revision"],
+            "result": "explicit_empty",
+            "source": "gmail",
+            "tool_binding": "gmail.search.v1",
+        },
+    )["result"]["structuredContent"]
     calls = {
         "status": _direct_call("gsv_status", {}),
+        "sources": _direct_call("gsv_source_list", {}),
         "context": _direct_call("gsv_context", {"max_characters": 4000}),
         "doctor": _direct_call("gsv_doctor", {}),
         "task_list": _direct_call("gsv_task_list", {"status": "doing"}),
@@ -686,6 +844,7 @@ def test_direct_protocol_surface_exercises_all_record_types(
     assert updated_entity["aliases"] == ["Owner", "Reviewer"]
     assert updated_thread["summary"] == "Records verified."
     assert "Direct MCP state" in updated_document["content"]
+    assert recorded_source["sources"][0]["observation"]["result"] == "explicit_empty"
     assert all(response["result"]["isError"] is False for response in calls.values())
 
 
@@ -713,3 +872,39 @@ def test_protocol_validation_and_tool_errors(
     assert unknown_tool["result"]["isError"] is True
     assert missing_field["result"]["isError"] is True
     assert unknown_notification is None
+
+
+def test_source_record_losing_to_concurrent_deselection_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault_path = tmp_path / "source-race"
+    Vault(vault_path).initialize(name="Source race")
+    monkeypatch.setenv("GSV_VAULT", str(vault_path))
+
+    initial = _direct_call("gsv_source_list", {})["result"]["structuredContent"]
+    selected = _direct_call(
+        "gsv_source_select",
+        {"expected_revision": initial["state"]["revision"], "sources": ["gmail"]},
+    )["result"]["structuredContent"]
+    deselected = _direct_call(
+        "gsv_source_select",
+        {"expected_revision": selected["revision"], "sources": []},
+    )["result"]["structuredContent"]
+
+    stale_record = _direct_call(
+        "gsv_source_record",
+        {
+            "actor_ref": "stale-mcp-task",
+            "error_code": "timeout",
+            "expected_revision": selected["revision"],
+            "result": "failure",
+            "source": "gmail",
+        },
+    )
+    assert stale_record["result"]["isError"] is True
+    assert "record changed" in stale_record["result"]["content"][0]["text"]
+
+    current = _direct_call("gsv_source_list", {})["result"]["structuredContent"]
+    assert current["state"]["revision"] == deselected["revision"]
+    assert current["state"]["selected_count"] == 0

@@ -174,7 +174,7 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
             encoding="utf-8"
         )
     )
-    assert "onboarding" in plugin_manifest["interface"]["defaultPrompt"][0].casefold()
+    assert "set up seld" in plugin_manifest["interface"]["defaultPrompt"][0].casefold()
     assert "$gsv-onboard" in agents.read_text(encoding="utf-8")
     onboard = generated_marketplace / "plugins/gsv/skills/gsv-onboard"
     assert (onboard / "SKILL.md").is_file()
@@ -183,8 +183,36 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
         "computer-use.md",
         "connector-readiness.md",
         "context-intake.md",
+        "local-files.md",
         "recovery.md",
+        "source-catalog.md",
     }
+    provider_names = {
+        "asana",
+        "atlassian",
+        "box",
+        "figma",
+        "github",
+        "gmail",
+        "google-calendar",
+        "google-drive",
+        "notion",
+        "outlook-calendar",
+        "outlook-email",
+        "sharepoint",
+        "slack",
+        "teams",
+    }
+    providers = onboard / "references/providers"
+    assert {path.stem for path in providers.glob("*.md")} == provider_names
+    source_catalog = (onboard / "references/source-catalog.md").read_text(encoding="utf-8")
+    for provider_name in provider_names:
+        provider_text = " ".join(
+            (providers / f"{provider_name}.md").read_text(encoding="utf-8").split()
+        )
+        assert f"providers/{provider_name}.md" in source_catalog
+        assert "$gsv-onboard" in provider_text
+        assert "fresh ChatGPT task" in provider_text
     pulse = generated_marketplace / "plugins/gsv/skills/gsv-pulse"
     assert (pulse / "SKILL.md").is_file()
     assert {path.name for path in (pulse / "references").iterdir() if path.is_file()} == {
@@ -599,7 +627,7 @@ def test_recovery_only_retry_reports_reappeared_managed_block_without_changing_h
     assert retried["local_cleanup_verified"] is False
     assert retried["manual_review_required"] is True
     assert retried["local_cleanup_error"] == (
-        f"the GSV managed instruction block reappeared after uninstall: {agents}"
+        f"the Seld managed instruction block reappeared after uninstall: {agents}"
     )
     assert retried["marketplace_files_path"] == str(next(iter(retained_before)))
     assert retried["marketplace_files_state"] == "retained"
@@ -3543,7 +3571,7 @@ def test_uninstall_rejects_duplicate_owned_provider_identities_before_mutation(
     assert removed["next"] == (
         "The Codex provider state is ambiguous: Codex returned duplicate "
         f"{identity!r} identities in {context}; provider state was left unchanged. "
-        "Inspect and remove the duplicate GSV registration explicitly, then re-run "
+        "Inspect and remove the duplicate Seld registration explicitly, then re-run "
         "`gsv codex uninstall`."
     )
     assert "points to" not in removed["next"]

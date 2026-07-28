@@ -23,6 +23,7 @@ from continuity_kernel.atomic import (
     sha256_bytes,
     sha256_file,
 )
+from continuity_kernel.config import local_host_id
 from continuity_kernel.direction import (
     ABSENT_DIRECTION_REVISION,
     Direction,
@@ -38,6 +39,12 @@ from continuity_kernel.errors import (
     NotFoundError,
     PersistenceError,
     ValidationError,
+)
+from continuity_kernel.local_files import (
+    LOCAL_FILE_READER_TOOL,
+    LOCAL_FILE_SOURCE_ID,
+    LocalFileGrantStore,
+    validate_local_file_tool_binding,
 )
 from continuity_kernel.portfolio import (
     ABSENT_PORTFOLIO_REVISION,
@@ -85,6 +92,18 @@ from continuity_kernel.records import (
     thread_status,
     title_text,
 )
+from continuity_kernel.source_state import (
+    ABSENT_SOURCE_REVISION,
+    MAX_SOURCE_STATE_BYTES,
+    SourceSnapshot,
+    empty_source_snapshot,
+    parse_source_snapshot,
+    record_source_observation,
+    render_source_snapshot,
+    select_sources,
+    source_fingerprint,
+    source_snapshot_dict,
+)
 from continuity_kernel.vault_backup import (
     BACKUP_MANIFEST as BACKUP_MANIFEST,
 )
@@ -124,7 +143,7 @@ MIND_TEMPLATE = """# Mind
 ## Purpose
 
 Help me preserve important context, make grounded decisions, and carry useful
-work across Codex sessions.
+work across ChatGPT tasks.
 
 ## Working style
 
@@ -139,9 +158,9 @@ NOW_TEMPLATE = """# Now
 No current orientation has been authored yet.
 """
 
-VAULT_README = """# GSV Vault
+VAULT_README = """# Seld records
 
-This folder is your private, local GSV data. Markdown is authoritative.
+This folder contains your local Seld record. Markdown is authoritative.
 
 - `MIND.md` describes durable purpose and working preferences.
 - `NOW.md` is the bounded current orientation.
@@ -151,9 +170,9 @@ This folder is your private, local GSV data. Markdown is authoritative.
 Do not publish this vault. Back it up with `gsv backup create`.
 """
 
-VAULT_AGENTS = """# GSV vault instructions
+VAULT_AGENTS = """# Seld record instructions
 
-At the start of a substantive task, use the installed GSV plugin to read
+At the start of a substantive task, use the installed Seld plugin to read
 the bounded context pack and inspect relevant exact records. Treat Markdown in
 this vault as authoritative; derived indexes and conversation recollection are
 not authority.
@@ -196,7 +215,7 @@ class Vault:
     def state(self) -> Path:
         return self.root / ".gsv"
 
-    def initialize(self, *, name: str = "My GSV", command: str = "gsv") -> dict[str, Any]:
+    def initialize(self, *, name: str = "My Seld", command: str = "gsv") -> dict[str, Any]:
         clean_name = title_text(name)
         self.root.mkdir(parents=True, exist_ok=True)
         if self.root.is_symlink():
@@ -782,6 +801,211 @@ class Vault:
     def context_pack(self, *, max_characters: int = 48_000) -> str:
         return _build_context_pack(self, max_characters=max_characters)
 
+    def get_source_snapshot(self) -> SourceSnapshot:
+        """Read the portable source ledger, or one explicit absent revision."""
+
+        path = self.root / "SOURCES.md"
+        if not os.path.lexists(path):
+            return empty_source_snapshot()
+        return parse_source_snapshot(self._read_bytes(path, max_bytes=MAX_SOURCE_STATE_BYTES))
+
+    def source_status(self) -> dict[str, Any]:
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("source", "selection")),
+        ):
+            snapshot = self.get_source_snapshot()
+            return self._source_snapshot_status_locked(snapshot)
+
+    def grant_local_file_root(self, root: Path | str) -> dict[str, Any]:
+        """Create one host-local grant only while local files are selected."""
+
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("source", "selection")),
+        ):
+            self._require_local_files_selected()
+            grants = self._local_file_grants()
+            return grants.create(root)
+
+    def list_local_file_grants(self) -> dict[str, Any]:
+        """List discoverable grants without exposing a grant mutation to MCP."""
+
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("source", "selection")),
+        ):
+            result = self._local_file_grants().list()
+            result["source_selected"] = (
+                LOCAL_FILE_SOURCE_ID in self.get_source_snapshot().selected_sources
+            )
+            return result
+
+    def revoke_local_file_grant(self, grant_id: str) -> dict[str, Any]:
+        """Revoke one exact host-local grant."""
+
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("source", "selection")),
+        ):
+            grants = self._local_file_grants()
+            return grants.revoke(grant_id)
+
+    def read_local_file(self, *, grant_id: str, relative_path: str) -> dict[str, Any]:
+        """Read through one current grant while selection cannot change."""
+
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("source", "selection")),
+        ):
+            self._require_local_files_selected()
+            return self._local_file_grants().read(
+                grant_id=grant_id,
+                relative_path=relative_path,
+            )
+
+    def select_sources(
+        self,
+        *,
+        expected_revision: str,
+        sources: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Replace the explicit source selection and purge deselected coverage."""
+
+        path = self.root / "SOURCES.md"
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("source", "selection")),
+        ):
+            before = self.get_source_snapshot()
+            self._expect(before.revision, expected_revision)
+            after = select_sources(before, sources)
+            local_file_membership_changed = (LOCAL_FILE_SOURCE_ID in before.selected_sources) != (
+                LOCAL_FILE_SOURCE_ID in after.selected_sources
+            )
+            if local_file_membership_changed:
+                # Revoke before publishing the portable selection. A later persistence
+                # failure may require the person to grant again, but can never retain
+                # authority across a selection boundary.
+                self._local_file_grants().revoke_all()
+            encoded = render_source_snapshot(after).encode("utf-8")
+            previous = (
+                None
+                if before.revision == ABSENT_SOURCE_REVISION
+                else self._read_bytes(path, max_bytes=MAX_SOURCE_STATE_BYTES)
+            )
+            projected = self._source_snapshot_status_locked(after)
+            self._persist_with_event(
+                path=path,
+                content=encoded,
+                previous=previous,
+                operation="sources.select",
+                identifier="SOURCES.md",
+                before_revision=(
+                    None if before.revision == ABSENT_SOURCE_REVISION else before.revision
+                ),
+                after_revision=after.revision,
+            )
+            return projected
+
+    def _local_file_grants(self) -> LocalFileGrantStore:
+        return LocalFileGrantStore(
+            vault_root=self.root,
+            vault_id=self._manifest()["vault_id"],
+        )
+
+    def _require_local_files_selected(self) -> None:
+        if LOCAL_FILE_SOURCE_ID not in self.get_source_snapshot().selected_sources:
+            raise ValidationError(
+                "local_files source is not selected; select it before granting or reading files"
+            )
+
+    def _source_snapshot_status_locked(self, snapshot: SourceSnapshot) -> dict[str, Any]:
+        """Project every public source response through the same host bindings."""
+
+        host_id = local_host_id(create=False)
+        host_fingerprint = source_fingerprint(host_id, "host identity") if host_id else None
+        current_tools: dict[str, str] = {}
+        if LOCAL_FILE_SOURCE_ID in snapshot.selected_sources:
+            local_binding = self._local_file_grants().source_binding()
+            local_fingerprint = source_fingerprint(local_binding, "local-file authority")
+            if local_fingerprint is not None:
+                current_tools[LOCAL_FILE_SOURCE_ID] = local_fingerprint
+        return source_snapshot_dict(
+            snapshot,
+            current_host_fingerprint=host_fingerprint,
+            current_tool_fingerprints=current_tools,
+        )
+
+    def record_source_observation(
+        self,
+        *,
+        expected_revision: str,
+        source_id: str,
+        actor_ref: str,
+        result: str,
+        covered_through: str | None = None,
+        completeness: str | None = None,
+        account_binding: str | None = None,
+        tool_binding: str | None = None,
+        cursor: str | None = None,
+        evidence_refs: tuple[str, ...] = (),
+        error_code: str | None = None,
+    ) -> dict[str, Any]:
+        """CAS-record one AI-performed bounded read without provider content."""
+
+        validate_local_file_tool_binding(
+            source_id=source_id,
+            result=result,
+            tool_binding=tool_binding,
+        )
+        path = self.root / "SOURCES.md"
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("source", "selection")),
+        ):
+            before = self.get_source_snapshot()
+            self._expect(before.revision, expected_revision)
+            persisted_tool_binding = tool_binding
+            if source_id == LOCAL_FILE_SOURCE_ID and tool_binding == LOCAL_FILE_READER_TOOL:
+                persisted_tool_binding = self._local_file_grants().source_binding(
+                    require_current_grant=result in {"success", "explicit_empty"},
+                )
+            persisted_tool_fingerprint = source_fingerprint(
+                persisted_tool_binding,
+                "tool binding",
+            )
+            host_id = local_host_id(create=result in {"success", "explicit_empty"})
+            after = record_source_observation(
+                before,
+                source_id=source_id,
+                actor_ref=actor_ref,
+                result=result,
+                covered_through=covered_through,
+                completeness=completeness,
+                account_fingerprint=source_fingerprint(account_binding, "account binding"),
+                host_fingerprint=source_fingerprint(host_id, "host identity"),
+                tool_fingerprint=persisted_tool_fingerprint,
+                cursor_digest=source_fingerprint(cursor, "source cursor"),
+                evidence_digests=tuple(
+                    source_fingerprint(item, "source evidence reference") for item in evidence_refs
+                ),
+                error_code=error_code,
+            )
+            encoded = render_source_snapshot(after).encode("utf-8")
+            previous = self._read_bytes(path, max_bytes=MAX_SOURCE_STATE_BYTES)
+            projected = self._source_snapshot_status_locked(after)
+            self._persist_with_event(
+                path=path,
+                content=encoded,
+                previous=previous,
+                operation="source.observe",
+                identifier=source_id,
+                before_revision=before.revision,
+                after_revision=after.revision,
+            )
+            return projected
+
     def doctor(self, *, repair: bool = False) -> DoctorResult:
         issues: list[DoctorIssue] = []
         repaired: list[str] = []
@@ -868,6 +1092,15 @@ class Vault:
                 parse_portfolio(self._read_text(portfolio_path))
             except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
                 issues.append(DoctorIssue("invalid-portfolio", "PORTFOLIO.md", str(exc)))
+
+        source_path = self.root / "SOURCES.md"
+        if os.path.lexists(source_path):
+            try:
+                parse_source_snapshot(
+                    self._read_bytes(source_path, max_bytes=MAX_SOURCE_STATE_BYTES)
+                )
+            except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
+                issues.append(DoctorIssue("invalid-sources", "SOURCES.md", str(exc)))
 
         records: dict[str, Record] = {}
         for kind, directory, parser in (

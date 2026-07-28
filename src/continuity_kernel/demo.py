@@ -1,4 +1,4 @@
-"""Synthetic, privacy-safe demonstration of the GSV guarantees."""
+"""Synthetic, privacy-safe demonstration of the Seld guarantees."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def _run_demo(output: Path) -> dict[str, Any]:
             """# Synthetic handoff proof
 
 Hand 01 wrote the Atlas commitment and returned its new revision.
-Its process was then terminated. A fresh GSV process recovered the exact revision
+Its process was then terminated. A fresh Seld process recovered the exact revision
 and next action without a rebrief.
 
 ## Authored synthetic coverage
@@ -109,7 +109,7 @@ def seed_demo_vault(root: Path) -> dict[str, Any]:
     """Create the neutral, deterministic vault used by docs and the proof command."""
 
     vault = Vault(root)
-    initialized = vault.initialize(name="Acme GSV Demo")
+    initialized = vault.initialize(name="Acme Seld Demo")
     mind = vault.read_document("MIND.md")
     vault.write_document(
         "MIND.md",

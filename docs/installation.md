@@ -1,79 +1,65 @@
 # Installation
 
 Installing Seld adds the local Bridge, bundled `gsv` plugin, skills, and durable
-records to Codex. It preserves existing Codex configuration and Seld data,
+records to the ChatGPT desktop app. It preserves existing ChatGPT configuration and Seld data,
 creates no Seld cloud account, and can be removed without deleting the
 person's records. The executable and command remain named `gsv`.
 
-## Current release status
+## Supported path
 
-`0.2.0` is Unreleased and the repository is private. No public `0.2.0` binary
-currently exists, and the `0.1.0` release does not contain the Bridge. The
-consumer commands below become live only after the exact `0.2.0` assets and
-checksums are published.
+Seld is public and installable from its source distribution on macOS. The
+current path uses `uv`, installs the `gsv` command directly from the public
+repository, and then lets Seld configure its bundled plugin, skills, and local
+Bridge:
 
-A predecessor `0.2.0` development snapshot passed local macOS Apple Silicon
-checks. That evidence does not transfer to this candidate. Every target,
-including macOS Apple Silicon, remains unpromoted until the exact release bytes
-pass their own hosted build and clean-install run.
+```bash
+uv tool install 'git+https://github.com/olivier-motium/seld.git'
+gsv setup
+```
+
+If `uv` reports that the Seld-managed `gsv` tool is already installed, update
+it deliberately and run setup again:
+
+```bash
+uv tool install --force 'git+https://github.com/olivier-motium/seld.git'
+gsv setup
+```
+
+Do not force replacement when an unrelated program owns the existing `gsv`
+command. Check `command -v gsv` first and resolve that collision explicitly.
+
+The source-install command was exercised against the frozen 0.3.0 implementation
+candidate at commit `fcffb499a9759b8e3790cde9a25b82cd30f467c6` on 2026-07-28. It
+built and installed `gsv==0.3.0`, exposed the CLI from a fresh isolated tool
+directory, returned a healthy `gsv doctor` result, and completed `gsv demo` with
+fresh-process resume, stale-write rejection, interrupted-write recovery, and
+backup/restore equivalence.
+
+The current consumer surface is the ChatGPT desktop app on macOS. Windows and
+Claude support are coming.
 
 ## Agent-led install
 
-Give Codex or another coding agent the repository URL and the complete prompt
+Give ChatGPT or another coding agent the repository URL and the complete prompt
 in the README. [`AGENT_INSTALL.md`](../AGENT_INSTALL.md) is the machine-readable
-operator contract. It requires the agent to stop instead of substituting a
-source install when repository access, a matching release asset, or its
-checksum is unavailable.
+operator contract. It uses the same public source distribution and preserves
+existing state.
 
 ## Consumer prerequisites
 
-Seld needs an installed Codex command surface. The macOS discovery code checks
-`GSV_CODEX`, `PATH`, and the installed Codex Desktop app bundle; Codex
+Seld needs Python 3.11 or newer, `uv`, and the installed ChatGPT desktop app on
+macOS. The discovery code checks `GSV_CODEX`, `PATH`, and the installed app
+bundle; the bundled command
 does not need to be added to `PATH` when that bundle contains the command.
-Source-level discovery behavior is not a support claim until the exact artifact
-passes its hosted acceptance run on that target.
 
-A release install does not require Python, `uv`, or `make`. The POSIX installer
-uses HTTPS plus `sha256sum` or `shasum`; the Windows installer uses PowerShell's
-`Invoke-WebRequest` and `Get-FileHash`.
-
-## Consumer commands
-
-After `0.2.0` is published, macOS and Linux:
-
-```bash
-curl --proto '=https' --tlsv1.2 -fsSLO \
-  https://raw.githubusercontent.com/olivier-motium/seld/main/scripts/install.sh
-sh install.sh
-```
-
-Windows PowerShell:
-
-```powershell
-Invoke-WebRequest `
-  https://raw.githubusercontent.com/olivier-motium/seld/main/scripts/install.ps1 `
-  -OutFile install.ps1
-.\install.ps1
-```
-
-The installer downloads the pinned platform artifact and `.sha256`, verifies
-the binary, and stages it in the target directory. On upgrade, the staged
-candidate stops only a Bridge whose authenticated live identity matches its
-owner-only receipt before replacing the old binary. Setup commits the verified
-Codex integration receipt before starting Bridge. A later Bridge-start failure
-returns the distinct installed-repair exit status `4`, keeps the candidate and
-committed integration, preserves any previous executable as recovery evidence,
-and never prints that Bridge is ready. It does not trigger executable rollback.
-If setup fails before that commit, the installer stops any candidate
-Bridge and restores the old executable only after that exact executable proves,
-through read-only status, doctor, and supported control-ledger reads, that it
-can read the current state without drift. Otherwise the candidate remains in
-place and the previous executable is preserved as named recovery evidence.
+Prebuilt installers are a separate distribution channel. Use one only when its
+GitHub release contains the matching platform artifact and `.sha256` file. The
+installer verifies that checksum before replacement and preserves the vault;
+the supported public source path above does not depend on a prebuilt asset.
 
 ## What setup changes
 
-- macOS/Linux executable: `${HOME}/.local/bin/gsv`
-- Windows executable: `%LOCALAPPDATA%\GSV\bin\gsv.exe`
+- `uv` tool executable: normally `${HOME}/.local/bin/gsv`
 - Default vault, only when no configured vault exists: `${HOME}/GSV`
 - Codex home: `${CODEX_HOME}` or `${HOME}/.codex`
 - A generated local marketplace under Seld's application-data directory
@@ -91,10 +77,11 @@ to open the private Bridge session. Browser launch is best-effort: an
 `OSError` or browser error returns `browser_opened: false`, keeps setup
 committed, and prints `run gsv` as the next step.
 
-After a healthy first setup, restart Codex, open one fresh task, and run
-`$gsv-onboard`. The skill gathers context in conversation and persists only
-accepted Mind material through document CAS; this foundation does not expose a
-durable OnboardingSession or connector-readiness command.
+After a healthy first setup, restart the ChatGPT desktop app, open one fresh
+task, and run `$gsv-onboard`. The skill gathers context in conversation,
+discovers the source tools available in that task, verifies selected sources
+with bounded live reads, and persists only accepted Mind material through
+document CAS.
 
 ## Verify first run
 
@@ -108,10 +95,10 @@ gsv bridge status
 not read the configured vault. `gsv` with no arguments opens the Bridge for the
 configured vault.
 
-Restart Codex after first setup so the new marketplace, plugin, and managed
+Restart the ChatGPT desktop app after first setup so the new marketplace, plugin, and managed
 instructions are loaded.
 
-## Offline or controlled install
+## Controlled prebuilt install
 
 Obtain a candidate binary and its expected checksum through the approved
 channel, verify its provenance independently, then run:
@@ -122,16 +109,25 @@ GSV_BINARY_SHA256='<expected sha256>' \
 sh scripts/install.sh
 ```
 
-PowerShell accepts the same two environment variables.
-
-The macOS candidate is not yet Developer ID signed or notarized. A browser may
-quarantine a downloaded copy. After independently verifying its checksum and
-provenance, use macOS System Settings > Privacy & Security > Open Anyway if
-Gatekeeper blocks it. Do not disable Gatekeeper globally.
+A locally built macOS binary may be unsigned and unnotarized. Gatekeeper may
+quarantine it. After independently verifying its checksum and provenance, use
+macOS System Settings > Privacy & Security > Open Anyway if Gatekeeper blocks
+it. Do not disable Gatekeeper globally.
 
 ## Upgrades
 
-Run the installer again. The verified staged candidate quiesces a live Bridge
+For the public source distribution:
+
+```bash
+uv tool install --force 'git+https://github.com/olivier-motium/seld.git'
+gsv setup
+```
+
+`gsv setup` is idempotent and preserves the selected vault. Check the existing
+`gsv` executable before a forced tool replacement.
+
+For a checksummed prebuilt distribution, run the installer again. The verified
+staged candidate quiesces a live Bridge
 before executable replacement, then setup starts the candidate Bridge. If the
 PID is alive but authenticated health is temporarily unavailable, upgrade
 aborts without replacing the executable or deleting the receipt; retry after
@@ -212,9 +208,9 @@ gsv --vault /path/to/restored-vault setup
 The first command must verify and stop the currently owned Bridge. The second
 configures the restored vault and rebinds the Codex integration and Bridge.
 
-## Source development
+## Contributor setup
 
-Source development is deliberately separate from the consumer promise:
+To work on Seld itself:
 
 ```bash
 uv sync --extra dev --extra release --extra browser-test
@@ -223,21 +219,37 @@ uv run python scripts/verify_bridge_browser.py
 uv run gsv setup
 ```
 
-That path requires Python 3.11+ and `uv`. It is not evidence that the standalone
-consumer artifact installs on a clean machine.
+That path requires Python 3.11+ and `uv`; it installs development, release, and
+browser-test dependencies rather than the minimal public tool.
 
 ## Removal
 
-`gsv codex uninstall` removes `gsv`-owned Codex integration while keeping the
-executable. The release uninstall script first stops only a Bridge instance
-whose live health identity matches its owner-only receipt. It removes the
-executable only after both the active integration and receipt-bound recovery
-catalog are retired.
+For the supported `uv` source install, remove the running surface, owned
+ChatGPT app integration, and managed tool environment in that order:
 
-Both paths preserve the vault, configuration, backups, unrelated Codex
-instructions, marketplaces, and plugins. Neither Codex status nor uninstall
-requires a readable vault configuration. Delete the vault or config only as a
-separate, deliberate user-data operation.
+```bash
+gsv bridge stop
+gsv codex uninstall
+uv tool uninstall gsv
+```
+
+Do not run the final command until `gsv codex uninstall` reports complete
+cleanup. If it retains recovery evidence, follow its exact retry instruction
+first so the executable remains available for verified cleanup.
+
+The release uninstall script is only for a checksummed prebuilt binary. It
+first stops a Bridge instance whose live health identity matches its owner-only
+receipt, then removes the executable after the active integration and
+receipt-bound recovery catalog are retired:
+
+```bash
+sh scripts/uninstall.sh
+```
+
+Both removal paths preserve the vault, configuration, backups, unrelated
+Codex instructions, marketplaces, and plugins. Neither Codex status nor
+uninstall requires a readable vault configuration. Delete the vault or config
+only as a separate, deliberate user-data operation.
 
 If the Codex executable is unavailable, a command times out, or final provider
 verification fails, cleanup is explicitly partial. The uninstaller may remove

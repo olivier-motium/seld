@@ -7,12 +7,12 @@ export function renderControlPanel(snapshot, { bridgeToken, currentControls, ref
   const panel = element("section", "control-panel");
   const copy = element("div");
   copy.append(
-    textElement("p", "section-label", "Tell GSV what changed"),
+    textElement("p", "section-label", "Correct Seld"),
     textElement("h2", "", "Queue a correction for review"),
     textElement(
       "p",
       "control-explainer",
-      "The Bridge records your wording exactly. Reviewing it only acknowledges or rejects what you wrote; it never applies the correction or takes action.",
+      "Seld saves your correction for review and records whether it was accepted or rejected. Submitting it does not change records or take action.",
     ),
   );
   const review = renderControlReviewActions(controls);
@@ -28,9 +28,13 @@ export function renderControlPanel(snapshot, { bridgeToken, currentControls, ref
           ? "Rejected"
           : "Waiting";
     entry.append(
-      textElement("strong", "", item.event?.choice || "Bridge intent"),
+      textElement("strong", "", item.event?.choice || "Correction"),
       textElement("span", "", status),
-      textElement("small", "", item.disposition?.reason_code || relativeTime(item.event?.created_at)),
+      textElement(
+        "small",
+        "",
+        relativeTime(item.disposition?.acknowledged_at || item.event?.created_at),
+      ),
     );
     recent.append(entry);
   }
@@ -43,12 +47,12 @@ export function renderControlPanel(snapshot, { bridgeToken, currentControls, ref
       const status =
         item.status === "accepted" ? "Acknowledged, not applied" : "Rejected";
       entry.append(
-        textElement("strong", "", item.event?.choice || "Bridge intent"),
+        textElement("strong", "", item.event?.choice || "Correction"),
         textElement("span", "", status),
         textElement(
           "small",
           "",
-          `${item.disposition?.reason_code || "Reviewed"} · History`,
+          `${relativeTime(item.disposition?.acknowledged_at || item.event?.created_at)} · History`,
         ),
       );
       recent.append(entry);
@@ -59,13 +63,13 @@ export function renderControlPanel(snapshot, { bridgeToken, currentControls, ref
       textElement(
         "li",
         "control-empty",
-        controls.available ? "No queued corrections." : "The intent queue is unavailable.",
+        controls.available ? "No queued corrections." : "The correction queue is unavailable.",
       ),
     );
   }
 
   const form = element("form", "control-form");
-  const label = textElement("label", "", "What should GSV correct?");
+  const label = textElement("label", "", "What should Seld correct?");
   const input = element("textarea", "control-input", {
     maxlength: "4096",
     name: "correction",
@@ -114,7 +118,7 @@ export function renderControlPanel(snapshot, { bridgeToken, currentControls, ref
       if (refreshedStatus) {
         refreshedStatus.textContent = newerDraftExists
           ? "Queued the submitted correction. Your newer draft is still here."
-          : "Queued. GSV will show an acknowledge or reject disposition here.";
+          : "Queued. Seld will show whether this was accepted or rejected here.";
       }
     } catch (error) {
       if (error.status === 409) {
@@ -141,7 +145,7 @@ export function renderControlPanel(snapshot, { bridgeToken, currentControls, ref
       status.textContent =
         error.status >= 400 && error.status < 500
           ? `The correction was not queued: ${error.message}`
-          : "GSV could not confirm whether the correction was saved. Refresh the queue before retrying.";
+          : "Seld could not confirm whether the correction was saved. Refresh the queue before retrying.";
     } finally {
       submit.disabled = !currentControls()?.available;
     }
@@ -150,7 +154,7 @@ export function renderControlPanel(snapshot, { bridgeToken, currentControls, ref
   return panel;
 }
 
-export function renderControlReviewActions(controls, { linkLabel = "Review in Codex" } = {}) {
+export function renderControlReviewActions(controls, { linkLabel = "Continue in ChatGPT" } = {}) {
   if (!controls.available || !controls.review_prompt) return null;
   const actions = element("div", "control-review-actions");
   if (controls.review_url) {
@@ -186,7 +190,7 @@ export function renderControlReviewActions(controls, { linkLabel = "Review in Co
 
 export function controlSystemCopy(snapshot) {
   if (!snapshot.controls?.available) {
-    return "Unavailable. Canonical Mind, task, and storyline reads remain usable.";
+    return "Unavailable. Your saved context, work, and situations remain readable.";
   }
   const history = snapshot.controls.archived_decided || 0;
   const historyCopy = history ? `; ${history} in recent history` : "";

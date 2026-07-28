@@ -20,6 +20,10 @@
   manifest-deleted, and destination races preserve both trees.
 - MCP requests are bounded, validated, and mapped to the same kernel as the
   CLI.
+- Selecting the `local_files` source grants no path. Directory authority stays
+  in an owner-only host record bound to one exact vault-directory identity and
+  selected root; grant changes or same-path vault replacement make earlier
+  source proof require revalidation, and MCP cannot create or revoke a grant.
 - A loopback caller without the current per-launch bearer cannot read the
   Bridge snapshot or health identity.
 - A stale, forged, or PID-reused Bridge receipt cannot cause Seld to signal an
@@ -69,28 +73,26 @@ cannot cross a vault boundary.
 The supported host lifecycle keeps one Bridge server active for a vault. If
 independently constructed servers race on one transport receipt, receipt CAS
 fails closed to an uncertain delivery state rather than replaying the turn.
-Stopping or killing Bridge does not prove that an already detached Codex child
-stopped: the parent owns an eight-minute timeout for each Codex invocation,
+Stopping or killing Bridge does not prove that an already detached ChatGPT task
+stopped: the parent owns an eight-minute timeout for each Codex CLI invocation,
 while the child runs in its own process session. A START uses two sequential
 invocations and can therefore take about sixteen minutes plus bounded setup;
 the browser may stop foreground polling earlier while durable reconciliation
 continues. A later Bridge therefore marks the orphaned
-receipt `delivery_uncertain`, preserves any exact hand, and never replays it;
-the user must reconcile that hand and its queued receipt explicitly. Consumer
-promotion remains blocked until an installed lifecycle contract can also own or
-reconcile the detached child itself.
+receipt `delivery_uncertain`, preserves any exact task, and never replays it.
+Automatic same-hand continuation remains unavailable for that receipt until
+the user reconciles the exact task and queued intent; Bridge keeps the safe
+recovery path visible instead of replaying it.
 Neither the receipt nor its disposition can directly write Tasks, Entities,
 WorkThreads, `MIND.md`, `NOW.md`, onboarding, source readiness, grants, or
 action policy. Every HTTP write method and path other than those two exact POST
 routes remains denied. The
 browser renders authored content using `textContent`, not HTML interpolation.
 
-The control queue and its CLI/MCP disposition surfaces currently require the
-secure directory-pinned storage primitive available on macOS and Linux. On
-Windows the CLI commands and MCP tools are not advertised, the Bridge control
-endpoint returns unavailable and writes nothing, and canonical Bridge reads
-remain available. This is a foundation limit, not cross-platform release
-evidence.
+The control queue and its CLI/MCP disposition surfaces use the secure
+directory-pinned storage primitive available on the current macOS consumer
+path. Windows support is coming; the repository's portability code is not a
+Windows consumer-support claim.
 
 The bearer restores the intended same-user local-file boundary against casual
 loopback reads. It is not a security boundary against hostile code already
@@ -122,21 +124,21 @@ does not roll back Codex integration or configuration.
 - Multi-file atomicity or a complete audit journal across process or operating-
   system death between canonical replacement and event append.
 - Secret storage or credential management.
-- Automatic task prioritization, semantic identity merging, or autonomous
-  background action.
-- A released autonomous Pulse scheduler or self-modifying Shipyard daemon. The
-  Culture-Grade foundation contains inert local-only admission and
-  scheduler-canary contracts plus a packaged AI Pulse skill, but has no public
-  scheduler mutation surface; an installed natural wake remains a release gate.
+- Mechanical task prioritization, semantic identity merging, or unattended
+  consequential external action.
+- An OS scheduler that decides meaning, priority, or work. Pulse is AI-authored;
+  the local layer may wake, bound, persist, and audit it but cannot replace that
+  judgment.
 - Protection after the host, user account, Codex installation, or release
   signing identity is compromised.
 
 ## Distribution
 
-Release installers verify the binary against the published SHA-256 file. A
-checksum fetched from the same compromised release is not an independent trust
-root. Production releases should also use platform signing where available.
-The `0.2.0` macOS candidate is not yet Developer ID signed or notarized.
+The current public distribution installs source from the GitHub repository.
+Optional prebuilt installers verify the binary against a published SHA-256 file.
+A checksum fetched from the same compromised release is not an independent
+trust root, so a prebuilt artifact may be called signed or notarized only when
+that exact platform verification exists.
 
 The privacy gate scans the working tree, generated reports, release artifacts,
 and reachable Git history for likely credentials, user-home paths, and private

@@ -950,7 +950,7 @@ def test_initial_start_uses_canonical_review_focus_despite_unowned_scope_mistag(
     assert b"one review-subject:task:<id> ref for each consequential" in first_prompt
     assert b"omit active_thread_id on create" in first_prompt
     assert b"clear_active_thread_id when repairing" in first_prompt
-    assert b"Never put the GSV WorkThread ID in that field" in first_prompt
+    assert b"Never put the Seld WorkThread ID in that field" in first_prompt
     assert b"never invent or retain a codex-thread:* ref" in first_prompt
     assert b"status=waiting with next_actor=human" in first_prompt
     assert THREAD_ID.encode() in second_prompt
@@ -1975,9 +1975,9 @@ def test_restart_converts_in_flight_receipt_to_delivery_uncertain_without_replay
 
     second_runner = _FakeRunner()
     restarted = _coordinator(vault, second_runner, instance_id=OTHER_INSTANCE_ID)
-    recovered = restarted.receipt(event.event_id)
-    assert recovered is not None
-    assert recovered.state is TurnState.DELIVERY_UNCERTAIN
+    public = restarted.snapshot(event.event_id, include_capability=False)
+    assert public["event"]["state"] == TurnState.DELIVERY_UNCERTAIN.value
+    assert second_runner.probes == []
     restarted.submit(context)
     assert second_runner.spawns == []
     release.set()

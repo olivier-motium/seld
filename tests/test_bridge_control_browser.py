@@ -82,7 +82,12 @@ class SemanticReviewTransport:
         self.receipts[exact.event_id] = receipt
         return receipt
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
         receipt = self.receipts.get(event_id) if event_id is not None else None
         return {
             "automatic_resume": True,
@@ -223,15 +228,21 @@ class PreparedBoardTransport(SemanticReviewTransport):
         self.sheets: dict[str, list[dict[str, Any]]] = {}
         self.batch_choices: list[str] = []
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
-        snapshot = super().snapshot(event_id)
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
+        snapshot = super().snapshot(event_id, include_capability=include_capability)
         event = snapshot.get("event")
         if isinstance(event, dict) and event_id in self.sheets:
+            sheet = self.sheets[event_id]
             event.update(
                 {
-                    "sheet": self.sheets[event_id],
+                    "sheet": sheet,
                     "sheet_state": "ready",
-                    "subject_task_ids": ["next-outcome", "third-outcome"],
+                    "subject_task_ids": [str(entry["task"]) for entry in sheet],
                 }
             )
         return snapshot
@@ -248,6 +259,11 @@ class PreparedBoardTransport(SemanticReviewTransport):
         refreshed = False
         if self.submit_count == 1:
             first = self.vault.get_task("exact-outcome")
+            prepared_ids = [
+                item.task_id
+                for item in self.vault.get_portfolio().items
+                if item.task_id != first.identifier
+            ]
             removed = tuple(
                 ref
                 for ref in session.refs
@@ -262,14 +278,18 @@ class PreparedBoardTransport(SemanticReviewTransport):
                         task_id_value=first.identifier,
                         task_revision=first.revision,
                     ),
-                    "review-subject:task:next-outcome",
-                    "review-subject:task:third-outcome",
+                    *(f"review-subject:task:{task_id}" for task_id in prepared_ids),
                 ),
                 next_action="Review the two consequential prepared decisions.",
                 waiting_on="Which of these exact outcomes should change?",
             )
             headline = "Two exact decisions genuinely need you."
         elif event.choice.startswith("Pause this guided all-open review"):
+            prepared_ids = [
+                ref.removeprefix("review-subject:task:")
+                for ref in session.refs
+                if ref.startswith("review-subject:task:")
+            ]
             advanced = self.vault.update_task(
                 session.identifier,
                 expected_revision=session.revision,
@@ -277,6 +297,11 @@ class PreparedBoardTransport(SemanticReviewTransport):
             )
             headline = "The exact prepared review is paused."
         elif event.choice == "resume-guided-review":
+            prepared_ids = [
+                ref.removeprefix("review-subject:task:")
+                for ref in session.refs
+                if ref.startswith("review-subject:task:")
+            ]
             advanced = self.vault.update_task(
                 session.identifier,
                 expected_revision=session.revision,
@@ -284,6 +309,11 @@ class PreparedBoardTransport(SemanticReviewTransport):
             )
             headline = "The exact prepared review resumed."
         else:
+            prepared_ids = [
+                ref.removeprefix("review-subject:task:")
+                for ref in session.refs
+                if ref.startswith("review-subject:task:")
+            ]
             self.batch_choices.append(event.choice)
             refreshed = True
             advanced = self.vault.update_task(
@@ -324,73 +354,119 @@ class PreparedBoardTransport(SemanticReviewTransport):
             created_at=now,
             updated_at=now,
         )
-        second = self.vault.get_task("next-outcome")
-        third = self.vault.get_task("third-outcome")
-        self.sheets[event.event_id] = [
-            {
-                "task": second.identifier,
-                "anchor": second.updated_at,
-                "current_anchor": second.updated_at,
-                "question": (
-                    "Does the refreshed dependency still deserve priority?"
-                    if refreshed
-                    else "Should this dependency stay ahead of the third outcome?"
-                ),
-                "recommendation": "Keep the dependency visible and name the next local proof.",
-                "reasoning": (
-                    "It gates the other prepared outcome without authorizing external action."
-                ),
-                "choices": [
+        prepared_tasks = [self.vault.get_task(task_id) for task_id in prepared_ids]
+        sheet: list[dict[str, Any]] = []
+        for task in prepared_tasks:
+            if task.identifier == "next-outcome":
+                sheet.append(
                     {
-                        "answer": "Keep this first and name the local proof.",
-                        "effect": "The dependent outcome stays explicitly behind it.",
-                        "recommended": True,
-                    },
+                        "task": task.identifier,
+                        "anchor": task.updated_at,
+                        "current_anchor": task.updated_at,
+                        "question": (
+                            "Does the refreshed dependency still deserve priority?"
+                            if refreshed
+                            else "Should this dependency stay ahead of the third outcome?"
+                        ),
+                        "recommendation": (
+                            "Keep the dependency visible and name the next local proof."
+                        ),
+                        "reasoning": (
+                            "It gates the other prepared outcome without authorizing external "
+                            "action."
+                        ),
+                        "choices": [
+                            {
+                                "answer": "Keep this first and name the local proof.",
+                                "effect": "The dependent outcome stays explicitly behind it.",
+                                "recommended": True,
+                            },
+                            {
+                                "answer": "Move it behind the third outcome.",
+                                "effect": "The authored order changes, but both remain open.",
+                                "recommended": False,
+                            },
+                        ],
+                        "dissent": (
+                            "Deferring this again would preserve the blockage rather than the "
+                            "option."
+                        ),
+                        "group": "One dependency chain",
+                        "stale": False,
+                    }
+                )
+            elif task.identifier == "third-outcome":
+                sheet.append(
                     {
-                        "answer": "Move it behind the third outcome.",
-                        "effect": "The authored order changes, but both remain open.",
-                        "recommended": False,
-                    },
-                ],
-                "dissent": (
-                    "Deferring this again would preserve the blockage rather than the option."
-                ),
-                "group": "One dependency chain",
-                "stale": False,
-            },
-            {
-                "task": third.identifier,
-                "anchor": third.updated_at,
-                "current_anchor": third.updated_at,
-                "question": "Should this remain behind the dependency?",
-                "recommendation": "Keep it open without pretending it is next.",
-                "reasoning": (
-                    "It still matters, but the first prepared outcome controls its timing."
-                ),
-                "choices": [
+                        "task": task.identifier,
+                        "anchor": task.updated_at,
+                        "current_anchor": task.updated_at,
+                        "question": "Should this remain behind the dependency?",
+                        "recommendation": "Keep it open without pretending it is next.",
+                        "reasoning": (
+                            "It still matters, but the first prepared outcome controls its timing."
+                        ),
+                        "choices": [
+                            {
+                                "answer": "Keep it open behind the dependency.",
+                                "effect": "No other record changes.",
+                                "recommended": True,
+                            },
+                            {
+                                "answer": "Make this the first prepared outcome.",
+                                "effect": "The authored order changes.",
+                                "recommended": False,
+                            },
+                        ],
+                        "dissent": "",
+                        "group": "One dependency chain",
+                        "stale": False,
+                    }
+                )
+            else:
+                sheet.append(
                     {
-                        "answer": "Keep it open behind the dependency.",
-                        "effect": "No other record changes.",
-                        "recommended": True,
-                    },
-                    {
-                        "answer": "Make this the first prepared outcome.",
-                        "effect": "The authored order changes.",
-                        "recommended": False,
-                    },
-                ],
-                "dissent": "",
-                "group": "One dependency chain",
-                "stale": False,
-            },
-        ]
+                        "task": task.identifier,
+                        "anchor": task.updated_at,
+                        "current_anchor": task.updated_at,
+                        "question": f"What should happen with {task.title}?",
+                        "recommendation": (
+                            f"Keep {task.title} open and name its next reversible move."
+                        ),
+                        "reasoning": (
+                            "The outcome remains open, but its next move still needs an explicit "
+                            "decision."
+                        ),
+                        "choices": [
+                            {
+                                "answer": f"Keep {task.title} moving.",
+                                "effect": "Seld carries the next reversible move.",
+                                "recommended": True,
+                            },
+                            {
+                                "answer": f"Hold {task.title} for later.",
+                                "effect": "The outcome stays open without becoming the next move.",
+                                "recommended": False,
+                            },
+                        ],
+                        "dissent": "",
+                        "group": "Prepared decisions",
+                        "stale": False,
+                    }
+                )
+        self.sheets[event.event_id] = sheet
         self.receipts[event.event_id] = receipt
         self.answers[event.event_id] = headline
         return receipt
 
 
 class NeverSubmittedTransport:
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
         del event_id
         return {
             "automatic_resume": True,
@@ -464,7 +540,12 @@ class DeliveryUncertainTransport:
         self.thread_id = thread_id
         self.submit_count = 0
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
         receipt = self.receipts.get(event_id) if event_id is not None else None
         return {
             "automatic_resume": True,
@@ -546,10 +627,13 @@ class RunningTransport(DeliveryUncertainTransport):
 class DispositionBeforeCompletionTransport(SemanticReviewTransport):
     """Expose the real disposition-before-process-exit completion window."""
 
-    def __init__(self, vault: Vault, *, running_reads: int = 5) -> None:
+    def __init__(self, vault: Vault) -> None:
         super().__init__(vault)
-        self.running_reads = running_reads
         self.completed: dict[str, TurnReceipt] = {}
+        self.completion_released = threading.Event()
+
+    def release_completion(self) -> None:
+        self.completion_released.set()
 
     def submit(self, context: TurnContext) -> TurnReceipt:
         completed = super().submit(context)
@@ -567,13 +651,20 @@ class DispositionBeforeCompletionTransport(SemanticReviewTransport):
         self.receipts[completed.event_id] = running
         return running
 
-    def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        event_id: str | None = None,
+        *,
+        include_capability: bool = True,
+    ) -> dict[str, Any]:
         receipt = self.receipts.get(event_id) if event_id is not None else None
-        if receipt is not None and receipt.state is TurnState.RUNNING:
-            self.running_reads -= 1
-            if self.running_reads <= 0:
-                receipt = self.completed[receipt.event_id]
-                self.receipts[receipt.event_id] = receipt
+        if (
+            receipt is not None
+            and receipt.state is TurnState.RUNNING
+            and self.completion_released.is_set()
+        ):
+            receipt = self.completed[receipt.event_id]
+            self.receipts[receipt.event_id] = receipt
         return {
             "automatic_resume": True,
             "automatic_start": True,
@@ -838,7 +929,7 @@ def test_browser_continues_one_saved_review_answer_when_receipt_is_missing(
                 page.get_by_text("The turn did not start", exact=True).wait_for(timeout=5_000)
                 assert transport.submit_count == 1
                 assert [event.event_id for event in ledger.snapshot().pending] == [event_id]
-                assert page.get_by_role("button", name="Retry this exact turn").is_visible()
+                assert page.get_by_role("button", name="Retry this answer").is_visible()
                 browser.close()
         finally:
             server.shutdown()
@@ -931,13 +1022,13 @@ def test_browser_unavailable_review_shows_repair_issue_without_new_hand(
                 ).is_visible()
                 assert page.get_by_text("Delivery could not be confirmed", exact=True).is_visible()
                 assert (
-                    page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                    page.get_by_role("link", name="Open the same ChatGPT task").get_attribute(
                         "href"
                     )
                     == f"codex://threads/{REVIEW_HAND_ID}"
                 )
                 assert page.get_by_role("button", name="Start review here").count() == 0
-                assert page.get_by_role("link", name="Start in Codex").count() == 0
+                assert page.get_by_role("link", name="Start in ChatGPT").count() == 0
 
                 snapshot["portfolio"]["review"].update(
                     {
@@ -949,7 +1040,7 @@ def test_browser_unavailable_review_shows_repair_issue_without_new_hand(
                 )
                 snapshot["guided_review_transport"]["event"] = None
                 page.reload(wait_until="load")
-                page.get_by_role("link", name="Repair in Codex").wait_for(timeout=5_000)
+                page.get_by_role("link", name="Repair in ChatGPT").wait_for(timeout=5_000)
                 assert page.get_by_role("link", name="Resume the review hand").count() == 0
                 browser.close()
         finally:
@@ -1026,7 +1117,7 @@ def test_browser_finished_review_keeps_terminal_delivery_recovery_visible(
                     timeout=5_000
                 )
                 assert (
-                    page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                    page.get_by_role("link", name="Open the same ChatGPT task").get_attribute(
                         "href"
                     )
                     == f"codex://threads/{REVIEW_HAND_ID}"
@@ -1086,8 +1177,8 @@ def test_browser_clears_stale_working_message_when_receipt_completes(tmp_path: P
             "state": "pending",
         }
         stale_message = (
-            "The review hand is still working. GSV will not resend your answer; use the exact "
-            "hand if you need to inspect it now."
+            "The review task is still working. Seld will not resend your answer; open the same "
+            "ChatGPT task if you need to inspect it now."
         )
         bridge_javascript = (Path(static_root) / "bridge.js").read_text(encoding="utf-8")
         fast_javascript = (
@@ -1138,7 +1229,7 @@ def test_browser_clears_stale_working_message_when_receipt_completes(tmp_path: P
                 )
                 page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="load")
                 page.locator('[data-view="commitments"]').press("Enter")
-                page.get_by_text("The Mind is working", exact=True).wait_for(timeout=5_000)
+                page.get_by_text("Seld is working", exact=True).wait_for(timeout=5_000)
                 page.evaluate(
                     "window.__gsvReviewStatus = "
                     "document.querySelector('.guided-review-delivery-copy')"
@@ -1149,10 +1240,10 @@ def test_browser_clears_stale_working_message_when_receipt_completes(tmp_path: P
                     "document.querySelector('.guided-review-delivery-copy')"
                 )
                 page.get_by_text(stale_message, exact=True).wait_for(timeout=5_000)
-                assert page.get_by_text("Same review hand active", exact=False).is_visible()
+                assert page.get_by_text("Same ChatGPT task active", exact=False).is_visible()
                 assert page.get_by_text("Checked just now", exact=False).is_visible()
                 assert (
-                    page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                    page.get_by_role("link", name="Open the same ChatGPT task").get_attribute(
                         "href"
                     )
                     == f"codex://threads/{REVIEW_HAND_ID}"
@@ -1165,7 +1256,7 @@ def test_browser_clears_stale_working_message_when_receipt_completes(tmp_path: P
                     "updated_at": "2026-07-26T06:01:00Z",
                 }
 
-                page.get_by_text("The review hand replied", exact=True).wait_for(timeout=5_000)
+                page.get_by_text("ChatGPT replied", exact=True).wait_for(timeout=5_000)
                 assert page.get_by_text(stale_message, exact=True).count() == 0
                 assert page.get_by_text("The exact turn finished.", exact=True).is_visible()
                 assert page.locator(".guided-review-delivery-activity").count() == 0
@@ -1220,6 +1311,7 @@ def test_browser_failed_receipt_read_removes_stale_hand_liveness(tmp_path: Path)
         thread.start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         snapshot = server.snapshot()
+        snapshot["portfolio"]["review"]["pending_intent"] = {"event_id": event_id}
         snapshot["guided_review_transport"]["event"] = pending_receipt
         bridge_javascript = (Path(static_root) / "bridge.js").read_text(encoding="utf-8")
         fast_javascript = bridge_javascript.replace(
@@ -1250,12 +1342,25 @@ def test_browser_failed_receipt_read_removes_stale_hand_liveness(tmp_path: Path)
                     ),
                 )
 
+                receipt_reads = 0
+
                 def review_turn(route: Any) -> None:
+                    nonlocal receipt_reads
                     if route.request.method == "POST":
                         route.fulfill(
                             body=json.dumps({"ok": True, "transport": running_receipt}),
                             content_type="application/json",
                             status=202,
+                        )
+                    elif receipt_reads < 10:
+                        # Keep the positive observation visible long enough for the
+                        # assertion, then fail the same exact read path. This proves
+                        # both transitions without racing Playwright's locator poll.
+                        receipt_reads += 1
+                        route.fulfill(
+                            body=json.dumps({"ok": True, "transport": running_receipt}),
+                            content_type="application/json",
+                            status=200,
                         )
                     else:
                         route.fulfill(
@@ -1267,11 +1372,11 @@ def test_browser_failed_receipt_read_removes_stale_hand_liveness(tmp_path: Path)
                 page.route("**/api/v1/review-turn*", review_turn)
                 page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="load")
                 page.locator('[data-view="commitments"]').press("Enter")
-                page.get_by_text("Same review hand active", exact=False).wait_for(timeout=5_000)
-                page.get_by_text("Bridge could not read the review receipt", exact=False).wait_for(
+                page.get_by_text("Same ChatGPT task active", exact=False).wait_for(timeout=5_000)
+                page.get_by_text("Bridge could not read the delivery record", exact=False).wait_for(
                     timeout=5_000
                 )
-                assert page.get_by_text("Same review hand active", exact=False).count() == 0
+                assert page.get_by_text("Same ChatGPT task active", exact=False).count() == 0
                 page.wait_for_function(
                     "() => document.querySelector('.guided-review-delivery-activity-copy')"
                     "?.textContent.includes(' ago')",
@@ -1281,7 +1386,7 @@ def test_browser_failed_receipt_read_removes_stale_hand_liveness(tmp_path: Path)
                 assert "Checked just now" not in activity
                 assert " ago" in activity
                 assert (
-                    page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                    page.get_by_role("link", name="Open the same ChatGPT task").get_attribute(
                         "href"
                     )
                     == f"codex://threads/{REVIEW_HAND_ID}"
@@ -1404,14 +1509,16 @@ def test_browser_guided_review_runs_semantic_cas_and_survives_fresh_process(
                 commitments.focus()
                 commitments.press("Enter")
 
-                page.get_by_role("heading", name="Work through every open outcome").wait_for()
+                page.get_by_role("heading", name="Review the decisions that need you").wait_for()
                 assert (
                     page.locator("article.guided-review-subject")
                     .get_by_role("heading", name="Exact outcome")
                     .is_visible()
                 )
                 assert page.get_by_text("Rank 7", exact=True).is_visible()
-                assert page.get_by_text("Checked never means resolved.", exact=False).is_visible()
+                assert page.get_by_text(
+                    "A checked item may still be unresolved.", exact=False
+                ).is_visible()
                 assert page.locator("body").evaluate(
                     "element => element.scrollWidth <= document.documentElement.clientWidth"
                 )
@@ -1419,7 +1526,7 @@ def test_browser_guided_review_runs_semantic_cas_and_survives_fresh_process(
                 page.get_by_role("button", name="Do / next").evaluate(
                     "button => { button.click(); button.click(); }"
                 )
-                page.get_by_text("The review hand replied", exact=True).wait_for(timeout=5_000)
+                page.get_by_text("ChatGPT replied", exact=True).wait_for(timeout=5_000)
                 page.get_by_text(
                     "I tightened the first next move and kept external action gated.",
                     exact=False,
@@ -1485,7 +1592,7 @@ def test_browser_guided_review_runs_semantic_cas_and_survives_fresh_process(
                 system.focus()
                 system.press("Enter")
                 page.get_by_text("Acknowledged, not applied", exact=True).wait_for(timeout=5_000)
-                assert page.get_by_text("semantic-readback-complete", exact=True).is_visible()
+                assert page.get_by_text("semantic-readback-complete", exact=True).count() == 0
                 browser.close()
         finally:
             fresh_server.shutdown()
@@ -1588,13 +1695,13 @@ def test_browser_prepared_board_batches_only_answered_rows_and_clears_on_new_rec
                 page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
                 page.locator('[data-view="commitments"]').press("Enter")
                 page.get_by_role("button", name="Do / next").click()
-                page.get_by_role("heading", name="Decisions that genuinely need you").wait_for(
+                page.get_by_role("heading", name="Review the prepared decisions").wait_for(
                     timeout=5_000
                 )
 
-                assert page.get_by_text("The Mind disagrees with you", exact=True).is_visible()
+                assert page.get_by_text("Why Seld disagrees", exact=True).is_visible()
                 assert page.get_by_role("heading", name="Open work", exact=True).count() == 0
-                assert page.get_by_label("Tell the Mind something about this set").is_visible()
+                assert page.get_by_label("Tell Seld something about this set").is_visible()
                 assert page.get_by_role("button", name="Pause here", exact=True).is_visible()
                 assert page.get_by_role("button", name="End review", exact=True).is_visible()
                 assert page.locator("body").evaluate(
@@ -1657,7 +1764,7 @@ def test_browser_prepared_board_batches_only_answered_rows_and_clears_on_new_rec
                     )
 
                 page.route("**/api/v1/control", fail_session_control, times=3)
-                session_note = page.get_by_label("Tell the Mind something about this set")
+                session_note = page.get_by_label("Tell Seld something about this set")
                 session_note.fill("The dependency changed; reassess only what this affects.")
                 page.get_by_role("button", name="Send note and keep going", exact=True).click()
                 assert len(session_controls) == 1
@@ -1687,10 +1794,11 @@ def test_browser_prepared_board_batches_only_answered_rows_and_clears_on_new_rec
                 ).click()
                 assert first_card.locator('[aria-pressed="true"]').count() == 1
 
-                page.get_by_role("button", name="Show all work").click()
+                page.get_by_role("button", name="See everything").click()
                 page.locator(".commitment-grid").wait_for()
                 assert page.locator(".task-card").count() >= 3
-                page.get_by_role("button", name="Return to review").click()
+                page.locator('[data-view="commitments"]').press("Enter")
+                first_card = page.locator('[data-prepared-task="next-outcome"]')
                 assert first_card.locator('[aria-pressed="true"]').count() == 1
 
                 first_card.focus()
@@ -1763,17 +1871,164 @@ def test_browser_prepared_board_batches_only_answered_rows_and_clears_on_new_rec
                 assert recovered_answer in recovery.input_value()
                 assert "task:next-outcome" in recovery.input_value()
                 assert page.get_by_text(
-                    "will not bind it to the refreshed set", exact=False
+                    "will not attach it to the refreshed set", exact=False
                 ).is_visible()
                 notice = page.locator(".guided-review-notice")
                 assert "queue changed" in notice.text_content().casefold()
                 assert "retry" in notice.text_content().casefold()
                 assert (
                     page.get_by_role(
-                        "heading", name="Decisions that genuinely need you", exact=True
+                        "heading", name="Review the prepared decisions", exact=True
                     ).count()
                     == 0
                 )
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_browser_ten_decision_rundown_fits_mobile_and_submits_only_answered_row(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Ten-decision mobile Rundown")
+    first = vault.create_task(
+        identifier="exact-outcome",
+        title="Opening outcome",
+        outcome="Open the prepared Rundown.",
+        status="ready",
+        next_actor="human",
+    )
+    prepared = [
+        vault.create_task(
+            identifier=identifier,
+            title=title,
+            outcome=f"Choose the bounded next move for {title}.",
+            status="ready",
+            next_actor="human",
+        )
+        for identifier, title in (
+            ("next-outcome", "Dependency decision"),
+            ("third-outcome", "Dependent decision"),
+            ("decision-04", "Decision 04"),
+            ("decision-05", "Decision 05"),
+            ("decision-06", "Decision 06"),
+            ("decision-07", "Decision 07"),
+            ("decision-08", "Decision 08"),
+            ("decision-09", "Decision 09"),
+            ("decision-10", "Decision 10"),
+            ("decision-11", "Decision 11"),
+        )
+    ]
+    session = vault.create_task(
+        identifier="review-session",
+        title="Review every open outcome",
+        outcome="Surface only consequential interventions.",
+        status="waiting",
+        next_actor="human",
+        next_action="Open the first exact review exchange.",
+        waiting_on="Should the intervention review begin?",
+        active_thread_id=REVIEW_HAND_ID,
+        refs=(
+            "review-scope:all-open",
+            "review-subject:task:exact-outcome",
+            review_option_ref(
+                intent="act-next",
+                subject_task_id="exact-outcome",
+                consequence="Prepare the decisions that need me.",
+            ),
+        ),
+    )
+    vault.create_thread(
+        identifier="thread:life-portfolio-review",
+        title="Finite Portfolio reviews",
+        purpose="Own only bounded all-open review sessions.",
+        summary="One exact review session is active.",
+        status="active",
+        focus_task_id=session.identifier,
+        task_ids=(session.identifier,),
+    )
+    vault.set_portfolio(
+        expected_revision=ABSENT_PORTFOLIO_REVISION,
+        summary="Eleven exact open outcomes.",
+        items=tuple(
+            portfolio_item(
+                task_id_value=task.identifier,
+                task_revision=task.revision,
+                stance="needs-human",
+                reason="The prepared board must preserve this exact decision boundary.",
+            )
+            for task in (first, *prepared)
+        ),
+    )
+    transport = PreparedBoardTransport(vault)
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            turn_transport=transport,
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(
+                    reduced_motion="reduce",
+                    viewport={"height": 844, "width": 390},
+                )
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
+                page.locator('[data-view="commitments"]').press("Enter")
+                page.get_by_role("button", name="Do / next").click()
+                page.get_by_role("heading", name="Review the prepared decisions").wait_for(
+                    timeout=5_000
+                )
+                cards = page.locator("[data-prepared-task]")
+                assert cards.count() == 10
+                assert page.evaluate(
+                    "document.body.scrollWidth <= window.innerWidth && "
+                    "document.documentElement.scrollWidth <= window.innerWidth"
+                )
+                last = page.locator('[data-prepared-task="decision-11"]')
+                last.scroll_into_view_if_needed()
+                rect = last.evaluate(
+                    "element => ({ bottom: element.getBoundingClientRect().bottom, "
+                    "top: element.getBoundingClientRect().top, viewport: window.innerHeight })"
+                )
+                assert rect["top"] >= 0
+                assert rect["bottom"] <= rect["viewport"]
+                last.get_by_role("button", name="Keep Decision 11 moving.", exact=False).click()
+                payloads: list[str] = []
+
+                def capture_last_row(route: Any) -> None:
+                    payloads.append(route.request.post_data_json["choice"])
+                    route.fulfill(
+                        body='{"error":"captured mobile row"}',
+                        content_type="application/json",
+                        status=503,
+                    )
+
+                page.route("**/api/v1/control", capture_last_row, times=1)
+                page.get_by_role("button", name="Send answered decisions").click()
+                page.get_by_text("captured mobile row", exact=True).wait_for(timeout=5_000)
+                assert len(payloads) == 1
+                assert "task:decision-11" in payloads[0]
+                assert "Keep Decision 11 moving." in payloads[0]
+                assert all(f"task:{task.identifier}" not in payloads[0] for task in prepared[:-1])
                 browser.close()
         finally:
             server.shutdown()
@@ -1859,9 +2114,7 @@ def test_browser_keeps_active_delivery_until_post_disposition_completion(
             ),
         ),
     )
-    # Keep a deterministic observable disposition-before-completion window even
-    # when the accelerated background snapshot loop runs faster on hosted CI.
-    transport = DispositionBeforeCompletionTransport(vault, running_reads=10)
+    transport = DispositionBeforeCompletionTransport(vault)
     ledger = OperationLedger(vault.root)
     static_resource = files("continuity_kernel") / "resources/bridge"
 
@@ -1884,12 +2137,12 @@ def test_browser_keeps_active_delivery_until_post_disposition_completion(
         thread.start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         bridge_javascript = (Path(static_root) / "bridge.js").read_text(encoding="utf-8")
-        fast_javascript = bridge_javascript.replace(
-            "const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;",
-            "const GUIDED_REVIEW_POLL_INTERVAL_MS = 100;",
-        ).replace(
-            "window.setInterval(() => loadSnapshot({ quiet: true }), 10_000);",
-            "window.setInterval(() => loadSnapshot({ quiet: true }), 25);",
+        fast_javascript = (
+            bridge_javascript.replace(
+                "const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;",
+                "const GUIDED_REVIEW_POLL_INTERVAL_MS = 100;",
+            )
+            + "\nglobalThis.__seldTestLoadSnapshot = loadSnapshot;\n"
         )
         assert fast_javascript != bridge_javascript
         try:
@@ -1907,15 +2160,26 @@ def test_browser_keeps_active_delivery_until_post_disposition_completion(
                 page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="load")
                 page.locator('[data-view="commitments"]').press("Enter")
                 page.get_by_role("button", name="Do / next").click()
-                page.get_by_text("The Mind is working", exact=True).wait_for(timeout=5_000)
+                page.get_by_text("Seld is working", exact=True).wait_for(timeout=5_000)
 
-                page.wait_for_timeout(150)
                 decided = ledger.snapshot()
                 assert decided.pending == ()
                 assert len(decided.decided) == 1
-                assert page.get_by_text("The Mind is working", exact=True).is_visible()
 
-                page.get_by_text("The review hand replied", exact=True).wait_for(timeout=5_000)
+                # Exercise the real snapshot where the queue is dispositioned
+                # but the same Codex hand has not finished yet.
+                assert (
+                    page.evaluate("() => globalThis.__seldTestLoadSnapshot({ quiet: true })")
+                    is True
+                )
+                assert page.get_by_text("Seld is working", exact=True).is_visible()
+
+                page.wait_for_timeout(2_750)
+                assert page.get_by_text("Seld is working", exact=True).is_visible()
+                assert page.get_by_role("button", name="Do / next").count() == 0
+
+                transport.release_completion()
+                page.get_by_text("ChatGPT replied", exact=True).wait_for(timeout=5_000)
                 assert page.get_by_text(
                     "I tightened the first next move and kept external action gated.",
                     exact=False,
@@ -2071,7 +2335,7 @@ def test_browser_fresh_process_resumes_one_restored_pending_receipt(
                 commitments = page.locator('[data-view="commitments"]')
                 commitments.focus()
                 commitments.press("Enter")
-                page.get_by_text("The review hand replied", exact=True).wait_for(timeout=5_000)
+                page.get_by_text("ChatGPT replied", exact=True).wait_for(timeout=5_000)
                 page.locator("#guided-review-current-title").get_by_text(
                     "Next outcome", exact=True
                 ).wait_for(timeout=5_000)
@@ -2166,7 +2430,7 @@ def test_browser_guided_review_preserves_unsent_draft_after_stale_cas(
                 commitments.press("Enter")
                 if race_kind == "queue":
                     oversized = "🧠" * 1024
-                    page.get_by_label("Tell the Mind what you want").fill(oversized)
+                    page.get_by_label("Tell Seld what you want").fill(oversized)
                     page.get_by_role("button", name="Send and keep going").click()
                     page.get_by_text(
                         "longer than the 4,096-byte local limit", exact=False
@@ -2178,7 +2442,7 @@ def test_browser_guided_review_preserves_unsent_draft_after_stale_cas(
                         "'.guided-review-form button.primary-action').disabled"
                     )
                 draft = "Move this below maintenance, but keep the outcome open."
-                page.get_by_label("Tell the Mind what you want").fill(draft)
+                page.get_by_label("Tell Seld what you want").fill(draft)
                 if race_kind == "queue":
                     ledger.queue.append(
                         kind="correction",
@@ -2212,7 +2476,7 @@ def test_browser_guided_review_preserves_unsent_draft_after_stale_cas(
                 assert len(ledger.snapshot().pending) == (1 if race_kind == "queue" else 0)
                 if race_kind == "conflict":
                     assert (
-                        page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                        page.get_by_role("link", name="Open the same ChatGPT task").get_attribute(
                             "href"
                         )
                         == f"codex://threads/{REVIEW_HAND_ID}"
@@ -2299,20 +2563,20 @@ def test_browser_failed_safe_retry_reports_semantic_drift_without_replay(
                 page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
                 page.locator('[data-view="commitments"]').press("Enter")
                 answer = "Move this below maintenance, but keep it open."
-                page.get_by_label("Tell the Mind what you want").fill(answer)
+                page.get_by_label("Tell Seld what you want").fill(answer)
                 page.get_by_role("button", name="Send and keep going").click()
                 page.get_by_text(
-                    "The review changed after this answer was queued.", exact=False
+                    "The review changed after this answer was saved.", exact=True
                 ).wait_for(timeout=5_000)
 
                 pending = ledger.snapshot().pending
                 assert len(pending) == 1
                 assert answer in pending[0].choice
                 assert transport.submit_count == 1
-                assert page.get_by_text("wording remains saved once", exact=False).is_visible()
+                assert page.get_by_text("wording remains stored once", exact=False).is_visible()
                 assert page.get_by_text("Bridge could not read", exact=False).count() == 0
                 assert (
-                    page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                    page.get_by_role("link", name="Open the same ChatGPT task").get_attribute(
                         "href"
                     )
                     == f"codex://threads/{REVIEW_HAND_ID}"
@@ -2417,11 +2681,11 @@ def test_browser_guided_review_never_replays_delivery_uncertain_event(
                 assert transport.submit_count == 1
                 assert vault.get_task(outcome.identifier).revision == outcome.revision
                 assert len(ledger.snapshot().pending) == 1
-                assert not page.get_by_role("button", name="Retry this exact turn").is_visible()
-                hand = page.get_by_role("link", name="Open the exact review hand")
+                assert not page.get_by_role("button", name="Retry this answer").is_visible()
+                hand = page.get_by_role("link", name="Open the same ChatGPT task")
                 assert hand.get_attribute("href") == f"codex://threads/{REVIEW_HAND_ID}"
                 assert (
-                    page.get_by_role("link", name="Resolve queued receipt")
+                    page.get_by_role("link", name="Resolve saved answer")
                     .get_attribute("href")
                     .startswith("codex://new?")
                 )
@@ -2467,15 +2731,15 @@ def test_browser_guided_review_never_replays_delivery_uncertain_event(
                 )
                 assert restarted_transport.submit_count == 0
                 assert len(ledger.snapshot().pending) == 1
-                assert not page.get_by_role("button", name="Retry this exact turn").is_visible()
+                assert not page.get_by_role("button", name="Retry this answer").is_visible()
                 assert (
-                    page.get_by_role("link", name="Open the exact review hand").get_attribute(
+                    page.get_by_role("link", name="Open the same ChatGPT task").get_attribute(
                         "href"
                     )
                     == f"codex://threads/{REVIEW_HAND_ID}"
                 )
                 assert (
-                    page.get_by_role("link", name="Resolve queued receipt")
+                    page.get_by_role("link", name="Resolve saved answer")
                     .get_attribute("href")
                     .startswith("codex://new?")
                 )
@@ -2489,7 +2753,7 @@ def test_browser_guided_review_never_replays_delivery_uncertain_event(
                     expected_queue_revision=pending.queue_revision,
                     expected_disposition_revision=pending.disposition_revision,
                 )
-                page.get_by_label("Tell the Mind what you want").wait_for(timeout=12_000)
+                page.get_by_label("Tell Seld what you want").wait_for(timeout=12_000)
                 assert page.get_by_text("Delivery could not be confirmed", exact=True).count() == 0
                 assert restarted_transport.submit_count == 0
                 browser.close()
@@ -2558,7 +2822,7 @@ def test_browser_start_delivery_uncertain_uses_created_exact_hand(
                 page.get_by_text("Delivery could not be confirmed", exact=True).wait_for(
                     timeout=5_000
                 )
-                hand = page.get_by_role("link", name="Open the exact review hand")
+                hand = page.get_by_role("link", name="Open the same ChatGPT task")
                 assert hand.get_attribute("href") == f"codex://threads/{REVIEW_HAND_ID}"
                 assert not hand.get_attribute("href").startswith("codex://new?")
                 assert page.get_by_role("button", name="Start review here").count() == 0
@@ -2626,11 +2890,11 @@ def test_browser_start_delivery_uncertain_without_hand_never_offers_new_hand(
                 page.get_by_text("Delivery could not be confirmed", exact=True).wait_for(
                     timeout=5_000
                 )
-                assert page.get_by_role("link", name="Open the exact review hand").count() == 0
-                assert page.get_by_role("link", name="Start in Codex").count() == 0
+                assert page.get_by_role("link", name="Open the same ChatGPT task").count() == 0
+                assert page.get_by_role("link", name="Start in ChatGPT").count() == 0
                 assert page.get_by_role("button", name="Start review here").count() == 0
                 assert (
-                    "cannot recover the Codex hand"
+                    "cannot recover the ChatGPT task"
                     in page.locator(".guided-review-delivery").text_content()
                 )
                 assert transport.submit_count == 1
@@ -2714,19 +2978,21 @@ def test_browser_full_receipt_store_keeps_queue_and_validated_exact_hand_fallbac
                 page = browser.new_page(viewport={"height": 844, "width": 390})
                 page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
                 page.locator('[data-view="commitments"]').press("Enter")
-                page.get_by_label("Tell the Mind what you want").fill(
+                page.get_by_label("Tell Seld what you want").fill(
                     "Keep this exact outcome current."
                 )
                 page.get_by_role("button", name="Send and keep going").click()
                 page.get_by_text("Automatic continuation is unavailable", exact=True).wait_for(
                     timeout=5_000
                 )
-                hand = page.get_by_role("link", name="Open the exact review hand")
+                hand = page.get_by_role("link", name="Open the same ChatGPT task")
                 assert hand.get_attribute("href") == f"codex://threads/{REVIEW_HAND_ID}"
-                assert page.get_by_role("link", name="Start in Codex").count() == 0
-                assert page.get_by_text("Reason: transport receipt store full").is_visible()
+                assert page.get_by_role("link", name="Start in ChatGPT").count() == 0
+                assert page.get_by_text(
+                    "Seld could not save another delivery record.", exact=True
+                ).is_visible()
                 assert (
-                    page.get_by_role("link", name="Resolve queued receipt")
+                    page.get_by_role("link", name="Resolve saved answer")
                     .get_attribute("href")
                     .startswith("codex://new?")
                 )
@@ -2812,11 +3078,11 @@ def test_browser_clears_stale_running_receipt_after_out_of_band_disposition(
                 page = browser.new_page(viewport={"height": 844, "width": 390})
                 page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
                 page.locator('[data-view="commitments"]').press("Enter")
-                page.get_by_label("Tell the Mind what you want").fill(
+                page.get_by_label("Tell Seld what you want").fill(
                     "Keep this exact outcome current."
                 )
                 page.get_by_role("button", name="Send and keep going").click()
-                page.get_by_text("The Mind is working", exact=True).wait_for(timeout=5_000)
+                page.get_by_text("Seld is working", exact=True).wait_for(timeout=5_000)
                 pending = ledger.snapshot()
                 assert len(pending.pending) == 1
                 ledger.decide(
@@ -2828,8 +3094,8 @@ def test_browser_clears_stale_running_receipt_after_out_of_band_disposition(
                     expected_disposition_revision=pending.disposition_revision,
                 )
 
-                page.get_by_label("Tell the Mind what you want").wait_for(timeout=12_000)
-                assert page.get_by_text("The Mind is working", exact=True).count() == 0
+                page.get_by_label("Tell Seld what you want").wait_for(timeout=12_000)
+                assert page.get_by_text("Seld is working", exact=True).count() == 0
                 assert transport.submit_count == 1
                 current = ledger.snapshot()
                 assert current.pending == ()
@@ -2890,7 +3156,7 @@ def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Pat
                 )
                 page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
                 page.locator('[data-view="system"]').click()
-                review_link = page.get_by_role("link", name="Review in Codex")
+                review_link = page.get_by_role("link", name="Continue in ChatGPT")
                 review_link.wait_for(timeout=5_000)
                 assert review_link.get_attribute("href").startswith("codex://new?")
                 page.get_by_text("Copy prompt instead", exact=True).click()
@@ -2900,7 +3166,16 @@ def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Pat
                     .filter(has_text="This is review only")
                     .is_visible()
                 )
-                page.get_by_label("What should GSV correct?").fill("Friday evening is protected.")
+                correction = page.get_by_label("What should Seld correct?")
+                correction.fill("Friday evening is protected.")
+                correction.evaluate("element => element.setSelectionRange(7, 14)")
+                focus_before_poll = page.evaluate(
+                    """() => ({
+                      id: document.activeElement?.id,
+                      start: document.activeElement?.selectionStart,
+                      end: document.activeElement?.selectionEnd,
+                    })"""
+                )
 
                 ledger = OperationLedger(vault.root)
                 before_refresh = ledger.snapshot()
@@ -2914,8 +3189,19 @@ def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Pat
                 # The production ten-second poll rebuilds the System view when the queue changes.
                 page.get_by_text("Background correction arrived first.").wait_for(timeout=12_000)
                 assert (
-                    page.get_by_label("What should GSV correct?").input_value()
+                    page.get_by_label("What should Seld correct?").input_value()
                     == "Friday evening is protected."
+                )
+                assert (
+                    page.evaluate(
+                        """() => ({
+                      id: document.activeElement?.id,
+                      start: document.activeElement?.selectionStart,
+                      end: document.activeElement?.selectionEnd,
+                    })"""
+                    )
+                    == focus_before_poll
+                    == {"id": "bridge-correction", "start": 7, "end": 14}
                 )
 
                 before_race = ledger.snapshot()
@@ -2930,7 +3216,7 @@ def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Pat
                     timeout=5_000
                 )
                 assert (
-                    page.get_by_label("What should GSV correct?").input_value()
+                    page.get_by_label("What should Seld correct?").input_value()
                     == "Friday evening is protected."
                 )
                 assert page.get_by_text("Background correction arrived first.").is_visible()
@@ -2959,17 +3245,34 @@ def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Pat
                     void 0;
                     """
                 )
-                page.get_by_label("What should GSV correct?").fill("Original submitted draft.")
+                page.get_by_label("What should Seld correct?").fill("Original submitted draft.")
                 page.get_by_role("button", name="Queue correction").click()
-                page.get_by_label("What should GSV correct?").fill(
+                page.get_by_label("What should Seld correct?").fill(
                     "Newer text typed while save was pending."
+                )
+                pending_editor_state = page.evaluate(
+                    """() => ({
+                      id: document.activeElement?.id,
+                      start: document.activeElement?.selectionStart,
+                      end: document.activeElement?.selectionEnd,
+                    })"""
                 )
                 page.get_by_text("The queue changed while you were editing.", exact=False).wait_for(
                     timeout=5_000
                 )
                 assert (
-                    page.get_by_label("What should GSV correct?").input_value()
+                    page.get_by_label("What should Seld correct?").input_value()
                     == "Newer text typed while save was pending."
+                )
+                assert (
+                    page.evaluate(
+                        """() => ({
+                      id: document.activeElement?.id,
+                      start: document.activeElement?.selectionStart,
+                      end: document.activeElement?.selectionEnd,
+                    })"""
+                    )
+                    == pending_editor_state
                 )
                 assert page.get_by_text(
                     "The queue changed while you were editing. Your current draft is still "
@@ -3003,7 +3306,7 @@ def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Pat
                 page.reload(wait_until="networkidle")
                 page.locator('[data-view="system"]').click()
                 page.get_by_text("Acknowledged, not applied", exact=True).wait_for(timeout=5_000)
-                assert page.get_by_text("supported-correction", exact=True).is_visible()
+                assert page.get_by_text("supported-correction", exact=True).count() == 0
                 assert page.get_by_text("Newer text typed while save was pending.").is_visible()
 
                 page.evaluate(
@@ -3022,7 +3325,7 @@ def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Pat
                     void 0;
                     """
                 )
-                page.get_by_label("What should GSV correct?").fill(
+                page.get_by_label("What should Seld correct?").fill(
                     "This write survives a failed view refresh."
                 )
                 page.get_by_role("button", name="Queue correction").click()
@@ -3031,7 +3334,7 @@ def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Pat
                     "entering another correction.",
                     exact=True,
                 ).wait_for(timeout=5_000)
-                assert page.get_by_label("What should GSV correct?").input_value() == ""
+                assert page.get_by_label("What should Seld correct?").input_value() == ""
                 assert any(
                     event.choice == "This write survives a failed view refresh."
                     for event in ledger.snapshot().pending
@@ -3052,15 +3355,15 @@ def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Pat
                     ),
                     times=1,
                 )
-                page.get_by_label("What should GSV correct?").fill(
+                page.get_by_label("What should Seld correct?").fill(
                     "Keep this text until storage is confirmed."
                 )
                 page.get_by_role("button", name="Queue correction").click()
                 page.get_by_text(
-                    "GSV could not confirm whether the correction was saved.", exact=False
+                    "Seld could not confirm whether the correction was saved.", exact=False
                 ).wait_for(timeout=5_000)
                 assert (
-                    page.get_by_label("What should GSV correct?").input_value()
+                    page.get_by_label("What should Seld correct?").input_value()
                     == "Keep this text until storage is confirmed."
                 )
                 assert (
@@ -3084,7 +3387,7 @@ def test_browser_queues_correction_and_renders_durable_disposition(tmp_path: Pat
                     exact=True,
                 ).wait_for(timeout=5_000)
                 assert (
-                    page.get_by_label("What should GSV correct?").input_value()
+                    page.get_by_label("What should Seld correct?").input_value()
                     == "Keep this text until storage is confirmed."
                 )
 

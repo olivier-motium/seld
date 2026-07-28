@@ -28,7 +28,6 @@ const ui = {
   localStatusCopy: document.querySelector("#local-status-copy"),
   main: document.querySelector("#main"),
   menuButton: document.querySelector("#menu-button"),
-  openCodex: document.querySelector("#open-codex"),
   pageIntro: document.querySelector("#page-intro"),
   pageTitle: document.querySelector("#page-title"),
   rail: document.querySelector("#rail"),
@@ -42,14 +41,35 @@ const ui = {
 startThinkingOrb(ui.connectionOrb);
 
 const viewCopy = {
-  commitments: ["Work", "Everything you want to keep moving or revisit later."],
-  mind: ["Context", "The saved notes and decisions you want Codex to use."],
-  now: ["Your work in Codex, in one place.", "See what is open, in progress, waiting, or closed."],
-  storylines: ["Related work", "Tasks and decisions that belong to the same larger effort."],
-  system: ["System", "Your local files, Codex connection, and dashboard health."],
+  commitments: ["Rundown", "Review each recommendation and accept it, change it, or close the outcome."],
+  mind: ["Saved context", "Direction, people, projects, and other context used in recommendations."],
+  now: ["Your brief is ready.", "The decisions that need you, with the context already assembled."],
+  storylines: ["Open work", "Current outcomes, waiting items, history, and related situations."],
+  system: ["System", "Your local record, ChatGPT connection, and repair controls."],
+};
+
+const publicRouteByView = {
+  commitments: "rundown",
+  mind: "knowledge",
+  now: "home",
+  storylines: "everything",
+  system: "system",
+};
+
+const viewByRoute = {
+  commitments: "commitments",
+  everything: "storylines",
+  home: "now",
+  knowledge: "mind",
+  mind: "mind",
+  now: "now",
+  rundown: "commitments",
+  storylines: "storylines",
+  system: "system",
 };
 
 const state = {
+  connectionState: "loading",
   currentView: viewFromHash(),
   integrationRetryTimer: null,
   lastSuccessAt: null,
@@ -67,7 +87,6 @@ let snapshotRequestSequence = 0;
 let guidedReviewSendPending = false;
 let guidedReviewPollGeneration = 0;
 let guidedReviewActivePollEventId = null;
-let guidedReviewOverviewVisible = false;
 let guidedReviewPreparedFocus = 0;
 let guidedReviewPreparedBatch = {
   drafts: new Map(),
@@ -81,6 +100,7 @@ const guidedReviewRestoredPendingEvents = new Set();
 
 const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;
 const GUIDED_REVIEW_POLL_LIMIT = 680;
+const GUIDED_REVIEW_SNAPSHOT_POLL_EVERY = 4;
 const GUIDED_REVIEW_DISPOSITION_GRACE_MS = 2_250;
 
 const guidedReviewOptionLabels = {
@@ -124,14 +144,16 @@ window.addEventListener("keydown", (event) => {
 });
 
 loadSnapshot();
-window.setInterval(() => loadSnapshot({ quiet: true }), 10_000);
+window.setInterval(() => {
+  if (guidedReviewActivePollEventId === null) void loadSnapshot({ quiet: true });
+}, 10_000);
 window.setInterval(updateLiveLabels, 1_000);
 
 async function loadSnapshot({ quiet = false } = {}) {
   const requestSequence = ++snapshotRequestSequence;
   if (!quiet) {
     ui.view.setAttribute("aria-busy", "true");
-    showConnectionOrb("searching", "Reading local GSV");
+    showConnectionOrb("searching", "Reading your local Seld record");
   }
   try {
     const response = await fetch("/api/v1/snapshot", {
@@ -160,15 +182,23 @@ async function loadSnapshot({ quiet = false } = {}) {
       guidedReviewNoticeContext = null;
     }
     const review = snapshot.portfolio?.review || {};
-    syncGuidedReviewDelivery(
-      snapshot.guided_review_transport?.event,
-      review.hand_url,
-      review,
-      snapshot.controls,
-    );
+    if (guidedReviewActivePollEventId === null) {
+      syncGuidedReviewDelivery(
+        snapshot.guided_review_transport?.event,
+        review.hand_url,
+        review,
+        snapshot.controls,
+      );
+    } else {
+      reconcileActiveGuidedReviewDisposition(review, snapshot.controls);
+    }
     state.lastSuccessAt = Date.now();
     setConnectionState(state.snapshot.doctor.healthy ? "healthy" : "partial");
-    if (snapshotChanged) render();
+    if (snapshotChanged) {
+      const editorState = captureActiveEditorState();
+      render();
+      restoreActiveEditorState(editorState);
+    }
     scheduleIntegrationRefresh(snapshot);
     return true;
   } catch (error) {
@@ -189,26 +219,14 @@ async function loadSnapshot({ quiet = false } = {}) {
 function render() {
   const snapshot = state.snapshot;
   if (!snapshot) return;
-  const [title, intro] = viewCopy[state.currentView] || viewCopy.now;
-  ui.pageTitle.textContent = title;
-  ui.pageIntro.textContent = intro;
-  if (codexReady(snapshot) && snapshot.codex.new_hand_url) {
-    ui.openCodex.href = snapshot.codex.new_hand_url;
-    ui.openCodex.hidden = false;
-  } else {
-    ui.openCodex.removeAttribute("href");
-    ui.openCodex.hidden = true;
-  }
+  updatePageHeading();
 
-  const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
-  const taskProjection = projectionSection(snapshot, "tasks");
-  ui.taskCount.textContent =
-    taskProjection.state === "unavailable"
-      ? "!"
-      : taskProjection.state === "partial"
-        ? `${openTasks.length}+`
-        : String(openTasks.length);
-  ui.taskCount.hidden = taskProjection.state === "complete" && openTasks.length === 0;
+  const review = snapshot.portfolio?.review || {};
+  const decisionCount = ["active", "paused"].includes(review.state)
+    ? (Array.isArray(review.subject_task_ids) ? review.subject_task_ids.length : 0)
+    : 0;
+  ui.taskCount.textContent = String(decisionCount);
+  ui.taskCount.hidden = decisionCount < 1;
   setActiveNavigation();
 
   const views = {
@@ -228,27 +246,57 @@ function render() {
   }
 }
 
+function captureActiveEditorState() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement)) return null;
+  if (!active.id || active.disabled) return null;
+  return {
+    end: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
+    id: active.id,
+    start: typeof active.selectionStart === "number" ? active.selectionStart : null,
+    value: active.value,
+  };
+}
+
+function restoreActiveEditorState(editorState) {
+  if (!editorState) return;
+  const replacement = document.getElementById(editorState.id);
+  if (
+    !(replacement instanceof HTMLInputElement || replacement instanceof HTMLTextAreaElement) ||
+    replacement.disabled || replacement.value !== editorState.value
+  ) return;
+  replacement.focus({ preventScroll: true });
+  if (editorState.start !== null && editorState.end !== null) {
+    const end = replacement.value.length;
+    replacement.setSelectionRange(
+      Math.min(editorState.start, end),
+      Math.min(editorState.end, end),
+    );
+  }
+}
+
 function renderNow(snapshot) {
   const fragment = document.createDocumentFragment();
+  fragment.append(renderGuidedReview(snapshot));
+
   const orientation = element("section", "orientation");
   const kicker = element("div", "orientation-kicker");
   kicker.append(
-    textElement("p", "section-label", "Last saved update"),
-    textElement("strong", "", "Current status"),
+    textElement("p", "section-label", "Your brief"),
+    textElement("strong", "", "Current picture"),
     textElement("span", "", revisionLabel(snapshot.now.revision)),
   );
   orientation.append(kicker, renderDocument(snapshot.now.content));
-  fragment.append(orientation, renderContinuity(snapshot));
+  fragment.append(orientation);
 
   const taskProjection = projectionSection(snapshot, "tasks");
   const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
   const completed = snapshot.tasks.filter((task) => ["done", "dropped"].includes(task.status));
   if (taskProjection.state !== "complete") {
     fragment.append(renderProjectionWarning(taskProjection, "work"));
-    if (openTasks.length > 0) {
-      fragment.append(renderOpenTaskHeading(openTasks.length), renderTaskBoard(openTasks, 3));
+    if (openTasks.length > 0 || completed.length > 0) {
+      fragment.append(renderEverythingSummary(openTasks.length, completed.length));
     }
-    appendClosedHistory(fragment, completed);
     return fragment;
   }
   if (snapshot.tasks.length === 0) {
@@ -256,85 +304,37 @@ function renderNow(snapshot) {
     return fragment;
   }
   if (openTasks.length === 0) {
-    fragment.append(renderAllClear(snapshot));
-    appendClosedHistory(fragment, completed);
+    fragment.append(renderAllClear(snapshot), renderEverythingSummary(0, completed.length));
     return fragment;
   }
 
-  fragment.append(renderOpenTaskHeading(openTasks.length), renderTaskBoard(openTasks, 3));
+  fragment.append(renderEverythingSummary(openTasks.length, completed.length));
   return fragment;
 }
 
-function renderOpenTaskHeading(count) {
-  const heading = element("div", "section-head");
-  const headingText = element("div");
-  headingText.append(
-    textElement("p", "section-label", "Current records"),
-    textElement("h2", "", "Open work"),
-  );
-  heading.append(headingText, textElement("p", "section-meta", `${count} open`));
-  return heading;
-}
-
-function renderContinuity(snapshot) {
-  const line = element("section", "continuity-line", { "aria-label": "GSV work flow" });
-  const taskProjection = projectionSection(snapshot, "tasks");
-  const open = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status)).length;
-  const inMotion = snapshot.tasks.filter((task) => task.status === "doing").length;
-  const openRecords =
-    taskProjection.state === "unavailable"
-      ? "Unavailable"
-      : taskProjection.state === "partial"
-        ? `${open} shown · partial`
-        : open
-          ? `${open} open`
-          : "Clear";
-  const integration = snapshot.codex.checking
-    ? "Checking"
-    : codexReady(snapshot)
-      ? "Installed"
-      : snapshot.codex.error
-        ? "Status unknown"
-        : snapshot.codex.available
-          ? "Setup incomplete"
-          : "Codex not found";
-  const inProgress =
-    taskProjection.state === "unavailable"
-      ? "Unavailable"
-      : taskProjection.state === "partial"
-        ? `${inMotion} shown · partial`
-        : String(inMotion);
-  line.append(
-    continuityStage("01", "Saved context", snapshot.mind.revision ? "Available" : "Not set up", "is-persistent"),
-    continuityStage(
-      "02",
-      "Open work",
-      openRecords,
-      "is-held",
-    ),
-    continuityStage(
-      "03",
-      "Marked in progress",
-      inProgress,
+function renderEverythingSummary(openCount, closedCount) {
+  const section = element("section", "everything-summary");
+  const copy = element("div");
+  copy.append(
+    textElement("p", "section-label", "Everything"),
+    textElement(
+      "h2",
       "",
-      inMotion ? "working" : "",
+      openCount ? `${openCount} ${openCount === 1 ? "item" : "items"} still moving` : "Nothing needs moving",
     ),
-    continuityStage("04", "Codex integration", integration),
+    textElement(
+      "p",
+      "",
+      closedCount
+        ? `${closedCount} ${closedCount === 1 ? "item is" : "items are"} in your history.`
+        : "Seld will keep the complete record here without turning it into a notification pile.",
+    ),
   );
-  return line;
-}
-
-function continuityStage(index, label, value, className = "", orbState = "") {
-  const item = element("div", `continuity-stage ${className}`.trim());
-  const head = element("div", "continuity-stage-head");
-  if (orbState) head.append(createThinkingOrb(orbState, `${label}: ${value}`));
-  head.append(textElement("span", "continuity-index", index));
-  item.append(
-    head,
-    textElement("strong", "", label),
-    textElement("span", "continuity-value", value),
-  );
-  return item;
+  const action = textElement("button", "quiet-action", "See everything");
+  action.type = "button";
+  action.addEventListener("click", () => navigate("storylines"));
+  section.append(copy, action);
+  return section;
 }
 
 function renderFirstRun(snapshot) {
@@ -342,14 +342,14 @@ function renderFirstRun(snapshot) {
   const copy = element("div");
   copy.append(
     textElement("p", "section-label", "Get started"),
-    textElement("h2", "", "Tell Codex what you want GSV to keep track of."),
+    textElement("h2", "", "Tell Seld what matters in your life."),
     textElement(
       "p",
       "",
-      "Codex will ask a few questions and save the context you choose to keep.",
+      "ChatGPT will help you connect the sources you choose and build the first useful picture.",
     ),
   );
-  empty.append(copy, renderCodexAction(snapshot, "Start in Codex", "new_mind_url"));
+  empty.append(copy, renderCodexAction(snapshot, "Start in ChatGPT", "new_mind_url"));
   return empty;
 }
 
@@ -357,37 +357,21 @@ function renderAllClear(snapshot) {
   const empty = element("section", "empty-state");
   const copy = element("div");
   copy.append(
-    textElement("p", "section-label", "Work"),
-    textElement("h2", "", "All clear"),
-    textElement("p", "", "Nothing is open right now."),
+    textElement("p", "section-label", "Your brief"),
+    textElement("h2", "", "Nothing needs you right now"),
+    textElement("p", "", "Your complete record remains available in Everything."),
   );
-  empty.append(copy, renderCodexAction(snapshot, "Start a Codex task"));
+  empty.append(copy, renderCodexAction(snapshot, "Open ChatGPT"));
   return empty;
 }
 
 function renderCommitments(snapshot) {
   const container = element("div");
-  const taskProjection = projectionSection(snapshot, "tasks");
-  const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
-  const completed = snapshot.tasks.filter((task) => ["done", "dropped"].includes(task.status));
-  if (taskProjection.state !== "complete") {
-    container.append(renderProjectionWarning(taskProjection, "work"));
-  }
   container.append(renderGuidedReview(snapshot));
-  const reviewState = snapshot.portfolio?.review?.state;
-  if (["active", "paused"].includes(reviewState) && !guidedReviewOverviewVisible) {
-    return container;
+  const taskProjection = projectionSection(snapshot, "tasks");
+  if (taskProjection.state !== "complete") {
+    container.append(renderProjectionWarning(taskProjection, "Rundown"));
   }
-  if (taskProjection.state === "complete" && snapshot.tasks.length === 0) {
-    container.append(renderFirstRun(snapshot));
-    return container;
-  }
-  if (taskProjection.state === "complete" && openTasks.length === 0) {
-    container.append(renderAllClear(snapshot));
-  } else if (openTasks.length > 0) {
-    container.append(renderTaskBoard(openTasks));
-  }
-  appendClosedHistory(container, completed);
   return container;
 }
 
@@ -399,14 +383,14 @@ function renderGuidedReview(snapshot) {
   const head = element("div", "guided-review-head");
   const copy = element("div");
   copy.append(
-    textElement("p", "section-label", "Guided all-open review"),
-    textElement("h2", "", "Work through every open outcome"),
+    textElement("p", "section-label", "The Rundown"),
+    textElement("h2", "", "Review the decisions that need you"),
     textElement(
       "p",
       "guided-review-progress",
       ["active", "paused"].includes(review.state)
-        ? `${review.checked_current_count ?? review.checked_count ?? 0} checked on current evidence · ${review.uncovered_count || 0} still to check. Checked never means resolved.`
-        : "One exact outcome at a time, with authored priority and native compare-and-swap changes.",
+        ? `${review.checked_current_count ?? review.checked_count ?? 0} checked on current evidence · ${review.uncovered_count || 0} still to check. A checked item may still be unresolved.`
+        : "Review each recommendation and accept it, change it, or close the outcome.",
     ),
   );
   head.append(copy);
@@ -414,13 +398,12 @@ function renderGuidedReview(snapshot) {
     const overview = textElement(
       "button",
       "quiet-action guided-review-overview-toggle",
-      guidedReviewOverviewVisible ? "Return to review" : "Show all work",
+      "See everything",
     );
     overview.type = "button";
-    overview.setAttribute("aria-expanded", guidedReviewOverviewVisible ? "true" : "false");
+    overview.setAttribute("aria-label", "See everything Seld is carrying");
     overview.addEventListener("click", () => {
-      guidedReviewOverviewVisible = !guidedReviewOverviewVisible;
-      render();
+      navigate("storylines");
     });
     head.append(overview);
   }
@@ -446,7 +429,7 @@ function renderGuidedReview(snapshot) {
     }
     if (guidedReviewDraft) {
       warning.append(guidedReviewDraftRecovery(
-        "The review state changed before this answer was saved. Your draft remains here; repair current truth, then retry.",
+        "The review changed before this answer was saved. Your draft remains here; repair the latest review, then retry.",
       ));
     }
     section.append(warning);
@@ -480,8 +463,8 @@ function renderGuidedReview(snapshot) {
         "p",
         "",
         portfolio.available
-          ? "No finite review session is open. Start one Codex review hand; answers then travel through the authenticated Bridge intent queue."
-          : "The complete authored Portfolio is not available yet. Codex must author it from the full open task set before review can begin.",
+          ? "No Rundown is open yet. Start one ChatGPT task; your answers will return through Seld's private local queue."
+          : "Seld does not have the complete open set yet. ChatGPT must prepare it before a Rundown can begin.",
       ),
     );
     const delivery = renderGuidedReviewDelivery(review, snapshot.controls);
@@ -513,11 +496,11 @@ function renderGuidedReview(snapshot) {
           },
           { handUrl: review.hand_url, status },
         );
-        if (queued) status.textContent = "Starting the review in this Bridge…";
+        if (queued) status.textContent = "Preparing your Rundown…";
       });
       empty.append(start, status);
     } else if (review.start_url && !review.pending_start && !guidedReviewDeliveryBlocksInput()) {
-      const start = textElement("a", "primary-action", "Start in Codex");
+      const start = textElement("a", "primary-action", "Start in ChatGPT");
       start.href = review.start_url;
       empty.append(
         start,
@@ -526,7 +509,7 @@ function renderGuidedReview(snapshot) {
           "guided-review-capability-note",
           transport.enabled
             ? "Automatic continuation is not currently available on this installed path."
-            : "Same-hand Bridge continuation is off in this foundation build.",
+            : "Seld cannot safely continue the same ChatGPT task in this build.",
         ),
       );
     }
@@ -541,7 +524,7 @@ function renderGuidedReview(snapshot) {
     const facts = element("div", "guided-review-facts");
     facts.append(
       textElement("span", "status-pill", statusLabel(task)),
-      textElement("span", "", `Portfolio ${subject.position} of ${review.open_count}`),
+      textElement("span", "", `Decision ${subject.position} of ${review.open_count}`),
       textElement("span", "", task.rank === null ? "No authored rank" : `Rank ${task.rank}`),
     );
     const title = textElement("h3", "", task.title);
@@ -572,7 +555,7 @@ function renderGuidedReview(snapshot) {
           "p",
           "",
           staleFacts.join(" ") ||
-            "The Portfolio anchor is older than the current task or storyline.",
+            "The saved context for this decision is older than its current task or situation.",
         ),
       );
       card.append(evidenceWarning);
@@ -599,7 +582,7 @@ function renderGuidedReview(snapshot) {
     const judgment = element("div", "guided-review-judgment");
     const recommendation = element("div", "guided-review-recommendation");
     recommendation.append(
-      textElement("strong", "guided-review-label", "The Mind recommends"),
+      textElement("strong", "guided-review-label", "Seld recommends"),
       textElement("p", "", review.recommendation || "No recommendation has been authored yet."),
     );
     const question = element("div", "guided-review-question");
@@ -680,10 +663,10 @@ function renderGuidedReview(snapshot) {
         "p",
         "",
         currentTurnReceipt?.sheet_state === "turn_returned_no_answer"
-          ? "The exact review hand completed without a user-facing answer. GSV did not reuse output from an earlier turn; continue the same hand to prepare the current set."
+          ? "The same ChatGPT task completed without an answer. Seld did not reuse an older result; continue there to prepare the current set."
           : changed
-          ? "The review session changed after this receipt. GSV withheld the old questions and picks instead of rebinding them to the new session."
-          : "GSV does not persist model output as a hidden cache. Continue the exact review hand to prepare the current set again; the old answer will not be replayed.",
+          ? "The Rundown changed after this answer was saved. Seld withheld the old questions and choices instead of attaching them to the new session."
+          : "Seld does not keep discarded answers as a hidden copy. Continue in the same ChatGPT task to prepare the current set again; the old answer will not be replayed.",
       ),
     );
     const recovered = renderGuidedReviewPreparedRecovery();
@@ -698,11 +681,11 @@ function renderGuidedReview(snapshot) {
   if (review.prepared && !review.pending_intent) {
     const unavailable = element("div", "guided-review-warning", { role: "status" });
     unavailable.append(
-      textElement("strong", "", "The prepared decisions are not available in this process"),
+      textElement("strong", "", "This prepared set needs to be rebuilt"),
       textElement(
         "p",
         "",
-        "GSV does not persist model output as a hidden preparation cache. Continue the exact review hand to regenerate a subject-bound board from current records.",
+        "Seld does not keep discarded answers as a hidden copy. Continue in the same ChatGPT task to rebuild the current decision set.",
       ),
     );
     const exactHand = retainedExactGuidedReviewHandUrl(review.hand_url);
@@ -723,15 +706,15 @@ function renderGuidedReview(snapshot) {
         "p",
         "",
         review.issue
-          ? "The session needs a fresh Codex repair hand before review can continue."
-          : "The session is durable, but no exact Codex hand is currently claimed.",
+          ? "The session needs a fresh ChatGPT repair task before the Rundown can continue."
+          : "The session is saved, but no ChatGPT task is currently connected.",
       ),
     );
     if (review.start_url) {
       const link = textElement(
         "a",
         "primary-action",
-        review.issue ? "Repair in Codex" : "Resume the review hand",
+        review.issue ? "Repair in ChatGPT" : "Resume this Rundown",
       );
       link.href = review.start_url;
       resume.append(link);
@@ -747,7 +730,7 @@ function renderGuidedReview(snapshot) {
       textElement(
         "p",
         "",
-        "The same review hand is reading current truth. It must apply any justified native CAS changes and acknowledge this exact receipt before another answer is accepted.",
+        "Seld is applying your previous answer to the same saved session. Wait for confirmation before sending another.",
       ),
     );
     const pendingHandUrl = retainedExactGuidedReviewHandUrl(review.hand_url);
@@ -756,7 +739,7 @@ function renderGuidedReview(snapshot) {
     if (queuedRecovery) pending.append(queuedRecovery);
     if (guidedReviewDraft && !review.issue) {
       pending.append(guidedReviewDraftRecovery(
-        "The review queue changed before this answer was saved. Your draft remains here; retry after the current receipt is resolved.",
+        "The review queue changed before this answer was saved. Your draft remains here; retry after the saved answer is resolved.",
       ));
     }
     section.append(pending);
@@ -772,13 +755,13 @@ function renderGuidedReview(snapshot) {
   if (!transport.enabled || !transport.automatic_resume) {
     const fallback = element("div", "guided-review-empty", { role: "status" });
     fallback.append(
-      textElement("strong", "", "Continue in the exact Codex hand"),
+      textElement("strong", "", "Continue in the same ChatGPT task"),
       textElement(
         "p",
         "",
         transport.enabled
-          ? "The restricted same-hand continuation check did not pass, so Bridge will not queue an answer it cannot deliver."
-          : "Same-hand Bridge continuation is off in this foundation build.",
+          ? "Seld could not verify the same ChatGPT task, so it will not queue an answer it cannot deliver."
+          : "Seld cannot safely continue the same ChatGPT task in this build.",
       ),
     );
     const unavailableHandUrl = retainedExactGuidedReviewHandUrl(review.hand_url);
@@ -829,7 +812,7 @@ function renderGuidedReview(snapshot) {
       ),
     );
   }
-  const label = textElement("label", "guided-review-label", "Tell the Mind what you want");
+  const label = textElement("label", "guided-review-label", "Tell Seld what you want");
   const input = element("textarea", "control-input", {
     maxlength: "4096",
     rows: "3",
@@ -982,7 +965,7 @@ function renderGuidedReviewPreparedRecovery() {
     textElement(
       "p",
       "",
-      "The review changed before the queue accepted them. GSV kept the wording below as plain recovery text and will not bind it to the refreshed set. Compare it with the current questions and choose again.",
+      "The Rundown changed before the queue accepted these answers. Seld kept the wording below as recovery text and will not attach it to the refreshed set. Compare it with the current questions and choose again.",
     ),
     label,
     text,
@@ -1010,13 +993,18 @@ function renderGuidedReviewPreparedBoard(snapshot, review, receipt, sheet) {
   const form = element("form", "guided-review-prepared-form");
   const head = element("div", "guided-review-prepared-head");
   const headCopy = element("div");
+  const staleCount = sheet.filter((entry) => entry.stale).length;
   headCopy.append(
-    textElement("p", "section-label", `${sheet.length} worked and waiting`),
-    textElement("h3", "", "Decisions that genuinely need you"),
+    textElement("p", "section-label", `${sheet.length} decisions`),
+    textElement(
+      "h3",
+      "",
+      staleCount ? "Some decisions need refreshing" : "Review the prepared decisions",
+    ),
     textElement(
       "p",
       "",
-      "Answer any number. Only answered rows travel; silence about a row means nothing was decided.",
+      "Send any subset of answers. Rows you leave unanswered remain unchanged.",
     ),
   );
   const editBatch = textElement(
@@ -1063,7 +1051,7 @@ function renderGuidedReviewPreparedBoard(snapshot, review, receipt, sheet) {
     if (entry.dissent) {
       const dissent = element("div", "guided-review-prepared-dissent");
       dissent.append(
-        textElement("strong", "", "The Mind disagrees with you"),
+        textElement("strong", "", "Why Seld disagrees"),
         textElement("p", "", entry.dissent),
       );
       card.append(dissent);
@@ -1295,7 +1283,7 @@ function renderGuidedReviewPausedPanel(snapshot, review) {
   const paused = element("div", "guided-review-empty", { role: "status" });
   paused.append(
     textElement("strong", "", "Review paused at this exact set"),
-    textElement("p", "", "Resume continues the same durable session and Codex hand."),
+    textElement("p", "", "Resume continues the same saved session and ChatGPT task."),
   );
   if (
     transport.enabled &&
@@ -1320,7 +1308,7 @@ function renderGuidedReviewPausedPanel(snapshot, review) {
         },
         { handUrl: review.hand_url, status },
       );
-      if (queued) status.textContent = "Resuming the exact review hand…";
+      if (queued) status.textContent = "Resuming the same ChatGPT task…";
     });
     paused.append(resume, status);
   }
@@ -1331,7 +1319,7 @@ function renderGuidedReviewPausedPanel(snapshot, review) {
 
 function renderGuidedReviewPreparedSessionControls(snapshot, review, sheet, form) {
   const controls = element("section", "guided-review-prepared-session");
-  const label = textElement("label", "guided-review-label", "Tell the Mind something about this set");
+  const label = textElement("label", "guided-review-label", "Tell Seld something about this set");
   const input = element("textarea", "control-input", { maxlength: "4096", rows: "3" });
   input.id = "guided-review-answer";
   label.htmlFor = input.id;
@@ -1433,7 +1421,7 @@ function appendReviewFact(list, label, value) {
 }
 
 function exactHandFallback(url) {
-  const link = textElement("a", "quiet-action", "Open the exact review hand");
+  const link = textElement("a", "quiet-action", "Open the same ChatGPT task");
   link.href = url;
   return link;
 }
@@ -1486,7 +1474,7 @@ function renderGuidedReviewQueuedRecovery(snapshot, review) {
       eventId,
       handUrl: review.hand_url || null,
       liveCheckedAt: null,
-      message: "This exact intent was already saved. GSV is continuing its existing receipt without appending or replaying it.",
+      message: "Seld is continuing the saved answer.",
       pendingSeen: true,
       queueRevision: snapshot.controls?.queue_revision || null,
       resolvedAt: null,
@@ -1510,7 +1498,7 @@ function renderGuidedReviewQueuedRecovery(snapshot, review) {
     textElement(
       "small",
       "guided-review-support",
-      "Uses the already queued event ID. It does not append the answer again.",
+      "No new queue item will be created.",
     ),
   );
   return recovery;
@@ -1530,7 +1518,7 @@ async function queueGuidedReviewIntent(
   try {
     const payload = await appendControlIntent(snapshot, bridgeToken, intent, { maxBytes });
     const eventId = payload.event?.event_id;
-    if (!eventId) throw new Error("The Bridge saved no exact review receipt.");
+    if (!eventId) throw new Error("Bridge saved no delivery record for this answer.");
     guidedReviewDelivery = {
       checkedAt: null,
       eventId,
@@ -1562,7 +1550,7 @@ async function queueGuidedReviewIntent(
       guidedReviewNotice = conflictMessage || "The review queue changed while you were answering. Your draft is still here; review the refreshed outcome, then retry.";
       const refreshed = await loadSnapshot({ quiet: true });
       if (!refreshed) {
-        guidedReviewNotice = conflictMessage || "The review queue changed while you were answering. Your draft is still here; refresh current truth, then retry.";
+        guidedReviewNotice = conflictMessage || "The review queue changed while you were answering. Your draft is still here; refresh the latest review, then retry.";
       }
       guidedReviewNoticeContext = guidedReviewContextFingerprint(state.snapshot);
       render();
@@ -1594,7 +1582,7 @@ async function continueGuidedReviewTurn(eventId, handUrl) {
     const triggered = await triggerReviewTurn(bridgeToken, eventId);
     if (generation !== guidedReviewPollGeneration) return;
     if (!updateGuidedReviewReceipt(triggered, handUrl, eventId)) {
-      throw new Error("Bridge returned a different review receipt.");
+      throw new Error("Bridge returned a different delivery record.");
     }
     const triggeredCurrent = guidedReviewDelivery?.eventId === eventId
       ? guidedReviewDelivery.receipt
@@ -1609,7 +1597,7 @@ async function continueGuidedReviewTurn(eventId, handUrl) {
       const receipt = await readReviewTurn(bridgeToken, eventId);
       if (generation !== guidedReviewPollGeneration) return;
       if (!updateGuidedReviewReceipt(receipt, handUrl, eventId)) {
-        throw new Error("Bridge returned a different review receipt.");
+        throw new Error("Bridge returned a different delivery record.");
       }
       const currentReceipt = guidedReviewDelivery?.eventId === eventId
         ? guidedReviewDelivery.receipt
@@ -1618,9 +1606,13 @@ async function continueGuidedReviewTurn(eventId, handUrl) {
         await finishGuidedReviewDelivery(currentReceipt);
         return;
       }
+      if ((attempt + 1) % GUIDED_REVIEW_SNAPSHOT_POLL_EVERY === 0) {
+        await loadSnapshot({ quiet: true });
+        if (generation !== guidedReviewPollGeneration) return;
+      }
     }
     updateGuidedReviewMessage(
-      "The review hand is still working. GSV will not resend your answer; use the exact hand if you need to inspect it now.",
+      "The review task is still working. Seld will not resend your answer; open the same ChatGPT task if you need to inspect it now.",
     );
   } catch (error) {
     if (guidedReviewDelivery?.eventId === eventId) {
@@ -1628,10 +1620,10 @@ async function continueGuidedReviewTurn(eventId, handUrl) {
     }
     updateGuidedReviewMessage(
       error.status === 409
-        ? "The review changed after this answer was queued. Your wording remains saved once and was not replayed. Reload current truth, then reconcile the queued receipt before retrying."
+        ? "The review changed after this answer was saved. Your wording remains stored once and was not replayed. Reload the latest review, then resolve the saved answer before retrying."
         : error.status === 404
-          ? "The review receipt is unavailable. Reload current truth; do not retry until the queued intent is reconciled."
-          : "Bridge could not read the review receipt. Your queued answer was not replayed; inspect the exact hand before retrying.",
+          ? "The delivery record is unavailable. Reload the latest review; do not retry until the saved answer is resolved."
+          : "Bridge could not read the delivery record. Your saved answer was not replayed; inspect the same ChatGPT task before retrying.",
     );
     await loadSnapshot({ quiet: true });
   } finally {
@@ -1660,22 +1652,22 @@ async function finishGuidedReviewDelivery(receipt) {
   if (receipt.state === "completed") {
     updateGuidedReviewMessage(
       receipt.final_answer
-        ? "The same review hand replied. Canonical state has been refreshed below."
-        : "The review turn completed. Canonical state has been refreshed below.",
+        ? "The same ChatGPT task replied. Your saved record has been refreshed below."
+        : "The review turn completed. Your saved record has been refreshed below.",
     );
   } else if (receipt.state === "failed_safe") {
     updateGuidedReviewMessage(
-      "The turn was proven not to have been delivered. You may retry this exact receipt once the cause is fixed.",
+      "Seld proved that this answer was not delivered. You may retry it once the cause is fixed.",
     );
   } else if (receipt.state === "delivery_uncertain") {
     updateGuidedReviewMessage(
       receipt.thread_id
-        ? "GSV cannot prove whether Codex received this answer. It will not resend it; reconcile the exact hand and canonical records."
-        : "GSV cannot recover the Codex hand for this turn. It will not resend it; inspect recent Codex tasks and canonical records before deciding what to do.",
+        ? "Seld cannot prove whether ChatGPT received this answer. It will not resend it; reconcile the same ChatGPT task and saved record."
+        : "Seld cannot recover the ChatGPT task for this turn. It will not resend it; inspect recent ChatGPT tasks and the saved record before deciding what to do.",
     );
   } else {
     updateGuidedReviewMessage(
-      "Automatic continuation is blocked. Your local receipt remains visible and has not been replayed.",
+      "Automatic continuation is blocked. Your delivery record remains visible and the answer has not been replayed.",
     );
   }
   await loadSnapshot({ quiet: true });
@@ -1726,6 +1718,52 @@ function updateGuidedReviewMessage(message) {
   render();
 }
 
+function guidedReviewDispositionIsOutOfBand(controls, receipt) {
+  if (!receipt?.event_id || !receipt?.thread_id) return false;
+  const resolved = [...(controls?.items || []), ...(controls?.history || [])].find(
+    (item) =>
+      item?.event?.event_id === receipt.event_id &&
+      ["accepted", "rejected"].includes(item?.status),
+  );
+  const actorRef = resolved?.disposition?.actor_ref;
+  return typeof actorRef === "string" && actorRef !== `codex:${receipt.thread_id}`;
+}
+
+function reconcileActiveGuidedReviewDisposition(review, controls) {
+  const delivery = guidedReviewDelivery;
+  const current = delivery?.receipt;
+  if (!current?.event_id || guidedReviewActivePollEventId !== current.event_id) return;
+  const pendingEventIds = [review?.pending_intent?.event_id, review?.pending_start?.event_id]
+    .filter(Boolean);
+  if (pendingEventIds.includes(current.event_id)) {
+    guidedReviewDelivery = { ...delivery, pendingSeen: true, resolvedAt: null };
+    return;
+  }
+  const resolvedOutOfBand = guidedReviewDispositionIsOutOfBand(controls, current);
+  if (
+    current.state === "completed" ||
+    review?.state === "unavailable" ||
+    controls?.available !== true ||
+    !resolvedOutOfBand ||
+    delivery.resolvedAt
+  ) return;
+  const resolvedAt = Date.now();
+  guidedReviewDelivery = { ...delivery, resolvedAt };
+  window.setTimeout(() => {
+    const latest = guidedReviewDelivery;
+    if (
+      latest?.eventId !== current.event_id ||
+      latest.receipt?.state === "completed" ||
+      latest.resolvedAt !== resolvedAt ||
+      Date.now() - resolvedAt < GUIDED_REVIEW_DISPOSITION_GRACE_MS
+    ) return;
+    guidedReviewPollGeneration += 1;
+    guidedReviewActivePollEventId = null;
+    guidedReviewDelivery = null;
+    render();
+  }, GUIDED_REVIEW_DISPOSITION_GRACE_MS);
+}
+
 function syncGuidedReviewDelivery(receipt, handUrl, review, controls) {
   if (!receipt?.event_id) {
     const current = guidedReviewDelivery?.receipt;
@@ -1735,45 +1773,14 @@ function syncGuidedReviewDelivery(receipt, handUrl, review, controls) {
       guidedReviewDelivery = { ...guidedReviewDelivery, pendingSeen: true };
       return;
     }
-    const observedQueuedRevision =
-      guidedReviewDelivery?.queueRevision &&
-      controls?.queue_revision === guidedReviewDelivery.queueRevision;
-    const resolvedVisible = [...(controls?.items || []), ...(controls?.history || [])].some(
-      (item) =>
-        item?.event?.event_id === current?.event_id &&
-        ["accepted", "rejected"].includes(item?.status),
-    );
+    const resolvedOutOfBand = guidedReviewDispositionIsOutOfBand(controls, current);
     if (
       current?.event_id &&
       current.state !== "completed" &&
       review?.state !== "unavailable" &&
       controls?.available === true &&
-      (guidedReviewDelivery?.pendingSeen === true || observedQueuedRevision || resolvedVisible)
+      resolvedOutOfBand
     ) {
-      if (guidedReviewActivePollEventId === current.event_id) {
-        if (!guidedReviewDelivery.resolvedAt) {
-          const resolvedAt = Date.now();
-          guidedReviewDelivery = { ...guidedReviewDelivery, resolvedAt };
-          window.setTimeout(() => {
-            const delivery = guidedReviewDelivery;
-            if (
-              delivery?.eventId !== current.event_id ||
-              delivery.receipt?.state === "completed" ||
-              delivery.resolvedAt !== resolvedAt ||
-              Date.now() - resolvedAt < GUIDED_REVIEW_DISPOSITION_GRACE_MS
-            ) return;
-            guidedReviewPollGeneration += 1;
-            guidedReviewActivePollEventId = null;
-            guidedReviewDelivery = null;
-            render();
-          }, GUIDED_REVIEW_DISPOSITION_GRACE_MS);
-          return;
-        }
-        if (
-          Date.now() - guidedReviewDelivery.resolvedAt <
-          GUIDED_REVIEW_DISPOSITION_GRACE_MS
-        ) return;
-      }
       guidedReviewPollGeneration += 1;
       guidedReviewActivePollEventId = null;
       guidedReviewDelivery = null;
@@ -1869,7 +1876,7 @@ function guidedReviewElapsedLabel(startedAt, now = Date.now()) {
 }
 
 function guidedReviewCheckedLabel(checkedAt, now = Date.now()) {
-  if (!Number.isFinite(checkedAt) || checkedAt <= 0) return "Checking the receipt";
+  if (!Number.isFinite(checkedAt) || checkedAt <= 0) return "Checking delivery";
   const seconds = Math.max(0, Math.floor((now - checkedAt) / 1_000));
   return seconds < 5 ? "Checked just now" : `Checked ${seconds}s ago`;
 }
@@ -1893,7 +1900,7 @@ function guidedReviewActivityParts(delivery, now = Date.now()) {
     Number.isFinite(delivery.liveCheckedAt) &&
     now - delivery.liveCheckedAt < 5_000
   ) {
-    parts.push("Same review hand active");
+    parts.push("Same ChatGPT task active");
   }
   return parts;
 }
@@ -1937,15 +1944,15 @@ function renderGuidedReviewDelivery(review, controls) {
   });
   const titles = {
     blocked: "Automatic continuation is unavailable",
-    completed: "The review hand replied",
+    completed: "ChatGPT replied",
     delivery_uncertain: "Delivery could not be confirmed",
     failed_safe: "The turn did not start",
     pending: "Answer saved locally",
-    running: "The Mind is working",
-    starting: "Opening the exact review hand",
+    running: "Seld is working",
+    starting: "Opening the same ChatGPT task",
   };
   statusCopy.append(
-    textElement("strong", "", titles[receipt.state] || "Review turn status"),
+    textElement("strong", "", titles[receipt.state] || "Rundown status"),
     textElement(
       "p",
       "",
@@ -1970,7 +1977,7 @@ function renderGuidedReviewDelivery(review, controls) {
   }
   const actions = element("div", "guided-review-delivery-actions");
   if (receipt.retryable) {
-    const retry = textElement("button", "primary-action", "Retry this exact turn");
+    const retry = textElement("button", "primary-action", "Retry this answer");
     retry.type = "button";
     retry.addEventListener("click", () => {
       if (guidedReviewSendPending) return;
@@ -1998,7 +2005,7 @@ function renderGuidedReviewDelivery(review, controls) {
     [review.pending_intent?.event_id, review.pending_start?.event_id].includes(receipt.event_id);
   if (unresolvedPendingEvent) {
     const resolution = renderControlReviewActions(controls || {}, {
-      linkLabel: "Resolve queued receipt",
+      linkLabel: "Resolve saved answer",
     });
     if (resolution) actions.append(resolution);
   }
@@ -2017,7 +2024,7 @@ function renderGuidedReviewDelivery(review, controls) {
       textElement(
         "small",
         "guided-review-reason",
-        `Reason: ${receipt.reason_code.replaceAll("_", " ")}`,
+        guidedReviewReasonCopy(receipt.reason_code),
       ),
     );
   }
@@ -2040,26 +2047,43 @@ function retainedExactGuidedReviewHandUrl(url) {
 
 function guidedReviewStateCopy(receipt) {
   if (receipt.state === "pending") {
-    return "Your exact answer is stored once while Bridge prepares delivery. You can leave this view; the review keeps its place.";
+    return "Your answer is stored locally while Seld prepares delivery; you can leave without losing it.";
   }
   if (receipt.state === "starting") {
-    return "Bridge is confirming delivery to one review hand. You can leave this view; the review keeps its place.";
+    return "Seld is confirming delivery to the same ChatGPT task.";
   }
   if (receipt.state === "running") {
-    return "The same review hand is reading current records and applying only what you asked for. This can take a minute or two; you can leave this view without losing your place.";
+    return "The same review task is using current records to process your answer. You can leave while it continues.";
   }
   if (receipt.state === "completed") {
-    return "The turn completed and canonical state has been refreshed.";
+    return "The answer completed and your saved record has been refreshed.";
   }
   if (receipt.state === "failed_safe") {
-    return "GSV proved the turn was not delivered, so this exact receipt is safe to retry.";
+    return "Seld proved the answer was not delivered, so it is safe to retry.";
   }
   if (receipt.state === "delivery_uncertain") {
     return receipt.thread_id
-      ? "GSV cannot prove whether Codex received this answer. It will not resend it; reconcile the exact hand and canonical records."
-      : "GSV cannot recover the Codex hand for this turn. It will not resend it; inspect recent Codex tasks and canonical records before deciding what to do.";
+      ? "Seld cannot prove whether ChatGPT received this answer. It will not resend it; reconcile the same ChatGPT task and saved record."
+      : "Seld cannot recover the ChatGPT task for this turn. It will not resend it; inspect recent ChatGPT tasks and the saved record before deciding what to do.";
   }
-  return "The queued receipt remains local. Continue in the exact hand or repair the installed capability.";
+  return "The queued answer remains local. Continue in the same ChatGPT task or repair the connection.";
+}
+
+function guidedReviewReasonCopy(reasonCode) {
+  const messages = {
+    canonical_context_unavailable_before_delivery: "The saved review was unavailable before delivery.",
+    context_changed_after_queue_append: "The review changed before delivery.",
+    context_changed_before_delivery: "The review changed before delivery.",
+    event_not_pending_before_delivery: "This saved answer was already resolved.",
+    interrupted_after_possible_spawn: "Delivery may have started, so Seld will not resend the answer automatically.",
+    operation_state_unavailable_before_delivery: "The saved answer was unavailable before delivery.",
+    spawn_failed_before_child: "ChatGPT could not be opened.",
+    transport_receipt_store_full: "Seld could not save another delivery record.",
+    transport_submission_unavailable: "Automatic delivery is unavailable.",
+    transport_unavailable_before_spawn: "Automatic delivery is unavailable.",
+    worker_lock_contended_before_spawn: "Another review delivery is already in progress.",
+  };
+  return messages[reasonCode] || "Seld stopped safely before retrying.";
 }
 
 function wait(milliseconds) {
@@ -2097,10 +2121,10 @@ function renderTaskBoard(tasks, limit = null) {
         const disclosure = textElement(
           "button",
           "primary-action",
-          `${remaining} more · View all work`,
+          `${remaining} more · See everything`,
         );
         disclosure.type = "button";
-        disclosure.addEventListener("click", () => navigate("commitments"));
+        disclosure.addEventListener("click", () => navigate("storylines"));
         list.append(disclosure);
       }
     }
@@ -2163,21 +2187,46 @@ function renderCompactTasks(tasks) {
 
 function renderStorylines(snapshot) {
   const container = element("div");
+  const taskProjection = projectionSection(snapshot, "tasks");
+  const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
+  const completed = snapshot.tasks.filter((task) => ["done", "dropped"].includes(task.status));
+  if (taskProjection.state !== "complete") {
+    container.append(renderProjectionWarning(taskProjection, "work"));
+  }
+  if (taskProjection.state === "complete" && snapshot.tasks.length === 0) {
+    container.append(renderFirstRun(snapshot));
+  } else if (taskProjection.state === "complete" && openTasks.length === 0) {
+    container.append(renderAllClear(snapshot));
+  } else if (openTasks.length > 0) {
+    const workHeading = element("div", "section-head");
+    const workHeadingText = element("div");
+    workHeadingText.append(
+      textElement("p", "section-label", "Open work"),
+      textElement("h2", "", "Open work"),
+    );
+    workHeading.append(
+      workHeadingText,
+      textElement("p", "section-meta", `${openTasks.length} open`),
+    );
+    container.append(workHeading, renderTaskBoard(openTasks));
+  }
+  appendClosedHistory(container, completed);
+
   const threadProjection = projectionSection(snapshot, "threads");
   const heading = element("div", "section-head");
   const headingText = element("div");
   headingText.append(
-    textElement("p", "section-label", "Across tasks"),
-    textElement("h2", "", "Work that belongs together"),
+    textElement("p", "section-label", "Situations"),
+    textElement("h2", "", "Related situations"),
   );
   heading.append(headingText, textElement("p", "section-meta", `${snapshot.threads.length} total`));
   container.append(heading);
   if (threadProjection.state !== "complete") {
-    container.append(renderProjectionWarning(threadProjection, "related work"));
+    container.append(renderProjectionWarning(threadProjection, "situations"));
   }
   if (snapshot.threads.length === 0) {
     if (threadProjection.state === "complete") {
-      container.append(textElement("div", "empty-lane", "No related work has been saved yet."));
+      container.append(textElement("div", "empty-lane", "No situations have been connected yet."));
     }
     return container;
   }
@@ -2211,11 +2260,11 @@ function renderMind(snapshot) {
   const head = element("div", "section-head");
   const headText = element("div");
   headText.append(
-    textElement("p", "section-label", "Saved context"),
-    textElement("h2", "", "What you want Codex to know"),
+    textElement("p", "section-label", "Living context"),
+    textElement("h2", "", "Saved context"),
   );
   head.append(headText, textElement("p", "section-meta", revisionLabel(snapshot.mind.revision)));
-  main.append(head, renderDocument(snapshot.mind.content));
+  main.append(head, renderDirection(snapshot.direction), renderDocument(snapshot.mind.content));
 
   const side = element("aside", "mind-side");
   side.append(textElement("h3", "", "People and projects"));
@@ -2246,6 +2295,47 @@ function renderMind(snapshot) {
   return layout;
 }
 
+function renderDirection(direction) {
+  const section = element("section", "direction-panel");
+  section.append(textElement("p", "section-label", "Direction"));
+  if (direction === null) {
+    section.append(
+      textElement("h3", "", "Your direction is not set yet"),
+      textElement("p", "", "Tell Seld what you are trying to change and what cannot be dropped."),
+    );
+    return section;
+  }
+  if (!direction || direction.available === false) {
+    section.append(
+      textElement("h3", "", "Direction unavailable"),
+      textElement("p", "", "Seld could not safely read this part of your record."),
+    );
+    return section;
+  }
+  section.append(
+    textElement("h3", "", direction.current_chapter || "Current direction"),
+    textElement(
+      "p",
+      "direction-status",
+      `${capitalize(direction.status || "provisional")} · ${relativeTime(direction.updated_at)}`,
+    ),
+  );
+  const aims = Array.isArray(direction.aims) ? direction.aims : [];
+  if (aims.length) {
+    const list = element("ul", "direction-aims");
+    for (const aim of aims) {
+      const item = element("li");
+      item.append(
+        textElement("strong", "", aim.title || "Aim"),
+        textElement("span", "", aim.desired_state || ""),
+      );
+      list.append(item);
+    }
+    section.append(list);
+  }
+  return section;
+}
+
 function projectionSection(snapshot, name) {
   const section = snapshot.projection?.sections?.[name];
   if (section && ["complete", "partial", "unavailable"].includes(section.state)) return section;
@@ -2263,7 +2353,7 @@ function renderProjectionWarning(section, label) {
   const readable = Number(section.readable || 0);
   const summary =
     section.state === "unavailable"
-      ? `GSV could not safely read these files. Review ${paths || label} with gsv doctor.`
+      ? `Seld could not safely read these files. Review ${paths || label} with gsv doctor.`
       : `${readable} readable ${readable === 1 ? "record is" : "records are"} shown; some files could not be read. Review ${paths || label} with gsv doctor.`;
   warning.append(
     textElement("p", "section-label", "Integrity warning"),
@@ -2278,7 +2368,7 @@ function renderSystem(snapshot) {
   const list = element("div", "system-list");
   list.append(
     systemRow(
-      "GSV files",
+      "Seld record",
       `Version ${snapshot.bridge.version}; readable Markdown. Older processes cannot overwrite newer changes.`,
       snapshot.doctor.healthy ? "Healthy" : "Needs attention",
       snapshot.doctor.healthy ? "" : "is-error",
@@ -2290,19 +2380,25 @@ function renderSystem(snapshot) {
       "",
     ),
     systemRow(
-      "Codex",
+      "Sources",
+      sourceSystemCopy(snapshot),
+      sourceSystemStatus(snapshot),
+      sourceSystemClass(snapshot),
+    ),
+    systemRow(
+      "ChatGPT",
       codexSystemCopy(snapshot),
       codexSystemStatus(snapshot),
       codexReady(snapshot) ? "" : "is-warning",
     ),
     systemRow(
-      "Local dashboard",
-      "Local canonical views plus a bounded queue for your explicit choices and corrections.",
+      "Local Bridge",
+      "Your brief is read-only except for the choices and corrections you explicitly submit.",
       "Local",
       "",
     ),
     systemRow(
-      "Bridge intent queue",
+      "Correction queue",
       controlSystemCopy(snapshot),
       controlSystemStatus(snapshot),
       snapshot.controls?.available || snapshot.bridge?.control_queue === false
@@ -2310,12 +2406,13 @@ function renderSystem(snapshot) {
         : "is-error",
     ),
     systemRow(
-      "Automatic task updates",
-      "GSV shows saved changes but does not change task status on its own.",
-      "Off",
+      "Approval boundary",
+      "Seld prepares consequential actions. Nothing is sent, booked, bought, or paid without you.",
+      "You decide",
       "",
     ),
   );
+  for (const row of sourceSystemRows(snapshot)) list.append(row);
   container.append(
     list,
     renderControlPanel(snapshot, {
@@ -2330,7 +2427,7 @@ function renderSystem(snapshot) {
   );
   if (!snapshot.doctor.healthy) container.append(renderDoctorRecovery(snapshot.doctor));
   if (!codexReady(snapshot) && !snapshot.codex.checking) {
-    container.append(renderRecoveryCommand("Connect Codex", "gsv codex install"));
+    container.append(renderRecoveryCommand("Connect ChatGPT", "gsv codex install"));
   }
   return container;
 }
@@ -2340,7 +2437,7 @@ function renderDoctorRecovery(doctor) {
   const copy = element("div");
   copy.append(
     textElement("p", "section-label", "Integrity check"),
-    textElement("h2", "", "Your GSV files need attention"),
+    textElement("h2", "", "Your Seld record needs attention"),
   );
   const issues = element("ul", "issue-list");
   for (const issue of doctor.issues || []) {
@@ -2348,7 +2445,7 @@ function renderDoctorRecovery(doctor) {
     item.append(
       textElement("strong", "", issue.path || issue.code || "File issue"),
       textElement("span", "", issue.message || "The integrity check did not pass."),
-      textElement("small", "", issue.repairable ? "Repairable by GSV" : "Review required"),
+      textElement("small", "", issue.repairable ? "Seld can repair this" : "Review required"),
     );
     issues.append(item);
   }
@@ -2408,8 +2505,8 @@ function renderCodexAction(snapshot, label, urlKey = "new_hand_url") {
   }
   if (snapshot.codex.checking) {
     const checking = element("div", "checking-action");
-    checking.append(createThinkingOrb("searching", "Checking Codex setup"));
-    checking.append(textElement("span", "", "Checking Codex"));
+    checking.append(createThinkingOrb("searching", "Checking ChatGPT setup"));
+    checking.append(textElement("span", "", "Checking ChatGPT"));
     return checking;
   }
   const recovery = element("div", "codex-recovery");
@@ -2425,13 +2522,13 @@ function codexReady(snapshot) {
 }
 
 function codexSystemCopy(snapshot) {
-  if (snapshot.codex.checking) return "Checking the local Codex integration.";
+  if (snapshot.codex.checking) return "Checking the local ChatGPT integration.";
   if (codexReady(snapshot)) {
-    return "The GSV integration is installed. New-task links point Codex to your saved GSV record.";
+    return "The Seld integration is installed. Continuation links open ChatGPT with your saved local record.";
   }
   if (snapshot.codex.error) return snapshot.codex.error;
-  if (snapshot.codex.available) return "Codex is present, but its GSV integration is incomplete.";
-  return "Your GSV files are available, but Codex could not be found.";
+  if (snapshot.codex.available) return "ChatGPT is present, but its Seld integration is incomplete.";
+  return "Your Seld record is available, but ChatGPT could not be found.";
 }
 
 function codexSystemStatus(snapshot) {
@@ -2439,6 +2536,132 @@ function codexSystemStatus(snapshot) {
   if (codexReady(snapshot)) return "Installed";
   if (snapshot.codex.available) return "Run setup";
   return "Unavailable";
+}
+
+function sourceSystemCopy(snapshot) {
+  const state = snapshot.sources || {};
+  if (state.available === false) return state.error || "Source coverage is unavailable.";
+  const sources = Array.isArray(state.sources) ? state.sources : [];
+  if (!sources.length) {
+    return "Choose the places Seld may read in ChatGPT. Nothing is scanned by default.";
+  }
+  const current = sources.filter(
+    (item) =>
+      item.freshness === "current" &&
+      item.observation?.result !== "failure" &&
+      item.observation?.completeness === "complete",
+  ).length;
+  const partial = sources.filter(
+    (item) =>
+      item.freshness === "current" &&
+      item.observation?.result !== "failure" &&
+      item.observation?.completeness === "partial",
+  ).length;
+  const unread = sources.filter((item) => item.freshness === "unread").length;
+  const stale = sources.filter((item) => item.freshness === "stale").length;
+  const revalidation = sources.filter(
+    (item) => item.freshness === "needs_revalidation",
+  ).length;
+  const failed = sources.filter((item) => item.observation?.result === "failure").length;
+  const parts = [`${current} fully covered`];
+  if (partial) parts.push(`${partial} partial`);
+  if (unread) parts.push(`${unread} not read yet`);
+  if (stale) parts.push(`${stale} stale`);
+  if (revalidation) parts.push(`${revalidation} to recheck`);
+  if (failed) parts.push(`${failed} latest read failed`);
+  return `${parts.join(" · ")}. Coverage is recorded without provider bodies.`;
+}
+
+function sourceSystemStatus(snapshot) {
+  const state = snapshot.sources || {};
+  if (state.available === false) return "Needs attention";
+  const sources = Array.isArray(state.sources) ? state.sources : [];
+  if (!sources.length) return "Choose sources";
+  const current = sources.filter(
+    (item) =>
+      item.freshness === "current" &&
+      item.observation?.result !== "failure" &&
+      item.observation?.completeness === "complete",
+  ).length;
+  const hasGap = sources.some(
+    (item) =>
+      item.freshness !== "current" ||
+      item.observation?.result === "failure" ||
+      item.observation?.completeness !== "complete",
+  );
+  return hasGap
+    ? `${current} of ${sources.length} fully covered`
+    : `${current} fully covered`;
+}
+
+function sourceSystemClass(snapshot) {
+  const state = snapshot.sources || {};
+  if (state.available === false) return "is-error";
+  const sources = Array.isArray(state.sources) ? state.sources : [];
+  return sources.some(
+    (item) =>
+      item.freshness !== "current" ||
+      item.observation?.result === "failure" ||
+      item.observation?.completeness !== "complete",
+  )
+    ? "is-warning"
+    : "";
+}
+
+function sourceSystemRows(snapshot) {
+  const sources = Array.isArray(snapshot.sources?.sources) ? snapshot.sources.sources : [];
+  return sources.map((item) => {
+    const label = item.recipe?.label || item.recipe?.source || "Selected source";
+    const observation = item.observation || null;
+    if (!observation) {
+      return systemRow(
+        label,
+        "Selected, but no bounded read has been recorded yet.",
+        "Not read yet",
+        "is-warning",
+      );
+    }
+    if (observation.result === "failure") {
+      const prior = observation.covered_through
+        ? ` Last successful coverage reached ${formatCoverageTime(observation.covered_through)}.`
+        : " No successful coverage is recorded yet.";
+      return systemRow(
+        label,
+        `The latest bounded read failed (${observation.error_code || "unknown error"}).${prior}`,
+        "Read failed",
+        "is-warning",
+      );
+    }
+    if (item.freshness === "needs_revalidation") {
+      return systemRow(
+        label,
+        "The saved proof no longer matches this computer, source recipe, or current local access. Run one new bounded read to confirm this source here.",
+        "Recheck",
+        "is-warning",
+      );
+    }
+    const empty = observation.result === "explicit_empty" ? "; no matching items" : "";
+    const coverage = observation.covered_through
+      ? `Covered through ${formatCoverageTime(observation.covered_through)}${empty}.`
+      : "A bounded read succeeded.";
+    const isPartial = observation.completeness === "partial";
+    const status = item.freshness === "stale" ? "Stale" : isPartial ? "Partial" : "Current";
+    return systemRow(
+      label,
+      `${coverage} ${capitalize(observation.completeness || "unknown")} coverage.`,
+      status,
+      item.freshness === "stale" || isPartial ? "is-warning" : "",
+    );
+  });
+}
+
+function formatCoverageTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "the recorded horizon";
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
 }
 
 function systemRow(title, copy, status, statusClass) {
@@ -2501,7 +2724,7 @@ function renderInspector(task) {
     detail("Outcome", task.outcome),
     detail("Next action", task.next_action || "Not recorded."),
     detail("Waiting on", task.waiting_on || "Nothing recorded."),
-    detail("Record", `${task.identifier}\nUpdated ${task.updated_at}\nRevision ${task.revision}`),
+    detail("Saved", `Updated ${task.updated_at}`),
   );
   if (codexReady(state.snapshot) && task.codex_url) {
     ui.continueInCodex.href = task.codex_url;
@@ -2509,7 +2732,7 @@ function renderInspector(task) {
     ui.inspectorFoot.hidden = false;
   } else {
     ui.continueInCodex.removeAttribute("href");
-    ui.inspectorFoot.replaceChildren(renderCodexAction(state.snapshot, "Start a Codex task"));
+    ui.inspectorFoot.replaceChildren(renderCodexAction(state.snapshot, "Open ChatGPT"));
     ui.inspectorFoot.hidden = false;
   }
 }
@@ -2536,7 +2759,7 @@ function closeInspector() {
 function navigate(view) {
   if (!viewCopy[view]) return;
   state.currentView = view;
-  window.location.hash = view;
+  window.location.hash = publicRouteByView[view] || view;
   setRailOpen(false);
   render();
   ui.main?.focus?.({ preventScroll: true });
@@ -2545,7 +2768,7 @@ function navigate(view) {
 
 function viewFromHash() {
   const candidate = window.location.hash.replace(/^#/, "").split("?")[0];
-  return viewCopy[candidate] ? candidate : "now";
+  return viewByRoute[candidate] || "now";
 }
 
 function setActiveNavigation() {
@@ -2564,6 +2787,7 @@ function setRailOpen(open) {
 }
 
 function setConnectionState(connectionState, message = "") {
+  state.connectionState = connectionState;
   const healthy = connectionState === "healthy";
   const partial = connectionState === "partial";
   const stale = connectionState === "stale";
@@ -2575,10 +2799,10 @@ function setConnectionState(connectionState, message = "") {
   ui.localStatus.classList.toggle("is-stale", stale);
   ui.localStatus.classList.toggle("is-unavailable", unavailable);
   const labels = {
-    healthy: "Local GSV healthy",
-    partial: "Local GSV needs attention",
+    healthy: "Seld is available",
+    partial: "Seld needs attention",
     stale: "Showing last local snapshot",
-    unavailable: "Local GSV unavailable",
+    unavailable: "Seld unavailable",
   };
   ui.localStatusCopy.textContent = labels[connectionState];
   if (stale) {
@@ -2588,10 +2812,50 @@ function setConnectionState(connectionState, message = "") {
     ui.statusDot.hidden = false;
   }
   if (partial) {
-    ui.connectionCopy.textContent = "Your GSV files are readable, but an integrity check needs attention.";
+    ui.connectionCopy.textContent = "Your Seld record is readable, but an integrity check needs attention.";
   } else if (!healthy) {
     ui.connectionCopy.textContent = message;
   }
+  updatePageHeading();
+}
+
+function updatePageHeading() {
+  let copy = viewCopy[state.currentView] || viewCopy.now;
+  if (state.currentView === "now") {
+    const tasks = state.snapshot ? projectionSection(state.snapshot, "tasks") : null;
+    if (state.connectionState === "unavailable") {
+      copy = [
+        "Your brief is unavailable.",
+        "Seld could not read the private local record. Nothing has been changed.",
+      ];
+    } else if (state.connectionState === "stale") {
+      copy = [
+        "Your last saved brief.",
+        "Seld cannot verify newer changes right now, so this is the last local snapshot.",
+      ];
+    } else if (
+      state.connectionState === "partial" ||
+      (tasks && tasks.state !== "complete")
+    ) {
+      copy = [
+        "Your latest brief is incomplete.",
+        "Some local context is unavailable. Seld is showing only what it can verify.",
+      ];
+    } else if (
+      state.connectionState === "healthy" &&
+      state.snapshot &&
+      state.snapshot.tasks.length === 0
+    ) {
+      copy = [
+        "Tell Seld what matters.",
+        "Start with the context, priorities, and sources you want Seld to use.",
+      ];
+    } else if (state.connectionState === "loading") {
+      copy = ["Opening your latest brief.", "Reading the local context Seld has assembled."];
+    }
+  }
+  ui.pageTitle.textContent = copy[0];
+  ui.pageIntro.textContent = copy[1];
 }
 
 function showConnectionOrb(orbState, label) {
@@ -2606,22 +2870,22 @@ function renderUnavailable() {
   const unavailable = element("section", "unavailable-state");
   const copy = element("div");
   copy.append(
-    textElement("p", "section-label", "Dashboard unavailable"),
+    textElement("p", "section-label", "Brief unavailable"),
     textElement("h2", "", "Your local files have not been changed."),
-    textElement("p", "", "Run gsv again to open a fresh private session."),
+    textElement("p", "", "Reopen Seld from ChatGPT to start a fresh private session."),
   );
   unavailable.append(copy);
   ui.view.replaceChildren(unavailable);
 }
 
 function connectionMessage(_error) {
-  return "The private GSV dashboard could not be reached. Your local files were not changed.";
+  return "The private Seld Bridge could not be reached. Your local record was not changed.";
 }
 
 function updateFreshness() {
   if (!state.snapshot || !state.lastSuccessAt) return;
   if (Date.now() - state.lastSuccessAt > 30_000) {
-    setConnectionState("stale", "Showing the last successful local snapshot while GSV reconnects.");
+    setConnectionState("stale", "Showing the last successful local snapshot while Seld reconnects.");
   }
 }
 
@@ -2666,7 +2930,7 @@ function captureBridgeToken() {
   const match = /^#token=([0-9a-f]{48})$/.exec(window.location.hash);
   if (match) {
     window.sessionStorage.setItem("gsv_bridge_token", match[1]);
-    window.history.replaceState(null, "", `${window.location.pathname}#now`);
+    window.history.replaceState(null, "", `${window.location.pathname}#home`);
     return match[1];
   }
   return window.sessionStorage.getItem("gsv_bridge_token") || "";
@@ -2693,8 +2957,8 @@ function capitalize(value) {
 
 function actorLabel(actor) {
   return {
-    agent: "Codex acts next",
-    external: "Waiting outside GSV",
+    agent: "Seld acts next",
+    external: "Waiting outside Seld",
     human: "You act next",
   }[actor] || actor;
 }
@@ -2716,7 +2980,7 @@ function relativeTimeElement(timestamp) {
 }
 
 function revisionLabel(revision) {
-  return revision ? `Revision ${revision.slice(0, 8)}` : "No revision";
+  return revision ? "Saved locally" : "Not saved yet";
 }
 
 function element(tag, className = "", attributes = {}) {

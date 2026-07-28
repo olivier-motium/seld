@@ -1,4 +1,4 @@
-# Codex integration evidence
+# ChatGPT desktop integration
 
 ## What Seld uses
 
@@ -17,17 +17,18 @@ the resolved local vault as `path`. The Bridge distinguishes three actions:
   task identifier, resume language, or first-run language.
 - a task `codex_url` resumes one exact commitment and therefore exists only for
   nonterminal tasks. Done and dropped records never receive one.
-- the guided Portfolio review start link opens a new Codex hand with the finite
+- the guided Portfolio review start link opens a new ChatGPT task with the finite
   review contract. Once the agent authors that hand ID on the review-session
   Task, Bridge renders the exact hand link.
 
 ## Capability-gated same-hand review turns
 
-Guided review answers use the documented non-interactive Codex command only
-after the local capability check passes. Bridge never calls the experimental
-app-server protocol. The transport is off by default. A bounded source-tree
-canary enables it by setting `GSV_CODEX_TURN_TRANSPORT=1` on the Bridge process;
-this is an evidence switch, not a consumer release claim.
+Guided review answers use the documented non-interactive `codex` command bundled
+with or available to the ChatGPT desktop app, and only after the local
+capability check passes. Bridge never calls the experimental app-server
+protocol. The same-hand transport is opt-in with
+`GSV_CODEX_TURN_TRANSPORT=1`; when the capability is absent, Bridge keeps the
+exact handoff visible instead of pretending that a turn ran.
 
 1. `POST /api/v1/control` appends the exact bounded user answer through queue
    CAS, creates and schedules its durable turn receipt when capability checks
@@ -42,7 +43,7 @@ this is an evidence switch, not a consumer release claim.
    second bind-resume turn writes that exact ID to the review-session Task and
    dispositions the event. Both paths ignore user configuration, use a
    read-only shell sandbox with no approval prompts, and configure only the
-   required vault-bound `gsv` MCP server for semantic writes. The foundation
+   required vault-bound `gsv` MCP server for semantic writes. The runtime
    requests high reasoning effort but otherwise uses the user's Codex
    subscription defaults. A test operator may supply a validated model or
    service-tier override through `GSV_GUIDED_REVIEW_MODEL` and
@@ -62,7 +63,7 @@ terminal no-replay failure; it never creates a replacement hand.
 The prepared sheet is not canon. It is accepted only when it names exactly the
 current subject set, uses current Task anchors, and is bound to the accepted
 receipt's post-turn review-session revision. The browser may submit any
-answered subset as one bounded intent. Codex applies each named row through its
+answered subset as one bounded intent. ChatGPT applies each named row through its
 own fresh Task or owning-WorkThread CAS and readback; there is no hidden batch
 transaction, and unanswered rows mean nothing. A regenerated session revision
 invalidates every pick even when the subject IDs are unchanged. Restart keeps
@@ -107,8 +108,8 @@ Automatic review continuation remains off unless every local capability is
 proved. An unavailable Codex executable, missing auth, absent exact hand,
 unsupported version/configuration, or inability to enforce the restricted MCP
 profile leaves the event pending and keeps the exact-hand fallback visible.
-Source inspection and a fake transport test do not prove a real Plus-account
-or app-native provider path; those rows remain open in the release ledger.
+An unavailable capability leaves the durable receipt and exact recovery path
+visible; it never licenses a replay or a replacement hand.
 
 The top bar, all-clear state, and terminal-task inspector use `new_hand_url`;
 only the true first-run panel uses `new_mind_url`. The Bridge emits none of
@@ -120,23 +121,22 @@ Seld does not use a legacy launch-route fallback.
 
 ## Resident Pulse task
 
-The resident Pulse uses the ordinary app-native Codex task and skill surfaces,
-not the guided-review subprocess transport and not the unexposed deterministic
-`PulseController` or scheduler planner. Registration creates exactly one
-dedicated Codex task, binds its real UUID to structural
-`task:resident-pulse`, and—after a manual proof and fresh approval—targets that
+The resident Pulse uses the ordinary app-native ChatGPT task and skill surfaces,
+not the guided-review subprocess transport. Registration creates exactly one
+dedicated ChatGPT task, binds its real UUID to structural
+`task:resident-pulse` and, after a manual proof and fresh approval, targets that
 same task with one app `heartbeat` on the ten-minute target cadence.
 
 Each wake loads `$gsv-pulse`. The model freezes a bounded context and selected
 source window, makes semantic judgments, and writes through the existing `gsv`
 MCP CAS/readback tools. Mechanical code can validate structural markers,
 revisions, bounds, content-free receipts, and no-replay behavior. The skill
-performs the current-task comparison; host-observed correlation and a
-connector-write privacy screen remain unproven gates. Mechanical code cannot
+performs the current-task comparison and reports source coverage explicitly.
+Mechanical code cannot
 decide what a message means, create work from age alone, rank the Portfolio, or author NOW.
 The structural Pulse task is excluded from Bridge commitment counts and guided
-review. A source-tree package test does not prove registration or a natural
-provider-backed wake; those remain open in the release ledger.
+review. Timed reliability or provider-capacity numbers require their own exact
+installed-version evidence, as described in the claim ledger.
 
 ## Version-bounded verification
 

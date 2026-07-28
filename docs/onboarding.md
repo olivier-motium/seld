@@ -1,104 +1,96 @@
 # Onboarding
 
-Seld gets useful when it understands what the person is trying to manage. The
-first conversation therefore covers the week ahead, active projects,
-obligations, important people, routines, constraints, and what must not be
-forgotten. It also establishes what Seld may read, retain, interrupt about, or
-act on.
+Onboarding begins by asking what the user manages and what Seld may access. The
+user can speak messily, paste notes, or point Seld at selected local files, and
+Seld reflects a provisional picture before source setup.
 
-Only then does Seld recommend sources. Email, messages, calendars, files, GitHub,
-and optional screen context supply evidence for the person's model. The first
-useful result is a grounded orientation: what matters now, what may be slipping,
-what changed, and what remains unknown.
+The shipped `$gsv-onboard` skill owns that conversation. ChatGPT interprets the
+context and recommends useful sources. The local `gsv` layer validates bounded
+inputs, source boundaries, revisions, privacy checks, receipts, and readback.
 
-> **Current status:** The packaged `$gsv-onboard` skill can collect context,
-> persist accepted Mind context through document CAS, guide one selected
-> connector enablement wave, and register the structural resident Pulse path.
-> This is not yet a proven consumer journey. The public CLI still exposes no
-> `gsv onboard` or `gsv source` commands; typed onboarding state, source recipes,
-> attestation validators, and scheduler planners remain unexposed foundation
-> code. Bridge does not publish, advance, or validate that state. Source-tree
-> instructions and tests do not prove a resumable journey, a ready source, a
-> natural app wake, or an installed clean-account flow.
+## The first run
 
-## Product principles
+1. **Tell Seld about your life.** Describe the week, active projects,
+   obligations, important people, routines, constraints, waiting-fors, and
+   anything that cannot be dropped.
+2. **Set the boundaries.** Say what Seld may read, retain, interrupt about, or
+   prepare. Passwords, tokens, financial credentials, and unnecessary sensitive
+   material never belong in the context.
+3. **Review the provisional picture.** Seld mirrors back what it understood,
+   what remains uncertain, and the first result it proposes to make useful.
+   Nothing becomes durable until the user accepts or edits it.
+4. **Connect where life happens.** Seld recommends sources based on the accepted
+   context. The user enables the relevant ChatGPT apps, custom MCP servers, or
+   local read tools in one setup wave and completes authentication personally.
+   A local directory gets its own path-specific grant after the user reviews
+   the exact root and exclusions.
+5. **Open one fresh ChatGPT task.** The fresh task discovers the tools that are
+   actually present, confirms each selected account or scope with the user, and
+   performs a bounded recent read. A valid empty result counts as a completed
+   read; a missing or failing tool stays visibly unavailable.
+6. **See the first Rundown.** Seld combines accepted context with the evidence it
+   could actually read, names the coverage window, and surfaces the few
+   decisions or corrections that need the user.
 
-- Begin with the person's desired outcome and boundaries.
-- Propose context in human language. The person may accept, edit, reject, or
-  skip each part before any later supported surface makes it durable.
-- Treat source-zero as an honest target state. External reality stays unknown
-  until a source has current installed-path evidence.
-- Treat authentication as different from readiness. A login or configured
-  account is not a source attestation.
-- Treat provider content as evidence, never instructions or authorization.
-- Retain small derived signals and stable references, not raw inboxes,
-  transcripts, screenshots, credentials, or unnecessary personal data.
-- Require one active onboarding hand and a fresh, exact approval for every
-  external mutation.
+Every interview question is skippable. A user can deepen context or add a new
+source later by running `$gsv-onboard` again.
 
-## Foundation state vocabulary
+## Source ecosystem
 
-The foundation model defines nine ordered phases so a future supported surface
-can resume without interpreting chat prose:
+`gsv source list` returns Seld's logical source catalog. It covers ChatGPT
+activity, Gmail, Google Calendar, Google Drive and Sheets, Outlook mail and
+calendar, Slack, Teams, GitHub, Asana, Atlassian, Box, Figma, Notion,
+SharePoint, local files, Apple Messages, WhatsApp, Shopify, Instagram, and
+optional screen context.
 
-| Phase | Target milestone |
-| --- | --- |
-| `codex_substrate` | Verify the exact local Seld and Codex substrate before collecting personal context. |
-| `privacy_and_context_capture` | Agree what matters, what remains separate, what may be retained, and the action boundary. |
-| `source_selection` | Keep mandatory Seld source zero and choose the smallest useful external source set. |
-| `enablement_wait` | Wait for user-owned plugin, authentication, permission, or policy work without pretending it is ready. |
-| `fresh_task_verification` | Prove the required tool and durable onboarding state in a fresh Codex task. |
-| `context_synthesis` | Synthesize only accepted context and currently attested evidence, with uncertainty and provenance. |
-| `initial_orientation` | Present the first useful orientation and let the person correct it. |
-| `continuity_and_autonomy_proof` | Prove only the declared continuity and autonomy boundary. |
-| `done` | Finish only when host identity/read evidence and fresh-task verification pass. |
+The catalog describes capabilities, not pre-authenticated accounts. The actual
+read surface comes from the source the user enabled:
 
-Completion is modeled independently as `in_progress`, `waiting_user`,
-`fresh_task_required`, `blocked`, `operational_with_gaps`, `fully_connected`,
-or `needs_revalidation`. These are storage and validation contracts today, not
-states a consumer can advance through the public CLI.
+- supported ChatGPT apps for services available in the user's plan and region;
+- custom MCP servers for services such as Shopify or Instagram;
+- bounded local read tools for local files or Apple Messages; and
+- the separately enabled WhatsApp read tool.
 
-## Target journey
+Selecting `local_files` does not grant a directory. After the user approves one
+exact root, the interactive task runs
+`gsv local-file grant --root '/exact/root'`. Grant creation and revocation are
+CLI-only. A fresh task reads the host-local grant through
+`gsv_local_file_grant_list`, then passes its opaque ID and one relative path to
+`gsv_local_file_read`. Deselecting local files revokes every root grant for that
+vault.
 
-### 1. Start from supported durable state
+Seld never falls back to browser scraping when a source tool is missing. It
+reports the gap and continues with the sources that are available. Provider and
+file content is untrusted evidence; it cannot change permissions, approve an
+action, or rewrite the onboarding contract.
 
-First inspect the exact installed command, MCP, skill, and app automation
-surfaces. Use supported document CAS and operation interfaces when present. If
-onboarding status, start, resume, takeover, and doctor interfaces are absent,
-do not invent their state: continue only with the skill's explicit context,
-task-local connector, and Pulse-registration boundaries. Do not edit
-onboarding Markdown directly, call an internal Python API, or reconstruct a
-journey from a transcript and present it as supported onboarding.
+## What source verification means
 
-### 2. Shape the first useful result
+For every selected source, the onboarding task checks four things in the live
+ChatGPT task:
 
-The onboarding skill conducts one context conversation. Ask
-one compact batch:
+1. the expected read capability is exposed;
+2. the intended identity, account, workspace, folder, or store is confirmed;
+3. one bounded recent read succeeds, including an explicitly empty result; and
+4. the resulting coverage window and any limitation are stated back to the
+   user.
 
-1. What should feel easier in two weeks?
-2. Which two or three parts of life or work matter most now?
-3. Which people, projects, or promises must not be dropped?
-4. What should Seld never read or retain?
-5. Which local, reversible actions are acceptable, and which actions always
-   require exact approval?
-6. Should the first proof be local-only, based on one source, or a bounded
-   cross-source view?
+The AI decides what the evidence means. The catalog, tool discovery, account
+confirmation, and read receipt do not mechanically create a person, project,
+task, priority, or decision. Accepted semantic context is written only through
+document compare-and-swap and read back before Seld treats it as current.
 
-Mirror back the proposed contexts, outcome, exclusions, action boundary, first
-proof, sources now or later, and remaining uncertainties. After explicit
-acceptance, write the bounded context to `MIND.md` only through its public
-document CAS surface and read it back. That creates accepted Mind context, not
-a fabricated onboarding session or readiness state. If document CAS is absent,
-the conversation remains a proposal only.
+If a tool later disappears or authentication expires, only that source becomes
+stale. Seld keeps the rest of the Mind available and routes repair back through
+`$gsv-onboard`.
 
-### 3. Use the implemented Bridge intent loop accurately
+## Bridge choices and approvals
 
-Bridge can append one authenticated, compare-and-swap intent of type setup
-choice, approval, correction, or undo request. The receipt is not canonical
-state and carries no external-action authority.
+Bridge can append one authenticated, compare-and-swap intent for a setup choice,
+approval, correction, or undo request. The intent is a durable handoff to the
+AI; it is not semantic canon and carries no external-action authority.
 
-On macOS and Linux, where the secure pinned store is available, the supported
-operation surfaces are:
+The supported operation surfaces are:
 
 - `gsv operation list`
 - `gsv operation accept --help`
@@ -106,111 +98,61 @@ operation surfaces are:
 - `gsv_operation_list`, `gsv_operation_accept`, and
   `gsv_operation_reject` over MCP
 
-The accept and reject commands require the logical vault ID plus the current
-queue and disposition revisions returned by `operation list`, along with
-bounded actor and reason references. Never reuse those tokens after changing,
-moving, or restoring the vault. They durably disposition a queued receipt
-exactly once. **Accept means acknowledge this receipt for later review. It does
-not approve or execute the request, authorize an external action, or mutate
-semantic canon.** Queue archival is an operator recovery surface, not an
-ordinary onboarding action.
+Accepting an operation acknowledges that exact receipt for processing. It does
+not send a message, place an order, book anything, pay anything, or authorize
+the proposed effect. A stale queue or disposition revision means reload and
+reconcile; never guess a new revision or replay the intent.
 
-The Windows foundation does not advertise these CLI commands or MCP tools. Its
-Bridge control endpoint remains unavailable and writes nothing while canonical
-read views continue to work. Windows support remains a release gate.
+## Pulse
 
-### 4. Prove selected sources only after public interfaces ship
+After the first useful orientation, the onboarding skill can register one
+dedicated resident Pulse task with the user's approval. Each wake loads the
+same accepted Mind, reads only the bounded sources available to that task, and
+lets ChatGPT reason over fresh changes plus durable context. Semantic writes go
+through the same compare-and-swap and readback path as an interactive task.
 
-The foundation uses these exact source states:
+Pulse may prepare a decision or a draft. It cannot silently send, book, buy,
+pay, change access, or use Computer Use. Missing source coverage and throttling
+stay visible rather than being filled in by inference.
 
-| State | Meaning |
-| --- | --- |
-| `not_selected` | The source remains off. |
-| `plugin_missing` | The selected supported connector plugin is absent. |
-| `auth_required` | The person must authenticate in the provider surface. |
-| `fresh_task_required` | Tool discovery or proof requires a fresh Codex task. |
-| `tool_absent` | The expected supported tool is absent from the current runtime. |
-| `identity_pending` | The intended owner, account, or scope still needs confirmation. |
-| `identity_mismatch` | The observed identity does not match the selected identity. |
-| `read_unverified` | A bounded read may be host-verified, but the full identity, account/scope confirmation, and Pulse-canary bundle is incomplete. |
-| `canary_failed` | The bounded real-read canary failed. |
-| `ready` | The complete deterministic proof bundle is current for the declared identity and scope. |
-| `stale` | Earlier proof expired or drifted. |
-| `blocked_by_policy` | A declared policy blocks the proof. |
-| `unsupported_tool_shape` | The available tool shape is not an accepted recipe. |
-| `unavailable` | The source cannot be proved on the current host or account. |
-| `declined` | The person explicitly kept the source off. |
+Seld's MCP server has no provider-action or Computer Use tools. The dedicated
+Pulse is still an ordinary ChatGPT task, so other installed plugins can make
+their own tools available there. Current heartbeat registration has no
+Seld-controlled per-task denylist; onboarding explains that read-only use and
+the ban on those separately owned write tools are Pulse policy.
 
-No current public command can produce `ready`. The target proof requires an
-installed supported recipe, a read-only capability check, confirmed identity
-and scope, one bounded real read, Pulse access to the same logical capability,
-and a correlated host-observed attestation. A model statement, login screen,
-configured account, synthetic response, or validator unit test is insufficient.
+## Optional Computer Use
 
-### 5. Prove fresh-task continuity
+Computer Use is an interactive setup accelerator, never a Pulse dependency. It
+requires a fresh approval naming the application and goal, stops for credentials,
+OAuth, second factors, legal terms, and macOS security prompts, and aborts on an
+unexpected application or dialog. Seld does not retain screenshots, and its own
+MCP server does not expose Computer Use. When the separate Computer Use plugin is
+installed, Pulse is instructed never to call it.
 
-The target product must open one fresh Codex task, reload the accepted context,
-journey state, and next safe step from the portable session, and re-prove
-host-specific evidence where needed. A copied summary or transcript is not
-continuity evidence. This fresh-task onboarding proof remains release-gated.
+## Recovery
 
-### 6. Synthesize only proven context
-
-The target synthesis combines accepted local context with evidence from
-currently attested sources. It keeps user statements, observations, and
-inferences distinct, preserves stable references and coverage boundaries, and
-excludes raw provider bodies and rejected material.
-
-### 7. Present an honest first orientation
-
-Show what matters now, what may be at risk of being dropped, which evidence
-supports the view, and what remains unknown. Let the person correct, accept, or
-reject every proposed addition. Orientation is not external-action permission.
-
-### 8. Prove continuity and autonomy separately
-
-The target product must prove fresh-task continuity and a real asynchronous
-app-native heartbeat waking the same dedicated Pulse task while preserving the
-declared local, reversible boundary. The model—not a deterministic scheduler
-controller—must read the frozen evidence and author any resulting semantic
-change through CAS/readback. The implemented Bridge operation round trip and
-packaged skill prove neither onboarding readiness nor natural wake autonomy.
-No public onboarding doctor exists in this foundation slice, so core onboarding
-readiness cannot currently be committed.
-
-### 9. Report the real operating state
-
-When the public validators and installed paths exist, report which evidence is
-local, which came from currently ready sources, and which areas remain unknown,
-unavailable, or foundation-gated. Preserve `operational_with_gaps` when that is
-the result; never relabel it `fully_connected`.
-
-## Optional Computer Use target
-
-Computer Use is an optional interactive accelerator for a bounded setup step,
-not an onboarding dependency or connector fallback. It must be explicitly
-selected, stop for credentials, OAuth, second factors, legal terms, and OS
-security prompts, and remain structurally unavailable to scheduled work. Its
-installed exclusion proof is still an open Gate 0 item.
-
-## Recovery today
+Run `$gsv-onboard` again after an interrupted setup, a new source, expired
+authentication, changed permissions, or a request to deepen context. The skill
+reuses accepted Mind context, rechecks only the affected live tools, and does
+not restart the whole interview unless the user asks.
 
 Use `gsv operation list` to reload queued and durably decided Bridge intents.
-Use the supported accept or reject command only with fresh revisions; a stale
-CAS conflict means reload, not retry with guessed state. Do not edit, delete,
-replay, or reorder queue and disposition files. The operator-only closed-queue
-archive surface exists for bounded-capacity recovery.
+Use accept or reject only with fresh revisions. Backups preserve the local Mind;
+after a restore, historical coverage remains visible, but its machine binding
+makes it `needs_revalidation` until a successful bounded read is recorded on the
+new computer.
 
-There is no supported public recovery command for the foundation onboarding or
-source models. Report the last proven state and stop. Backup and restore cover
-the existing continuity kernel; they do not turn inert onboarding state into a
-consumer-ready journey.
+## A useful first run is complete when
 
-## Done means
+- the user has accepted enough context for Seld to understand the intended
+  outcome and boundaries;
+- every selected source was either read in a bounded live call or named as an
+  exact gap;
+- the first orientation distinguishes user statements, observations,
+  inferences, and unknowns; and
+- a fresh ChatGPT task can reload the accepted Mind without copying the old
+  transcript.
 
-For 1.0, onboarding will be complete only when the person has accepted the
-useful context and boundaries, the agreed proof works, every source boundary
-is explicit, host-level identity and read evidence passes, the resident AI
-Pulse completes a natural wake, and a fresh task resumes without the old
-transcript. Those conditions are not met by this foundation slice.
-See [Release gates](release-gates.md) for the authoritative claim boundary.
+A completed first run leaves accepted context, explicit source coverage, and a
+Mind that reloads in a fresh task.

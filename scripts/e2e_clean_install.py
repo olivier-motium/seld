@@ -37,7 +37,7 @@ class _RejectRedirects(HTTPRedirectHandler):
         raise HTTPError(
             request.full_url,
             code,
-            "GSV refuses redirects during the clean-install proof",
+            "Seld refuses redirects during the clean-install proof",
             headers,
             file_pointer,
         )
@@ -155,7 +155,7 @@ def run_e2e(
         installed = install_bin / "gsv"
     _run(install_command, environment)
     if not installed.is_file():
-        raise RuntimeError("installer did not place the GSV executable")
+        raise RuntimeError("installer did not place the Seld executable")
     # The first setup used the explicit isolated vault. All later bare commands
     # must prove the persisted configuration path rather than an env override.
     environment.pop("GSV_VAULT", None)
@@ -225,7 +225,7 @@ def run_e2e(
     if not codex_status["plugin_installed"] or not codex_status["instructions_installed"]:
         raise RuntimeError("Codex integration did not report installed")
     if not any(item.get("pluginId") == "gsv@gsv-local" for item in plugin_list["installed"]):
-        raise RuntimeError("actual Codex plugin list does not contain GSV")
+        raise RuntimeError("actual ChatGPT plugin list does not contain Seld")
 
     marketplace = next(
         item for item in marketplace_list["marketplaces"] if item.get("name") == "gsv-local"
@@ -435,9 +435,9 @@ def run_e2e(
         [codex, "plugin", "marketplace", "list", "--json"], environment
     )
     if any(item.get("pluginId") == "gsv@gsv-local" for item in after_plugins["installed"]):
-        raise RuntimeError("GSV plugin remains after uninstall")
+        raise RuntimeError("Seld plugin remains after uninstall")
     if any(item.get("name") == "gsv-local" for item in after_marketplaces["marketplaces"]):
-        raise RuntimeError("GSV marketplace remains after uninstall")
+        raise RuntimeError("Seld marketplace remains after uninstall")
     if marketplace_root.exists() or not integration_receipt.is_file():
         raise RuntimeError("legacy uninstall did not isolate its recovery state")
     if (
@@ -530,7 +530,7 @@ def run_e2e(
     shutil.rmtree(retained_path)
     _run(uninstall_command, environment)
     if installed.exists():
-        raise RuntimeError("full uninstall left the GSV executable installed")
+        raise RuntimeError("full uninstall left the Seld executable installed")
     if live_receipt.exists() or not _wait_for_process_exit(live_pid, timeout=8.0):
         raise RuntimeError("full uninstaller left the live Bridge running or its receipt behind")
     if (
@@ -716,7 +716,7 @@ def _verify_bridge_http(
         raise RuntimeError("Bridge snapshot did not match the expected vault path")
     with _open_loopback(url, timeout=5) as response:
         static = response.read()
-    if b"Your work in Codex, in one place." not in static:
+    if b"<title>Seld</title>" not in static or b'id="view"' not in static:
         raise RuntimeError("Bridge static product surface was not bundled")
 
 
@@ -889,13 +889,13 @@ def _native_codex_sessions(
     first_message = output / "first.txt"
     second_message = output / "second.txt"
     first_prompt = (
-        "Use the GSV MCP tool gsv_task_create to create task id native-codex-proof, "
+        "Use the Seld MCP tool gsv_task_create to create task id native-codex-proof, "
         "title Native Codex proof, outcome A separate native Codex session recovers this state, "
         "status doing, next actor agent, and next action Read this in a fresh Codex session. "
         "After the tool succeeds, reply exactly NATIVE_CREATED."
     )
     second_prompt = (
-        "Use the GSV MCP tool gsv_task_show to read task native-codex-proof. "
+        "Use the Seld MCP tool gsv_task_show to read task native-codex-proof. "
         "If its next action says Read this in a fresh Codex session, reply exactly NATIVE_RESUMED."
     )
     base = [codex, "exec", "--skip-git-repo-check", "-C", str(workspace), "--color", "never"]
@@ -909,14 +909,14 @@ def _native_codex_sessions(
 
 def _require_native_codex(result: bool) -> None:
     if not result:
-        raise RuntimeError("fresh native Codex session did not recover synthetic GSV state")
+        raise RuntimeError("fresh native ChatGPT session did not recover synthetic Seld state")
 
 
 def _cli(binary: Path, environment: dict[str, str], arguments: list[str]) -> dict[str, Any]:
     result = _run([str(binary), "--json", *arguments], environment)
     payload = json.loads(result.stdout)
     if not payload.get("ok"):
-        raise RuntimeError(f"GSV command failed: {arguments}")
+        raise RuntimeError(f"Seld command failed: {arguments}")
     return cast(dict[str, Any], payload["result"])
 
 
@@ -928,14 +928,14 @@ def _cli_expected_incomplete_cleanup(
     result = _run([str(binary), "--json", *arguments], environment, check=False)
     if result.returncode != 3:
         raise RuntimeError(
-            f"GSV incomplete-cleanup command returned {result.returncode}, expected 3: {arguments}"
+            f"Seld incomplete-cleanup command returned {result.returncode}, expected 3: {arguments}"
         )
     payload = json.loads(result.stdout)
     cleanup = payload.get("result")
     if payload.get("ok") is not False or not isinstance(cleanup, dict):
-        raise RuntimeError(f"GSV incomplete-cleanup JSON was not fail-closed: {arguments}")
+        raise RuntimeError(f"Seld incomplete-cleanup JSON was not fail-closed: {arguments}")
     if cleanup.get("cleanup_complete") is not False:
-        raise RuntimeError(f"GSV incomplete-cleanup result claimed completion: {arguments}")
+        raise RuntimeError(f"Seld incomplete-cleanup result claimed completion: {arguments}")
     return cast(dict[str, Any], cleanup)
 
 

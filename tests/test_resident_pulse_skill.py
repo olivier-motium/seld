@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from continuity_kernel import bridge
+from continuity_kernel import bridge, mcp_server
 from continuity_kernel.errors import ValidationError
 from continuity_kernel.portfolio import ABSENT_PORTFOLIO_REVISION, portfolio_item
 from continuity_kernel.records import RESIDENT_PULSE_REF, RESIDENT_PULSE_TASK_ID
@@ -34,12 +34,12 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
     resident = _skill_text("gsv")
 
     for marker in (
-        "The model owns meaning and canonical judgment",
+        "Meaning and canonical judgment belong to the model",
         "Deterministic facts",
         "never decide meaning",
         "task:resident-pulse",
         "system-role:resident-pulse",
-        "current Codex task UUID",
+        "current ChatGPT task UUID",
         'id="resident-pulse"',
         "canonical notation, not tool input",
         "Only the exact resident Pulse writes `NOW.md`",
@@ -47,6 +47,10 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
         "never use browser automation, Computer Use",
         "At seven elapsed minutes",
         "At eight minutes",
+        "Seld's own MCP server exposes local record, receipt, and queue tools",
+        "current heartbeat surface does not give Seld a per-task tool allowlist or denylist",
+        "mandatory policy for tools owned by those plugins",
+        "do not register Pulse",
     ):
         assert marker in pulse
 
@@ -56,6 +60,7 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
         "ten-minute cadence",
         "observe one natural wake",
         "never create a second",
+        "current heartbeat surface has no Seld-controlled per-task denylist",
     ):
         assert marker in registration
 
@@ -68,13 +73,50 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
         assert marker in sources
 
     for marker in (
-        "task-local connector verification",
-        "Register the resident AI Pulse last",
-        "The model reads bounded evidence and authors every judgment",
+        "gsv_source_select",
+        "gsv_source_record",
+        "core hashes bindings, cursors, and references",
+        "Register one resident Pulse",
+        "model reads selected sources and authors every judgment",
     ):
         assert marker in onboard
 
+    for marker in (
+        "gsv_source_list",
+        "content-free coverage",
+        "coverage receipt is not a semantic claim",
+    ):
+        assert marker in pulse
+
+    for marker in (
+        "gsv_source_record",
+        "Seld persists only their hashes",
+        "stale CAS means another task won",
+    ):
+        assert marker in sources
+
     assert "Ordinary hands do not write `NOW.md`" in resident
+
+
+def test_seld_mcp_surface_is_closed_to_provider_and_computer_actions() -> None:
+    names = {tool["name"] for tool in mcp_server.TOOLS}
+
+    assert names
+    assert all(name.startswith("gsv_") for name in names)
+    assert not any(
+        token in name
+        for name in names
+        for token in (
+            "browser",
+            "computer_use",
+            "provider",
+            "purchase",
+            "send",
+            "upload",
+        )
+    )
+    assert all(tool["annotations"]["openWorldHint"] is False for tool in mcp_server.TOOLS)
+    assert all(tool["annotations"]["destructiveHint"] is False for tool in mcp_server.TOOLS)
 
 
 def test_resident_pulse_task_is_structural_not_a_life_outcome(tmp_path: Path) -> None:

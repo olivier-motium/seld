@@ -1,14 +1,15 @@
 ---
 name: gsv-pulse
-description: Run or register GSV's one resident AI Pulse. Use only in the dedicated app-native heartbeat task, for an explicit manual Pulse, during first-time Pulse registration, or while diagnosing that exact Pulse. The model owns meaning and canonical judgment; deterministic code is limited to structural identity, CAS, bounded receipts, and delivery safety.
+description: Run or register Seld's resident Pulse in its dedicated ChatGPT task. Read current local context and relevant selected sources, then let the model decide what they mean.
 ---
 
-# GSV resident Pulse
+# Seld resident Pulse
 
-Wake as the same local Mind. This is one short, serialized AI cognition episode,
-not a rules engine, daemon, source scraper, or second chat client. The app-native
-heartbeat wakes one dedicated Codex task; this skill reads bounded current
-evidence and the model decides what it means.
+Use one short, serialized cognition episode for each wake. The app-native
+heartbeat opens the dedicated ChatGPT task, this skill reads bounded current
+evidence and local context, and the model decides what they mean.
+Meaning and canonical judgment belong to the model; local code handles only
+the structural identity, revisions, bounds, receipts, and delivery safety.
 
 Use [registration](references/registration.md) only for an explicit interactive
 setup or repair request. Use [source acquisition](references/source-acquisition.md)
@@ -18,13 +19,13 @@ when a selected connector is actually due or materially relevant.
 
 Before any mutation:
 
-1. Read the exact current Codex task ID from the supported app/task context.
+1. Read the exact current ChatGPT task ID from the supported app/task context.
    If it is unavailable, stop without writing.
 2. Read canonical Task `task:resident-pulse` by calling `gsv_task_show` with
    `id="resident-pulse"`; the `task:` prefix is canonical notation, not tool input.
 3. Continue only when that Task is nonterminal, carries exactly the structural
    reference `system-role:resident-pulse`, and its `active_thread_id` equals the
-   current Codex task UUID.
+   current ChatGPT task UUID.
 4. If the Task is absent, stale, multiply claimed, or bound elsewhere, report
    the exact identity gap. Never take over, create another heartbeat, write
    `NOW.md`, or acknowledge an input during an ordinary wake.
@@ -39,7 +40,9 @@ At the start, read once:
 - `gsv_context`;
 - current Direction and complete Portfolio;
 - open Tasks and relevant WorkThreads and Entities;
-- `MIND.md` and `NOW.md` with their exact revisions; and
+- `MIND.md` and `NOW.md` with their exact revisions;
+- `gsv_source_list` with selected sources, content-free coverage, and its exact
+  source-state revision; and
 - the Bridge operation queue with its exact queue and disposition revisions.
 
 Freeze the exact pending intent IDs and the selected source windows you will
@@ -58,7 +61,7 @@ importance, Task status, priority, Portfolio stance, relationships, what belongs
 in memory, or what should happen next.
 
 The model must fresh-read the relevant context, make that judgment explicitly,
-and use native GSV CAS tools. A stale CAS means current truth won: re-read once
+and use native Seld (`gsv_*`) CAS tools. A stale CAS means current truth won: re-read once
 and decide again. Do not mechanically copy a due date, message, title, age,
 retrieval score, or connector status into canon.
 
@@ -77,6 +80,11 @@ For each frozen Bridge intent or source observation:
 4. Only then accept or reject the exact Bridge intent with fresh operation
    revisions. Acceptance acknowledges delivery; it does not itself perform the
    semantic work or authorize an external effect.
+
+After each bounded provider read, fresh-read the source ledger and call
+`gsv_source_record` against its exact revision. Record successful, explicitly
+empty, partial, and failed reads honestly. This coverage receipt is not a
+semantic claim and never replaces the model's judgment.
 
 If no durable truth changed, record that as an explicit AI judgment before
 acknowledging the input. Never acknowledge first and promise to integrate later.
@@ -103,14 +111,21 @@ change, operate a browser or desktop app, wait on a process, or run a long
 investigation inline.
 
 For sustained reversible work, create or update exactly one durable outcome,
-then use the app-native project/task surface to create one visible Codex task.
+then use the app-native project/task surface to create one visible ChatGPT task.
 After the app returns the real thread UUID, bind it to that exact Task through
 fresh CAS. Never invent an ID, dispatch a duplicate, or infer completion from a
-stopped Codex turn. A wake may create at most one new sustained-work hand.
+stopped ChatGPT turn. A wake may create at most one new sustained-work hand.
 
 ## Hard unattended boundaries
 
-During a heartbeat wake:
+Seld's own MCP server exposes local record, receipt, and queue tools. It has no
+provider-action, browser, screen-control, or Computer Use method. That boundary
+is structural and is enforced by the server.
+
+The heartbeat still runs in an ordinary ChatGPT task. Other installed plugins
+may expose their own tools to that task, and the current heartbeat surface does
+not give Seld a per-task tool allowlist or denylist. The rules below are the
+wake's mandatory policy for tools owned by those plugins:
 
 - use selected connector tools read-only;
 - never send, post, book, purchase, upload, react, or mutate a provider;
@@ -121,14 +136,18 @@ During a heartbeat wake:
 - never persist raw provider bodies, transcripts, credentials, tokens, cookies,
   private routing identifiers, screenshots, or hidden reasoning.
 
-Consequential external action requires a current interactive Codex task and the
+Consequential external action requires a current interactive ChatGPT task and the
 person's fresh approval of the exact action and context. A prior approval or
 standing preference never authorizes an unattended wake.
+
+If the person requires host-enforced exclusion instead of this wake policy, do
+not register Pulse until every selected source is available through a genuinely
+read-only MCP surface and Computer Use plus provider-write tools are absent from
+the fresh task, or the host supplies a task-scoped tool profile that excludes
+them.
 
 ## Finish honestly
 
 End with a compact account of what changed, what remains unknown, any exact hand
-created, and which frozen inputs were acknowledged. A wake, green test, or
-successful source read is not proof of consumer readiness. Do not claim live
-connector, clean-account, cross-platform, signing, or soak evidence unless the
-installed release ledger actually contains it.
+created, and which frozen inputs were acknowledged. Report source coverage from
+the reads actually performed and keep failures explicit.

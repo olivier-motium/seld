@@ -75,23 +75,24 @@ class _ObservedRecordFile:
 
 
 _NEW_MIND_PROMPT: Final = (
-    "Use $gsv-onboard to help me describe the context GSV should use. Persist only context I "
-    "explicitly accept through the supported Mind document CAS and read it back. This foundation "
-    "does not expose a durable OnboardingSession or readiness command: do not fabricate one or "
-    "claim any source is ready."
+    "Use $gsv-onboard to help me describe the context Seld should use. Persist only context I "
+    "explicitly accept through the supported Mind document CAS and read it back. Use "
+    "gsv_source_list and gsv_source_select for my chosen sources. After each real bounded read, "
+    "use gsv_source_record against the exact source-state revision and read it back. A coverage "
+    "receipt is AI-attested delivery evidence, not semantic truth or permanent provider readiness."
 )
 _NEW_HAND_PROMPT: Final = (
-    "Start a new GSV hand. Read the installed GSV context and exact current records before "
+    "Start a new Seld hand. Read the installed Seld context and exact current records before "
     "deciding what deserves attention."
 )
 _CONTROL_REVIEW_PROMPT: Final = (
-    "Review the pending Bridge intents for this GSV vault through the supported "
+    "Review the pending Bridge intents for this Seld vault through the supported "
     "`gsv operation list` surface. Acknowledge or reject each intent against its current queue "
     "and disposition revisions. This is review only: do not apply the requested change, edit "
     "canonical records, use provider tools, or take external action. If nothing is pending, say so."
 )
 _GUIDED_REVIEW_PROMPT: Final = (
-    "Start or resume one finite all-open GSV Portfolio review. At opening, read Direction, the "
+    "Start or resume one finite all-open Seld Rundown. At opening, read Direction, the "
     "complete Portfolio, every open Task, and relevant WorkThreads and Entities once. Audit the "
     "whole set silently. Surface a row only when all three intervention tests hold: there is a "
     "concrete decision with a supported durable Task, WorkThread, or Portfolio effect available "
@@ -105,9 +106,9 @@ _GUIDED_REVIEW_PROMPT: Final = (
     "outside that threshold, but it is navigation only and adds no semantic change or coverage. "
     "Use one "
     "ordinary nonterminal review-session Task owned and focused only by "
-    "thread:life-portfolio-review, one exact active Codex hand, exactly one "
+    "thread:life-portfolio-review, one exact active ChatGPT task, exactly one "
     "review-scope:all-open ref, and up to 25 review-subject:task:<id> refs naming the prepared "
-    "working set. Store the raw Codex thread UUID only in active_thread_id, the GSV WorkThread ID "
+    "working set. Store the raw ChatGPT task UUID only in active_thread_id, the Seld WorkThread ID "
     "only in ownership and focus, and never retain a codex-thread:* shadow ref. A nonterminal set "
     "uses status=waiting, next_actor=human, next_action, and waiting_on; review-state:paused "
     "exists "
@@ -196,7 +197,7 @@ def project_snapshot(
         if codex_ready and item.status not in TERMINAL_TASK_STATUSES:
             task["codex_url"] = codex_deep_link(
                 vault.root,
-                f"Resume the GSV commitment `{item.identifier}`. Load its exact current record "
+                f"Resume the Seld commitment `{item.identifier}`. Load its exact current record "
                 "and revision before deciding or changing anything.",
             )
         tasks.append(task)
@@ -218,6 +219,17 @@ def project_snapshot(
             "threads": len(thread_records),
         },
     }
+    try:
+        sources = {"available": True, **vault.source_status()}
+    except (ContinuityError, OSError, UnicodeError, ValueError):
+        sources = {
+            "available": False,
+            "error": "The saved source-coverage record could not be read safely.",
+            "revision": None,
+            "selected_count": 0,
+            "sources": [],
+            "updated_at": None,
+        }
     controls, pending_controls = _project_controls(
         vault,
         codex_ready=codex_ready,
@@ -265,6 +277,7 @@ def project_snapshot(
             "sections": {name: section.payload() for name, section in projections.items()}
         },
         "status": status,
+        "sources": sources,
         "tasks": tasks,
         "threads": threads,
     }
@@ -419,17 +432,16 @@ def _project_portfolio(
         )
         if session.active_thread_id is not None and active_thread_id is None and not issue:
             issue = (
-                "The guided review hand is not an exact Codex task UUID; repair it before "
-                "continuing."
+                "The ChatGPT task linked to this review is invalid; repair it before continuing."
             )
         if not issue and len(pending_intents) > 1:
-            issue = "More than one pending answer targets this exact review session."
+            issue = "More than one answer is waiting for this review; repair it before continuing."
         if (
             not issue
             and len(pending_intents) == 1
             and pending_intents[0].get("target_revision") != session.revision
         ):
-            issue = "The pending review answer targets an older session revision."
+            issue = "The review changed after this answer was saved."
         subject_id = inspected_review.current_subject_task_id
         subject_matches = [item for item in projected_items if item["task_id"] == subject_id]
         subject = dict(subject_matches[0]) if len(subject_matches) == 1 else None
@@ -462,13 +474,13 @@ def _project_portfolio(
             subject["evidence_refs"] = list(dict.fromkeys((*task_refs, *thread_refs)))
             staleness: list[str] = []
             if subject["task_stale"]:
-                staleness.append("The Task changed after this Portfolio judgment was authored.")
+                staleness.append("This outcome changed after Seld prepared the decision.")
             if subject["thread_stale"]:
                 staleness.append(
-                    "The owning WorkThread changed after this Portfolio judgment was authored."
+                    "The surrounding situation changed after Seld prepared the decision."
                 )
             if inspection.direction_changed:
-                staleness.append("Direction changed after this Portfolio judgment was authored.")
+                staleness.append("Your current direction changed after Seld prepared the decision.")
             subject["staleness"] = staleness
         review.update(
             {
@@ -757,7 +769,7 @@ def _merge_projection_doctor(
 
 
 def codex_deep_link(vault: Path, prompt: str) -> str:
-    """Build the installed Codex app's verified new-task deep-link shape."""
+    """Build the installed ChatGPT desktop app's verified new-task deep-link shape."""
 
     query = urlencode(
         {

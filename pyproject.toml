@@ -4,20 +4,26 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gsv"
-version = "0.2.0"
+version = "0.3.0"
 description = "An ambient AI chief of staff that stays caught up across the sources you choose"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Seld contributors" }]
-keywords = ["agents", "chief-of-staff", "codex", "gsv", "local-first", "mcp", "seld"]
+keywords = [
+  "ambient-ai",
+  "chatgpt",
+  "chief-of-staff",
+  "gsv",
+  "local-first",
+  "mcp",
+  "personal-ai",
+  "seld",
+]
 classifiers = [
-  "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "License :: OSI Approved :: Apache Software License",
   "Operating System :: MacOS",
-  "Operating System :: Microsoft :: Windows",
-  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
 ]
@@ -42,7 +48,8 @@ release = [
 gsv = "continuity_kernel.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/olivier-motium/seld"
+Homepage = "https://seld.ai"
+Repository = "https://github.com/olivier-motium/seld"
 Issues = "https://github.com/olivier-motium/seld/issues"
 
 [tool.hatch.build.targets.wheel]

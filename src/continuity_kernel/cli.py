@@ -46,6 +46,8 @@ from continuity_kernel.portfolio import (
     portfolio_item,
 )
 from continuity_kernel.records import record_dict
+from continuity_kernel.source_recipes import list_recipes
+from continuity_kernel.source_state import SOURCE_ERROR_CODES
 from continuity_kernel.vault import Vault, doctor_dict
 
 ROLLBACK_PROBE_TIMEOUT_SECONDS = 5
@@ -255,6 +257,42 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "context":
         context = vault.context_pack(max_characters=args.max_characters)
         return context if args.format == "markdown" else {"context": context}
+    if args.command == "source":
+        if args.source_command == "list":
+            return {"catalog": list_recipes(), "state": vault.source_status()}
+        if args.source_command == "select":
+            return vault.select_sources(
+                expected_revision=args.expected_revision,
+                sources=tuple(args.source),
+            )
+        if args.source_command == "record":
+            return vault.record_source_observation(
+                expected_revision=args.expected_revision,
+                source_id=args.source,
+                actor_ref=args.actor_ref,
+                result=args.result,
+                covered_through=args.covered_through,
+                completeness=args.completeness,
+                account_binding=args.account_binding,
+                tool_binding=args.tool_binding,
+                cursor=args.cursor,
+                evidence_refs=tuple(args.evidence_ref),
+                error_code=args.error_code,
+            )
+        raise AssertionError("unreachable source command")
+    if args.command == "local-file":
+        if args.local_file_command == "grant":
+            return vault.grant_local_file_root(args.root)
+        if args.local_file_command == "list":
+            return vault.list_local_file_grants()
+        if args.local_file_command == "revoke":
+            return vault.revoke_local_file_grant(args.grant_id)
+        if args.local_file_command == "read":
+            return vault.read_local_file(
+                grant_id=args.grant_id,
+                relative_path=args.relative_path,
+            )
+        raise AssertionError("unreachable local-file command")
     if args.command == "task":
         return _task(vault, args)
     if args.command == "direction":
@@ -285,7 +323,7 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
     if not isinstance(result, dict):
         return None
     if args.command == "setup" and result.get("setup_complete") is False:
-        return 3, "GSV setup stopped because the vault is unhealthy; follow result.next."
+        return 3, "Seld setup stopped because the local record is unhealthy; follow result.next."
     if (
         args.command == "setup"
         and result.get("setup_complete") is True
@@ -294,28 +332,28 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
     ):
         return (
             4,
-            "GSV installation committed, but the Bridge needs repair; follow result.next.",
+            "Seld installation committed, but the Bridge needs repair; follow result.next.",
         )
     if args.command == "doctor" and result.get("healthy") is False:
-        return 3, "GSV doctor found unresolved integrity issues; follow result.issues."
+        return 3, "Seld doctor found unresolved integrity issues; follow result.issues."
     if (
         args.command == "backup"
         and args.backup_command == "verify"
         and result.get("valid") is False
     ):
-        return 3, "GSV backup verification failed; do not restore this archive."
+        return 3, "Seld backup verification failed; do not restore this archive."
     if (
         args.command == "backup"
         and args.backup_command == "create"
         and result.get("verified") is False
     ):
-        return 3, "GSV backup creation did not verify; do not use the reported archive."
+        return 3, "Seld backup creation did not verify; do not use the reported archive."
     if (
         args.command == "codex"
         and args.codex_command == "uninstall"
         and result.get("cleanup_complete") is False
     ):
-        return 3, "GSV cleanup is incomplete; follow result.next and retry."
+        return 3, "Seld cleanup is incomplete; follow result.next and retry."
     return None
 
 
@@ -359,7 +397,7 @@ def _setup_next(
         steps.append("The Bridge was not started.")
     elif bridge is not None and bridge.get("running") is False:
         steps.append(
-            "GSV and its Codex integration are installed, but the Bridge did not start. "
+            "Seld and its ChatGPT integration are installed, but the Bridge did not start. "
             "Inspect `gsv --json bridge status`, then retry `gsv bridge open`; no older "
             "executable was substituted."
         )
@@ -372,13 +410,13 @@ def _setup_next(
 
     if no_codex:
         steps.append(
-            "Codex integration was skipped; run `gsv codex install` when you want a new "
-            "Codex hand to load this vault."
+            "ChatGPT integration was skipped; run `gsv codex install` when you want a new "
+            "ChatGPT task to load this local record."
         )
     else:
         steps.append(
-            "Restart Codex, open one fresh task, and run `$gsv-onboard` to describe your "
-            "world and verify only the sources you choose."
+            "Restart the ChatGPT desktop app, open one fresh task, and run `$gsv-onboard` "
+            "to describe your world and verify only the sources you choose."
         )
     return " ".join(steps)
 
@@ -600,7 +638,7 @@ def _operation(vault: Vault, args: argparse.Namespace) -> Any:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gsv",
-        description="Local-first durable state for coding agents.",
+        description="Seld: your private, resident AI chief of staff.",
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--vault", help="Override the configured vault path.")
@@ -608,20 +646,20 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
 
     setup = commands.add_parser(
-        "setup", help="Initialize a vault and install the Codex integration."
+        "setup", help="Initialize a local record and install the ChatGPT integration."
     )
-    setup.add_argument("--name", default="My GSV")
+    setup.add_argument("--name", default="My Seld")
     setup.add_argument("--codex-home", default=str(codex_home()))
     setup.add_argument("--no-bridge", action="store_true")
     setup.add_argument("--no-browser", action="store_true")
     setup.add_argument("--no-codex", action="store_true")
 
-    init = commands.add_parser("init", help="Initialize a vault without changing Codex.")
-    init.add_argument("--name", default="My GSV")
+    init = commands.add_parser("init", help="Initialize a local record without changing ChatGPT.")
+    init.add_argument("--name", default="My Seld")
     init.add_argument("--configure", action="store_true")
 
     commands.add_parser("status", help="Show vault identity and counts.")
-    doctor = commands.add_parser("doctor", help="Validate storage and Codex integration.")
+    doctor = commands.add_parser("doctor", help="Validate storage and ChatGPT integration.")
     doctor.add_argument(
         "--repair", action="store_true", help="Remove interrupted-write temp files only."
     )
@@ -629,6 +667,67 @@ def _parser() -> argparse.ArgumentParser:
     context.add_argument("--format", choices=("markdown", "json"), default="markdown")
     context.add_argument("--max-characters", type=int, default=48_000)
     context.set_defaults(raw=True)
+
+    source = commands.add_parser(
+        "source",
+        help="Select sources and record bounded reads made by the resident AI.",
+    )
+    source_commands = source.add_subparsers(dest="source_command", required=True)
+    source_commands.add_parser("list")
+    source_select = source_commands.add_parser(
+        "select",
+        help="CAS-replace the user-approved source set; deselection purges its coverage.",
+    )
+    source_select.add_argument("--expected-revision", required=True)
+    source_select.add_argument("--source", action="append", default=[])
+    source_record = source_commands.add_parser(
+        "record",
+        help="CAS-record one content-free source read or bounded failure.",
+    )
+    source_record.add_argument("--expected-revision", required=True)
+    source_record.add_argument("--source", required=True)
+    source_record.add_argument("--actor-ref", required=True)
+    source_record.add_argument(
+        "--result",
+        choices=("success", "explicit_empty", "failure"),
+        required=True,
+    )
+    source_record.add_argument("--covered-through")
+    source_record.add_argument("--completeness", choices=("complete", "partial"))
+    source_record.add_argument("--account-binding")
+    source_record.add_argument("--tool-binding")
+    source_record.add_argument("--cursor")
+    source_record.add_argument("--evidence-ref", action="append", default=[])
+    source_record.add_argument("--error-code", choices=SOURCE_ERROR_CODES)
+
+    local_file = commands.add_parser(
+        "local-file",
+        help="Read one explicitly selected local text file through Seld's privacy screen.",
+    )
+    local_file_commands = local_file.add_subparsers(
+        dest="local_file_command",
+        required=True,
+    )
+    local_file_grant = local_file_commands.add_parser(
+        "grant",
+        help="Grant one exact root to this vault from the local host.",
+    )
+    local_file_grant.add_argument("--root", required=True)
+    local_file_commands.add_parser(
+        "list",
+        help="List host-local roots granted to this exact vault.",
+    )
+    local_file_revoke = local_file_commands.add_parser(
+        "revoke",
+        help="Revoke one host-local root grant from this vault.",
+    )
+    local_file_revoke.add_argument("--grant-id", required=True)
+    local_file_read = local_file_commands.add_parser(
+        "read",
+        help="Return one bounded file transiently without writing its content to the vault.",
+    )
+    local_file_read.add_argument("--grant-id", required=True)
+    local_file_read.add_argument("--relative-path", required=True)
 
     task = commands.add_parser("task", help="Create, inspect, and update durable tasks.")
     task_commands = task.add_subparsers(dest="task_command", required=True)
@@ -789,20 +888,23 @@ def _parser() -> argparse.ArgumentParser:
     backup_restore.add_argument("path")
     backup_restore.add_argument("target")
 
-    demo = commands.add_parser("demo", help="Run the complete synthetic GSV proof.")
+    demo = commands.add_parser("demo", help="Run the complete synthetic Seld proof.")
     demo.add_argument("--output")
 
-    bridge = commands.add_parser("bridge", help="Open or inspect the local GSV Bridge.")
+    bridge = commands.add_parser("bridge", help="Open or inspect the local Seld Bridge.")
     bridge_commands = bridge.add_subparsers(dest="bridge_command", required=True)
     bridge_open = bridge_commands.add_parser("open", help="Open The Bridge in your browser.")
     bridge_open.add_argument("--no-browser", action="store_true")
     bridge_commands.add_parser("status", help="Show the verified Bridge process state.")
-    bridge_commands.add_parser("stop", help="Stop only the verified GSV Bridge process.")
+    bridge_commands.add_parser("stop", help="Stop only the verified Seld Bridge process.")
     bridge_serve = bridge_commands.add_parser("serve", help=argparse.SUPPRESS)
     bridge_serve.add_argument("--port", type=int, default=0)
     bridge_serve.add_argument("--instance-id")
 
-    codex = commands.add_parser("codex", help="Manage the supported Codex integration.")
+    codex = commands.add_parser(
+        "codex",
+        help="Manage the supported ChatGPT desktop integration (compatibility command).",
+    )
     codex_commands = codex.add_subparsers(dest="codex_command", required=True)
     for name in ("install", "status", "uninstall"):
         command = codex_commands.add_parser(name)

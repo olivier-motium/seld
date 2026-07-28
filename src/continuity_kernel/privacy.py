@@ -71,7 +71,9 @@ _EXCLUDED_NAMES: Final = frozenset(
         "secrets.json",
     }
 )
-_SECRET_NAME: Final = re.compile(r"(?:^|\.)(?:credential|credentials|secret|secrets)(?:\.|$)")
+_SECRET_NAME: Final = re.compile(
+    r"(?:^|\.)(?:credential|credentials|password|passwords|secret|secrets)(?:\.|$)"
+)
 _CODEX_CREDENTIAL_CONTAINERS: Final = frozenset({".codex", ".openai", "openai"})
 _CODEX_CREDENTIAL_ARTIFACT: Final = re.compile(r"^(?:auth(?:\.jsonl?)?|.+[-_.]auth(?:\.jsonl?)?)$")
 _POSIX_SYSTEM_ROOTS: Final = frozenset(
@@ -98,8 +100,19 @@ _SECRET_PATTERNS: Final = (
         re.compile(
             rb"(?i)(?<![A-Za-z0-9_-])(?:[\"']?)(?:api[_-]?key|client[_-]?secret|access[_-]?token|"
             rb"refresh[_-]?token|id[_-]?token|password|secret|token)(?:[\"']?)\s*[:=]\s*"
-            rb"(?:[\"']?)[^\s\"',;}]{12,}(?:[\"']?)"
+            rb"(?:[\"']?)[^\s\"',;}]+(?:[\"']?)"
         ),
+    ),
+    (
+        "credential-uri",
+        re.compile(
+            rb"(?i)\b(?:https?|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?|ftp)://"
+            rb"[^\s/:@]+:[^\s/@]+@"
+        ),
+    ),
+    (
+        "credential-header",
+        re.compile(rb"(?im)^\s*(?:authorization|cookie|proxy-authorization|set-cookie)\s*:\s*\S+"),
     ),
 )
 _HIGH_ENTROPY_TOKEN: Final = re.compile(rb"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{32,}(?![A-Za-z0-9])")
@@ -220,6 +233,7 @@ def read_screened_local_content(
     path: Path | str,
     *,
     selected_root: Path | str,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> ScreenedLocalContent:
     """Read and screen one approved file through the stable no-follow boundary.
 
@@ -235,6 +249,10 @@ def read_screened_local_content(
         approved_root = os.lstat(root_input)
     except OSError:
         approved_root = None
+    if expected_root_identity is not None and (
+        approved_root is None or _posix_identity(approved_root) != expected_root_identity
+    ):
+        raise ValidationError("selected local context root no longer matches its grant")
 
     assessment = assess_local_path(path, selected_root=root_input, content_requested=True)
     if assessment.decision is not AwarenessDecision.CONTENT_ALLOWED:

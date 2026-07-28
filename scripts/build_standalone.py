@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and smoke-test one self-contained GSV executable."""
+"""Build and smoke-test one self-contained Seld executable."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class _RejectRedirects(HTTPRedirectHandler):
         raise HTTPError(
             request.full_url,
             code,
-            "GSV refuses redirects during the frozen Bridge smoke test",
+            "Seld refuses redirects during the frozen Bridge smoke test",
             headers,
             file_pointer,
         )
@@ -233,16 +233,23 @@ def _bridge_static_smoke(binary: Path) -> dict[str, bool]:
                 root_page = response.read()
             with _open_loopback(f"{url.rstrip('/')}/static/bridge.css", timeout=5) as response:
                 stylesheet = response.read()
+            with _open_loopback(
+                f"{url.rstrip('/')}/static/fonts/nunito-var.woff2", timeout=5
+            ) as response:
+                font_content_type = response.headers.get_content_type()
+                font_payload = response.read()
             snapshot_request = Request(
                 f"{url.rstrip('/')}/api/v1/snapshot",
                 headers={"Authorization": f"Bearer {state['token']}"},
             )
             with _open_loopback(snapshot_request, timeout=5) as response:
                 snapshot = json.loads(response.read())
-            if b"Your work in Codex, in one place." not in root_page:
+            if b"<title>Seld</title>" not in root_page or b'id="view"' not in root_page:
                 raise RuntimeError("frozen Bridge root page was not bundled")
             if b".connection-notice" not in stylesheet:
                 raise RuntimeError("frozen Bridge stylesheet was not bundled")
+            if font_content_type != "font/woff2" or not font_payload.startswith(b"wOF2"):
+                raise RuntimeError("frozen Bridge font was not bundled with deterministic MIME")
             if snapshot.get("status", {}).get("vault_id") != state.get("vault_id"):
                 raise RuntimeError("frozen Bridge snapshot did not match its vault")
         finally:
@@ -273,6 +280,7 @@ def _isolated_environment(root: Path, vault: Path) -> dict[str, str]:
             "APPDATA": str(config),
             "CODEX_HOME": str(codex_home),
             "GSV_CONFIG_DIR": str(config),
+            "GSV_CODEX": str(root / "missing-codex"),
             "GSV_DATA_DIR": str(data),
             "GSV_VAULT": str(vault),
             "HOME": str(home),

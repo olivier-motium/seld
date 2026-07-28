@@ -341,6 +341,7 @@ def _is_owned_vault_temp(relative: str) -> bool:
             "NOW.md",
             "PORTFOLIO.md",
             "README.md",
+            "SOURCES.md",
         }
     if parent in {"tasks", "entities", "threads"}:
         return target_name.endswith(".md")

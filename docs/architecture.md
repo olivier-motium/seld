@@ -3,7 +3,7 @@
 Seld has one product loop. The AI reads bounded context from the sources a person
 selected, relates it to durable local records, authors any justified change
 through compare-and-swap writes, and presents the current result in Bridge.
-When work is needed, one exact Codex task carries the outcome. Pulse repeats the
+When work is needed, one exact ChatGPT task carries the outcome. Pulse repeats the
 same reasoning loop on a bounded heartbeat; it does not replace the model with
 rules.
 
@@ -16,16 +16,14 @@ owns meaning, priority, relationships, memory judgment, and what happens next.
 - **Seld** is the local continuity layer: the records, persistence protocol,
   recovery, and adapters.
 - **Mind** is the authored point of view in durable documents and records.
-- **Codex tasks** are replaceable execution hands using the same kernel.
+- **ChatGPT tasks** are replaceable execution hands using the same kernel.
 - **Bridge** is the human home screen plus a narrow append-only queue for
   explicit setup choices, approvals, corrections, and undo requests. A queued
   intent and its accept/reject disposition cannot write semantic records or
   authorize an external action.
-- **Pulse** is one dedicated Codex task awakened by an app-native heartbeat.
+- **Pulse** is one dedicated ChatGPT task awakened by an app-native heartbeat.
   The model reorients, reads bounded selected sources, and authors judgment.
-  It is not the deterministic `PulseController` and not a rules engine.
-- **Shipyard** is an operating role with durable review boundaries in `0.2.0`,
-  not an autonomous self-modification service.
+  It is not a rules engine.
 
 ## Kernel
 
@@ -35,15 +33,30 @@ Portfolio. `continuity_kernel.vault` owns validation, locking, atomic
 persistence, context rendering, backup, restore, and health checks. The CLI and
 dependency-free stdio MCP server are adapters over that same vault.
 
-The Culture-Grade branch packages `gsv-onboard` and `gsv-pulse` skills over the
-existing document, Task, WorkThread, Portfolio, operation, and Bridge surfaces.
-It also contains onboarding storage, source recipes and attestation validation,
-deterministic Pulse admission, OS-scheduler planning, privacy screening, and
-migration modules. Unless a module is exposed through a documented public path
-and proved through its installed user flow, it is foundation code, not a
-shipped capability. Bridge does not publish onboarding or host-readiness
-foundation state. The onboarding/source mutation interfaces, deterministic
-Pulse controller, OS scheduler, and migration interfaces remain unexposed.
+`continuity_kernel.source_state` adds the portable `SOURCES.md` ledger over
+that same vault. `gsv source` and `gsv_source_*` expose explicit selection plus
+content-free AI-attested read/failure receipts; Bridge shows current, partial,
+unread, stale, failed, and host/recipe-revalidation states. Successful receipts
+are bound to the local host and recipe version, and failed attempts retain the
+lineage of any prior successful coverage. Provider reads stay in the
+user-enabled ChatGPT app, custom MCP server, or audited local reader. The core
+never parses provider content or decides what it means.
+
+Local-file access uses a separate host-local authority store. Selecting the
+logical source grants no directory access. Grant and revoke are explicit CLI
+operations bound to one exact vault directory and selected root; MCP can list
+current grants and read one named relative path but cannot create authority.
+Replacing or restoring the vault at the same path invalidates the grant. The
+reader pins both directory identities, refuses links and path escape, avoids
+cloud placeholders, and passes content through the privacy screen. The portable
+source ledger retains only a fingerprint of the current grant set, so any grant
+change makes earlier coverage require a new bounded read.
+
+The packaged `gsv-onboard` and `gsv-pulse` skills compose document, Task,
+WorkThread, Portfolio, source, operation, and Bridge surfaces. Deterministic
+code on those paths protects identity, privacy, bounds, compare-and-swap writes,
+recovery, and replay safety. Seld ships no second rules-based onboarding,
+Pulse, scheduler, or migration control plane.
 
 Markdown in the vault is authoritative. Deterministic code may persist,
 validate, traverse, and render authored facts. It may not infer task meaning,
@@ -54,35 +67,33 @@ activity.
 
 The public Pulse composition deliberately reuses ordinary Seld primitives:
 
-1. one structural `task:resident-pulse` is bound to one real Codex task UUID by
+1. one structural `task:resident-pulse` is bound to one real ChatGPT task UUID by
    `system-role:resident-pulse`;
-2. one app-native `heartbeat` wakes that same Codex task on a ten-minute target
+2. one app-native `heartbeat` wakes that same ChatGPT task on a ten-minute target
    cadence;
 3. the `$gsv-pulse` skill freezes a bounded context and source window;
-4. the model reads selected connectors directly, treats their contents as
+4. the model reads selected sources directly, treats their contents as
    untrusted evidence, and makes the semantic judgment;
 5. justified Task, WorkThread, Entity, Direction, Portfolio, Mind, and NOW
    changes use the existing native CAS surfaces and exact readback; and
-6. one wake may create at most one visible sustained-work Codex hand.
+6. one wake may create at most one visible sustained-work ChatGPT hand.
 
 The implemented deterministic substrate has only mechanical authority: validate
 the structural Pulse Task marker, bound its stored hand as one opaque identifier
 line, reject stale CAS, bound input, preserve content-free operation receipts,
-and prevent duplicate delivery. The skill performs the UUID comparison. Exact
-host-observed correlation with the current Codex task and a
-connector-write secret screen are still Gate 0 work, not present-tense kernel
-guarantees. It does not decide
-what matters, translate a source item into a task, rank work, curate memory, or
-write an orientation. The exact resident Pulse is the sole autonomous NOW
-writer.
+and prevent duplicate delivery. The skill performs the UUID comparison. The
+content-free source ledger records AI-attested coverage rather than claiming
+independent provider certification. It does not decide what matters, translate
+a source item into a task, rank work, curate memory, or write an orientation.
+The exact resident Pulse is the sole autonomous NOW writer.
 
 The structural Pulse task is transport identity, not a life outcome. Bridge
 and guided Portfolio review exclude it from commitment counts and open-outcome
-selection. Registration, one natural wake, connector use, and long-running
-reliability still require installed evidence; the packaged skill and tests do
-not close those gates. See [Resident AI Pulse](pulse.md).
+selection. Seld makes no guaranteed wake-rate or uptime claim; those narrower
+measurements require the exact installed evidence named in the claim ledger.
+See [Resident AI Pulse](pulse.md).
 
-## Codex integration
+## ChatGPT integration
 
 Setup generates a per-Codex-home local marketplace containing the bundled
 `gsv` plugin,
@@ -186,7 +197,7 @@ unknown journal state or failed canonical recovery is reported as degraded and
 left in place for inspection.
 
 A process or operating-system death between canonical replacement and journal
-append can still leave authoritative Markdown without its audit event. `0.2.0`
+append can still leave authoritative Markdown without its audit event. `0.3.0`
 does not ship a pending-mutation protocol and the journal is not authoritative.
 Callers must reload after any committed or degraded persistence error rather
 than retrying with a stale revision.
@@ -226,7 +237,7 @@ introduce a transcript database or a second task system:
 2. One ordinary nonterminal review-session Task belongs to exactly
    `thread:life-portfolio-review`, and that WorkThread focuses the session Task.
    The Task carries one all-open scope, at most 25 exact current subjects, and
-   one exact Codex hand. `review-state:paused` pauses that same session without
+   one exact ChatGPT task. `review-state:paused` pauses that same session without
    clearing its subjects or hand. A legacy single-subject session may also
    carry authored quick-option references; a prepared multi-subject session
    keeps its questions and recommendations out of canon.
@@ -257,7 +268,7 @@ introduce a transcript database or a second task system:
 5. When the local Codex capability check passes, the authenticated append
    creates and schedules one durable turn receipt. The browser's bounded
    review-turn endpoint is an idempotent trigger and recovery path for that
-   exact event ID. START first creates a Codex hand, then immediately resumes it
+   exact event ID. START first creates a ChatGPT task, then immediately resumes it
    to bind the emitted UUID; later answers resume the authored hand once. Every
    invocation uses the required vault-bound `gsv` MCP server and exposes no
    provider, Computer Use, shell-write, or external-action tools. The browser
@@ -278,8 +289,8 @@ introduce a transcript database or a second task system:
    only for outcomes actually checked on current truth. Audited-but-hidden and
    unanswered outcomes remain uncovered. A Task or owning WorkThread change
    makes its row or coverage stale and returns the outcome to the remaining
-   scope. A newly open outcome joins the scope. Checked never means resolved
-   and never changes Portfolio order mechanically.
+   scope. A newly open outcome joins the scope. Review progress does not resolve
+   the outcome or change Portfolio order mechanically.
 8. A successful turn may return one bounded final answer plus a bounded
    prepared sheet for transient Bridge display before the browser reloads
    canon. Neither is persisted. A Bridge restart preserves canonical progress
@@ -312,9 +323,9 @@ local capability probe is cached for only a bounded interval, so repaired Codex
 authentication can become visible without restarting Bridge.
 
 This control write flow currently depends on POSIX directory descriptors,
-`O_NOFOLLOW`, and directory-root locking. It is enabled on macOS and Linux. The
-Windows foundation deliberately does not advertise the operation CLI or MCP
-surface until an equivalent secure pinned-store backend exists. Bridge reports
+`O_NOFOLLOW`, and directory-root locking. It is enabled on macOS and Linux.
+Windows support is coming; Seld does not advertise the operation CLI or MCP
+surface there until an equivalent secure pinned-store backend exists. Bridge reports
 the control lane unavailable, does not fall back to a path-based writer, and
 keeps canonical read projections usable.
 
@@ -376,7 +387,9 @@ state.
 ## Portability
 
 The runtime uses the Python standard library before freezing, plus bundled
-static Bridge assets. The UI uses the host system font stack and ships no font
-runtime. PyInstaller produces one executable per OS and architecture. Vault
-records and backups are platform-neutral UTF-8/ZIP data and never contain
-executable installation state.
+static Bridge assets. The UI bundles the open-source Nunito and Nunito Sans
+variable fonts with their OFL 1.1 license; the Bridge serves them from the same
+loopback origin with deterministic `font/woff2` metadata and retains system
+font fallbacks. PyInstaller produces one executable per OS and architecture.
+Vault records and backups are platform-neutral UTF-8/ZIP data and never
+contain executable installation state.

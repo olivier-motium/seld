@@ -26,7 +26,6 @@ from continuity_kernel.errors import (
     PersistenceError,
     ValidationError,
 )
-from continuity_kernel.migration import FoundationMigration
 from continuity_kernel.records import new_task, render_task
 from continuity_kernel.vault import BACKUP_MANIFEST, Vault
 from continuity_kernel.vault_identity import REQUIRED_VAULT_DIRECTORIES
@@ -812,6 +811,7 @@ def test_backup_excludes_only_exact_writer_owned_atomic_temps(vault: Vault, tmp_
         ".MIND.md.tmp-token",
         ".NOW.md.tmp-token",
         ".README.md.tmp-token",
+        ".SOURCES.md.tmp-token",
         "tasks/.example.md.tmp-token",
         "entities/.example.md.tmp-token",
         "threads/.example.md.tmp-token",
@@ -845,6 +845,7 @@ def test_backup_with_crash_leftover_foundation_temps_restores_cleanly(
 ) -> None:
     owned_temps = (
         ".DIRECTION.md.tmp-crash",
+        ".SOURCES.md.tmp-crash",
         ".gsv/control/.queue.jsonl.tmp-crash",
         ".gsv/control/.dispositions-0000000000000000.jsonl.tmp-crash",
         ".gsv/control/archive/.queue-0-aaaaaaaa.jsonl.tmp-crash",
@@ -869,11 +870,55 @@ def test_backup_with_crash_leftover_foundation_temps_restores_cleanly(
 def test_backup_excludes_only_exact_host_local_migration_tombstone_markers(
     vault: Vault, tmp_path: Path
 ) -> None:
-    migration = FoundationMigration(vault)
-    applied = migration.apply()
-    migration.rollback(expected_revision=applied.revision)
-    exact_markers = tuple(vault.root.glob(".onboarding.gsv-remove-*.marker")) + tuple(
-        (vault.root / ".gsv").glob(".*.gsv-remove-*.marker")
+    def legacy_marker(parent: Path, name: str, relative: str) -> Path:
+        staging = parent / f".{name}.gsv-create-fixture.stage"
+        staging.mkdir()
+        # Mirror the retired writer exactly: record the private create-stage
+        # identity, publish it at the canonical path, verify ownership there,
+        # and only then isolate that same directory under its tombstone name.
+        metadata = os.lstat(staging)
+        owned = parent / name
+        atomic_module.move_no_replace(staging, owned)
+        published = os.lstat(owned)
+        assert (published.st_dev, published.st_ino) == (metadata.st_dev, metadata.st_ino)
+        token = sha256_bytes(
+            f"culture-grade-foundation-v1\0{relative}\0{metadata.st_dev}\0{metadata.st_ino}".encode()
+        )[:24]
+        quarantine = parent / f".{name}.gsv-remove-{token}.quarantine"
+        atomic_module.move_no_replace(owned, quarantine)
+        moved = os.lstat(quarantine)
+        assert (moved.st_dev, moved.st_ino) == (metadata.st_dev, metadata.st_ino)
+        marker = quarantine.with_suffix(".marker")
+        marker_bytes = (
+            json.dumps(
+                {
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "migration_id": "culture-grade-foundation-v1",
+                    "relative_path": relative,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        # The retired writer used os.write with canonical LF bytes. Text-mode
+        # writes translate that terminator to CRLF on Windows and no longer
+        # represent a marker the backup scanner is allowed to trust.
+        marker_stage = marker.with_name(f".{marker.name}.gsv-stage-fixture")
+        marker_stage.write_bytes(marker_bytes)
+        atomic_module.durable_publish_new(marker_stage, marker)
+        assert not marker_stage.exists()
+        assert marker.read_bytes() == marker_bytes
+        assert vault_backup_module._is_owned_migration_tombstone_marker(
+            marker, marker.relative_to(vault.root).as_posix()
+        )
+        return marker
+
+    exact_markers = (
+        legacy_marker(vault.root, "onboarding", "onboarding"),
+        legacy_marker(vault.root / ".gsv", "control", ".gsv/control"),
+        legacy_marker(vault.root / ".gsv", "migrations", ".gsv/migrations"),
     )
     assert len(exact_markers) == 3
     lookalike = vault.root / ".onboarding.gsv-remove-000000000000000000000000.marker"

@@ -1,14 +1,20 @@
 #!/bin/sh
 set -eu
 
-VERSION="${GSV_VERSION:-0.2.0}"
+VERSION="${GSV_VERSION:-0.3.0}"
 RELEASE_BASE="${GSV_RELEASE_BASE_URL:-https://github.com/olivier-motium/seld/releases/download/v${VERSION}}"
 INSTALL_DIR="${GSV_BIN_DIR:-${HOME}/.local/bin}"
 TARGET="${INSTALL_DIR}/gsv"
 
 case "$(uname -s)" in
   Darwin) platform="macos" ;;
-  Linux) platform="linux" ;;
+  Linux)
+    if [ -z "${GSV_BINARY:-}" ]; then
+      printf '%s\n' "Seld does not publish a Linux prebuilt yet. Use the supported macOS source install; other platforms are coming." >&2
+      exit 2
+    fi
+    platform="linux"
+    ;;
   *) printf '%s\n' "Unsupported operating system. Use install.ps1 on Windows." >&2; exit 2 ;;
 esac
 
@@ -72,20 +78,20 @@ else
 fi
 
 if [ "$actual" != "$expected" ]; then
-  printf '%s\n' "GSV artifact checksum verification failed." >&2
+  printf '%s\n' "Seld artifact checksum verification failed." >&2
   exit 2
 fi
 
 mkdir -p "$INSTALL_DIR"
 if [ -L "$TARGET" ]; then
-  printf '%s\n' "Refusing to replace a symbolic-link GSV target: $TARGET" >&2
+  printf '%s\n' "Refusing to replace a symbolic-link Seld target: $TARGET" >&2
   exit 2
 fi
 staged="$(mktemp "${INSTALL_DIR}/.gsv.new.XXXXXX")"
 install -m 0755 "$download" "$staged"
 if ! "$staged" --version >/dev/null; then
   rm -f "$staged"
-  printf '%s\n' "The staged GSV executable did not pass its version preflight." >&2
+  printf '%s\n' "The staged Seld executable did not pass its version preflight." >&2
   exit 2
 fi
 prior_bridge_stopped=0
@@ -106,7 +112,7 @@ if [ -e "$TARGET" ]; then
     *'"ok":true'*) ;;
     *)
       rm -f "$backup" "$staged"
-      printf '%s\n' "The staged GSV executable returned an invalid Bridge stop result." >&2
+      printf '%s\n' "The staged Seld executable returned an invalid Bridge stop result." >&2
       exit 2
       ;;
   esac
@@ -117,7 +123,7 @@ if ! mv "$staged" "$TARGET"; then
       printf '%s\n' "Warning: the previous Bridge could not be restarted after install replacement failed." >&2
   fi
   [ -z "$backup" ] || rm -f "$backup"
-  printf '%s\n' "Could not atomically install the GSV executable." >&2
+  printf '%s\n' "Could not atomically install the Seld executable." >&2
   exit 2
 fi
 
@@ -129,7 +135,7 @@ if [ "$setup_status" -eq 4 ]; then
   if [ -n "$backup" ] && [ -e "$backup" ]; then
     preserve_backup=1
   fi
-  printf '\nInstalled GSV at %s, but the Bridge needs repair.\n' "$TARGET" >&2
+  printf '\nInstalled Seld at %s, but the Bridge needs repair.\n' "$TARGET" >&2
   printf '%s\n' "The candidate and committed Codex integration were kept; no executable rollback was attempted." >&2
   if [ -n "$backup" ] && [ -e "$backup" ]; then
     printf 'The previous executable remains staged at %s.\n' "$backup" >&2
@@ -151,16 +157,16 @@ if [ "$setup_status" -ne 0 ]; then
   if [ "$cleanup_status" -ne 0 ]; then
     if [ -n "$backup" ]; then
       preserve_backup=1
-      printf '%s\n' "GSV setup failed and its Bridge stop could not be verified (exit $cleanup_status); the previous executable remains staged at $backup." >&2
+      printf '%s\n' "Seld setup failed and its Bridge stop could not be verified (exit $cleanup_status); the previous executable remains staged at $backup." >&2
     else
-      printf '%s\n' "GSV setup failed and its Bridge stop could not be verified (exit $cleanup_status); the candidate executable was left in place." >&2
+      printf '%s\n' "Seld setup failed and its Bridge stop could not be verified (exit $cleanup_status); the candidate executable was left in place." >&2
     fi
     exit "$setup_status"
   fi
   if [ -n "$backup" ] && [ -e "$backup" ]; then
     if ! previous_executable_is_compatible "$backup"; then
       preserve_backup=1
-      printf '%s\n' "GSV setup failed and the previous executable could not prove it can read the current vault and control ledger; no rollback was performed. The candidate remains installed and the previous executable remains staged at $backup." >&2
+      printf '%s\n' "Seld setup failed and the previous executable could not prove it can read the current vault and control ledger; no rollback was performed. The candidate remains installed and the previous executable remains staged at $backup." >&2
       exit "$setup_status"
     fi
     mv "$backup" "$TARGET"
@@ -172,17 +178,17 @@ if [ "$setup_status" -ne 0 ]; then
       printf '%s\n' "Warning: the previous executable was restored, but its Bridge could not be restarted." >&2
     fi
   fi
-  printf '%s\n' "GSV setup failed; the previous executable was restored and its Bridge restart was attempted." >&2
+  printf '%s\n' "Seld setup failed; the previous executable was restored and its Bridge restart was attempted." >&2
   exit "$setup_status"
 fi
 if [ -n "$backup" ] && [ -e "$backup" ]; then
   rm "$backup"
 fi
 
-printf '\nInstalled GSV at %s\n' "$TARGET"
+printf '\nInstalled Seld at %s\n' "$TARGET"
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *) printf 'Add %s to PATH to run gsv directly in future shells.\n' "$INSTALL_DIR" ;;
 esac
-printf '%s\n' "GSV setup completed. Run gsv to open or verify the Bridge."
-printf '%s\n' "Restart Codex, open one fresh task, and run \$gsv-onboard."
+printf '%s\n' "Seld setup completed. Run gsv to open or verify the Bridge."
+printf '%s\n' "Restart the ChatGPT desktop app, open one fresh task, and run \$gsv-onboard."

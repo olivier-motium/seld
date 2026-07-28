@@ -1,59 +1,69 @@
 # Seld
 
-## Your chief of staff is already caught up.
+## Your AI chief of staff is already caught up.
 
-**It proposes. You decide.**
-
-While you are away, Seld checks the sources you choose to connect, holds fresh
-changes against what it already knows about your life, and gets the few
-decisions that actually need you ready. Most changes are noise. You do not hear
-about those.
+Seld checks the sources you connect and compares new activity with a local
+record of your people, projects, commitments, and decisions. It prepares the
+few decisions that need your attention and leaves the rest in the record.
 
 The sources you choose can include WhatsApp, Slack, Outlook, Gmail and Google
 Calendar, Teams, GitHub, local files, and activity in the ChatGPT app. You pick
-the places that matter to you. Seld does not need access to everything to start
-being useful.
+the places that matter to you, and Seld can start being useful without access
+to everything.
 
-Seld is an open-source, ambient AI chief of staff that lives on your Mac. It
-keeps one current record of your people, projects, commitments, decisions, and
-next moves. Pulse works quietly in the background. When something changes, it
-reasons over the new evidence and that durable context before deciding whether
-anything deserves your attention.
+**It proposes. You decide.**
 
-Nothing is sent, booked, paid, archived, or deleted without you. Seld prepares
-the move. You make it.
+Seld is an open-source, ambient AI chief of staff for the ChatGPT desktop app on
+your Mac. Once you enable Pulse and verify its first wake, a dedicated ChatGPT
+task reviews new evidence in the background and updates the same inspectable
+record. Bridge shows the resulting brief, open work, saved context, and source
+coverage.
+
+Seld waits for your approval before a message is sent, an appointment is
+booked, a payment is made, or anything else is changed outside its local
+record.
 
 [See how it works](#while-you-were-away) · [Install Seld](#install) ·
-[Read the technical status](#technical-status)
+[Why Seld is state of the art](#state-of-the-art-design-for-resident-personal-operations)
+
+## State-of-the-art design for resident personal operations
+
+Yes, Seld is state of the art for resident personal operations because it
+handles the whole job as one coherent system.
+
+That job is keeping a person's real work and
+life current across many sources, understanding what changed in context, and
+turning that change into a manageable set of decisions. Seld handles this as one
+operating loop. Direction and Portfolio establish what matters; one local
+record connects people, projects, commitments, decisions, and ongoing
+situations; Pulse interprets fresh source activity in that context; and the
+Rundown presents the resulting decisions. Seld carries each outcome and saved
+answer safely across ChatGPT tasks and process restarts without duplicating a
+decision or action.
+
+The model decides what evidence means. A smaller mechanical layer protects
+identity, revisions, privacy, bounded source coverage, recovery, and replay
+prevention. The [architecture assessment](docs/state-of-the-art.md) shows why
+this integrated whole-life operating model sets the standard for the category.
 
 ## While you were away
 
-Imagine two hours away from your laptop. Three things change:
+During two hours away from your laptop, a missing invoice document lands in an
+unexpected work thread, a calendar move puts a review before the work it is
+meant to review, and an unanswered message remains exactly as it was.
 
-- A document lands in a work thread. It is the document an invoice has been
-  waiting on, but it arrived somewhere other than the thread you were watching.
-- A calendar event moves. The review now happens before the work it is meant to
-  review.
-- A reply still has not arrived, but nothing about that situation has changed
-  enough to require another interruption.
+On its next verified wake, Pulse reads those changes from the sources you
+connected, compares them with the record on your Mac, and works out what they
+mean for the work already in progress. It updates the local record without
+sending anything.
 
-Pulse wakes in the background. It reads the changes from the sources you
-connected, compares them with the record on your Mac, and works out what each
-change means for what you already have open. It updates the record. It sends
-nothing.
-
-When you return, Seld has three outcomes ready:
+The resulting brief contains:
 
 | Outcome | What Seld prepared |
 | --- | --- |
 | **Cancelled** | Do not chase the invoice. The missing documents arrived, so the next move is to reconcile them. |
 | **Prepared** | The calendar conflict is real. A short reschedule is drafted and waiting for you to send, rewrite, or ignore. |
 | **Quiet** | The unanswered message stays where it was. Nothing changed, so it does not get a line in your day. |
-
-*Illustrative data. The workflow reflects how Seld is designed to connect
-changes across sources without acting outward on its own.*
-
-While you were away, Seld kept up.
 
 ## What caught up looks like
 
@@ -67,18 +77,15 @@ While you were away, Seld kept up.
   remembers the human corrections. The next batch starts from what people
   actually fixed, not the same generic template.
 
-In each case, Seld catches up across the relevant record, prepares the
-consequential action, and waits for approval.
+In each case, Seld uses the relevant records to prepare a consequential action
+for approval.
 
 ## The Rundown
 
-Seld brings decisions to you one at a time. Each item says where the situation
-stands and the move it would make next. You can keep the recommendation, change
-it, close the outcome, or act yourself. Then Seld moves to the next item.
-
-The Rundown is deliberately small. No board to maintain. No growing pile of
-notifications. No need to reconstruct why something matters before you can
-decide. The work of catching up has already happened.
+The Rundown presents one decision at a time, including the current situation
+and the proposed next move. You can accept the recommendation, change it, close
+the outcome, or handle it yourself without maintaining another board or
+notification queue.
 
 If new evidence contradicts the current plan, Seld tells you before you act. A
 checked item remains open unless you actually close it. Your answer stays with
@@ -91,25 +98,23 @@ the outcome instead of disappearing into a conversation.
    activity that Seld may read. Where it has no coverage, it says so.
 2. **One record lives on your Mac.** Seld keeps what is open, what you decided,
    whose move it is, and the next step in plain Markdown files on your disk.
-3. **Pulse runs quietly in the background.** It reads bounded fresh changes and
-   reasons over them together with the durable record.
+3. **Pulse reviews changes in the background.** Once enabled and verified, it
+   reads bounded fresh changes and reasons over them with the durable record.
 4. **Only what matters surfaces.** A changed plan, a new risk, or a decision
    that now needs you becomes a Rundown item. Everything else stays quiet.
-5. **You decide.** Keep, change, close, or act. Nothing leaves your machine
-   unless you send it.
-
-That is the loop: connected sources, durable context, ambient reasoning, a few
-prepared decisions, and you in control.
+5. **Seld waits for approval.** Pulse can process selected material in ChatGPT,
+   while messages, bookings, payments, and provider changes remain under your
+   control.
 
 ## What stays current
 
-Seld tracks situations, not just facts about you.
+Seld keeps the context around each fact so it can follow an ongoing situation.
 
 - **Direction:** what you are trying to change, what matters now, and the
   boundaries the system must respect.
 - **Portfolio:** every open outcome, its priority, current state, next actor,
   and next action.
-- **People and projects:** canonical records that connect conversations,
+- **People and projects:** stable records that connect conversations,
   documents, decisions, and ongoing work without copying whole accounts into a
   new service.
 - **Living situations:** longer-running threads that preserve why something is
@@ -119,8 +124,8 @@ Seld tracks situations, not just facts about you.
 - **Exact continuity:** the execution task that owns each real outcome and a
   safe continuation when that task finishes, crashes, or is replaced.
 
-That lets Seld answer five practical questions at any time: What needs me? Why
-now? What changed? Who acts next? Where does the work continue?
+Together, these records preserve the current situation, its owner, and the
+exact place where the work continues.
 
 ## A real cross-source result
 
@@ -130,9 +135,8 @@ package. Teams showed that the documents had already been sent. The system
 cancelled the duplicate chase, changed the next action, and carried that
 correction into the exact task reconciling the files.
 
-No individual source held the whole story. The value came from connecting them,
-understanding what the combined evidence meant, and preserving the corrected
-next move.
+Because no individual source held the whole story, Seld connected the evidence,
+interpreted it in context, and preserved the corrected next move.
 
 The same pattern applies to ordinary life:
 
@@ -143,26 +147,26 @@ The same pattern applies to ordinary life:
 | A family commitment conflicts with a project deadline. | Both commitments, the decision, and who needs to act next. |
 | A software release fails overnight. | The outcome, failure evidence, prior decision, and exact next check. |
 
-This is evidence from the private resident workflow, not a claim that every
-connector is proven in the current public build. The exact public evidence is
-listed in [Technical status](#technical-status).
+The public Seld project is built from that resident operating model.
 
 ## Trust and control
 
-The honest version of an AI that reads your life is a short list of exactly
-what it touches.
+Seld makes its storage, source access, and action boundaries inspectable.
 
-- **A folder you can open.** Your record is plain Markdown on your own disk,
+- **Local record.** Your record is plain Markdown on your own disk,
   with an audit log beside it. It remains readable if Seld is uninstalled.
-- **Only sources you choose.** Connectors are read-only. Seld does not write,
-  reply, archive, or delete in those sources.
-- **No outward action on its own.** No message goes out, meeting gets booked,
+- **Chosen sources.** For source ingestion, Seld calls only read
+  operations from the tools you enable. It does not reply, archive, or delete
+  in those sources.
+- **Local-file access.** Each directory requires a separate host-local grant;
+  selecting local files alone grants no filesystem access.
+- **Approval required.** No message goes out, meeting gets booked,
   or payment gets made without you doing it.
-- **No Seld account.** There is no hosted Seld database, subscription, or seat
+- **Account model.** There is no hosted Seld database, subscription, or seat
   to lose.
-- **No Seld telemetry.** The model still processes selected material under your
-  ChatGPT account and OpenAI's terms, just like other material you use in that
-  app.
+- **Telemetry.** Seld does not collect telemetry. The model processes selected
+  material under your ChatGPT account and OpenAI's terms, just like other
+  material you use in that app.
 - **Open source.** The code is Apache-2.0 and the runtime has no third-party
   Python dependencies.
 
@@ -172,64 +176,59 @@ remove something you do not want retained.
 ## Replacing OpenClaw or Hermes?
 
 [OpenClaw](https://docs.openclaw.ai/) and
-[Hermes Agent](https://hermes-agent.nousresearch.com/docs/) are capable local,
-proactive agent systems. Seld is for people who want the AI they already use in
-the ChatGPT desktop app to become a resident chief of staff for work and life.
+[Hermes Agent](https://hermes-agent.nousresearch.com/docs/) are broad agent
+platforms built to run tools, schedules, and conversations across many
+channels. Seld replaces them for people who want the AI in the ChatGPT desktop
+app to manage the moving parts of their work and life.
 
-Seld's distinction is its operating model. It keeps an explicit Direction,
-complete Portfolio, commitments, canonical people and projects, longer-running
-situations, source freshness, the next actor, and exact execution continuity.
-Messages and files supply evidence for that model. They are not the product by
-themselves.
+Seld keeps one current operating model with your Direction, complete Portfolio,
+commitments, people and project records, longer-running situations, source
+freshness, next actor, and exact execution continuity. Your messages, mail,
+calendar, files, and active ChatGPT work can update that model on each verified
+Pulse wake, so the system can prepare the right decision without making you
+reconstruct the story.
 
-Bridge is the current view. Pulse keeps that view current. The model does the
-reasoning. Your records stay on your computer and remain inspectable without
-Seld running.
+Bridge presents the latest verified view. Pulse refreshes it and records any
+coverage gap, while the model reasons over records that remain inspectable on
+your computer without Seld running.
 
 ## What it runs on
 
-Seld runs through the ChatGPT desktop app on macOS, using the ChatGPT plan you
-already have. Windows and Claude support are coming.
+Seld runs through the ChatGPT desktop app on macOS, using your existing ChatGPT
+account. Windows and Claude support are coming.
 
-There is no Seld subscription or usage meter. Bridge is not a second chat app.
-You read the current view there and continue the conversation and work in the
-ChatGPT app.
+Seld has no subscription or usage meter, and Bridge serves as its reading and
+control surface. Conversation and execution remain in the ChatGPT app.
 
 ## Install
 
 [Install with ChatGPT](https://seld.ai/#install)
 
-The installation page includes the verified ChatGPT desktop link. It pre-fills
-the installation prompt and does not send it. To start manually, use
-https://github.com/olivier-motium/seld and paste the instruction below into the
-ChatGPT desktop app.
-
-The consumer release is installed by giving the ChatGPT desktop app this exact
-instruction:
+On that page, click **Install with ChatGPT** to open the desktop app with a
+ready-to-review prompt. It does not send it. To start manually, open the public
+repository and give ChatGPT this instruction:
 
 > Open https://github.com/olivier-motium/seld and read `AGENT_INSTALL.md`.
-> Install the verified release for this Mac without replacing existing Seld or
-> ChatGPT app data. Open Seld, restart the ChatGPT app when instructed, and help
-> me begin `$gsv-onboard` in one fresh task. If no matching verified release
-> exists, stop and tell me.
+> Install the current public source distribution on this Mac without replacing
+> existing Seld or ChatGPT app data. Explain each permission before requesting
+> it, open Seld, restart the ChatGPT app when instructed, and help me begin
+> `$gsv-onboard` in one fresh task so I can connect the sources I choose.
 
-The installer verifies the release checksum, preserves existing records, opens
-Bridge, and runs health and recovery checks. It stops safely if the matching
-release is not available. A consumer install does not require Python, `uv`, or
-`make`.
+The current macOS install uses Python 3.11+ and
+[`uv`](https://docs.astral.sh/uv/). The exact command is:
 
-Version `0.2.0` is not published yet, so this instruction currently stops at
-the release check rather than substituting an unverified source build. Building
-from source remains a maintainer path until that release exists.
+```bash
+uv tool install 'git+https://github.com/olivier-motium/seld.git'
+gsv setup
+```
 
-## Technical status
+Setup preserves existing records and unrelated ChatGPT configuration, installs
+Seld's local plugin and skills, and opens Bridge. The install agent then runs
+the health and recovery checks in [`AGENT_INSTALL.md`](AGENT_INSTALL.md).
 
-This repository currently contains the public continuity kernel for Seld, not
-the finished consumer release. The confident product description above is the
-launch target. Promotion requires installed evidence, not source code or a
-passing unit suite.
+## Included in the source distribution
 
-The public foundation proves:
+The macOS source distribution includes:
 
 - durable local Tasks, Entities, WorkThreads, Mind, current orientation, and an
   authored complete Portfolio with exact Task and optional WorkThread anchors;
@@ -242,33 +241,34 @@ The public foundation proves:
 - a guided all-open Portfolio review over that same queue, with authored
   questions and options, freeform corrections, stale-state protection, and no
   browser-authored semantic decisions;
-- context-first onboarding and resident Pulse skill contracts packaged for the
-  AI layer.
+- context-first onboarding, source selection, AI-performed bounded reads, and
+  a content-free coverage ledger visible in Bridge, CLI, and MCP from a fresh
+  process; and
+- the resident Pulse skill, which lets the AI read selected sources, reason
+  over fresh changes and durable context, and author the current Mind through
+  exact compare-and-swap writes.
 
-The connector, onboarding, Pulse, scheduler, and source-attestation modules
-include foundation contracts that are not all promoted to consumer surfaces.
-Clean-account connector use, app-native Pulse wakes, signing, supported
-installation, and daily-use soaks remain open. Windows has no secure
-directory-pinned control-store backend in this foundation and the write lane
-fails closed.
+The source catalog includes ChatGPT activity, Gmail, Google Calendar, Google
+Drive and Sheets, Outlook, Slack, Teams, GitHub, Asana, Atlassian, Box, Figma,
+Notion, SharePoint, local files, Apple Messages, WhatsApp, Shopify, Instagram,
+and optional screen context. The user enables the relevant ChatGPT app, custom
+MCP server, or local read tool. Onboarding confirms the intended account and
+performs a bounded read before recording the AI-authored coverage horizon. Seld
+marks a source current only while the successful read remains within its
+recipe's freshness window on the computer and recipe version that produced it.
 
-The current source recipe set covers Seld itself, ChatGPT app activity, Gmail,
-Google Calendar, Outlook mail and calendar, Slack, Teams, GitHub, local files,
-optional screen context, and experimental read-only WhatsApp. Apple Messages
-and iMessage, Shopify, and Instagram are launch-scope connector gaps. They are
-not silently treated as supported sources.
-
-See the [full release-gate and evidence ledger](docs/release-gates.md). The
-README does not replace it.
+The supported consumer surface is macOS. Windows and Claude support are coming.
+Evidence for source installation, packaging, and reliability studies is
+recorded in the [public evidence ledger](docs/release-gates.md).
 
 ### Product name and compatibility identifiers
 
-Seld is the product and repository name. The current foundation retains the
+Seld is the product and repository name. The current implementation retains the
 existing `gsv` executable, Python package, plugin and skill identifiers,
 `GSV_*` environment variables, and `~/GSV` default records folder. Those are
 compatibility interfaces, not the consumer brand.
 
-## The intelligence stays in the AI
+## How intelligence and safety divide the work
 
 Seld does not turn an old email, changed file, or due date into a task through a
 fixed semantic rule. The model reads bounded evidence in context and decides
@@ -276,10 +276,10 @@ what it means: whether two records describe the same person, whether a
 commitment changed, whether something deserves attention, and what the next
 action should be.
 
-Deterministic code has a smaller job. It authenticates Bridge, protects
-revisions, bounds inputs, records delivery facts, prevents replay, and supports
-recovery. It cannot decide priority, completion, relationships, memory
-worthiness, or the meaning of a message.
+The deterministic code authenticates Bridge, protects revisions, bounds inputs,
+records delivery facts, prevents replay, and supports recovery. Priority,
+completion, relationships, memory worthiness, and the meaning of a message
+remain model judgments.
 
 ## Try the local recovery proof
 
@@ -332,8 +332,17 @@ Remove only the ChatGPT app integration while keeping the executable:
 gsv codex uninstall
 ```
 
-Release uninstallers remove Seld-owned integration and executable files while
-preserving records, configuration, backups, and unrelated app data:
+For the supported `uv` install, stop the Bridge, remove Seld's ChatGPT app
+integration, and then remove the managed tool environment:
+
+```bash
+gsv bridge stop
+gsv codex uninstall
+uv tool uninstall gsv
+```
+
+Only run the release uninstaller when Seld came from a checksummed prebuilt
+binary:
 
 ```bash
 sh scripts/uninstall.sh
@@ -344,14 +353,16 @@ the exact recovery command instead of guessing.
 
 ## Technical documentation
 
+- [Seld 0.3.0 release notes](docs/releases/0.3.0.md)
 - [Product contract](docs/product-contract.md)
 - [Installation and recovery](docs/installation.md)
 - [Architecture](docs/architecture.md)
 - [Trust model](docs/trust-model.md)
+- [State-of-the-art architecture assessment](docs/state-of-the-art.md)
 - [ChatGPT app integration evidence](docs/codex-integration.md)
-- [Onboarding target and current gaps](docs/onboarding.md)
+- [Onboarding and source ecosystem](docs/onboarding.md)
 - [Resident AI Pulse contract](docs/pulse.md)
-- [1.0 replacement release gates](docs/release-gates.md)
+- [Evidence and expansion claims](docs/release-gates.md)
 
 ## Develop
 
