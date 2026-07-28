@@ -256,6 +256,7 @@ def test_screened_read_never_opens_a_cloud_placeholder(
     assert result.content is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-pinned reads")
 def test_placeholder_state_change_before_stable_open_still_prevents_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -296,6 +297,7 @@ def test_placeholder_state_change_before_stable_open_still_prevents_open(
     assert result.content is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-pinned reads")
 def test_screened_read_withholds_quarantined_bytes(tmp_path: Path) -> None:
     secret = tmp_path / "notes.txt"
     secret.write_bytes(b"password: this-is-a-real-password-value")

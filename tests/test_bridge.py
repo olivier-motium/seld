@@ -167,6 +167,11 @@ def _health_unavailable() -> bridge._HealthProbe:
     return bridge._HealthProbe(bridge._HealthOutcome.UNAVAILABLE)
 
 
+windows_pinned_control_only = pytest.mark.skipif(
+    os.name == "nt", reason="secure directory-pinned control storage is POSIX-only foundation"
+)
+
+
 def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> None:
     task = vault.create_task(
         identifier="ship-atlas",
@@ -260,6 +265,7 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
         }
 
 
+@windows_pinned_control_only
 def test_snapshot_projects_one_exact_guided_review_subject_without_inference(
     vault: Vault,
 ) -> None:
@@ -493,6 +499,7 @@ def test_snapshot_reenters_changed_coverage_and_includes_new_open_outcomes(
     assert changed["uncovered_count"] == 2
 
 
+@windows_pinned_control_only
 def test_snapshot_marks_a_new_workthread_owner_as_stale_and_nonactionable(
     vault: Vault,
 ) -> None:
@@ -573,6 +580,7 @@ def test_snapshot_marks_a_new_workthread_owner_as_stale_and_nonactionable(
     ]
 
 
+@windows_pinned_control_only
 def test_snapshot_never_exposes_review_controls_across_inspection_race(
     vault: Vault,
     monkeypatch: pytest.MonkeyPatch,
@@ -640,6 +648,7 @@ def test_snapshot_never_exposes_review_controls_across_inspection_race(
     assert mixed["review"]["actionable"] is False
 
 
+@windows_pinned_control_only
 def test_snapshot_projects_an_empty_open_scope_as_finished(vault: Vault) -> None:
     vault.set_portfolio(
         expected_revision=ABSENT_PORTFOLIO_REVISION,
@@ -1902,6 +1911,7 @@ def test_bridge_control_endpoint_rejects_forged_host_without_creating_control_st
     assert not (server.vault.root / ".gsv/control").exists()
 
 
+@windows_pinned_control_only
 def test_bridge_reports_an_unconfirmed_control_commit_without_claiming_no_change(
     running_bridge: tuple[bridge.BridgeHTTPServer, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -1940,6 +1950,7 @@ def test_bridge_reports_an_unconfirmed_control_commit_without_claiming_no_change
     assert "not changed" not in payload["error"]
 
 
+@windows_pinned_control_only
 def test_bridge_preflights_dispositions_before_committing_a_new_intent(
     running_bridge: tuple[bridge.BridgeHTTPServer, str],
 ) -> None:
@@ -1987,6 +1998,7 @@ def test_bridge_preflights_dispositions_before_committing_a_new_intent(
     assert len(ControlQueue(server.vault.root).snapshot().events) == 1
 
 
+@windows_pinned_control_only
 def test_bridge_returns_the_committed_queue_revision_without_a_post_commit_ledger_read(
     running_bridge: tuple[bridge.BridgeHTTPServer, str],
     monkeypatch: pytest.MonkeyPatch,

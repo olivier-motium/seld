@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -58,6 +59,10 @@ HOST_ID = "019f5678-1234-4234-8234-123456789abc"
 OTHER_VAULT_ID = "019f1234-1234-4234-8234-123456789abd"
 OTHER_HOST_ID = "019f5678-1234-4234-8234-123456789abd"
 TASK_ID = "019f9999-1234-7234-8234-123456789abc"
+
+windows_pinned_storage_only = pytest.mark.skipif(
+    os.name == "nt", reason="secure directory-pinned onboarding storage is POSIX-only foundation"
+)
 
 
 def _pending_source(
@@ -316,6 +321,7 @@ def test_session_invariants_reject_duplicates_and_impossible_completion() -> Non
         render_onboarding_session(replace(session, next_actor=None))
 
 
+@windows_pinned_storage_only
 def test_onboarding_store_is_cas_safe_and_preserves_markdown_authority(tmp_path: Path) -> None:
     store = OnboardingStore(tmp_path / "vault")
     created = store.create(new_onboarding_session(observed_at=NOW))
@@ -340,6 +346,7 @@ def test_onboarding_store_is_cas_safe_and_preserves_markdown_authority(tmp_path:
         store.create(new_onboarding_session(observed_at=NOW))
 
 
+@windows_pinned_storage_only
 def test_onboarding_cas_never_writes_into_a_replacement_vault_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -392,6 +399,7 @@ def test_onboarding_cas_never_writes_into_a_replacement_vault_root(
     assert b"replacement-must-not-receive-this" not in replacement_before
 
 
+@windows_pinned_storage_only
 def test_generic_save_rejects_impossible_phase_and_reconcile_derives_bound_state(
     tmp_path: Path,
 ) -> None:
@@ -459,6 +467,7 @@ def test_derive_requires_exact_vault_and_host_receipt_binding() -> None:
     ) == (OnboardingPhase.PRIVACY_AND_CONTEXT_CAPTURE, CompletionState.IN_PROGRESS)
 
 
+@windows_pinned_storage_only
 def test_two_session_writers_with_one_revision_produce_one_winner(tmp_path: Path) -> None:
     store = OnboardingStore(tmp_path / "vault")
     before = store.create(new_onboarding_session(observed_at=NOW))
@@ -486,6 +495,7 @@ def test_two_session_writers_with_one_revision_produce_one_winner(tmp_path: Path
     assert len([item for item in results if item.startswith("writer-")]) == 1
 
 
+@windows_pinned_storage_only
 def test_lease_claim_renew_release_and_expired_takeover(tmp_path: Path) -> None:
     store = OnboardingStore(tmp_path / "vault")
     session = store.create(new_onboarding_session(observed_at=NOW))
@@ -539,6 +549,7 @@ def test_lease_claim_renew_release_and_expired_takeover(tmp_path: Path) -> None:
     assert expired_takeover.lease.predecessor_lease_id == again.lease.lease_id
 
 
+@windows_pinned_storage_only
 def test_explicit_active_lease_takeover_requires_exact_lease_and_revision(tmp_path: Path) -> None:
     store = OnboardingStore(tmp_path / "vault")
     first = store.create(new_onboarding_session(observed_at=NOW))
@@ -572,6 +583,7 @@ def test_explicit_active_lease_takeover_requires_exact_lease_and_revision(tmp_pa
         )
 
 
+@windows_pinned_storage_only
 def test_generic_save_requires_current_live_hand_and_preserves_the_exact_lease(
     tmp_path: Path,
 ) -> None:
@@ -611,6 +623,7 @@ def test_generic_save_requires_current_live_hand_and_preserves_the_exact_lease(
     assert saved.lease == claimed.lease
 
 
+@windows_pinned_storage_only
 def test_generic_save_rejects_expired_hand_and_only_takeover_owner_can_continue(
     tmp_path: Path,
 ) -> None:
@@ -664,6 +677,7 @@ def test_generic_save_rejects_expired_hand_and_only_takeover_owner_can_continue(
 
 
 @pytest.mark.parametrize("ttl", [timedelta(seconds=4), timedelta(hours=25)])
+@windows_pinned_storage_only
 def test_lease_rejects_unsafe_ttl(tmp_path: Path, ttl: timedelta) -> None:
     store = OnboardingStore(tmp_path / "vault")
     session = store.create(new_onboarding_session(observed_at=NOW))

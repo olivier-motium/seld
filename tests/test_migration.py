@@ -106,6 +106,7 @@ def test_visible_receipt_after_ambiguous_publish_preserves_applied_directories(
     assert migration.plan().already_applied is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="exact root replacement proof is POSIX-only")
 def test_apply_never_returns_success_after_canonical_vault_root_swap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -192,6 +193,7 @@ def test_apply_never_returns_success_after_vault_swap_during_lock_exit(
     assert (parked / "onboarding").is_dir()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="exact root replacement proof is POSIX-only")
 def test_idempotent_apply_never_returns_receipt_from_replacement_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -126,7 +126,7 @@ try {
             $RepairRequired = $true
             $RetainedBackup = $Backup
         } elseif ($SetupStatus -ne 0) {
-            throw "GSV setup failed with exit code $LASTEXITCODE."
+            throw "GSV setup failed with exit code $SetupStatus."
         }
         if (-not $RepairRequired -and $Backup -and (Test-Path -LiteralPath $Backup)) {
             Remove-Item -LiteralPath $Backup -Force
@@ -169,6 +169,12 @@ try {
                 Write-Warning "The previous executable was restored, but its Bridge could not be restarted."
             }
         }
+        if ($SetupStatus -and $SetupStatus -ne 4) {
+            [Console]::Error.WriteLine(
+                "GSV setup failed; the previous executable was restored when a compatible backup was available."
+            )
+            exit $SetupStatus
+        }
         throw $Failure
     } finally {
         Remove-Item -LiteralPath $Staged -Force -ErrorAction SilentlyContinue
@@ -179,11 +185,11 @@ try {
 
 Write-Host "Installed GSV at $Target"
 if ($RepairRequired) {
-    Write-Warning "GSV and its Codex integration were installed, but the Bridge needs repair. No executable rollback was attempted."
+    [Console]::Error.WriteLine("GSV and its Codex integration were installed, but the Bridge needs repair. No executable rollback was attempted.")
     if ($RetainedBackup -and (Test-Path -LiteralPath $RetainedBackup)) {
-        Write-Warning "The previous executable remains staged at $RetainedBackup."
+        [Console]::Error.WriteLine("The previous executable remains staged at $RetainedBackup.")
     }
-    Write-Warning "Run gsv --json bridge status, then retry gsv bridge open."
+    [Console]::Error.WriteLine("Run gsv --json bridge status, then retry gsv bridge open.")
     exit 4
 }
 Write-Host "GSV setup completed. Run gsv to open or verify the Bridge."
