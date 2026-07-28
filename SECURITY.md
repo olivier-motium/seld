@@ -2,18 +2,21 @@
 
 ## Supported versions
 
-Security fixes currently target the latest tagged release only.
+Security fixes target current public `main` and the latest published prebuilt
+release, when one exists.
 
 ## Reporting
 
 Do not open a public issue for a vulnerability that could expose a user's local
 vault, bypass compare-and-swap writes, escape archive paths, or execute an
-untrusted command. Use GitHub private vulnerability reporting once the public
-repository is available.
+untrusted command.
 
-Until then, report privately to the repository owner. Do not include a real
-vault, credentials, tokens, or provider payloads. A synthetic reproduction is
-enough.
+If GitHub shows **Report a vulnerability** on the repository's Security page,
+use it. If that private form is unavailable, open a public issue titled
+`Security contact request` with no vulnerability details and ask the repository
+owner to establish a private channel. Do not include a real vault, exploit,
+credentials, tokens, provider payloads, private paths, or identifying data in
+that issue. A synthetic reproduction is enough once a private channel exists.
 
 ## Scope
 

@@ -46,12 +46,11 @@
   color: inherit;
   cursor: pointer;
   text-align: left;
-  transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+  transition: border-color 120ms ease, background-color 120ms ease, transform 120ms ease;
 }
 
 .task-card:hover {
   border-color: #cfcfcb;
-  box-shadow: 0 8px 24px rgba(41, 41, 41, 0.06);
   transform: translateY(-1px);
 }
 
@@ -395,10 +394,8 @@ button.storyline:hover {
   margin-bottom: 32px;
   padding: clamp(20px, 4vw, 36px);
   border: 1px solid var(--line);
-  border-radius: 24px;
-  background:
-    linear-gradient(135deg, rgba(24, 131, 111, 0.055), transparent 38%),
-    var(--surface);
+  border-radius: var(--radius-card);
+  background: var(--surface);
 }
 
 .guided-review::before {
@@ -431,13 +428,12 @@ button.storyline:hover {
   display: grid;
   gap: 12px;
   padding: 18px;
-  border-radius: 18px;
+  border-radius: var(--radius-card);
   background: color-mix(in srgb, var(--surface) 94%, var(--subtle));
 }
 
 .guided-review-subject {
   border: 1px solid var(--line);
-  box-shadow: 0 18px 48px rgba(29, 38, 35, 0.06);
 }
 
 .guided-review-subject h3 {
@@ -721,7 +717,7 @@ button.storyline:hover {
 .guided-review-prepared-card {
   padding: clamp(16px, 2vw, 22px);
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: var(--radius-card);
   background: var(--surface);
 }
 
@@ -894,7 +890,6 @@ button.storyline:hover {
   flex: 0 0 8px;
   border-radius: var(--radius-pill);
   background: var(--healthy);
-  box-shadow: 0 0 0 4px var(--healthy-soft);
 }
 
 .guided-review-delivery-pulse.is-observed {
@@ -1136,7 +1131,6 @@ button.storyline:hover {
   flex-direction: column;
   border-left: 1px solid var(--line);
   background: var(--surface);
-  box-shadow: -16px 0 40px rgba(41, 41, 41, 0.1);
   transform: translateX(105%);
   transition: transform 180ms ease;
 }
@@ -1277,4 +1271,467 @@ button.storyline:hover {
 .noscript h1 {
   font-size: var(--text-title);
   font-weight: 500;
+}
+
+/* --------------------------------------------------------------------------
+   Seld consumer component layer
+   -------------------------------------------------------------------------- */
+
+.everything-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-6);
+  margin-top: var(--space-6);
+  padding: var(--space-6);
+  border: var(--border-width) solid var(--seld-border);
+  border-radius: var(--radius);
+  background: var(--seld-surface-muted);
+}
+
+.everything-summary h2 {
+  margin: var(--space-1) 0;
+  color: var(--seld-text);
+  font-size: var(--text-subheading);
+  font-weight: 800;
+}
+
+.everything-summary p:last-child {
+  margin: 0;
+  color: var(--seld-text);
+}
+
+.everything-summary .section-label,
+.direction-panel .section-label {
+  color: var(--seld-night);
+}
+
+.commitment-grid {
+  gap: var(--space-4);
+}
+
+.lane-head {
+  min-height: 44px;
+}
+
+.lane-head h3,
+.storyline h3,
+.system-row h3,
+.mind-side h3,
+.entity-list strong {
+  color: var(--seld-text);
+  font-weight: 800;
+}
+
+.task-list {
+  gap: var(--space-3);
+}
+
+.task-card {
+  min-height: 164px;
+  padding: var(--space-5);
+  border: var(--border-width) solid var(--seld-border-control);
+}
+
+.task-card:hover {
+  border-color: var(--seld-night);
+  background: var(--seld-surface-muted);
+}
+
+.task-card:active {
+  transform: translateY(2px);
+}
+
+.task-card h4 {
+  color: var(--seld-text);
+  font-size: var(--text-subheading);
+  font-weight: 800;
+}
+
+.status-pill {
+  min-height: 28px;
+  padding: 2px var(--space-3);
+  border: var(--border-width) solid var(--seld-border);
+  border-radius: var(--radius);
+  background: var(--seld-paper);
+  color: var(--seld-text);
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.status-pill.is-doing,
+.status-pill.is-ready {
+  border-color: var(--seld-success);
+  background: var(--seld-success-soft);
+  color: var(--seld-success);
+}
+
+.status-pill.is-waiting {
+  border-color: var(--seld-warning);
+  background: var(--seld-warning-soft);
+  color: var(--seld-warning);
+}
+
+.empty-lane,
+.empty-state,
+.unavailable-state,
+.recovery-panel,
+.control-panel {
+  border-width: var(--border-width);
+}
+
+.empty-state h2,
+.unavailable-state h2,
+.recovery-panel h2,
+.control-panel h2 {
+  color: var(--seld-text);
+  font-size: var(--text-subheading);
+  font-weight: 800;
+}
+
+.command-action {
+  min-height: 48px;
+  border: var(--border-width) solid var(--seld-border-control);
+  border-radius: var(--radius);
+  background: var(--seld-paper);
+}
+
+.command-action code {
+  font-family: var(--font-mono);
+}
+
+.command-copy {
+  min-height: 44px;
+  border: var(--border-width) solid var(--seld-blue-ink);
+  border-radius: var(--radius);
+  background: var(--seld-paper);
+  color: var(--seld-blue-ink);
+  font-weight: 800;
+}
+
+.command-copy:hover {
+  background: #eaf8fc;
+}
+
+.storyline-list,
+.system-list {
+  border: var(--border-width) solid var(--seld-border-control);
+}
+
+.storyline,
+.system-row {
+  padding: var(--space-5);
+  border-bottom: var(--border-width) solid var(--seld-border);
+}
+
+.system-state {
+  color: var(--seld-success);
+  font-weight: 800;
+}
+
+.guided-review {
+  gap: var(--space-5);
+  margin-bottom: var(--space-8);
+  padding: clamp(20px, 4vw, 36px);
+  border: var(--border-width) solid var(--seld-border-control);
+  background: var(--seld-paper);
+}
+
+.guided-review::before {
+  width: 8px;
+  background: var(--seld-green);
+}
+
+.guided-review-head {
+  justify-content: space-between;
+}
+
+.guided-review-head h2 {
+  margin: var(--space-1) 0;
+  color: var(--seld-text);
+  font-size: clamp(28px, 4vw, var(--text-heading));
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+.guided-review-progress {
+  max-width: 66ch;
+}
+
+.guided-review-subject,
+.guided-review-warning,
+.guided-review-empty,
+.guided-review-prepared-card,
+.guided-review-batch-editor,
+.guided-review-prepared-session,
+.guided-review-delivery,
+.guided-review-recommendation,
+.guided-review-question {
+  border: var(--border-width) solid var(--seld-border);
+  border-radius: var(--radius);
+  background: var(--seld-paper);
+}
+
+.guided-review-subject h3 {
+  color: var(--seld-text);
+  font-family: var(--font-display);
+  font-weight: 900;
+  letter-spacing: -0.02em;
+}
+
+.guided-review-warning,
+.guided-review-delivery.is-failed_safe,
+.guided-review-delivery.is-delivery_uncertain,
+.guided-review-delivery.is-blocked {
+  border-color: var(--seld-warning);
+  background: var(--seld-warning-soft);
+}
+
+.guided-review-empty.is-finished,
+.guided-review-delivery.is-pending,
+.guided-review-delivery.is-starting,
+.guided-review-delivery.is-running {
+  border-color: var(--seld-success);
+  background: var(--seld-success-soft);
+}
+
+.guided-review-current {
+  border: var(--border-width) solid var(--seld-border);
+  border-radius: var(--radius);
+}
+
+.guided-review-evidence-list li {
+  border-width: var(--border-width);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+}
+
+.guided-review-recommendation {
+  border-color: var(--seld-green-edge);
+  background: var(--seld-green-soft);
+}
+
+.guided-review-question {
+  border-color: var(--seld-border-control);
+}
+
+.guided-review-label,
+.control-form label {
+  color: var(--seld-green-edge);
+  font-weight: 800;
+}
+
+.guided-review-option,
+.guided-review-prepared-choice {
+  min-height: 52px;
+  border: var(--border-width) solid var(--seld-border-control);
+  border-radius: var(--radius);
+}
+
+.guided-review-option:hover,
+.guided-review-prepared-choice:hover,
+.guided-review-prepared-choice:focus-visible {
+  border-color: var(--seld-night);
+  background: var(--seld-surface-muted);
+}
+
+.guided-review-option strong,
+.guided-review-prepared-answer {
+  color: var(--seld-text);
+  font-weight: 800;
+}
+
+.guided-review-prepared-choice.is-picked {
+  border-color: var(--seld-green-edge);
+  background: var(--seld-green-soft);
+  color: var(--seld-night);
+}
+
+.guided-review-prepared-choice.is-recommended .guided-review-prepared-answer::after {
+  color: var(--seld-green-edge);
+  font-weight: 800;
+}
+
+.guided-review-prepared-key {
+  border: var(--border-width) solid var(--seld-border-control);
+  border-radius: var(--radius);
+  background: var(--seld-paper);
+  font-weight: 800;
+}
+
+.guided-review-prepared-card.is-stale {
+  border-color: var(--seld-warning);
+  background: var(--seld-warning-soft);
+}
+
+.guided-review-delivery-pulse {
+  border-radius: 50%;
+}
+
+.quiet-action {
+  min-height: 44px;
+  padding: 0 var(--space-4);
+  border: var(--border-width) solid var(--seld-blue-ink);
+  border-radius: var(--radius);
+  background: var(--seld-paper);
+  color: var(--seld-blue-ink);
+  font-size: var(--text-nav);
+  font-weight: 800;
+}
+
+.quiet-action:hover {
+  border-color: var(--seld-blue-ink);
+  background: #eaf8fc;
+  color: var(--seld-blue-ink);
+}
+
+.control-input {
+  min-height: 48px;
+  padding: var(--space-3) var(--space-4);
+  border: var(--border-width) solid var(--seld-border-control);
+  border-radius: var(--radius);
+  font-size: 16px;
+}
+
+.direction-panel {
+  display: grid;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+  padding: var(--space-5);
+  border: var(--border-width) solid var(--seld-green-edge);
+  border-radius: var(--radius);
+  background: var(--seld-green-soft);
+}
+
+.direction-panel h3,
+.direction-panel p {
+  margin: 0;
+}
+
+.direction-panel h3 {
+  color: var(--seld-night);
+  font-size: var(--text-subheading);
+  font-weight: 900;
+}
+
+.direction-status {
+  color: var(--seld-night);
+  font-size: var(--text-caption);
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.direction-aims {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.direction-aims li {
+  display: grid;
+  gap: var(--space-1);
+  padding-top: var(--space-3);
+  border-top: var(--border-width) solid var(--seld-green-edge);
+}
+
+.direction-aims strong,
+.direction-aims span {
+  color: var(--seld-night);
+}
+
+.mind-side {
+  border-left-width: var(--border-width);
+}
+
+.entity-list li {
+  border-bottom-width: var(--border-width);
+}
+
+.inspector {
+  border-left: 4px solid var(--seld-green-edge);
+}
+
+.inspector-head,
+.inspector-foot,
+.detail-block {
+  border-color: var(--seld-border);
+  border-width: 0 0 var(--border-width);
+}
+
+.inspector-head h2 {
+  color: var(--seld-text);
+  font-size: var(--text-subheading);
+  font-weight: 900;
+}
+
+.control-review-actions .primary-action,
+.inspector-foot .primary-action {
+  min-height: 48px;
+}
+
+.close-button {
+  width: 44px;
+  height: 44px;
+  border: var(--border-width) solid var(--seld-border-control);
+}
+
+.loading-state {
+  border-width: var(--border-width);
+}
+
+.loading-line {
+  border-radius: var(--radius);
+  background: var(--seld-green-soft);
+}
+
+.noscript h1 {
+  color: var(--seld-green-display);
+  font-family: var(--font-display);
+  font-weight: 900;
+}
+
+@media (max-width: 760px) {
+  .everything-summary {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .everything-summary .quiet-action {
+    width: 100%;
+  }
+}
+
+@media (forced-colors: active) {
+  .rail,
+  .topbar,
+  .nav-item,
+  .nav-item.is-active,
+  .codex-link,
+  .primary-action,
+  .quiet-action,
+  .command-copy,
+  .command-action,
+  .task-card,
+  .storyline-list,
+  .system-list,
+  .storyline,
+  .system-row,
+  .everything-summary,
+  .direction-panel,
+  .control-panel,
+  .control-input,
+  .inspector,
+  .close-button {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  :focus-visible {
+    outline: 3px solid Highlight;
+    outline-offset: 3px;
+  }
 }

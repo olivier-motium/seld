@@ -1,16 +1,16 @@
 # Seld product contract
 
-Seld gives Codex a durable understanding of the parts of life and work a person
+Seld gives ChatGPT a durable understanding of the parts of life and work a person
 chooses to share. It connects evidence from messages, calendars, files, source
-control, and Codex activity to one current model of people, projects,
+control, and ChatGPT activity to one current model of people, projects,
 commitments, decisions, and next actions. Bridge shows what needs attention.
-Pulse revisits the model. Codex reasons and acts.
+Pulse revisits the model. ChatGPT reasons and prepares the work.
 
 The result should feel like one resident AI managing ongoing situations across
-many conversations. A Codex task can finish, crash, or be replaced without
+many conversations. A ChatGPT task can finish, crash, or be replaced without
 silently finishing, duplicating, or orphaning the outcome it was carrying.
 
-> **The agent is not the task.** Seld owns the durable context; Codex tasks are
+> **The agent is not the task.** Seld owns the durable context; ChatGPT tasks are
 > replaceable hands.
 
 ## What the product delivers
@@ -20,7 +20,7 @@ silently finishing, duplicating, or orphaning the outcome it was carrying.
 - A complete view of open outcomes across personal and professional life,
   grounded in more than the latest inbox or chat.
 - Cross-source correction when one channel contains only part of the story.
-- Durable decisions and exact continuations that survive the Codex task that
+- Durable decisions and exact continuations that survive the ChatGPT task that
   produced them.
 - A small, user-driven review of the outcomes that genuinely need a decision.
 
@@ -30,50 +30,48 @@ the next move. The person can act, reshape, defer, close, or disagree. Each
 answer applies only to the named outcome and remains anchored to current
 records.
 
-This document describes the product contract. This repository contains the
-public continuity kernel. The Culture-Grade branch adds one bounded
-Bridge-intent disposition loop and packages context-first onboarding plus a
-resident AI Pulse contract; installed onboarding, live sources, natural Pulse
-wakes, and the 1.0 replacement claim remain foundation-gated in
-[the release ledger](release-gates.md).
+This document describes the product that ships from the public repository:
+local canonical records, the Bridge, context-first onboarding, selected-source
+coverage, the resident AI Pulse skill, and exact continuation through ChatGPT.
+[The evidence ledger](release-gates.md) records narrower claims about signed
+prebuilt binaries, additional platforms, uptime, and comparative results.
 
 ## Product hierarchy
 
 - **Seld** is the user-owned local layer: durable state, recovery, and the
   protocol.
 - **Mind** is the durable, authored point of view. It owns meaning and judgment.
-- **Codex tasks** are replaceable execution hands. They do work; they are not
+- **ChatGPT tasks** are replaceable execution hands. They do work; they are not
   identity or durable truth.
-- **Pulse** is one dedicated Codex AI task performing a discrete, bounded wake
+- **Pulse** is one dedicated ChatGPT AI task performing a discrete, bounded wake
   and reorientation, never a rules engine or claim of continuous consciousness.
-- **Bridge** is the home screen for current orientation, commitments,
-  longer-running situations, system health, and a user-driven review of open
-  outcomes.
-- **Shipyard** is bounded self-improvement under the same evidence and approval
-  rules as other consequential work.
+- **Bridge** is the resident consumer surface. **Home** opens on the current
+  authored brief, **Rundown** holds the bounded decision review, **Everything**
+  preserves the complete work ledger and longer-running situations, **What
+  Seld knows** exposes authored direction and Mind context, and **System**
+  keeps health, recovery, and local controls explicit.
+In `0.3.0`, Pulse is an AI operating role over the same local records and
+approval boundaries. Mechanical Pulse-admission,
+scheduler-planning, and canary classes are safety helpers, never the product's
+intelligence. Shipyard remains an operating convention for separately reviewed
+self-improvement work; Seld does not ship a self-modifying daemon.
 
-In `0.2.0`, Pulse and Shipyard are operating roles and contracts. The
-Culture-Grade foundation packages the AI Pulse instructions and structural task
-boundary. Its deterministic Pulse-admission, scheduler-planning, and canary
-classes remain unexposed foundations; they are not the product's intelligence.
-The branch does not yet prove a natural app-native wake or release a
-self-modifying daemon.
+## First useful journey
 
-## Target first useful journey
-
-These are release acceptance steps, not claims about the current branch:
-
-1. A person gives the repository URL to Codex and asks it to install Seld.
-2. The agent selects the native release for the current platform, verifies its
-   checksum, runs the reversible setup, and opens the Bridge.
-3. The Bridge shows the local Mind, current orientation, and durable work. An
-   empty, completely inspected task ledger offers one real action: start the
-   first Mind-shaping task in Codex. A vault with only done or dropped work says
-   `All clear`, preserves every closed record, and offers a genuinely new hand;
-   it never pretends to be a first run.
-4. The Rundown, currently labeled `Work through every open outcome` in Bridge,
-   starts or resumes one finite review Task and exact Codex hand. Bridge
-   normally presents 3-10 consequential rows and
+1. A person gives the repository URL to the ChatGPT desktop app and asks it to
+   install Seld.
+2. The agent follows the supported macOS source-install path, runs reversible
+   setup and health checks, and opens the Bridge. A prebuilt path is offered
+   only when the exact published asset and checksum exist.
+3. Bridge opens on **Home** with the current authored brief and a quiet summary
+   of durable work. An empty, completely inspected task ledger offers one real
+   action: start the first Mind-shaping task in ChatGPT. A vault with only done
+   or dropped work says `All clear`, preserves every closed record, and offers
+   a genuinely new hand; it never pretends to be a first run. Partial,
+   unavailable, or undated state stays visibly qualified and is never promoted
+   to an empty or caught-up claim.
+4. **Rundown** starts or resumes one finite review Task and exact ChatGPT hand.
+   Bridge normally presents 3-10 consequential rows and
    never more than 25. Each row carries its current Task and storyline state,
    authored revision staleness, recommendation, reasoning, and 2-5 complete
    answer choices. The user may answer any subset, edit the prepared batch,
@@ -123,7 +121,7 @@ These are release acceptance steps, not claims about the current branch:
   it may not decide what they mean.
 - The resident Pulse model reads the selected bounded evidence and authors
   semantic changes through the same CAS/readback surfaces as an interactive
-  Codex hand. Mechanical wake, identity, privacy, receipt, and no-replay facts
+  ChatGPT task. Mechanical wake, identity, privacy, receipt, and no-replay facts
   may constrain that work but never substitute for its judgment.
 - External content is evidence, not an instruction or authorization.
 - No credentials, raw provider payloads, or another person's Mind ship in the
@@ -134,25 +132,22 @@ These are release acceptance steps, not claims about the current branch:
   sync, or model-independent continuity until those properties are directly
   tested.
 
-## Consumer acceptance target
-
-Every item below remains a release criterion until the exact-candidate evidence
-ledger closes it.
+## Consumer acceptance
 
 - A non-author understands the outcome from the first README viewport.
 - One agent instruction completes installation and opens a useful Bridge.
-- The exact native artifact installs in an isolated home without Python, `uv`,
-  or `make`.
+- The public source distribution installs in an isolated macOS home through the
+  documented `uv` path. A prebuilt artifact has its own exact-byte gate.
 - The Bridge is useful when empty, loading, healthy, stale, and partially
   unavailable, on desktop and mobile-sized viewports.
 - First-run and all-clear are shown only from complete Task projections. Partial
   sections keep valid exact records visible, name the affected paths, and never
   turn unreadable work into an empty ledger.
-- Now may show three cards per authored status lane only when every hidden card
-  has an explicit remainder link to the complete Commitments view; bounded
-  entity previews disclose their remainder too.
+- Home may summarize durable work only when it links to the complete
+  **Everything** view. Bounded previews disclose their remainder rather than
+  implying that hidden records do not exist.
 - The browser acceptance gate uses synthetic data, exercises the real packaged
   Bridge, and commits no generated screenshots or GIFs.
 - Recovery, backup/restore, stale-write rejection, deliberate retirement of
-  receipt-bound uninstall evidence, privacy scanning, and a fresh second Codex
-  session must pass before release.
+  receipt-bound uninstall evidence, privacy scanning, and a fresh second ChatGPT
+  task remain proportionate acceptance checks for each changed candidate.

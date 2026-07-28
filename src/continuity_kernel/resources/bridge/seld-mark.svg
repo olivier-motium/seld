@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Seld">
+  <title>Seld</title>
+  <rect x="2" y="2" width="60" height="60" rx="12" fill="#ffffff" stroke="#3a8700" stroke-width="3"/>
+  <path d="M45 20 C45 10, 19 9, 19 23 C19 34, 45 32, 45 43 C45 57, 19 56, 19 45"
+        fill="none" stroke="#58cc02" stroke-width="11" stroke-linecap="round"/>
+  <circle cx="50" cy="50" r="5" fill="#1cb0f6"/>
+</svg>

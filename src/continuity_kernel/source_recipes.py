@@ -1,8 +1,8 @@
 """Versioned logical source recipes used by deterministic readiness checks.
 
 Recipes describe capabilities rather than provider bodies or unstable display
-labels.  A host adapter must bind those capabilities to the exact tools exposed
-in a fresh Codex task and include that mapping in the attestation fingerprint.
+labels.  The resident AI binds those capabilities to the exact tools exposed
+in a fresh ChatGPT task and records a content-free fingerprint of that mapping.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any, Final
 
 from continuity_kernel.errors import ValidationError
 
-RECIPE_SET_VERSION: Final = "2026-07-24.1"
+RECIPE_SET_VERSION: Final = "2026-07-28.2"
 
 
 @dataclass(frozen=True)
@@ -23,16 +23,16 @@ class SourceRecipe:
     recipe_version: str
     identity_capability: str | None
     read_capability: str
-    pulse_capability: str
     read_limit: int
     proof_ttl: timedelta
-    experimental: bool = False
-    interactive_only: bool = False
+    max_future_coverage: timedelta
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["proof_ttl_seconds"] = int(self.proof_ttl.total_seconds())
+        payload["max_future_coverage_seconds"] = int(self.max_future_coverage.total_seconds())
         del payload["proof_ttl"]
+        del payload["max_future_coverage"]
         return payload
 
 
@@ -42,11 +42,9 @@ def _recipe(
     *,
     identity: str | None,
     read: str,
-    pulse: str | None = None,
     limit: int = 25,
     ttl_hours: int = 24,
-    experimental: bool = False,
-    interactive_only: bool = False,
+    future_coverage_hours: int = 0,
 ) -> SourceRecipe:
     return SourceRecipe(
         source=source,
@@ -54,11 +52,12 @@ def _recipe(
         recipe_version=RECIPE_SET_VERSION,
         identity_capability=identity,
         read_capability=read,
-        pulse_capability=pulse or read,
         read_limit=limit,
         proof_ttl=timedelta(hours=ttl_hours),
-        experimental=experimental,
-        interactive_only=interactive_only,
+        max_future_coverage=timedelta(
+            hours=future_coverage_hours,
+            minutes=1 if future_coverage_hours == 0 else 0,
+        ),
     )
 
 
@@ -67,14 +66,14 @@ RECIPES: Final = {
     for recipe in (
         _recipe(
             "gsv",
-            "GSV on this computer",
+            "Seld on this computer",
             identity="gsv.vault.identity",
             read="gsv.context.bounded_read",
             ttl_hours=24 * 30,
         ),
         _recipe(
             "codex_activity",
-            "Codex activity",
+            "ChatGPT activity",
             identity="codex.account.identity",
             read="codex.activity.bounded_read",
             ttl_hours=24,
@@ -90,6 +89,19 @@ RECIPES: Final = {
             "Google Calendar",
             identity="google.calendar.identity",
             read="google.calendar.window_read",
+            future_coverage_hours=24 * 60,
+        ),
+        _recipe(
+            "google_drive",
+            "Google Drive",
+            identity="google.drive.identity",
+            read="google.drive.recent_read",
+        ),
+        _recipe(
+            "google_sheets",
+            "Google Sheets",
+            identity="google.drive.identity",
+            read="google.sheets.recent_read",
         ),
         _recipe(
             "outlook_mail",
@@ -102,6 +114,7 @@ RECIPES: Final = {
             "Outlook Calendar",
             identity="microsoft.calendar.identity",
             read="microsoft.calendar.window_read",
+            future_coverage_hours=24 * 60,
         ),
         _recipe(
             "slack",
@@ -122,12 +135,70 @@ RECIPES: Final = {
             read="github.activity.recent_read",
         ),
         _recipe(
+            "asana",
+            "Asana",
+            identity="asana.workspace.identity",
+            read="asana.work.recent_read",
+        ),
+        _recipe(
+            "atlassian",
+            "Atlassian",
+            identity="atlassian.site.identity",
+            read="atlassian.work.recent_read",
+        ),
+        _recipe(
+            "box",
+            "Box",
+            identity="box.account.identity",
+            read="box.files.recent_read",
+        ),
+        _recipe(
+            "figma",
+            "Figma",
+            identity="figma.account.identity",
+            read="figma.files.recent_read",
+        ),
+        _recipe(
+            "notion",
+            "Notion",
+            identity="notion.workspace.identity",
+            read="notion.pages.recent_read",
+        ),
+        _recipe(
+            "sharepoint",
+            "SharePoint",
+            identity="microsoft.sharepoint.identity",
+            read="microsoft.sharepoint.recent_read",
+        ),
+        _recipe(
             "local_files",
             "Files you choose",
             identity=None,
             read="local.files.bounded_read",
             limit=100,
             ttl_hours=24 * 7,
+        ),
+        _recipe(
+            "apple_messages",
+            "Apple Messages",
+            identity="apple.messages.identity",
+            read="apple.messages.recent_read",
+            ttl_hours=6,
+        ),
+        _recipe(
+            "shopify",
+            "Shopify",
+            identity="shopify.store.identity",
+            read="shopify.orders.recent_read",
+            limit=50,
+            ttl_hours=6,
+        ),
+        _recipe(
+            "instagram",
+            "Instagram",
+            identity="meta.instagram.identity",
+            read="meta.instagram.activity.recent_read",
+            ttl_hours=6,
         ),
         _recipe(
             "screen_context",
@@ -138,10 +209,9 @@ RECIPES: Final = {
         ),
         _recipe(
             "whatsapp",
-            "WhatsApp (experimental, read-only)",
+            "WhatsApp",
             identity="wacli.account.identity",
             read="wacli.messages.recent_read",
-            experimental=True,
             ttl_hours=6,
         ),
     )

@@ -257,7 +257,9 @@ def test_guided_control_post_returns_service_unavailable_for_partial_vault(
             )
 
         assert unavailable.value.code == HTTPStatus.SERVICE_UNAVAILABLE
-        assert json.loads(unavailable.value.read())["error"] == "The local GSV vault is unavailable"
+        assert json.loads(unavailable.value.read())["error"] == (
+            "The local Seld record is unavailable"
+        )
         assert ControlQueue(vault.root).snapshot().events == ()
         assert transport.contexts == []
 
@@ -843,7 +845,9 @@ def test_noncanonical_legacy_review_hand_is_rejected_before_answer_is_queued(
     assert review["state"] == "conflict"
     assert review["active_thread_id"] is None
     assert review["hand_url"] is None
-    assert "exact Codex task UUID" in review["issue"]
+    assert review["issue"] == (
+        "The ChatGPT task linked to this review is invalid; repair it before continuing."
+    )
 
     static = tmp_path / "static"
     static.mkdir()

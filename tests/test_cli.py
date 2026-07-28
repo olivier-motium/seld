@@ -20,6 +20,7 @@ from continuity_kernel.atomic import durable_replace as actual_durable_replace
 from continuity_kernel.codex_integration import CodexInstallResult
 from continuity_kernel.config import config_path, load_config, save_config
 from continuity_kernel.errors import SetupError, ValidationError
+from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
 from continuity_kernel.vault import Vault
 
 
@@ -48,6 +49,202 @@ def test_cli_json_task_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[s
 
     assert created["ok"] is True
     assert created["result"]["identifier"] == "cli-proof"
+
+
+def test_cli_source_selection_read_and_fresh_process_visibility(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = tmp_path / "source-vault"
+    assert cli.main(["--json", "--vault", str(vault), "init"]) == 0
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault),
+                "source",
+                "select",
+                "--expected-revision",
+                ABSENT_SOURCE_REVISION,
+                "--source",
+                "gmail",
+            ]
+        )
+        == 0
+    )
+    selected = json.loads(capsys.readouterr().out)["result"]
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault),
+                "source",
+                "record",
+                "--expected-revision",
+                selected["revision"],
+                "--source",
+                "gmail",
+                "--actor-ref",
+                "fresh-chatgpt-task",
+                "--result",
+                "explicit_empty",
+                "--covered-through",
+                "2026-07-28T10:00:00Z",
+                "--completeness",
+                "complete",
+                "--account-binding",
+                "workspace:test-account",
+                "--tool-binding",
+                "gmail.search.v1",
+            ]
+        )
+        == 0
+    )
+    recorded = json.loads(capsys.readouterr().out)["result"]
+
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault),
+                "source",
+                "record",
+                "--expected-revision",
+                selected["revision"],
+                "--source",
+                "gmail",
+                "--actor-ref",
+                "stale-chatgpt-task",
+                "--result",
+                "failure",
+                "--error-code",
+                "timeout",
+            ]
+        )
+        == 2
+    )
+    stale_error = json.loads(capsys.readouterr().err)
+    assert "record changed" in stale_error["error"]
+
+    assert cli.main(["--json", "--vault", str(vault), "source", "list"]) == 0
+    restarted = json.loads(capsys.readouterr().out)["result"]
+    assert restarted["state"]["revision"] == recorded["revision"]
+    assert restarted["state"]["sources"][0]["observation"]["result"] == "explicit_empty"
+    assert any(item["source"] == "gmail" for item in restarted["catalog"])
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure descriptor-pinned reads are POSIX-only")
+def test_cli_local_file_read_is_bounded_and_does_not_mutate_vault(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host-data"))
+    vault = tmp_path / "vault"
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    (selected / "note.txt").write_text("A bounded local note.", encoding="utf-8")
+    assert cli.main(["--json", "--vault", str(vault), "init"]) == 0
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault),
+                "source",
+                "select",
+                "--expected-revision",
+                ABSENT_SOURCE_REVISION,
+                "--source",
+                "local_files",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    before = Vault(vault).logical_digest()
+
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault),
+                "local-file",
+                "grant",
+                "--root",
+                str(selected),
+            ]
+        )
+        == 0
+    )
+    granted = json.loads(capsys.readouterr().out)["result"]["grant"]
+
+    assert cli.main(["--json", "--vault", str(vault), "local-file", "list"]) == 0
+    listed = json.loads(capsys.readouterr().out)["result"]
+    assert listed["source_selected"] is True
+    assert [item["grant_id"] for item in listed["grants"]] == [granted["grant_id"]]
+
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault),
+                "local-file",
+                "read",
+                "--grant-id",
+                granted["grant_id"],
+                "--relative-path",
+                "note.txt",
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)["result"]
+
+    assert result["content"] == "A bounded local note."
+    assert result["tool_binding"] == "gsv_local_file_read"
+    assert result["persisted"] is False
+    assert Vault(vault).logical_digest() == before
+
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault),
+                "local-file",
+                "revoke",
+                "--grant-id",
+                granted["grant_id"],
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["result"]["revoked"] is True
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault),
+                "local-file",
+                "read",
+                "--grant-id",
+                granted["grant_id"],
+                "--relative-path",
+                "note.txt",
+            ]
+        )
+        == 2
+    )
+    assert "not found for this vault" in json.loads(capsys.readouterr().err)["error"]
 
 
 def test_cli_authors_rank_hand_and_complete_portfolio(
@@ -280,8 +477,8 @@ def test_setup_reuses_configured_vault_when_no_override(
 
     assert result == 0
     assert Path(output["result"]["vault"]["vault"]) == configured.resolve()
-    assert "Codex integration was skipped" in output["result"]["next"]
-    assert "Restart Codex" not in output["result"]["next"]
+    assert "ChatGPT integration was skipped" in output["result"]["next"]
+    assert "Restart the ChatGPT desktop app" not in output["result"]["next"]
 
 
 def test_unhealthy_setup_preserves_config_and_never_calls_provider_or_bridge(
@@ -318,7 +515,7 @@ def test_unhealthy_setup_preserves_config_and_never_calls_provider_or_bridge(
     assert exit_code == 3
     assert payload["ok"] is False
     assert payload["error"] == (
-        "GSV setup stopped because the vault is unhealthy; follow result.next."
+        "Seld setup stopped because the local record is unhealthy; follow result.next."
     )
     assert payload["result"]["setup_complete"] is False
     assert payload["result"]["doctor"]["healthy"] is False
@@ -344,13 +541,13 @@ def test_setup_next_text_matches_every_feature_flag_combination() -> None:
                     bridge=bridge,
                 )
                 if no_codex:
-                    assert "Codex integration was skipped" in message
-                    assert "Restart Codex" not in message
+                    assert "ChatGPT integration was skipped" in message
+                    assert "Restart the ChatGPT desktop app" not in message
                     assert "$gsv-onboard" not in message
                 else:
-                    assert "Restart Codex" in message
+                    assert "Restart the ChatGPT desktop app" in message
                     assert "$gsv-onboard" in message
-                    assert "Codex integration was skipped" not in message
+                    assert "ChatGPT integration was skipped" not in message
                 if no_bridge:
                     assert "The Bridge was not started" in message
                     assert "The Bridge is running" not in message
@@ -747,7 +944,7 @@ def test_unhealthy_doctor_returns_nonzero_and_json_failure(
     assert exit_code == 3
     assert payload["ok"] is False
     assert payload["error"] == (
-        "GSV doctor found unresolved integrity issues; follow result.issues."
+        "Seld doctor found unresolved integrity issues; follow result.issues."
     )
     assert payload["result"]["healthy"] is False
     assert payload["result"]["issues"][0]["path"] == "tasks/broken.md"
@@ -858,14 +1055,14 @@ def test_invalid_utf8_configuration_is_structured_for_loader_and_cli(
     configuration.parent.mkdir(parents=True)
     configuration.write_bytes(b"\xff\xfeinvalid utf-8 configuration")
 
-    with pytest.raises(ValidationError, match="invalid GSV configuration"):
+    with pytest.raises(ValidationError, match="invalid Seld configuration"):
         load_config()
 
     assert cli.main(["--json", "status"]) == 2
     output = capsys.readouterr()
     payload = json.loads(output.err)
     assert payload == {
-        "error": f"invalid GSV configuration: {configuration}",
+        "error": f"invalid Seld configuration: {configuration}",
         "ok": False,
     }
 
@@ -939,7 +1136,7 @@ def test_restore_publishes_when_configured_vault_contains_nul(
     assert cli.main(["--json", "status"]) == 2
     failure = json.loads(capsys.readouterr().err)
     assert failure["ok"] is False
-    assert failure["error"] == "GSV configuration has an invalid vault path"
+    assert failure["error"] == "Seld configuration has an invalid records path"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation may require elevated privileges")
@@ -1051,7 +1248,7 @@ def test_invalid_backup_verification_returns_nonzero_json_failure(
 
     assert exit_code == 3
     assert payload["ok"] is False
-    assert payload["error"] == "GSV backup verification failed; do not restore this archive."
+    assert payload["error"] == "Seld backup verification failed; do not restore this archive."
     assert payload["result"]["valid"] is False
 
 
@@ -1076,7 +1273,7 @@ def test_unverified_backup_creation_returns_nonzero_json_failure(
     assert exit_code == 3
     assert payload["ok"] is False
     assert payload["error"] == (
-        "GSV backup creation did not verify; do not use the reported archive."
+        "Seld backup creation did not verify; do not use the reported archive."
     )
 
 
@@ -1478,7 +1675,7 @@ def test_partial_codex_uninstall_prints_result_and_returns_retry_exit(
     payload = json.loads(capsys.readouterr().out)
 
     assert payload["ok"] is False
-    assert payload["error"] == "GSV cleanup is incomplete; follow result.next and retry."
+    assert payload["error"] == "Seld cleanup is incomplete; follow result.next and retry."
     assert payload["result"]["cleanup_complete"] is False
     assert payload["result"]["provider_cleanup_error"] == "Codex timed out"
 

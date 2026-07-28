@@ -1,148 +1,131 @@
 ---
 name: gsv-onboard
-description: Guide context-first GSV intake, selected connector setup, and registration of one resident AI Pulse task while verifying the exact installed public surfaces. Use for first-time setup, interrupted setup, a new source, stale source evidence, permission drift, Pulse repair, or deeper life context; stop at an explicit foundation gate instead of simulating unavailable readiness.
+description: Guide first setup and source repair for Seld by gathering accepted context, verifying selected reads, preparing the initial Mind, and registering Pulse when requested.
 ---
 
-# GSV onboarding
+# Seld onboarding
 
-Learn what would make GSV useful in the person's real life, then use only the
-public surfaces exposed by the exact installed build.
+Learn the person's current situation, connect the relevant sources, prove one
+bounded read from each selected source in the current ChatGPT task, and prepare
+the first useful orientation.
 
-## Establish the available surface first
+The AI owns interviewing, source selection, synthesis, and judgment. The local
+`gsv` surfaces own only durable records, compare-and-swap writes, bounded
+receipts, recovery, and no-replay delivery.
 
-1. Inspect `gsv --help`, relevant subcommand help, and the GSV MCP tools exposed
-   in this task.
-2. Treat absent commands or tools as absent. Do not call an internal Python
-   module, edit storage by hand, use browser activity as a substitute, or claim
-   that a typed foundation model is a supported product flow.
-3. In the current foundation, expect the Bridge operation loop, native document
-   CAS, and `$gsv-pulse` skill to be public while deterministic onboarding and
-   source-readiness commands remain absent. Report any different observed
-   surface rather than relying on this skill's wording.
+## Begin with the person
 
-## Keep these boundaries
+Read [context intake](references/context-intake.md). Ask one compact, skippable
+batch:
 
-- Start with the person and the outcome they want, not a connector catalogue.
-- Ask one compact batch. Mirror answers back for acceptance, editing, rejection,
-  or skipping.
-- Treat conversational intake as a proposal until a supported canonical
-  mutation surface persists it.
-- Support source-zero orientation. Describe external reality as unknown until
-  an installed-path attestation proves a source current.
-- Keep exactly one active onboarding hand when a public lease surface exists.
-  Never reconstruct or duplicate a hand from chat history.
-- Require fresh, exact approval before any external mutation.
-- Do not describe GSV as Jarvis, universally autonomous, consumer-ready, or a
-  proven replacement while the release ledger is open.
+- What would make Seld worth having this month?
+- What does this week actually look like?
+- What are you trying to change?
+- Who or what can you not afford to drop?
+- Which projects, obligations, routines, waiting-fors, and constraints matter?
+- What may Seld read, retain, interrupt about, or prepare for approval?
 
-## Capture context before connector work
+Accept pasted notes and user-selected local files. Never ask for passwords,
+tokens, financial credentials, second factors, or unnecessary raw transcripts.
+Reflect a provisional picture immediately. Persist only the context the person
+accepts, through `gsv_document_update` against the exact current `MIND.md`
+revision, then read it back.
 
-Read [context intake](references/context-intake.md). Establish the first useful
-outcome, exclusions, retention boundary, and action boundary before suggesting
-sources or authentication. Make every question skippable. Never request a
-password, token, financial credential, second factor, or raw private transcript.
+## Connect where life happens
 
-When the person accepts the reflected context, read `MIND.md` and propose one
-bounded owner-neutral edit. Persist it only through `gsv_document_update` with
-the exact current revision, then read it back. Keep source permissions,
-retention, interruption, and action boundaries explicit. This is accepted Mind
-context, not a fabricated onboarding-session state.
+Read [the source catalog](references/source-catalog.md), then recommend sources
+from the accepted context rather than presenting a generic checklist. The
+person chooses the sources and accounts.
 
-If document CAS is absent, return a proposed intake card in the conversation
-and say plainly that it has not created durable context.
+When `local_files` is selected, read [local file access](references/local-files.md).
+Logical source selection does not grant a directory; create an exact host-local
+root grant only after showing the path and receiving fresh approval.
 
-## Use the Bridge intent loop precisely
+Use one setup wave:
 
-Treat Bridge setup choices, approvals, corrections, and undo requests as
-append-only intent receipts, never semantic canon or action authority.
+1. Call `gsv_source_list`, then show one combined checklist for the selected
+   ChatGPT apps, custom MCP apps, local read tools, and required macOS
+   permissions.
+2. Let the person complete OAuth, credentials, 2FA, legal terms, administrator
+   approval, and OS privacy prompts personally.
+3. After the person confirms the set, call `gsv_source_select` against the exact
+   returned source-state revision. This stores only the selection and purges
+   coverage for anything deselected; it does not claim a provider is live.
+4. Open one fresh ChatGPT task after the apps and plugins are enabled.
+5. Discover the actual read-only tools exposed in that task. Map them to the
+   logical recipe capabilities returned by `gsv_source_list`; never depend on
+   a display name or a repository file that is unavailable in the installed
+   task.
+6. For each selected source, confirm the account or workspace in human terms,
+   then perform one bounded recent read. An explicitly empty successful read is
+   valid. A wrong identity, missing tool, auth failure, or policy block is not.
+7. Fresh-read `gsv_source_list`, then call `gsv_source_record` against that exact
+   source-state revision. Pass the transient account and tool bindings, result,
+   coverage horizon, completeness, and only stable references needed for
+   correlation. The core hashes bindings, cursors, and references before they
+   enter the vault. For a failure, record no claimed coverage and use one of
+   the error classifications advertised by `gsv_source_record`. Never put
+   provider text or an identifier in that field. Read the updated source state
+   back.
+8. Record retention, interruption, and action boundaries in accepted Mind
+   context. Do not copy raw provider bodies.
 
-- Use `gsv operation list` or `gsv_operation_list` to read current queue and
-  disposition revisions.
-- Use the supported accept or reject CLI/MCP operation only with the exact
-  logical vault ID, queue revision, disposition revision, and bounded actor and
-  reason references returned by that same read.
-- Explain that **accept acknowledges the receipt for later review**. It does not
-  approve or execute the request, authorize an external action, change onboarding or
-  source readiness, or mutate Tasks, Entities, WorkThreads, Mind, or policy.
-- Reload after a stale-CAS conflict. Never replay, reorder, delete, or edit the
-  append-only files.
-- Leave closed-queue archival to the operator recovery path.
+Seld supports any user-enabled ChatGPT app or MCP tool that can satisfy the
+same bounded read contract. The catalog supplies first-class recipes for
+ChatGPT activity, Gmail, Google Calendar, Drive and Sheets, Outlook mail and
+calendar, Slack, Teams, GitHub, Asana, Atlassian, Box, Figma, Notion,
+SharePoint, local files, Apple Messages, WhatsApp, Shopify, Instagram, and
+optional screen context.
 
-## Keep source proof foundation-gated
+A source may inform the current synthesis after a successful read and fresh,
+content-free coverage receipt. Pulse rechecks its availability and freshness
+when relevant. A missing tool remains an explicit coverage gap, while semantic
+interpretation stays with the model.
 
-Read [connector readiness](references/connector-readiness.md) before discussing
-a source. The current repository contains source-state vocabulary, recipes,
-and validators, but no public `gsv source` workflow. Do not mark a source
-`ready` or claim connector support from those modules or their tests.
+## Use the Bridge request loop precisely
 
-In one batched enablement wave, help the person install or authenticate only the
-selected Codex connector plugins. The person completes credentials, OAuth, 2FA,
-legal terms, OS security prompts, and account changes personally. Then use one
-fresh Codex task to verify exposed read-only tools, confirm each account or
-workspace identity with the person, and perform one bounded real read, including
-an explicitly empty result. Record the selected source and its read/retain/
-interrupt/act boundary in accepted Mind context.
+Bridge setup choices, approvals, corrections, and undo requests are append-only
+receipts, not semantic truth or action authority.
 
-Until a deterministic readiness doctor and host-observed attestation surface
-ships, describe this as task-local connector verification, not durable `ready`
-state or `fully_connected`. Tool absence in one task is not uninstall evidence.
-The resident AI Pulse may use a selected connector read-only under
-[its source-acquisition contract](../gsv-pulse/references/source-acquisition.md),
-but it must preserve stale/unknown coverage honestly.
+- Read them through `gsv operation list` or `gsv_operation_list`.
+- Accept or reject only the exact event against the returned queue,
+  disposition, and vault revisions.
+- Integrate any justified meaning through native record CAS and readback before
+  acknowledging the receipt.
+- Reload on stale CAS. Never edit, reorder, replay, or delete queue files.
 
-Read [Computer Use](references/computer-use.md) only when the person explicitly
-asks for interactive browser assistance. Computer Use cannot compensate for a
-missing onboarding or source interface and must remain unavailable to scheduled
-work.
+Acceptance acknowledges delivery. It does not send a message, change a
+provider, or approve an external action.
 
-## Register the resident AI Pulse last
+## Register one resident Pulse
 
-After accepted context exists and the selected connector wave is complete or
-explicitly deferred, open exactly one dedicated Codex task for `$gsv-pulse`.
-Follow its [registration contract](../gsv-pulse/references/registration.md):
-bind `task:resident-pulse` to that real task UUID, prove one manual bounded wake,
-then obtain fresh approval before creating one app-native heartbeat targeting
-that same task. Inspect existing automations first and never create a duplicate.
+After the first context and source wave, follow the Pulse
+[registration contract](../gsv-pulse/references/registration.md). Bind
+`task:resident-pulse` to one real ChatGPT task, prove one manual bounded wake,
+inspect existing automations, and create at most one app-native heartbeat for
+that exact task after fresh user approval.
 
-The heartbeat wakes the AI skill; it does not turn scheduler or Pulse foundation
-classes into a semantic rules engine. Deterministic code owns only structural
-identity, CAS, bounded receipts, delivery, and fail-closed recovery. The model reads
-bounded evidence and authors every judgment.
+Observe one natural wake. The heartbeat only wakes the AI skill; the model
+reads selected sources and authors every judgment. The Pulse policy forbids
+Computer Use. Seld's MCP server does not expose it, although a separately
+installed Computer Use plugin may still be visible in the ordinary ChatGPT
+task; explain that host boundary before registration.
 
-Do not call continuity ready from registration alone. Read the automation back
-and observe one natural wake before saying it is usable, and keep clean-account,
-provider, cross-platform, signing, economics, and soak gates open.
+## Finish with a useful first view
 
-## Preserve the target state contract
+Run one bounded manual Pulse or equivalent onboarding synthesis. Read accepted
+Mind context and the successfully verified source windows, then produce:
 
-Use these nine phase names only when a supported session surface actually
-returns them:
+- a provisional Direction;
+- the few current outcomes and waiting-fors that matter;
+- named people, projects, and situations only where evidence supports them;
+- honest source coverage and unknowns; and
+- the first small Rundown, if a real decision needs the person.
 
-1. `codex_substrate`
-2. `privacy_and_context_capture`
-3. `source_selection`
-4. `enablement_wait`
-5. `fresh_task_verification`
-6. `context_synthesis`
-7. `initial_orientation`
-8. `continuity_and_autonomy_proof`
-9. `done`
+Every proposed outcome or claim links back to a source label, observation time,
+and stable non-sensitive reference when available. If coverage is thin, show a
+useful orientation without inventing certainty.
 
-Report completion exactly as `in_progress`, `waiting_user`,
-`fresh_task_required`, `blocked`, `operational_with_gaps`, `fully_connected`,
-or `needs_revalidation`. Never infer one of these values from conversation,
-elapsed time, a working Bridge, a provider login, or green unit tests.
-
-## Finish honestly
-
-Report four separate things:
-
-1. context the person accepted in this conversation;
-2. durable state actually read or changed through a supported surface;
-3. installed-path evidence that passed; and
-4. unavailable, unknown, or foundation-gated capabilities.
-
-Do not claim onboarding readiness, connector readiness, autonomous continuity,
-or fresh-task continuity unless their exact public interfaces and real proof
-exist. Read [recovery](references/recovery.md) for an interrupted attempt, stale
-evidence, Pulse identity mismatch, or a Bridge queue problem.
+Read [Computer Use](references/computer-use.md) only when the person asks for
+interactive setup help, and [recovery](references/recovery.md) when setup was
+interrupted or a source changed identity.

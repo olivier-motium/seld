@@ -11,6 +11,7 @@ GSV/
   MIND.md
   NOW.md
   PORTFOLIO.md
+  SOURCES.md
   AGENTS.md
   README.md
   tasks/*.md
@@ -102,6 +103,35 @@ contains it. The kernel does not run cognition from that marker or infer any
 semantic change; the `$gsv-pulse` model task uses ordinary native CAS/readback
 surfaces.
 
+`SOURCES.md` is the portable, canonical source-coverage ledger. Its exact
+revision protects the complete selected-source set and its latest content-free
+observations with compare-and-swap writes. Each observation records only the
+source recipe ID and version, AI task reference, success/explicit-empty/failure
+result, attempt and coverage times, completeness, enumerated error
+classification, and
+SHA-256 fingerprints of the local host plus transient account, tool, cursor,
+and evidence bindings. A failed attempt keeps the tool fingerprint that
+produced retained successful coverage and records its attempted tool
+separately. Raw provider bodies and raw bindings never enter the file.
+
+The resident AI performs the provider or local read and authors the receipt;
+the ledger is therefore AI-attested coverage rather than a semantic claim or
+an independent provider certification. Deterministic code validates shape,
+source selection, account continuity, recipe and host lineage, temporal bounds,
+canonical rendering, freshness, and CAS. Older horizons and completeness
+downgrades fail closed. Deselecting a source removes its observation, while a
+failed read preserves the correlated prior successful horizon. `gsv doctor`
+validates the file. Backup and restore preserve its revision, and a different
+host or recipe version presents retained coverage as `needs_revalidation`
+until a new bounded read succeeds.
+
+Local-file grants are deliberately absent from the portable vault. Their
+owner-only host record binds each opaque grant ID to one exact vault path and
+directory identity. `SOURCES.md` stores only the hash of the reader and current
+grant set. Creating, revoking, replacing, or invalidating a grant therefore
+changes that hash and makes retained local-file coverage
+`needs_revalidation`; no local path is written into `SOURCES.md` or a backup.
+
 ## Guided review references
 
 One nonterminal review-session Task carries deterministic navigation facts:
@@ -133,7 +163,7 @@ decodes and queues that exact visible answer but never supplies meaning or a
 hidden payload. Replacing a legacy subject also replaces its option refs.
 Coverage records the exact Task revision checked and, when the Portfolio item
 has an owning WorkThread, that exact thread revision too. Legacy unanchored
-`review-covered:task:<task-id>` refs from unreleased development builds remain
+`review-covered:task:<task-id>` refs from pre-0.2 development builds remain
 readable only for explicit migration; they are stale and never count as current
 coverage. Duplicate, malformed, wrong-owner, or conflicting review refs fail
 closed.

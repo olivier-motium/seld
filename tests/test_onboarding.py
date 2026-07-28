@@ -287,7 +287,7 @@ def test_portable_session_round_trips_as_canonical_markdown() -> None:
 
     assert parsed == session
     assert parsed.revision
-    assert "# GSV onboarding" in markdown
+    assert "# Seld onboarding" in markdown
     assert parsed.selected_sources == ("github", "gmail", "gsv")
     assert "gmail" in markdown
     assert "provider body" not in markdown.lower()

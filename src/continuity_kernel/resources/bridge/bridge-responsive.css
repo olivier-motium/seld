@@ -47,7 +47,7 @@
   }
 
   .topbar {
-    height: 58px;
+    height: 64px;
     justify-content: space-between;
     padding: 0 14px;
   }
@@ -55,6 +55,8 @@
   .menu-button {
     display: grid;
     place-items: center;
+    width: 44px;
+    height: 44px;
   }
 
   .local-status {
@@ -62,12 +64,12 @@
   }
 
   .codex-link {
-    min-height: 34px;
+    min-height: 44px;
     padding: 0 12px;
   }
 
   .main {
-    width: calc(100% - 28px);
+    width: calc(100% - 32px);
     padding: 30px 0 64px;
     scroll-margin-top: 72px;
   }
@@ -171,7 +173,7 @@
 
   .guided-review {
     padding: 18px 16px;
-    border-radius: 18px;
+    border-radius: var(--radius-card);
   }
 
   .guided-review-intents {
@@ -215,6 +217,16 @@
 
   .guided-review-session-actions .quiet-action {
     width: 100%;
+  }
+
+  .topbar .codex-link span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
   }
 }
 

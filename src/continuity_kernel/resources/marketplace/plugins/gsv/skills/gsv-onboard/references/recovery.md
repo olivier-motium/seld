@@ -6,17 +6,18 @@ disposition files by hand.
 
 ## Interrupted onboarding
 
-Inspect the exact installed CLI and MCP surfaces. The current foundation has no
-public onboarding status, resume, takeover, or doctor interface. If those
-interfaces are absent, report the last proven state and stop. Do not call the
-internal store or create a duplicate hand.
+Read accepted Mind context, the current Pulse binding, and the Bridge request
+queue. Continue in the same onboarding task when its exact task UUID is known.
+If ownership is ambiguous, ask before taking over and never create a duplicate
+Pulse or silently replace another active hand.
 
 ## Stale or failed source
 
-The current foundation has no public source list, probe, recheck, repair, or
-attestation interface. Preserve the last known coverage boundary as historical,
-describe current provider reality as unknown, and stop. Let the person
-reauthenticate only after a supported connector surface explicitly requests it.
+Preserve the last successful coverage boundary, open one fresh ChatGPT task,
+and repeat the selected source's identity plus bounded-read check. Let the
+person reauthenticate only in the provider-owned app when it requests it. A
+failed recheck is current evidence of stale or unavailable coverage, not an
+empty source.
 
 ## Bridge operation queue
 
@@ -34,8 +35,8 @@ ordinary onboarding step.
 
 For damaged existing continuity-kernel state, stop the Bridge before following
 the repository's verified backup-and-restore procedure. Restore only a validated
-backup. Backup recovery does not activate inert onboarding or source modules.
+backup. Reconnect task-local source tools and re-register the Pulse on a new
+host; do not copy machine-specific task or automation identities.
 
-Report the last proven state, exact failure, safe state now in effect, and next
-human decision. Never convert a unit test, internal state file, working UI, or
-elapsed time into readiness evidence.
+Report the last successful coverage, exact failed check, safe state now in
+effect, and next human decision.

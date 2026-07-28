@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Version = if ($env:GSV_VERSION) { $env:GSV_VERSION } else { "0.2.0" }
+$Version = if ($env:GSV_VERSION) { $env:GSV_VERSION } else { "0.3.0" }
 $ReleaseBase = if ($env:GSV_RELEASE_BASE_URL) {
     $env:GSV_RELEASE_BASE_URL
 } else {

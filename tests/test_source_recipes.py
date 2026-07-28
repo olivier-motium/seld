@@ -14,15 +14,26 @@ from continuity_kernel.source_recipes import (
 
 def test_supported_source_set_is_explicit_and_versioned() -> None:
     assert set(RECIPES) == {
+        "apple_messages",
+        "asana",
+        "atlassian",
+        "box",
         "codex_activity",
+        "figma",
         "github",
         "gmail",
         "google_calendar",
+        "google_drive",
+        "google_sheets",
         "gsv",
+        "instagram",
         "local_files",
+        "notion",
         "outlook_calendar",
         "outlook_mail",
         "screen_context",
+        "sharepoint",
+        "shopify",
         "slack",
         "teams",
         "whatsapp",
@@ -32,9 +43,39 @@ def test_supported_source_set_is_explicit_and_versioned() -> None:
     assert all(recipe.proof_ttl.total_seconds() > 0 for recipe in RECIPES.values())
 
 
-def test_whatsapp_is_the_only_experimental_recipe() -> None:
-    assert [source for source, recipe in RECIPES.items() if recipe.experimental] == ["whatsapp"]
-    assert "read-only" in RECIPES["whatsapp"].label
+def test_promoted_source_catalog_uses_capabilities_not_dead_status_flags() -> None:
+    assert all("experimental" not in recipe.to_dict() for recipe in RECIPES.values())
+    assert all("interactive_only" not in recipe.to_dict() for recipe in RECIPES.values())
+    assert all("pulse_capability" not in recipe.to_dict() for recipe in RECIPES.values())
+    assert RECIPES["whatsapp"].label == "WhatsApp"
+
+
+def test_consumer_source_ecosystem_has_bounded_read_recipes() -> None:
+    for source in (
+        "apple_messages",
+        "asana",
+        "atlassian",
+        "box",
+        "figma",
+        "gmail",
+        "google_calendar",
+        "google_drive",
+        "google_sheets",
+        "instagram",
+        "notion",
+        "outlook_calendar",
+        "outlook_mail",
+        "shopify",
+        "sharepoint",
+        "slack",
+        "teams",
+        "whatsapp",
+    ):
+        recipe = RECIPES[source]
+        assert recipe.identity_capability
+        assert recipe.read_capability.endswith(".recent_read") or recipe.read_capability.endswith(
+            ".window_read"
+        )
 
 
 def test_source_zero_has_long_lived_local_capabilities() -> None:

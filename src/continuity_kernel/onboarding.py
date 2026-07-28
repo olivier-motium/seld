@@ -504,7 +504,7 @@ def render_onboarding_session(session: OnboardingSession) -> str:
             f"- Generation: {session.lease.generation}",
         ]
         if session.lease
-        else ["- No active Codex hand."]
+        else ["- No active ChatGPT task."]
     )
     next_action = (
         f"{session.next_actor.value}:`{session.next_action_code}`"
@@ -515,7 +515,7 @@ def render_onboarding_session(session: OnboardingSession) -> str:
         [
             f"<!-- gsv-onboarding:{encoded_meta} -->",
             "",
-            "# GSV onboarding",
+            "# Seld onboarding",
             "",
             "## Selected sources",
             *selected,

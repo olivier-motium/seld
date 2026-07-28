@@ -716,7 +716,7 @@ def _verify_bridge_http(
         raise RuntimeError("Bridge snapshot did not match the expected vault path")
     with _open_loopback(url, timeout=5) as response:
         static = response.read()
-    if b"Your work in Codex, in one place." not in static:
+    if b"<title>Seld</title>" not in static or b'id="view"' not in static:
         raise RuntimeError("Bridge static product surface was not bundled")
 
 

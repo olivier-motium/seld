@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
@@ -35,6 +36,7 @@ from continuity_kernel.errors import MutationCommittedError, SetupError, Validat
 from continuity_kernel.operations import OperationLedger
 from continuity_kernel.portfolio import ABSENT_PORTFOLIO_REVISION, portfolio_item
 from continuity_kernel.records import review_coverage_ref, review_option_ref
+from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
 from continuity_kernel.vault import Vault, doctor_dict
 
 INSTANCE_ID = "a" * 32
@@ -77,11 +79,11 @@ def test_guided_review_deep_link_fallback_matches_installed_skill_contract() -> 
         "supported durable task, workthread, or portfolio effect",
         "complete portfolio cas when affected",
         "new open outcomes",
-        "active codex hand",
+        "active chatgpt task",
         "workthread focus",
-        "raw codex thread uuid",
+        "raw chatgpt task uuid",
         "active_thread_id",
-        "gsv workthread id",
+        "seld workthread id",
         "codex-thread:*",
         "status=waiting",
         "next_actor=human",
@@ -208,7 +210,7 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
         "originUrl": [bridge.REPOSITORY_URL],
         "path": [str(vault.root)],
         "prompt": [
-            "Start a new GSV hand. Read the installed GSV context and exact current records "
+            "Start a new Seld hand. Read the installed Seld context and exact current records "
             "before deciding what deserves attention."
         ],
     }
@@ -227,6 +229,14 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
         "local": True,
         "semantic_write": False,
         "version": __version__,
+    }
+    assert snapshot["sources"] == {
+        "available": True,
+        "format_version": 1,
+        "revision": ABSENT_SOURCE_REVISION,
+        "selected_count": 0,
+        "sources": [],
+        "updated_at": None,
     }
     if os.name == "nt":
         assert snapshot["controls"] == {
@@ -263,6 +273,45 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
             "review_url": review_url,
             "state": "ready",
         }
+
+
+def test_snapshot_projects_source_coverage_and_degrades_impossible_timeline(
+    vault: Vault,
+) -> None:
+    selected = vault.select_sources(
+        expected_revision=ABSENT_SOURCE_REVISION,
+        sources=("gmail",),
+    )
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": False},
+    )
+
+    assert snapshot["sources"]["available"] is True
+    assert snapshot["sources"]["revision"] == selected["revision"]
+    assert snapshot["sources"]["sources"][0]["recipe"]["label"] == "Gmail"
+    assert snapshot["sources"]["sources"][0]["freshness"] == "unread"
+
+    source_path = vault.root / "SOURCES.md"
+    lines = source_path.read_text(encoding="utf-8").splitlines()
+    metadata = json.loads(lines[0].removeprefix("<!-- seld-sources:").removesuffix(" -->"))
+    metadata["updated_at"] = "9999-12-31T23:59:59.000000Z"
+    lines[0] = (
+        "<!-- seld-sources:"
+        + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + " -->"
+    )
+    source_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    degraded = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": False},
+    )
+    assert degraded["sources"]["available"] is False
+    assert "could not be read safely" in degraded["sources"]["error"]
+    assert degraded["sources"]["sources"] == []
+    assert degraded["doctor"]["healthy"] is False
 
 
 @windows_pinned_control_only
@@ -399,7 +448,7 @@ def test_snapshot_projects_one_exact_guided_review_subject_without_inference(
     assert checked["state"] == "active"
     assert checked["actionable"] is False
     assert checked["subject"]["staleness"] == [
-        "The Task changed after this Portfolio judgment was authored."
+        "This outcome changed after Seld prepared the decision."
     ]
 
 
@@ -576,7 +625,7 @@ def test_snapshot_marks_a_new_workthread_owner_as_stale_and_nonactionable(
     assert drifted["review"]["state"] == "active"
     assert drifted["review"]["actionable"] is False
     assert drifted["review"]["subject"]["staleness"] == [
-        "The owning WorkThread changed after this Portfolio judgment was authored."
+        "The surrounding situation changed after Seld prepared the decision."
     ]
 
 
@@ -687,7 +736,9 @@ def test_snapshot_exposes_mind_shaping_only_for_a_proven_empty_ledger(vault: Vau
     mind_prompt = parse_qs(mind_link.query)["prompt"][0]
     assert "$gsv-onboard" in mind_prompt
     assert "Mind document CAS" in mind_prompt
-    assert "does not expose a durable OnboardingSession" in mind_prompt
+    assert "gsv_source_select" in mind_prompt
+    assert "gsv_source_record" in mind_prompt
+    assert "coverage receipt is AI-attested delivery evidence" in mind_prompt
     assert parse_qs(hand_link.query)["originUrl"] == [bridge.REPOSITORY_URL]
 
 
@@ -798,7 +849,7 @@ def test_only_nonterminal_tasks_receive_resume_links(vault: Vault) -> None:
 
     assert "codex_url" not in by_id["closed"]
     assert (
-        "Resume the GSV commitment `open`"
+        "Resume the Seld commitment `open`"
         in parse_qs(urlsplit(by_id["open"]["codex_url"]).query)["prompt"][0]
     )
     assert "new_mind_url" not in snapshot["codex"]
@@ -1214,10 +1265,14 @@ def test_packaged_bridge_bundle_contains_ui_assets_and_licenses() -> None:
     expected = {
         "bridge.css",
         "bridge.js",
-        "gsv-mark.svg",
+        "fonts/nunito-sans-var.woff2",
+        "fonts/nunito-var.woff2",
         "index.html",
         "licenses/Lucide-ISC.txt",
+        "licenses/Nunito-OFL-1.1.txt",
         "licenses/Thinking-Orbs-MIT.txt",
+        "seld-mark.svg",
+        "seld-tokens.css",
     }
 
     with as_file(resource) as root:
@@ -1226,15 +1281,19 @@ def test_packaged_bridge_bundle_contains_ui_assets_and_licenses() -> None:
         }
 
     assert expected <= present
+    assert "gsv-mark.svg" not in present
 
 
 def test_bridge_ui_tokens_and_dependency_free_orb_contract() -> None:
     resource = files("continuity_kernel") / "resources/bridge"
     with as_file(resource) as root:
-        css = "\n".join(
-            (Path(root) / name).read_text(encoding="utf-8")
-            for name in ("bridge.css", "bridge-components.css", "bridge-responsive.css")
+        css_names = (
+            "seld-tokens.css",
+            "bridge.css",
+            "bridge-components.css",
+            "bridge-responsive.css",
         )
+        css = "\n".join((Path(root) / name).read_text(encoding="utf-8") for name in css_names)
         html = (Path(root) / "index.html").read_text(encoding="utf-8")
         javascript = "\n".join(
             (Path(root) / name).read_text(encoding="utf-8")
@@ -1242,28 +1301,27 @@ def test_bridge_ui_tokens_and_dependency_free_orb_contract() -> None:
         )
 
     for token in (
-        "--text-xs: 12px",
-        "--text-sm: 13px",
-        "--text-md: 14px",
-        "--text-title: 24px",
-        "--ink: #292929",
-        "--muted: #5d5d5d",
-        "--quiet: #9e9e9e",
-        "--radius-nav: 8px",
-        "--radius-card: 16px",
-        "--radius-pill: 999px",
+        "--seld-green: #58cc02",
+        "--seld-green-edge: #3a8700",
+        "--seld-green-display: #45a000",
+        "--seld-green-soft: #d7ffb8",
+        "--seld-blue: #1cb0f6",
+        "--seld-blue-ink: #0a7290",
+        "--seld-night: #000437",
+        "--seld-text: #4b4b4b",
+        "--seld-muted: #757575",
+        "--seld-border-control: #8e8e8e",
+        "--radius: 12px",
+        "--border-width: 2px",
+        "--sticker-edge: 4px",
     ):
         assert token in css
-    assert '"SF Pro Text"' in css
-    assert '"SF Pro Display"' in css
-    assert "@font-face" not in css
-    assert "letter-spacing: -0.15px" in css
-    assert "letter-spacing: 0" not in css
-    assert {match.group(1) for match in re.finditer(r"font-weight:\s*(\d+)", css)} == {
-        "400",
-        "500",
-    }
-    assert re.search(r"\.nav-icon,[^{]+\{[^}]*width:\s*14px", css, re.DOTALL)
+    assert "@font-face" in css
+    assert 'font-family: "Nunito"' in css
+    assert 'font-family: "Nunito Sans"' in css
+    assert "gradient" not in css
+    assert "backdrop-filter" not in css
+    assert re.search(r"\.nav-icon,[^{]+\{[^}]*width:\s*20px", css, re.DOTALL)
     assert re.search(r"\.thinking-orb\s*\{[^}]*width:\s*20px[^}]*height:\s*20px", css, re.DOTALL)
     assert "thinking-orbs 0.1.1" in javascript
     assert "382be79c472cd600277f01e14f98f8c0ee18dcb0" in javascript
@@ -1271,16 +1329,52 @@ def test_bridge_ui_tokens_and_dependency_free_orb_contract() -> None:
     assert "IntersectionObserver" in javascript
     assert "Math.min(2, window.devicePixelRatio || 1)" in javascript
     assert "snapshotSignature" in javascript
-    assert "snapshot.codex.new_hand_url" in javascript
+    assert 'urlKey = "new_hand_url"' in javascript
+    assert "renderCodexAction" in javascript
     assert '"new_mind_url"' in javascript
-    assert "Nothing is open right now." in javascript
-    assert "more · View all work" in javascript
+    assert "Nothing needs you right now" in javascript
+    assert "more · See everything" in javascript
     assert "more not shown." in javascript
     assert 'taskProjection.state !== "complete"' in javascript
     assert 'readable: fallback, state: "unavailable", unreadable: 0' in javascript
     assert 'from "react"' not in javascript
-    assert 'aria-live="polite"' not in html
-    assert ".woff2" not in bridge._MIME_TYPES
+    assert "Opening your latest brief." in html
+    assert "GSV" not in html
+    assert "Codex" not in html
+    for navigation_label in ("Home", "Rundown", "Everything", "What Seld knows", "System"):
+        assert f'<span class="nav-copy">{navigation_label}</span>' in html
+    for unproven_claim in ("already caught up", "you're caught up"):
+        assert unproven_claim not in html.casefold()
+        assert unproven_claim not in javascript.casefold()
+    assert not re.search(r'["`][^"`\n]*(?:GSV|Codex)[^"`\n]*["`]', javascript)
+    assert bridge._MIME_TYPES[".woff2"] == "font/woff2"
+
+    with as_file(resource) as root:
+        static_root = Path(root)
+        for font_name, expected_hash in (
+            (
+                "fonts/nunito-var.woff2",
+                "20fc9b6fc618e7c3c68d3ac750a2a5dfbceb8521675458d2cea580b5693e4798",
+            ),
+            (
+                "fonts/nunito-sans-var.woff2",
+                "39184f4d011106f5bfbe3813d3a8c3673663f04a45a9c9f55b1ed15f4d5b1cc9",
+            ),
+        ):
+            payload = (static_root / font_name).read_bytes()
+            assert payload.startswith(b"wOF2")
+            assert hashlib.sha256(payload).hexdigest() == expected_hash
+        referenced = set()
+        for value in re.findall(r"(?:src|href)=\"(/static/[^\"]+)\"", html):
+            referenced.add(value.removeprefix("/static/"))
+        for value in re.findall(r"url\([\"']?([^\"')]+)", css):
+            if value.startswith("/static/"):
+                referenced.add(value.removeprefix("/static/"))
+            else:
+                assert not re.match(r"(?:https?:)?//", value)
+        assert referenced
+        assert all((static_root / value).is_file() for value in referenced)
+    assert not re.search(r"(?:https?:)?//", html)
 
 
 def test_http_surface_requires_per_launch_bearer_for_private_data(
@@ -1289,7 +1383,11 @@ def test_http_surface_requires_per_launch_bearer_for_private_data(
     server, base = running_bridge
     with urlopen(f"{base}/", timeout=2) as response:
         assert response.status == HTTPStatus.OK
-        assert b"Your work in Codex, in one place." in response.read()
+        csp = response.headers["Content-Security-Policy"]
+        assert "font-src 'self'" in csp
+        assert "connect-src 'self'" in csp
+        assert response.headers["Cross-Origin-Resource-Policy"] == "same-origin"
+        assert b"Opening your latest brief." in response.read()
 
     with pytest.raises(HTTPError) as missing:
         urlopen(_request(f"{base}/api/v1/snapshot"), timeout=2)

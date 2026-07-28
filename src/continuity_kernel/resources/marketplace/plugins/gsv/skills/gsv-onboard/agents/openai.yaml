@@ -1,4 +1,4 @@
 interface:
-  display_name: "GSV onboarding"
-  short_description: "Capture context and verify available setup"
-  default_prompt: "Use $gsv-onboard to capture what matters to me and show which setup and continuity steps this installed GSV can actually prove."
+  display_name: "Set up Seld"
+  short_description: "Tell Seld what matters and connect your sources"
+  default_prompt: "Use $gsv-onboard to learn what matters to me, connect the sources I choose, and prepare my first useful Seld brief."

@@ -170,6 +170,18 @@ def test_macos_file_provider_content_stays_metadata_only_without_residency_proof
             b'{"access_token": "sk-' + b'proj-this-is-a-quoted-json-credential"}',
             "credential-assignment",
         ),
+        (
+            b'[remote "origin"]\n url = https://alice:' + b"short-pass@example.com/org/repo.git\n",
+            "credential-uri",
+        ),
+        (
+            b"database_url=postgres://user:" + b"short-pass@db.example/app\n",
+            "credential-uri",
+        ),
+        (
+            b"Cookie: sessionid=" + b"abc123def456ghi789\n",
+            "credential-header",
+        ),
         (bytes(range(32)), "binary-content"),
     ],
 )

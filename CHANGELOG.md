@@ -1,11 +1,15 @@
 # Changelog
 
-The product was renamed from GSV to Seld during the unreleased `0.2.0` cycle.
+The product was renamed from GSV to Seld in `0.2.0`.
 The `gsv` command, package, plugin and skill identifiers, `GSV_*` environment
 variables, existing data paths, and historical `0.1.0` entries retain their
 original names for compatibility.
 
-## 0.2.0 - Unreleased
+## 0.3.0 - 2026-07-28
+
+Read the [0.3.0 release notes](docs/releases/0.3.0.md) for the consumer-facing
+overview of the rebuilt Bridge, resident Pulse, source onboarding, and durable
+decision loop.
 
 - Add authored whole-life Direction and a complete ordered Portfolio whose
   judgments are bound to exact Direction, Task, and WorkThread revisions.
@@ -18,13 +22,18 @@ original names for compatibility.
   archival only after every live intent is decided. Disposition acknowledges an
   intent; it never approves or executes an external action.
 - Add the event-bound, `gsv`-only MCP profile and same-hand Codex review-turn
-  transport. The transport is off by default and remains foundation-gated while
-  installed-candidate, clean-account, platform, signing, and soak gates are
-  open.
-- Add tested foundation contracts for context-first onboarding, deterministic
-  source attestations, local privacy screening, mechanical and cognitive Pulse
-  admission, scheduler canaries, and reversible migration. They remain
-  unexposed until their named release gates close.
+  transport with fail-closed capability checks and durable no-replay receipts.
+- Add context-first onboarding, a source capability catalog, bounded live-read
+  guidance, local privacy screening, an AI-authored Pulse skill, scheduler
+  safety contracts, and reversible migration.
+- Add host-local, per-vault directory grants and the bounded
+  `gsv_local_file_read` surface. Selecting local files grants nothing by itself,
+  and deselection revokes every root grant before publishing the new source
+  selection.
+- Add the canonical `SOURCES.md` coverage ledger with `gsv source` CLI and
+  `gsv_source_*` MCP surfaces: explicit selection, content-free AI-attested
+  read/failure receipts, stale-CAS protection, account continuity, and
+  fresh-process Bridge visibility.
 - Add the private, read-only Bridge for current orientation, commitments, and
   storylines, including authenticated loopback access and responsive states.
 - Make live-Bridge upgrades quiesce before executable replacement and restore
@@ -48,6 +57,12 @@ original names for compatibility.
 - Recheck receipt-owned marketplace bytes after atomic isolation during
   reinstall and uninstall, preserve destination races, and delete only exact
   manifest entries rather than recursively removing a mutable public path.
+
+## 0.2.0 - 2026-07-28
+
+- Publish the Seld resident-mind core with canonical local records,
+  authenticated Bridge reads, the bounded intent queue, guided Portfolio
+  review, exact continuation, and reversible ChatGPT integration.
 
 ## 0.1.0
 

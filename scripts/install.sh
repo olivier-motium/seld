@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION="${GSV_VERSION:-0.2.0}"
+VERSION="${GSV_VERSION:-0.3.0}"
 RELEASE_BASE="${GSV_RELEASE_BASE_URL:-https://github.com/olivier-motium/seld/releases/download/v${VERSION}}"
 INSTALL_DIR="${GSV_BIN_DIR:-${HOME}/.local/bin}"
 TARGET="${INSTALL_DIR}/gsv"

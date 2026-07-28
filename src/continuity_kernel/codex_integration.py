@@ -315,7 +315,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
         )
         if prior_receipt.get("uninstall_phase") == "provider_verified":
             raise SetupError(
-                "A verified GSV uninstall is still in progress. Run `gsv codex uninstall` "
+                "A verified Seld uninstall is still in progress. Run `gsv codex uninstall` "
                 "to finish local cleanup before reinstalling."
             )
         if prior_receipt.get("integration_active", True):

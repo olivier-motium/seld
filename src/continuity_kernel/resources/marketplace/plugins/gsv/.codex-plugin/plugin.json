@@ -1,9 +1,9 @@
 {
   "name": "gsv",
-  "version": "0.2.0",
-  "description": "Durable local context, tasks, entities, and work threads for Codex.",
+  "version": "0.3.0",
+  "description": "A resident AI chief of staff for ChatGPT that maintains local context and prepares decisions for review.",
   "author": {
-    "name": "GSV contributors"
+    "name": "Seld contributors"
   },
   "homepage": "https://github.com/olivier-motium/seld",
   "repository": "https://github.com/olivier-motium/seld",
@@ -12,17 +12,17 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "GSV",
-    "shortDescription": "Carry grounded context across Codex sessions",
-    "longDescription": "Local-first durable context for coding agents, with inspectable Markdown, exact records, compare-and-swap writes, and portable backup and restore.",
-    "developerName": "GSV contributors",
-    "category": "Developer Tools",
+    "displayName": "Seld",
+    "shortDescription": "Resident context and decision support",
+    "longDescription": "Seld connects the sources you choose, maintains a durable local record of your life and work, and prepares decisions for review.",
+    "developerName": "Seld contributors",
+    "category": "Productivity",
     "capabilities": ["Read", "Write"],
     "defaultPrompt": [
-      "Start or resume GSV onboarding and help me describe my world",
-      "Show me what this GSV vault currently knows",
+      "Set up Seld and help me describe my world",
+      "Show me what Seld currently knows",
       "Create a durable task for this outcome",
-      "Prepare a handoff for my next Codex session"
+      "Prepare my next Rundown"
     ],
     "screenshots": []
   }

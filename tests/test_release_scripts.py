@@ -185,7 +185,7 @@ def test_candidate_version_is_consistent_across_runtime_installers_and_lock() ->
     lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     locked_gsv = next(package for package in lock["package"] if package["name"] == "gsv")
 
-    assert project["project"]["version"] == __version__ == "0.2.0"
+    assert project["project"]["version"] == __version__ == "0.3.0"
     assert locked_gsv["version"] == __version__
     assert f"GSV_VERSION:-{__version__}" in (ROOT / "scripts/install.sh").read_text(
         encoding="utf-8"
@@ -314,7 +314,7 @@ printf 'old binary\\n'
     candidate.write_text(
         """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'gsv 0.2.0\\n'
+  printf 'gsv 0.3.0\\n'
   exit 0
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
@@ -395,7 +395,7 @@ printf 'old binary\\n'
     candidate.write_text(
         """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'gsv 0.2.0\\n'
+  printf 'gsv 0.3.0\\n'
   exit 0
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
@@ -473,7 +473,7 @@ exit 2
     candidate.write_text(
         """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'gsv 0.2.0\\n'
+  printf 'gsv 0.3.0\\n'
   exit 0
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
@@ -535,7 +535,7 @@ def test_posix_post_commit_bridge_failure_keeps_candidate_and_recovery_binary(
     candidate.write_text(
         """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'gsv 0.2.0\\n'
+  printf 'gsv 0.3.0\\n'
   exit 0
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
@@ -590,7 +590,7 @@ exit 2
 def test_posix_install_primitive_failure_removes_staged_file(tmp_path: Path) -> None:
     install_dir = tmp_path / "bin"
     candidate = tmp_path / "candidate"
-    candidate.write_text("#!/bin/sh\nprintf 'gsv 0.2.0\\n'\n", encoding="utf-8")
+    candidate.write_text("#!/bin/sh\nprintf 'gsv 0.3.0\\n'\n", encoding="utf-8")
     candidate.chmod(0o755)
     fake_tools = tmp_path / "tools"
     fake_tools.mkdir()
@@ -638,7 +638,7 @@ def test_posix_rollback_preserves_backup_when_stop_result_is_invalid(tmp_path: P
     candidate.write_text(
         """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'gsv 0.2.0\n'
+  printf 'gsv 0.3.0\n'
   exit 0
 fi
 if [ "${1:-}" = "--json" ] && [ "${2:-}" = "bridge" ] && [ "${3:-}" = "stop" ]; then
@@ -943,7 +943,7 @@ public static class Candidate {
             return 0;
         }
         if (args.Length == 1 && args[0] == "--version") {
-            Console.WriteLine("gsv 0.2.0");
+            Console.WriteLine("gsv 0.3.0");
             return 0;
         }
         if (args.Length == 3 && args[0] == "--json" && args[1] == "bridge" && args[2] == "stop") {
