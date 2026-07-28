@@ -25,6 +25,9 @@ decision loop.
   transport with fail-closed capability checks and durable no-replay receipts.
 - Add context-first onboarding, a source capability catalog, bounded live-read
   guidance, local privacy screening, and an AI-authored Pulse skill.
+- Remove unused deterministic onboarding, Pulse-controller,
+  scheduler-planning, and migration modules. The shipped skills own semantic
+  orchestration; legacy backup marker recognition remains for safe restore.
 - Add host-local, per-vault directory grants and the bounded
   `gsv_local_file_read` surface. Selecting local files grants nothing by itself,
   and deselection revokes every root grant before publishing the new source
