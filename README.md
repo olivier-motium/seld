@@ -197,6 +197,13 @@ ChatGPT app.
 
 ## Install
 
+[Install with ChatGPT](https://seld.ai/#install)
+
+The installation page includes the verified ChatGPT desktop link. It pre-fills
+the installation prompt and does not send it. To start manually, use
+https://github.com/olivier-motium/seld and paste the instruction below into the
+ChatGPT desktop app.
+
 The consumer release is installed by giving the ChatGPT desktop app this exact
 instruction:
 
