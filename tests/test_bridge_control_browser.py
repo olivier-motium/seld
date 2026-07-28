@@ -1311,6 +1311,7 @@ def test_browser_failed_receipt_read_removes_stale_hand_liveness(tmp_path: Path)
         thread.start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         snapshot = server.snapshot()
+        snapshot["portfolio"]["review"]["pending_intent"] = {"event_id": event_id}
         snapshot["guided_review_transport"]["event"] = pending_receipt
         bridge_javascript = (Path(static_root) / "bridge.js").read_text(encoding="utf-8")
         fast_javascript = bridge_javascript.replace(
@@ -1341,12 +1342,25 @@ def test_browser_failed_receipt_read_removes_stale_hand_liveness(tmp_path: Path)
                     ),
                 )
 
+                receipt_reads = 0
+
                 def review_turn(route: Any) -> None:
+                    nonlocal receipt_reads
                     if route.request.method == "POST":
                         route.fulfill(
                             body=json.dumps({"ok": True, "transport": running_receipt}),
                             content_type="application/json",
                             status=202,
+                        )
+                    elif receipt_reads < 10:
+                        # Keep the positive observation visible long enough for the
+                        # assertion, then fail the same exact read path. This proves
+                        # both transitions without racing Playwright's locator poll.
+                        receipt_reads += 1
+                        route.fulfill(
+                            body=json.dumps({"ok": True, "transport": running_receipt}),
+                            content_type="application/json",
+                            status=200,
                         )
                     else:
                         route.fulfill(
