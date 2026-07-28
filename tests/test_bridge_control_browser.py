@@ -607,10 +607,13 @@ class RunningTransport(DeliveryUncertainTransport):
 class DispositionBeforeCompletionTransport(SemanticReviewTransport):
     """Expose the real disposition-before-process-exit completion window."""
 
-    def __init__(self, vault: Vault, *, running_reads: int = 5) -> None:
+    def __init__(self, vault: Vault) -> None:
         super().__init__(vault)
-        self.running_reads = running_reads
         self.completed: dict[str, TurnReceipt] = {}
+        self.completion_released = threading.Event()
+
+    def release_completion(self) -> None:
+        self.completion_released.set()
 
     def submit(self, context: TurnContext) -> TurnReceipt:
         completed = super().submit(context)
@@ -630,11 +633,13 @@ class DispositionBeforeCompletionTransport(SemanticReviewTransport):
 
     def snapshot(self, event_id: str | None = None) -> dict[str, Any]:
         receipt = self.receipts.get(event_id) if event_id is not None else None
-        if receipt is not None and receipt.state is TurnState.RUNNING:
-            self.running_reads -= 1
-            if self.running_reads <= 0:
-                receipt = self.completed[receipt.event_id]
-                self.receipts[receipt.event_id] = receipt
+        if (
+            receipt is not None
+            and receipt.state is TurnState.RUNNING
+            and self.completion_released.is_set()
+        ):
+            receipt = self.completed[receipt.event_id]
+            self.receipts[receipt.event_id] = receipt
         return {
             "automatic_resume": True,
             "automatic_start": True,
@@ -2070,9 +2075,7 @@ def test_browser_keeps_active_delivery_until_post_disposition_completion(
             ),
         ),
     )
-    # Keep a deterministic observable disposition-before-completion window even
-    # when the accelerated background snapshot loop runs faster on hosted CI.
-    transport = DispositionBeforeCompletionTransport(vault, running_reads=10)
+    transport = DispositionBeforeCompletionTransport(vault)
     ledger = OperationLedger(vault.root)
     static_resource = files("continuity_kernel") / "resources/bridge"
 
@@ -2095,12 +2098,12 @@ def test_browser_keeps_active_delivery_until_post_disposition_completion(
         thread.start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         bridge_javascript = (Path(static_root) / "bridge.js").read_text(encoding="utf-8")
-        fast_javascript = bridge_javascript.replace(
-            "const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;",
-            "const GUIDED_REVIEW_POLL_INTERVAL_MS = 100;",
-        ).replace(
-            "window.setInterval(() => loadSnapshot({ quiet: true }), 10_000);",
-            "window.setInterval(() => loadSnapshot({ quiet: true }), 25);",
+        fast_javascript = (
+            bridge_javascript.replace(
+                "const GUIDED_REVIEW_POLL_INTERVAL_MS = 750;",
+                "const GUIDED_REVIEW_POLL_INTERVAL_MS = 100;",
+            )
+            + "\nglobalThis.__seldTestLoadSnapshot = loadSnapshot;\n"
         )
         assert fast_javascript != bridge_javascript
         try:
@@ -2120,12 +2123,19 @@ def test_browser_keeps_active_delivery_until_post_disposition_completion(
                 page.get_by_role("button", name="Do / next").click()
                 page.get_by_text("Seld is working", exact=True).wait_for(timeout=5_000)
 
-                page.wait_for_timeout(150)
                 decided = ledger.snapshot()
                 assert decided.pending == ()
                 assert len(decided.decided) == 1
+
+                # Exercise the real snapshot where the queue is dispositioned
+                # but the same Codex hand has not finished yet.
+                assert (
+                    page.evaluate("() => globalThis.__seldTestLoadSnapshot({ quiet: true })")
+                    is True
+                )
                 assert page.get_by_text("Seld is working", exact=True).is_visible()
 
+                transport.release_completion()
                 page.get_by_text("ChatGPT replied", exact=True).wait_for(timeout=5_000)
                 assert page.get_by_text(
                     "I tightened the first next move and kept external action gated.",
