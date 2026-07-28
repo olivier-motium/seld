@@ -124,9 +124,9 @@ described above.
 
 **Name and compatibility:** Seld is the product name. This foundation keeps the
 existing `gsv` command, package, plugin and skill identifiers, `GSV_*`
-environment variables, `~/GSV` default records folder, and repository URL. The
-rename changes the public brand and documentation, not those technical
-interfaces.
+environment variables, and `~/GSV` default records folder. The repository now
+lives at `olivier-motium/seld`; the rename does not change the existing
+technical interfaces.
 
 ## What is proven, and what is only foundation code
 
@@ -198,7 +198,7 @@ the published `0.1.0` release does not include the dashboard.
 
 Once a matching `0.2.0` build is published, give Codex this instruction:
 
-> Open https://github.com/olivier-motium/gsv and read `AGENT_INSTALL.md`.
+> Open https://github.com/olivier-motium/seld and read `AGENT_INSTALL.md`.
 > Install the verified release for this computer without replacing existing
 > Seld or Codex data. Open Seld, then help me restart Codex and begin
 > `$gsv-onboard` in one fresh task. If no matching verified release exists,

@@ -24,7 +24,7 @@ onboarding. The shipped executable and command remain named `gsv`.
 
 ## Consumer path
 
-1. Open `https://github.com/olivier-motium/gsv` and confirm this file belongs to
+1. Open `https://github.com/olivier-motium/seld` and confirm this file belongs to
    that repository.
 2. Read the candidate status in `README.md` and the current version in
    `pyproject.toml`. Continue only when that exact version has a published

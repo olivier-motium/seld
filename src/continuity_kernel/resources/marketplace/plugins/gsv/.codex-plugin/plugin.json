@@ -5,8 +5,8 @@
   "author": {
     "name": "GSV contributors"
   },
-  "homepage": "https://github.com/olivier-motium/gsv",
-  "repository": "https://github.com/olivier-motium/gsv",
+  "homepage": "https://github.com/olivier-motium/seld",
+  "repository": "https://github.com/olivier-motium/seld",
   "license": "Apache-2.0",
   "keywords": ["agents", "codex", "gsv", "local-first", "memory"],
   "skills": "./skills/",

@@ -42,8 +42,8 @@ release = [
 gsv = "continuity_kernel.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/olivier-motium/gsv"
-Issues = "https://github.com/olivier-motium/gsv/issues"
+Homepage = "https://github.com/olivier-motium/seld"
+Issues = "https://github.com/olivier-motium/seld/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/continuity_kernel"]

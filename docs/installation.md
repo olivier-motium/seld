@@ -43,7 +43,7 @@ After `0.2.0` is published, macOS and Linux:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO \
-  https://raw.githubusercontent.com/olivier-motium/gsv/main/scripts/install.sh
+  https://raw.githubusercontent.com/olivier-motium/seld/main/scripts/install.sh
 sh install.sh
 ```
 
@@ -51,7 +51,7 @@ Windows PowerShell:
 
 ```powershell
 Invoke-WebRequest `
-  https://raw.githubusercontent.com/olivier-motium/gsv/main/scripts/install.ps1 `
+  https://raw.githubusercontent.com/olivier-motium/seld/main/scripts/install.ps1 `
   -OutFile install.ps1
 .\install.ps1
 ```

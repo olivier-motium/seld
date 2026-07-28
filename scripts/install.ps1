@@ -4,7 +4,7 @@ $Version = if ($env:GSV_VERSION) { $env:GSV_VERSION } else { "0.2.0" }
 $ReleaseBase = if ($env:GSV_RELEASE_BASE_URL) {
     $env:GSV_RELEASE_BASE_URL
 } else {
-    "https://github.com/olivier-motium/gsv/releases/download/v$Version"
+    "https://github.com/olivier-motium/seld/releases/download/v$Version"
 }
 $InstallDir = if ($env:GSV_BIN_DIR) {
     $env:GSV_BIN_DIR

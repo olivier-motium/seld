@@ -37,7 +37,7 @@ from continuity_kernel.records import (
 )
 from continuity_kernel.vault import Vault, doctor_dict
 
-REPOSITORY_URL: Final = "https://github.com/olivier-motium/gsv"
+REPOSITORY_URL: Final = "https://github.com/olivier-motium/seld"
 
 
 @dataclass(frozen=True)
