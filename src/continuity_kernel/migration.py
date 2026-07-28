@@ -12,7 +12,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from continuity_kernel.atomic import (
     PINNED_PATH_ROOT_SUPPORTED,
@@ -56,6 +56,7 @@ _PINNED_PARENT_SUPPORTED: Final = (
     and os.open in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
 )
+_POSIX_OS = cast(Any, os)
 
 
 @dataclass(frozen=True)
@@ -545,10 +546,10 @@ def _publish_owned_empty_directory(root: Path, relative: str) -> DirectoryOwners
                 f"migration staged directory disappeared for {relative}; all paths were preserved"
             )
         if parent_descriptor >= 0:
-            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            flags = os.O_RDONLY | _POSIX_OS.O_DIRECTORY | _POSIX_OS.O_NOFOLLOW
             stage_descriptor = os.open(stage_name, flags, dir_fd=parent_descriptor)
             opened = os.fstat(stage_descriptor)
-            os.fchmod(stage_descriptor, 0o700)
+            _POSIX_OS.fchmod(stage_descriptor, 0o700)
             os.fsync(stage_descriptor)
             has_entries = bool(os.listdir(stage_descriptor))
         else:
@@ -644,7 +645,7 @@ def _publish_owned_empty_directory(root: Path, relative: str) -> DirectoryOwners
 def _parent_pin(parent: Path, *, relative: str) -> tuple[int, tuple[int, int] | None]:
     if not _PINNED_PARENT_SUPPORTED:
         return -1, None
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    flags = os.O_RDONLY | _POSIX_OS.O_DIRECTORY | _POSIX_OS.O_NOFOLLOW
     descriptor = -1
     try:
         descriptor = os.open(parent, flags)
@@ -836,7 +837,7 @@ def _verify_owned_empty_directory(
     descriptor = -1
     try:
         if parent_descriptor >= 0:
-            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            flags = os.O_RDONLY | _POSIX_OS.O_DIRECTORY | _POSIX_OS.O_NOFOLLOW
             descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
             opened = os.fstat(descriptor)
             has_entries = bool(os.listdir(descriptor))

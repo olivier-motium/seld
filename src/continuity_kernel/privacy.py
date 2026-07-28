@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
-from typing import Final
+from typing import Any, Final, cast
 
 from continuity_kernel.errors import ValidationError
 
@@ -25,6 +25,7 @@ _PINNED_LOCAL_READ_SUPPORTED: Final = (
     and os.stat in os.supports_dir_fd
     and os.stat in os.supports_follow_symlinks
 )
+_POSIX_OS = cast(Any, os)
 
 _EXCLUDED_COMPONENTS: Final = frozenset(
     {
@@ -408,7 +409,7 @@ def _read_bounded_non_placeholder(
     if relative.is_absolute() or not parts or any(part in {"", ".", ".."} for part in parts):
         raise ValidationError("selected local context must be a safe relative path")
 
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags = os.O_RDONLY | _POSIX_OS.O_DIRECTORY | _POSIX_OS.O_NOFOLLOW
     root_descriptor = -1
     directory_descriptors: list[int] = []
     directory_links: list[tuple[int, str, tuple[int, int]]] = []
@@ -464,7 +465,7 @@ def _read_bounded_non_placeholder(
         if listed.st_size > MAX_LOCAL_CONTENT_BYTES:
             raise ValidationError(f"selected local context exceeds its size bound: {display_path}")
 
-        file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        file_flags = os.O_RDONLY | _POSIX_OS.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
         try:
             file_descriptor = os.open(name, file_flags, dir_fd=parent)
         except OSError as exc:

@@ -102,6 +102,7 @@ class DurablePublishError(OSError):
 PINNED_PATH_ROOT_SUPPORTED = (
     os.name != "nt" and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
 )
+_POSIX_OS = cast(Any, os)
 
 
 @dataclass(frozen=True)
@@ -162,7 +163,7 @@ class PinnedPathRoot:
         if not root_name:
             raise ValidationError("secure directory-pinned storage requires a named root")
         canonical_root = canonical_parent / root_name
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags = os.O_RDONLY | _POSIX_OS.O_DIRECTORY | _POSIX_OS.O_NOFOLLOW
         parent_descriptor = -1
         root_descriptor = -1
         try:
@@ -314,7 +315,7 @@ class PinnedPathRoot:
         self._validate_root_identity()
         descriptor = self._open_directory(parts, create=True, mode=mode)
         try:
-            os.fchmod(descriptor, mode)
+            _POSIX_OS.fchmod(descriptor, mode)
             os.fsync(descriptor)
             try:
                 self._validate_directory_path(parts, descriptor)
@@ -357,7 +358,7 @@ class PinnedPathRoot:
                 raise ValidationError(f"{label} must be a regular file, not a link")
             if listed.st_size > max_bytes:
                 raise ValidationError(f"{label} exceeds its size bound")
-            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+            flags = os.O_RDONLY | _POSIX_OS.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
             descriptor = os.open(name, flags, dir_fd=parent)
             opened = os.fstat(descriptor)
             opened_snapshot = _snapshot(opened)
@@ -413,7 +414,7 @@ class PinnedPathRoot:
         temp_name = f".{name}.tmp-{secrets.token_hex(16)}"
         try:
             self._validate_directory_path(parent_parts, parent)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _POSIX_OS.O_NOFOLLOW
             descriptor = os.open(temp_name, flags, mode, dir_fd=parent)
             _write_all(descriptor, content)
             os.fsync(descriptor)
@@ -551,7 +552,7 @@ class PinnedPathRoot:
             metadata = os.fstat(canonical_parent)
             if (int(metadata.st_dev), int(metadata.st_ino)) != parent_identity:
                 raise OSError("canonical publication parent changed")
-            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+            flags = os.O_RDONLY | _POSIX_OS.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
             descriptor = os.open(name, flags, dir_fd=canonical_parent)
             published = os.fstat(descriptor)
             opened_snapshot = _snapshot(published)
@@ -636,7 +637,7 @@ class PinnedPathRoot:
         try:
             try:
                 self._validate_directory_path(parent_parts, parent)
-                flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                flags = os.O_RDWR | os.O_CREAT | _POSIX_OS.O_NOFOLLOW
                 descriptor = os.open(name, flags, 0o600, dir_fd=parent)
                 metadata = os.fstat(descriptor)
                 if not stat.S_ISREG(metadata.st_mode):
@@ -844,7 +845,7 @@ class PinnedPathRoot:
         create: bool,
         mode: int,
     ) -> int:
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags = os.O_RDONLY | _POSIX_OS.O_DIRECTORY | _POSIX_OS.O_NOFOLLOW
         try:
             for part in parts:
                 if create:
@@ -997,7 +998,7 @@ def exclusive_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
     descriptor = -1
     try:
         if PINNED_PATH_ROOT_SUPPORTED:
-            parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            parent_flags = os.O_RDONLY | _POSIX_OS.O_DIRECTORY | _POSIX_OS.O_NOFOLLOW
             try:
                 parent_descriptor = os.open(path.parent, parent_flags)
             except OSError as exc:

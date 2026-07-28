@@ -1760,7 +1760,7 @@ def _positive_integer(value: object, label: str) -> int:
 def _terminate_exact_process(process: subprocess.Popen[bytes]) -> None:
     try:
         if os.name != "nt":
-            os.killpg(process.pid, signal.SIGKILL)
+            cast(Any, os).killpg(process.pid, cast(Any, signal).SIGKILL)
         else:
             process.kill()
     except OSError:

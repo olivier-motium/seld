@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -234,7 +234,7 @@ def test_screened_read_uses_root_pinned_component_no_follow_open(
     assert calls[1][2] is not None
     assert calls[2][0] == "note.txt"
     assert calls[2][2] is not None
-    assert all(flags & os.O_NOFOLLOW for _, flags, _ in calls)
+    assert all(flags & cast(Any, os).O_NOFOLLOW for _, flags, _ in calls)
 
 
 def test_screened_read_never_opens_a_cloud_placeholder(

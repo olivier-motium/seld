@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -419,7 +419,7 @@ def test_pinned_file_lock_rejects_leaf_replacement_immediately_after_open(
             os.rename("global.lock", "global.lock-parked", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             replacement = actual_open(
                 "global.lock",
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | cast(Any, os).O_NOFOLLOW,
                 0o600,
                 dir_fd=dir_fd,
             )
