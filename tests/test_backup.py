@@ -811,6 +811,7 @@ def test_backup_excludes_only_exact_writer_owned_atomic_temps(vault: Vault, tmp_
         ".MIND.md.tmp-token",
         ".NOW.md.tmp-token",
         ".README.md.tmp-token",
+        ".SOURCES.md.tmp-token",
         "tasks/.example.md.tmp-token",
         "entities/.example.md.tmp-token",
         "threads/.example.md.tmp-token",
@@ -844,6 +845,7 @@ def test_backup_with_crash_leftover_foundation_temps_restores_cleanly(
 ) -> None:
     owned_temps = (
         ".DIRECTION.md.tmp-crash",
+        ".SOURCES.md.tmp-crash",
         ".gsv/control/.queue.jsonl.tmp-crash",
         ".gsv/control/.dispositions-0000000000000000.jsonl.tmp-crash",
         ".gsv/control/archive/.queue-0-aaaaaaaa.jsonl.tmp-crash",
