@@ -25,6 +25,9 @@ from continuity_kernel.vault import Vault
 FROM_SHA = "1" * 40
 TO_SHA = "2" * 40
 APPROVAL_REF = "codex:019f8a30-f5db-7b80-b53f-0377296f2d3c"
+SOURCE_UPDATE_RUNTIME_ONLY = pytest.mark.skipif(
+    os.name == "nt", reason="source self-update is macOS-only"
+)
 
 
 def _installed(tmp_path: Path, *, sha: str = FROM_SHA) -> self_update.InstallProvenance:
@@ -291,7 +294,7 @@ def test_fetch_json_rejects_malformed_or_oversized_responses(
         self_update._fetch_json(f"{self_update.API_ROOT}/commits/main")
 
 
-@pytest.mark.skipif(os.name == "nt", reason="source self-update is macOS-only")
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_command_timeout_terminates_the_entire_process_group(tmp_path: Path) -> None:
     marker = tmp_path / "late-child-write"
     child = (
@@ -383,6 +386,7 @@ def test_forged_available_receipt_cannot_authorize_an_update(
         self_update.status()
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_recovery_preserves_concurrent_vault_change_and_rejects_unbound_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -422,6 +426,7 @@ def test_recovery_preserves_concurrent_vault_change_and_rejects_unbound_paths(
     assert calls == []
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_recovery_quarantines_partial_install_and_restores_verified_previous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -468,6 +473,7 @@ def test_recovery_quarantines_partial_install_and_restores_verified_previous(
     assert not previous.exists()
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_rollback_restores_missing_stable_launcher_after_partial_uv_install(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -560,6 +566,7 @@ def test_rollback_rejects_wrong_preserved_revision_before_any_execution_or_move(
     assert not Path(transaction["failed_environment"]).exists()
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_launcher_repair_never_replaces_an_existing_entry(
     tmp_path: Path,
 ) -> None:
@@ -580,7 +587,7 @@ def test_launcher_repair_never_replaces_an_existing_entry(
     assert launcher.read_text(encoding="utf-8") == "user-owned"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="source self-update is macOS-only")
+@SOURCE_UPDATE_RUNTIME_ONLY
 @pytest.mark.parametrize("failure", ("setup", "launcher"))
 def test_restored_failure_reports_an_existing_token_recovery_runtime(
     tmp_path: Path,
@@ -626,7 +633,7 @@ def test_restored_failure_reports_an_existing_token_recovery_runtime(
     assert Path(command[0]).is_file()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="source self-update is macOS-only")
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_unchanged_preflight_failure_never_points_at_an_absent_previous_runtime(
     tmp_path: Path,
 ) -> None:
@@ -654,7 +661,7 @@ def test_unchanged_preflight_failure_never_points_at_an_absent_previous_runtime(
     assert str(Path(transaction["previous_environment"])) not in command[0]
 
 
-@pytest.mark.skipif(os.name == "nt", reason="source self-update is macOS-only")
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_owned_recovery_launcher_survives_swap_and_sanitizes_python_state(
     tmp_path: Path,
 ) -> None:
@@ -714,7 +721,7 @@ def test_owned_recovery_launcher_survives_swap_and_sanitizes_python_state(
     assert not launcher.exists()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="source self-update is macOS-only")
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_recovery_launcher_never_replaces_a_foreign_entry(tmp_path: Path) -> None:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Recovery launcher no-clobber")
@@ -736,6 +743,7 @@ def test_recovery_launcher_never_replaces_a_foreign_entry(tmp_path: Path) -> Non
     assert launcher.read_text(encoding="utf-8") == "user-owned\n"
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_apply_verifies_backup_before_any_candidate_preflight(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -797,6 +805,7 @@ def test_apply_verifies_backup_before_any_candidate_preflight(
     assert events == ["backup", "preflight", "verify"]
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_concurrent_vault_write_during_preflight_is_retained(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -949,6 +958,7 @@ def test_update_refuses_to_stop_a_bridge_for_another_vault(
         )
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_preflight_rebinds_every_seld_and_chatgpt_state_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1161,6 +1171,7 @@ def test_apply_rejects_expired_or_future_check_receipts(
         )
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 @pytest.mark.parametrize(
     ("outcome", "recovery_command"),
     (
@@ -1202,6 +1213,7 @@ def test_apply_preserves_unresolved_transaction_lineage(
     assert self_update._transaction_path().read_bytes() == before
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 @pytest.mark.parametrize(
     ("outcome", "active_sha", "clean_outcome"),
     (
@@ -1279,6 +1291,7 @@ def test_token_recovery_can_close_any_unresolved_terminal_lineage(
     assert self_update._transaction_resolved(persisted) is True
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_recovery_reanchors_routine_writes_after_a_completed_activation_audit(
     vault: Vault,
     tmp_path: Path,
@@ -1318,6 +1331,7 @@ def test_recovery_reanchors_routine_writes_after_a_completed_activation_audit(
     assert persisted["protected_vault_digest"] == current_digest
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_ambiguous_vault_drift_requires_exact_fresh_approval_before_reanchoring(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1385,6 +1399,7 @@ def test_ambiguous_vault_drift_requires_exact_fresh_approval_before_reanchoring(
     assert resolved["recovery_approval_vault_digest"] == current_digest
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_recovery_rolls_back_when_interrupted_candidate_setup_fails(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1424,6 +1439,7 @@ def test_recovery_rolls_back_when_interrupted_candidate_setup_fails(
     assert (active / "previous").read_text(encoding="utf-8") == "old"
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_status_projects_interrupted_and_terminal_transactions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
