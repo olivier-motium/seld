@@ -52,11 +52,11 @@ cloud placeholders, and passes content through the privacy screen. The portable
 source ledger retains only a fingerprint of the current grant set, so any grant
 change makes earlier coverage require a new bounded read.
 
-The packaged `gsv-onboard` and `gsv-pulse` skills compose document, Task,
-WorkThread, Portfolio, source, operation, and Bridge surfaces. Deterministic
-code on those paths protects identity, privacy, bounds, compare-and-swap writes,
-recovery, and replay safety. Seld ships no second rules-based onboarding,
-Pulse, scheduler, or migration control plane.
+The packaged `gsv-onboard`, `gsv-pulse`, and `gsv-update` skills compose
+document, Task, WorkThread, Portfolio, source, operation, Bridge, and updater
+surfaces. Deterministic code on those paths protects identity, privacy, bounds,
+compare-and-swap writes, recovery, and replay safety. Seld ships no second
+rules-based onboarding, Pulse, scheduler, or migration control plane.
 
 Markdown in the vault is authoritative. Deterministic code may persist,
 validate, traverse, and render authored facts. It may not infer task meaning,
@@ -71,12 +71,15 @@ The public Pulse composition deliberately reuses ordinary Seld primitives:
    `system-role:resident-pulse`;
 2. one app-native `heartbeat` wakes that same ChatGPT task on a ten-minute target
    cadence;
-3. the `$gsv-pulse` skill freezes a bounded context and source window;
-4. the model reads selected sources directly, treats their contents as
+3. the `$gsv-pulse` skill freezes a bounded context, source window, and cached
+   update status;
+4. one non-forced `gsv update check` may refresh that cache when its mechanical
+   six-hour network bound is due;
+5. the model reads selected sources directly, treats their contents as
    untrusted evidence, and makes the semantic judgment;
-5. justified Task, WorkThread, Entity, Direction, Portfolio, Mind, and NOW
+6. justified Task, WorkThread, Entity, Direction, Portfolio, Mind, and NOW
    changes use the existing native CAS surfaces and exact readback; and
-6. one wake may create at most one visible sustained-work ChatGPT hand.
+7. one wake may create at most one visible sustained-work ChatGPT hand.
 
 The implemented deterministic substrate has only mechanical authority: validate
 the structural Pulse Task marker, bound its stored hand as one opaque identifier
@@ -92,6 +95,50 @@ and guided Portfolio review exclude it from commitment counts and open-outcome
 selection. Seld makes no guaranteed wake-rate or uptime claim; those narrower
 measurements require the exact installed evidence named in the claim ledger.
 See [Resident AI Pulse](pulse.md).
+
+## Source self-update
+
+Update awareness is part of Pulse; update authority is not. `gsv update status`
+reads installed source provenance and owner-local check/transaction receipts
+without network access. Pulse may invoke non-forced `gsv update check` once per
+wake. The CLI permits a public GitHub request only when its six-hour cache is
+due, while the AI decides whether the result deserves the person's attention.
+Bridge, its browser POST routes, and MCP project cached state only and contain
+no update network or apply surface.
+
+The checker resolves public `main` once through the fixed GitHub API over TLS
+and records one exact 40-character SHA. A candidate is available only when it
+descends from the installed revision, GitHub marks its commit verified, and all
+returned GitHub Actions checks form the complete reported set, are green for
+that exact head SHA, and include every named Seld release job pinned by the
+installed updater. Installation uses the exact SHA, never a moving branch ref.
+
+`$gsv-update` is an interactive approval protocol. It binds the installed SHA,
+candidate SHA, check-receipt revision, and current ChatGPT task UUID to one CLI
+apply invocation. The resident Pulse skill is forbidden from applying or
+recovering; the current ChatGPT host does not attest interactive task identity
+to a local shell command, so that part is an execution policy rather than a
+host capability boundary. Bridge and MCP structurally expose no apply or
+recover method. The updater supports only an official macOS `uv` source
+installation; prebuilt, frozen, Windows, unofficial, and unrecognized installs
+return unsupported.
+
+Apply is one host-local transaction: verified vault backup, candidate preflight
+with isolated Seld, ChatGPT, config, data, home, and temporary roots,
+authenticated Bridge stop, preservation of the prior environment, exact-SHA
+install, setup, and fresh-process provenance, vault, doctor, ChatGPT, and Bridge
+verification. Failure restores the prior environment only after its reader
+proves the recorded source SHA and compatibility with the current vault and
+control ledger. An owner-only `seld-recover` entrypoint is durably installed
+outside uv's managed launcher before the active environment moves, so status
+and exact-token recovery remain executable across a process or power loss.
+Legitimate writes that finish before activation are retained; a short
+vault-writer lock freezes one digest across candidate setup and fresh-process
+verification, so a canonical mutation cannot be silently accepted. Ambiguous
+drift after setup requires a new exact-digest approval in an interactive task.
+An interrupted state remains token-bound and recoverable; it does not trigger a
+different target or a vault down-migration. An unprovable state becomes
+`repair_required` and preserves its evidence for manual repair.
 
 ## ChatGPT integration
 

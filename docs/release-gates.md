@@ -25,6 +25,18 @@ claim.
 - The AI-authored Pulse skill, which reasons over current changes and durable
   context while the deterministic layer remains limited to integrity, privacy,
   bounds, and no-replay safety.
+- An approval-gated updater for the official macOS `uv` source install. Pulse
+  may check the six-hour cache and let the AI surface an exact verified
+  public-main SHA with its complete exact-head GitHub Actions set green; only a
+  current interactive task may apply or recover it. A recovery-only launcher
+  remains executable through the environment swap, and successful update,
+  rollback, interruption, and fresh-process recovery have isolated installed-path
+  proofs.
+
+The updater's required GitHub Actions job names are part of this source-channel
+contract. Renaming or removing one requires keeping the legacy name green for
+installed clients or publishing a manual-reinstall migration; silently changing
+the names makes existing clients correctly refuse the candidate.
 
 The consumer surface is the ChatGPT desktop app on macOS. Windows and Claude
 support are coming.
@@ -45,6 +57,7 @@ current comparison, and exact candidate behind that position.
 | --- | --- | --- |
 | Signed prebuilt macOS distribution | Exact GitHub release asset, SHA-256, workflow provenance, Developer ID signature, notarization, and a clean-host install/upgrade/uninstall run of those bytes. | The public source install is current. Do not describe a prebuilt asset as signed or available until it is published. |
 | Windows consumer support | Exact Windows x64 asset, Authenticode, and installed-path proof for setup, Bridge, backup/restore, update, and uninstall. | Windows support is coming. Portability code and a cross-compile are not the support claim. |
+| Self-update outside the official macOS `uv` source install | A channel-specific signed update manifest, staged-install proof, rollback/recovery proof, and clean-host evidence for the exact platform and artifact. | `gsv update` refuses prebuilt or frozen binaries, Windows, unofficial repositories, and unrecognized tool environments. |
 | Claude consumer support | A packaged Claude integration and fresh-account installed-path proof using the same local records and approval boundary. | Claude support is coming. |
 | Guaranteed unattended Pulse cadence or uptime | A natural app wake on the exact installed version plus a published 72-hour awake-time study whose expected wakes, sleep, throttling, and recovery are accounted for. | Describe Pulse behavior, not an uptime SLA or guaranteed ten-minute cadence. |
 | Host-enforced Pulse tool isolation | A task-scoped host tool profile, or a fresh Pulse task exposing only Seld and read-only source tools, plus a natural-wake tool-inventory proof. | Seld's MCP boundary is structurally local and closed-world. Read-only use of tools from separately installed plugins remains Pulse policy because the current heartbeat surface has no Seld-controlled per-task denylist. |

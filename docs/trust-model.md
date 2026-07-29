@@ -13,6 +13,9 @@
   an incomplete final-path archive while falling back from hard links.
 - A failed install does not replace the last working executable or remove
   pre-existing Codex components.
+- A stale or changed update check cannot authorize a different source revision,
+  and a failed source update either verifies the restored runtime or retains an
+  exact recovery transaction instead of guessing.
 - Uninstall removes only expected `gsv`-owned integration and preserves the records folder,
   configuration, backups, and unrelated Codex state.
 - Marketplace replacement and uninstall recheck an atomically isolated tree;
@@ -99,6 +102,67 @@ loopback reads. It is not a security boundary against hostile code already
 running as the same OS user, which can inspect the local vault or process-owned
 state.
 
+## Source-update boundary
+
+The source updater accepts only an official macOS `uv` tool environment whose
+package provenance, commit SHA, launcher, and receipt agree. It does not support
+prebuilt or frozen binaries, Windows, another repository, an editable checkout,
+or an unrecognized environment.
+
+`gsv update status` is offline. Only the explicit CLI `gsv update check` may use
+the network, and normal checks are mechanically limited to one public request
+cycle per six-hour host cache. The request target is fixed to the public Seld
+repository on `api.github.com` over TLS; redirects, oversized responses, and
+unexpected repository or commit shapes fail closed. Bridge and MCP can project
+the cached receipt but have no network-check or apply method, and no Bridge
+browser POST route can apply an update.
+
+An installable candidate must be one exact 40-character SHA descended from the
+installed SHA on public `main`. GitHub must mark that commit verified, and every
+returned GitHub Actions check run must form the complete reported set and be
+successful for the same exact head SHA. The installed updater also requires the
+named Seld release suite, so a lone green replacement workflow is insufficient.
+The updater then asks `uv` for that exact commit. This trusts GitHub's TLS,
+verification, and check-run metadata; it is not a claim that the source is a
+separately signed or notarized release artifact. The Seld source revision is
+exact, but `uv` resolves its declared Python dependencies at install time; this
+source channel does not claim a separately locked or signed dependency bundle.
+
+Application is interactive. The packaged skill shows the exact from/to SHAs
+and check-receipt revision, reads the current ChatGPT task UUID, obtains fresh
+approval in that task, and records it as `codex:<uuid>`. The CLI rejects a
+changed installed SHA, candidate, or check revision. Pulse may run the
+non-forced check and decide whether to surface it, but it may never call apply
+or recovery under the resident skill policy. The current ChatGPT host does not
+provide an attested interactive-task capability to the local CLI, so the
+`codex:<uuid>` reference is durable approval evidence and stale-state binding,
+not a cryptographic proof of who invoked the command. The structural boundary
+is narrower: Bridge, browser routes, and MCP expose no apply or recovery method.
+
+Before any candidate code executes, Seld creates and verifies a vault backup.
+It then preflights the candidate with isolated Seld, ChatGPT, config, data,
+home, and temporary roots. It preserves the current environment, installs the
+exact candidate, reruns setup, and verifies source provenance, vault identity
+and a frozen activation digest, doctor, ChatGPT integration, and prior Bridge
+lifecycle from a fresh process. Before the environment moves, an owner-only
+`seld-recover` launcher is durably published outside uv's managed `gsv` path;
+it selects only the transaction's preserved or active runtime, strips ambient
+Python injection variables, and is removed after a resolved outcome. The vault
+writer lock is held only across setup and those checks, not network access,
+staging, or installation. Legitimate earlier writes become the protected
+digest, and within-attempt drift fails closed. Writes after an already audited
+terminal outcome become the next attempt's baseline. Drift after setup could
+have started remains ambiguous until an interactive recovery binds the exact
+current digest and a fresh ChatGPT task approval. Failure restores the previous
+runtime only after its source SHA matches the transaction and that runtime proves it
+can read the current vault and control ledger. An interrupted state is retained
+under one token-bound transaction for explicit `gsv update recover`; recovery
+never chooses a different target or rewrites vault data. A state that cannot be
+proved safe becomes `repair_required` and retains its evidence for explicit
+operator repair instead of retrying automatically. Once repaired, the same
+token can re-prove and close that transaction. Only `installed` or `rolled_back`
+with no remaining recovery command may be superseded by another update.
+
 ## Assumptions
 
 Seld trusts the local operating-system account, the installed Codex command it
@@ -135,6 +199,8 @@ does not roll back Codex integration or configuration.
 ## Distribution
 
 The current public distribution installs source from the GitHub repository.
+Its self-update path is limited to the official macOS `uv` source environment
+described above. Prebuilt and Windows self-update remain unsupported.
 Optional prebuilt installers verify the binary against a published SHA-256 file.
 A checksum fetched from the same compromised release is not an independent
 trust root, so a prebuilt artifact may be called signed or notarized only when

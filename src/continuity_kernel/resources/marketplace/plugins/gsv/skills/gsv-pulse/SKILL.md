@@ -43,7 +43,10 @@ At the start, read once:
 - `MIND.md` and `NOW.md` with their exact revisions;
 - `gsv_source_list` with selected sources, content-free coverage, and its exact
   source-state revision; and
-- the Bridge operation queue with its exact queue and disposition revisions.
+- the Bridge operation queue with its exact queue and disposition revisions;
+  and
+- cached local update state from `gsv update status`, which performs no network
+  request.
 
 Freeze the exact pending intent IDs and the selected source windows you will
 inspect. Inputs arriving after that point wait for the next wake. Re-read only
@@ -52,6 +55,23 @@ an exact record immediately before its CAS mutation or disposition.
 Keep the episode inside the heartbeat cadence. At seven elapsed minutes, begin
 no new connector read, recall, or hand inspection. At eight minutes, stop
 acquiring and finish the smallest honest judgment and readback already in hand.
+
+## Notice updates without applying them
+
+After reading cached status, invoke `gsv update check` at most once in the wake
+and never pass `--force`. The command itself permits a public GitHub check only
+when its host-local six-hour cache is due. Do not call GitHub directly, loop on
+a failure, or improvise another update channel.
+
+An available, unavailable, unsupported, not-ready, or interrupted update is
+evidence for the model. Decide whether it matters enough to surface in NOW or
+as an interactive next step; deterministic age or availability does not make
+that decision. If the person should review or recover an update, route the work
+to one current interactive task using `$gsv-update`.
+
+Never run `gsv update apply` or `gsv update recover` in Pulse. Never install,
+roll back, repair, or delete a retained update environment during an unattended
+wake.
 
 ## The AI owns judgment
 

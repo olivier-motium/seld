@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Final, cast
 from urllib.parse import urlencode
 
+import continuity_kernel.update as self_update
 from continuity_kernel import __version__
 from continuity_kernel.codex_turn_transport import (
     START_REVIEW_CHOICE,
@@ -90,6 +91,27 @@ _CONTROL_REVIEW_PROMPT: Final = (
     "`gsv operation list` surface. Acknowledge or reject each intent against its current queue "
     "and disposition revisions. This is review only: do not apply the requested change, edit "
     "canonical records, use provider tools, or take external action. If nothing is pending, say so."
+)
+_UPDATE_REVIEW_PROMPT: Final = (
+    "Review the cached Seld update for this installation. Start with `gsv --json update status` "
+    "and require one current `available` result with exact installed revision, candidate "
+    "revision, and check revision. Explain what changed and the update's local backup, health, "
+    "and rollback checks. Do not install anything until I explicitly approve this exact update "
+    "in this ChatGPT task. If I approve, use only the values from that fresh status with the "
+    "supported `gsv update apply` command and this task's `codex:<task UUID>` approval reference, "
+    "then read back the fresh-process, vault, ChatGPT, and Bridge result."
+)
+_UPDATE_RECOVERY_PROMPT: Final = (
+    "Recover this Seld installation without starting or approving a different update. Start with "
+    "`gsv --json update status`, inspect the exact saved transaction, and explain what is known. "
+    "If status is `interrupted` or `recovery_command` is present, use only its current token once "
+    "with `gsv --json update recover`; a `rolled_back` outcome is still unresolved in that case. "
+    "Only a resolved `rolled_back` transaction with an empty recovery command is "
+    "confirmation-only: confirm the restored version and explain the failure without running "
+    "recovery again. "
+    "If it needs repair, take only the smallest reversible repair. Verify the installed revision, "
+    "unchanged vault identity, ChatGPT integration, and Bridge from a fresh process before calling "
+    "recovery complete."
 )
 _GUIDED_REVIEW_PROMPT: Final = (
     "Start or resume one finite all-open Seld Rundown. At opening, read Direction, the "
@@ -236,6 +258,7 @@ def project_snapshot(
         expected_vault_id=expected_vault_id,
         expected_root_identity=expected_root_identity,
     )
+    update = _project_update(vault, codex_ready=codex_ready)
     portfolio = _project_portfolio(
         vault,
         tasks=all_task_records,
@@ -280,7 +303,61 @@ def project_snapshot(
         "sources": sources,
         "tasks": tasks,
         "threads": threads,
+        "update": update,
     }
+
+
+def _project_update(vault: Vault, *, codex_ready: bool) -> dict[str, Any]:
+    """Project cached updater evidence without checking the network or changing state."""
+
+    try:
+        payload = dict(self_update.status())
+    except (ContinuityError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "installed": None,
+            "candidate": None,
+            "checked_at": None,
+            "check_revision": None,
+            "error_code": "cached_update_status_unreadable",
+            "next_check_after": None,
+            "transaction": None,
+        }
+
+    transaction = payload.get("transaction")
+    outcome = transaction.get("outcome") if isinstance(transaction, dict) else None
+    candidate = payload.get("candidate")
+    candidate_sha = candidate.get("sha") if isinstance(candidate, dict) else None
+    transaction_sha = transaction.get("to_sha") if isinstance(transaction, dict) else None
+    rollback_is_current = outcome == "rolled_back" and (
+        not isinstance(candidate_sha, str)
+        or not isinstance(transaction_sha, str)
+        or candidate_sha == transaction_sha
+    )
+    prompt: str | None = None
+    if (
+        payload.get("state") == "available"
+        and outcome
+        not in {
+            "installed_bridge_repair",
+            "repair_required",
+        }
+        and not rollback_is_current
+    ):
+        prompt = _UPDATE_REVIEW_PROMPT
+    elif (
+        payload.get("state") == "interrupted"
+        or outcome
+        in {
+            "installed_bridge_repair",
+            "repair_required",
+        }
+        or rollback_is_current
+    ):
+        prompt = _UPDATE_RECOVERY_PROMPT
+    if codex_ready and prompt is not None:
+        payload["action_url"] = codex_deep_link(vault.root, prompt)
+    return payload
 
 
 def _project_portfolio(

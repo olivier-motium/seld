@@ -31,6 +31,8 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
     registration = _skill_text("gsv-pulse", "references/registration.md")
     sources = _skill_text("gsv-pulse", "references/source-acquisition.md")
     onboard = _skill_text("gsv-onboard")
+    updater = _skill_text("gsv-update")
+    updater_metadata = _skill_text("gsv-update", "agents/openai.yaml")
     resident = _skill_text("gsv")
 
     for marker in (
@@ -51,6 +53,10 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
         "current heartbeat surface does not give Seld a per-task tool allowlist or denylist",
         "mandatory policy for tools owned by those plugins",
         "do not register Pulse",
+        "cached local update state from `gsv update status`",
+        "invoke `gsv update check` at most once in the wake",
+        "never pass `--force`",
+        "Never run `gsv update apply` or `gsv update recover` in Pulse",
     ):
         assert marker in pulse
 
@@ -94,6 +100,21 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
         "stale CAS means another task won",
     ):
         assert marker in sources
+
+    for marker in (
+        "current interactive ChatGPT task",
+        "complete 40-character `installed.sha`, `candidate.sha`, and `check_revision`",
+        "--approval-ref codex:<current-task-uuid>",
+        "--from-sha <installed.sha>",
+        "--to-sha <candidate.sha>",
+        "--expected-check-revision <check_revision>",
+        "gsv update recover --token <transaction.token>",
+        "Pulse must never run `update apply` or `update recover`",
+    ):
+        assert marker in updater
+
+    assert 'display_name: "Update Seld"' in updater_metadata
+    assert "$gsv-update" in updater_metadata
 
     assert "Ordinary hands do not write `NOW.md`" in resident
 

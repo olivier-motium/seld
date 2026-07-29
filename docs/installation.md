@@ -116,30 +116,88 @@ it. Do not disable Gatekeeper globally.
 
 ## Upgrades
 
-For the public source distribution:
+Seld's resident updater supports the official `uv` source install on the current
+macOS consumer path. It refuses frozen or prebuilt binaries, Windows installs,
+unrecognized tool environments, and source installs that do not prove they
+came from the official public repository.
+
+Read local update state without network access, then request a bounded check:
 
 ```bash
-uv tool install --force 'git+https://github.com/olivier-motium/seld.git'
-gsv setup
+gsv update status
+gsv update check
 ```
 
-`gsv setup` is idempotent and preserves the selected vault. Check the existing
-`gsv` executable before a forced tool replacement.
+`status` reads only owner-local receipts. `check` contacts the fixed public
+GitHub API only when the local six-hour cache is due; `--force` is reserved for
+an explicit interactive recheck. The candidate is one exact 40-character SHA
+descended from the installed revision on public `main`. GitHub must report it as
+verified, the complete exact-head GitHub Actions check set as successful, and
+every named Seld release job as present. Seld then installs that exact SHA
+rather than a moving branch name.
 
-For a checksummed prebuilt distribution, run the installer again. The verified
-staged candidate quiesces a live Bridge
-before executable replacement, then setup starts the candidate Bridge. If the
-PID is alive but authenticated health is temporarily unavailable, upgrade
-aborts without replacing the executable or deleting the receipt; retry after
-checking `gsv bridge status` or `gsv bridge stop`.
+Pulse may call the non-forced check once per wake and let the AI decide whether
+to mention the result. Its installed skill forbids apply and recovery. Bridge,
+browser POST routes, and MCP structurally read cached update state only and
+contain no update network or installation method.
 
-Setup is idempotent and pre-commit integration rollback removes only components
-added by the failed invocation. A compatible binary rollback restores the old
-executable and attempts to restore its prior Bridge lifecycle. If a new
-ownership receipt becomes visible but its write reports failure, first install
-removes only those exact new bytes; an upgrade restores and durability-checks
-the exact prior receipt. A concurrent or unrelated user change is left
-untouched.
+Use `$gsv-update` in a current interactive ChatGPT task to review the exact
+`installed.sha`, `candidate.sha`, and `check_revision`, then approve this exact
+command:
+
+```bash
+gsv update apply \
+  --from-sha '<installed.sha>' \
+  --to-sha '<candidate.sha>' \
+  --expected-check-revision '<check_revision>' \
+  --approval-ref 'codex:<current-task-uuid>'
+```
+
+The updater validates that the installed revision and cached check still match
+the approval, creates and verifies a vault backup, then stages the exact
+candidate with isolated Seld, ChatGPT, config, data, home, and temporary roots
+for its version and synthetic continuity proof. It stops only an authenticated
+live Bridge and preserves the current tool environment before installing the
+candidate. A fresh candidate process
+must rerun setup, report the expected source SHA, prove the same vault identity,
+pass doctor with ChatGPT integration ready, and restore the prior Bridge
+lifecycle. Seld freezes the current vault digest only for setup and the
+fresh-process checks: legitimate writes completed earlier remain intact, while
+any canonical change during activation is detected and fails the transaction
+instead of being silently accepted.
+
+If candidate verification fails, Seld first proves the preserved runtime can
+still read the current vault and control ledger, then restores that environment
+and verifies it. Before moving the active environment, Seld also publishes one
+owner-only `seld-recover` entrypoint outside uv's managed `gsv` path. If a
+process or the machine stops while `gsv` is being replaced, a fresh process can
+still inspect the exact transaction:
+
+```bash
+seld-recover --json update status
+```
+
+The normal status surface, or this recovery-only entrypoint during the swap,
+exposes the exact token, phase, and recovery command. After fresh interactive
+approval, resume only that transaction:
+
+```bash
+gsv update recover --token '<transaction.token>'
+```
+
+Recovery either finishes the checked candidate or restores the preserved
+environment; it never selects a new revision. If neither environment can be
+proved safe, Seld retains both and returns `repair_required` instead of deleting
+evidence or guessing. If the vault changed after candidate or restored setup
+could have run, Seld does not decide whether those bytes are legitimate. The
+reported recovery command binds the current vault digest and requires fresh
+approval from the current ChatGPT task before re-anchoring that one attempt.
+After the reported repair or approval, the same token-bound recover command
+re-verifies and closes the transaction. A transaction is clean
+only when it reports `installed` or `rolled_back` with no recovery command; a
+new update cannot overwrite retained repair or cleanup lineage. A prebuilt
+installer, Windows install, or manual tool replacement does not use this
+self-update transaction.
 
 Executable rollback is not a data down-migration. Multi-subject review Tasks
 and review answers above 4 KiB use explicit version-2 stored shapes; an older

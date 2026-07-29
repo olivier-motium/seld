@@ -68,6 +68,63 @@ const viewByRoute = {
   system: "system",
 };
 
+const updateSystemStates = {
+  available: {
+    action: "Review update in ChatGPT",
+    copy: "Pulse found a newer reviewed version. Open ChatGPT to see what changed and approve the exact update when you are ready.",
+    status: "Update ready",
+    statusClass: "",
+  },
+  current: {
+    copy: "This installation matches the latest reviewed version recorded by Pulse.",
+    status: "Current",
+    statusClass: "",
+  },
+  installed: {
+    copy: "The approved update installed successfully, and Seld verified your local record and ChatGPT connection afterwards.",
+    status: "Updated",
+    statusClass: "",
+  },
+  interrupted: {
+    action: "Recover in ChatGPT",
+    copy: "An update stopped before Seld could verify the result. Continue the saved recovery in ChatGPT before trying another update.",
+    status: "Recovery needed",
+    statusClass: "is-error",
+  },
+  not_ready: {
+    copy: "Pulse found newer code, but it has not passed Seld's update checks. Your current installation stays in place.",
+    status: "Waiting for checks",
+    statusClass: "is-warning",
+  },
+  repair: {
+    action: "Repair in ChatGPT",
+    copy: "The saved update result needs a local repair before Seld can verify the installation again.",
+    status: "Repair needed",
+    statusClass: "is-error",
+  },
+  rolled_back: {
+    action: "Review rollback in ChatGPT",
+    copy: "The candidate did not pass its checks, so Seld restored the previous installation and kept your local record in place.",
+    status: "Restored",
+    statusClass: "is-warning",
+  },
+  unavailable: {
+    copy: "The last background check could not verify the public version. Seld keeps running the installed version and will try again later.",
+    status: "Check unavailable",
+    statusClass: "is-warning",
+  },
+  unchecked: {
+    copy: "Pulse has not checked for a newer reviewed version yet. The Bridge only reads the cached result and never checks the network itself.",
+    status: "Not checked",
+    statusClass: "",
+  },
+  unsupported: {
+    copy: "This installation cannot update itself. Use the supported source installation path to receive future updates.",
+    status: "Manual update",
+    statusClass: "is-warning",
+  },
+};
+
 const state = {
   connectionState: "loading",
   currentView: viewFromHash(),
@@ -2373,6 +2430,7 @@ function renderSystem(snapshot) {
       snapshot.doctor.healthy ? "Healthy" : "Needs attention",
       snapshot.doctor.healthy ? "" : "is-error",
     ),
+    updateSystemRow(snapshot),
     systemRow(
       "Saved context",
       "Your context and current status files are available.",
@@ -2458,6 +2516,52 @@ function renderDoctorRecovery(doctor) {
   }
   panel.append(copy, issues, actions);
   return panel;
+}
+
+function updateSystemState(update) {
+  const outcome = update?.transaction?.outcome;
+  const rollbackIsCurrent =
+    outcome === "rolled_back" &&
+    (!update?.candidate?.sha ||
+      !update?.transaction?.to_sha ||
+      update.candidate.sha === update.transaction.to_sha);
+  if (["installed_bridge_repair", "repair_required"].includes(outcome)) return "repair";
+  if (update?.state === "interrupted") return "interrupted";
+  if (update?.state === "unsupported") return "unsupported";
+  if (rollbackIsCurrent) return "rolled_back";
+  if (["available", "not_ready", "unavailable"].includes(update?.state)) return update.state;
+  if (outcome === "installed") return "installed";
+  if (update?.state === "stale") return "unchecked";
+  if (Object.hasOwn(updateSystemStates, update?.state)) return update.state;
+  return "unavailable";
+}
+
+function updateSystemRow(snapshot) {
+  const update = snapshot.update || {};
+  const stateName = updateSystemState(update);
+  const presentation = updateSystemStates[stateName];
+  let copy = presentation.copy;
+  if (stateName === "repair" && update.transaction?.outcome === "installed_bridge_repair") {
+    copy = "The approved version is installed, but the local Bridge still needs repair before Seld can verify the full update.";
+  }
+  let action = null;
+  if (
+    presentation.action &&
+    typeof update.action_url === "string" &&
+    update.action_url.startsWith("codex://new?")
+  ) {
+    action = textElement("a", "quiet-action", presentation.action);
+    action.href = update.action_url;
+  } else if (presentation.action) {
+    copy += " Connect ChatGPT below to continue.";
+  }
+  return systemRow(
+    "Seld updates",
+    copy,
+    presentation.status,
+    presentation.statusClass,
+    action,
+  );
 }
 
 function renderRecoveryCommand(title, command) {
@@ -2664,11 +2768,14 @@ function formatCoverageTime(value) {
   }).format(date);
 }
 
-function systemRow(title, copy, status, statusClass) {
+function systemRow(title, copy, status, statusClass, action = null) {
   const row = element("div", "system-row");
+  const body = element("div", "system-row-copy");
+  body.append(textElement("p", "", copy));
+  if (action) body.append(action);
   row.append(
     textElement("h3", "", title),
-    textElement("p", "", copy),
+    body,
     textElement("span", `system-state ${statusClass}`, status),
   );
   return row;

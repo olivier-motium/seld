@@ -246,7 +246,11 @@ The macOS source distribution includes:
   process; and
 - the resident Pulse skill, which lets the AI read selected sources, reason
   over fresh changes and durable context, and author the current Mind through
-  exact compare-and-swap writes.
+  exact compare-and-swap writes; and
+- an approval-gated source updater that lets Pulse notice a reviewed release,
+  installs its exact public-main revision only after approval in the current
+  ChatGPT task, verifies the result from a fresh process, and preserves an
+  executable recovery path throughout the environment swap.
 
 The source catalog includes ChatGPT activity, Gmail, Google Calendar, Google
 Drive and Sheets, Outlook, Slack, Teams, GitHub, Asana, Atlassian, Box, Figma,
@@ -306,6 +310,8 @@ does not claim that a live connector was tested.
 gsv                  # Open Bridge
 gsv doctor           # Check files, integration, and local health
 gsv status           # Show a compact status summary
+gsv update status    # Read cached update and recovery state without network access
+gsv update check     # Check public main when the six-hour cache is due
 gsv bridge status    # Check the Bridge process
 gsv backup create    # Create a verified backup without overwriting one
 gsv bridge stop      # Stop Bridge

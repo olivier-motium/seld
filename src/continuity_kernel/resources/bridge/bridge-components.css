@@ -348,6 +348,13 @@ button.storyline:hover {
   line-height: 1.55;
 }
 
+.system-row-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+}
+
 .storyline-next {
   margin-top: 8px !important;
   color: var(--ink) !important;
