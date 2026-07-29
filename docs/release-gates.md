@@ -91,9 +91,9 @@ continuity paths on macOS for those exact implementation bytes. The rows above
 name the separate evidence needed for signed binaries, another platform, or a
 published reliability rate.
 
-The approval-gated source updater was added in signed implementation commit
-`c231f9d5dc1d3bccdca7ba7bc97f457bd6df4a4f` on 2026-07-29. Its updater module
-has SHA-256
+The approval-gated source updater was added in implementation commit
+`c231f9d5dc1d3bccdca7ba7bc97f457bd6df4a4f` on 2026-07-29. That commit carries
+the required DCO sign-off. Its updater module has SHA-256
 `8a0e07c42e50aa5351ef6e98816f2162cfd3c4cfd841bcdc150e92aa6fcb04c4`.
 The exact source tree passed `make check` with 953 tests passed, 5 skipped,
 strict mypy, Ruff, 80.57% branch coverage, and a zero-finding privacy scan. The
