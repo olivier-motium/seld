@@ -124,6 +124,16 @@ source-update proof with 658 five-millisecond availability probes and zero
 gaps. The amended exact-head GitHub matrix remains a separate publication
 receipt.
 
+That amended run (`30435202754`) proved the Windows type-check repair, then
+showed the POSIX activation and recovery fixtures executing on Windows despite
+the product's explicit unsupported-platform boundary. Commit
+`2901ecd67fb283a763b503a6e5c99ac168f0df77` applies one shared macOS-only marker
+only to those activation, swap, recovery-launcher, and interrupted-transaction
+tests. Windows still runs the cross-platform update status, public-main check,
+receipt validation, unsupported-provenance, approval-conflict, and CLI tests.
+The complete exact-head matrix must pass after this test-boundary correction;
+the earlier red run is not publication evidence.
+
 This packet proves the updater's local installed-path, interruption, and
 rollback contracts for the official macOS source channel. Remote publication
 still requires exact-head PR checks, a verified public-main commit, and a
