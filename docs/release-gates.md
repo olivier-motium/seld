@@ -91,6 +91,32 @@ continuity paths on macOS for those exact implementation bytes. The rows above
 name the separate evidence needed for signed binaries, another platform, or a
 published reliability rate.
 
+The approval-gated source updater was added in signed implementation commit
+`c231f9d5dc1d3bccdca7ba7bc97f457bd6df4a4f` on 2026-07-29. Its updater module
+has SHA-256
+`8a0e07c42e50aa5351ef6e98816f2162cfd3c4cfd841bcdc150e92aa6fcb04c4`.
+The exact source tree passed `make check` with 953 tests passed, 5 skipped,
+strict mypy, Ruff, 80.57% branch coverage, and a zero-finding privacy scan. The
+real Bridge browser gate passed 23 Chromium cases.
+
+The isolated source-update proof installed two exact Git revisions through
+real `uv tool` environments. It completed the forward update, restored the
+previous environment after an injected candidate failure, survived a real
+SIGKILL at `previous_preserved`, retained a concurrent canonical vault write,
+and recovered the exact interrupted transaction from a fresh process. Across
+555 probes at five-millisecond intervals, either `gsv` or the independently
+published `seld-recover` entrypoint remained executable with zero availability
+gaps. The matching wheel, source distribution, frozen-artifact, clean-install,
+dependency, privacy, backup/restore, Bridge, MCP, and uninstall gates passed.
+Fable 5 Max and an independent hostile security review both returned `READY`
+with no Blocker or High finding.
+
+This packet proves the updater's local installed-path, interruption, and
+rollback contracts for the official macOS source channel. Remote publication
+still requires exact-head PR checks, a verified public-main commit, and a
+post-merge readback of those same checks before that public revision becomes an
+eligible candidate.
+
 ## Provider-backed continuity evidence
 
 On 2026-07-25, an authenticated Codex CLI canary loaded source from base commit
