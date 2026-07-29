@@ -219,6 +219,9 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
         "registration.md",
         "source-acquisition.md",
     }
+    update = generated_marketplace / "plugins/gsv/skills/gsv-update"
+    assert (update / "SKILL.md").is_file()
+    assert (update / "agents/openai.yaml").is_file()
     assert not (home / "AGENTS.md.gsv-backup").exists()
     second = integration.install_codex(vault=vault, codex_home=home)
     removed = integration.uninstall_codex(codex_home=home)

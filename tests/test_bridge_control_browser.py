@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+import continuity_kernel.update as self_update
 from continuity_kernel import bridge as bridge_module
 from continuity_kernel.bridge import BridgeHTTPServer
 from continuity_kernel.codex_turn_transport import (
@@ -40,6 +41,139 @@ pytestmark = pytest.mark.skipif(
 ACCESS_TOKEN = "e" * 48
 INSTANCE_ID = "f" * 32
 REVIEW_HAND_ID = "018f6a20-7b3c-7d42-8a19-2e5f603b91c4"
+
+
+def test_browser_renders_cached_update_states_as_chatgpt_links_not_browser_posts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Cached update Bridge proof")
+    current_update: dict[str, Any] = {
+        "state": "unchecked",
+        "installed": {"supported": True, "sha": "1" * 40, "version": "0.3.0"},
+        "candidate": None,
+        "checked_at": None,
+        "check_revision": None,
+        "error_code": None,
+        "next_check_after": None,
+        "transaction": None,
+    }
+    monkeypatch.setattr(self_update, "status", lambda: dict(current_update))
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"height": 760, "width": 1024})
+                update_requests: list[tuple[str, str]] = []
+                page.on(
+                    "request",
+                    lambda request: (
+                        update_requests.append((request.method, request.url))
+                        if "/update" in request.url
+                        else None
+                    ),
+                )
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
+                for state_name, outcome, expected_status, expected_action in (
+                    ("unchecked", None, "Not checked", None),
+                    ("current", None, "Current", None),
+                    ("available", None, "Update ready", "Review update in ChatGPT"),
+                    ("not_ready", None, "Waiting for checks", None),
+                    ("unavailable", None, "Check unavailable", None),
+                    ("unsupported", None, "Manual update", None),
+                    ("interrupted", None, "Recovery needed", "Recover in ChatGPT"),
+                    ("interrupted", "installed", "Recovery needed", "Recover in ChatGPT"),
+                    ("interrupted", "rolled_back", "Recovery needed", "Recover in ChatGPT"),
+                    ("current", "installed", "Updated", None),
+                    ("available", "installed", "Update ready", "Review update in ChatGPT"),
+                    (
+                        "available",
+                        "rolled_back",
+                        "Restored",
+                        "Review rollback in ChatGPT",
+                    ),
+                    ("current", "repair_required", "Repair needed", "Repair in ChatGPT"),
+                    ("unsupported", "repair_required", "Repair needed", "Repair in ChatGPT"),
+                ):
+                    current_update["state"] = state_name
+                    current_update["candidate"] = (
+                        {"sha": "2" * 40, "verified": True, "ci_checks": 8}
+                        if state_name in {"available", "not_ready"}
+                        else None
+                    )
+                    current_update["checked_at"] = (
+                        None if state_name == "unchecked" else "2026-07-29T08:00:00Z"
+                    )
+                    current_update["check_revision"] = (
+                        None if state_name == "unchecked" else "3" * 64
+                    )
+                    current_update["transaction"] = (
+                        None
+                        if outcome is None and state_name != "interrupted"
+                        else {
+                            "token": "018f6a20-7b3c-7d42-8a19-2e5f603b91c4",
+                            "outcome": outcome,
+                        }
+                    )
+                    page.reload(wait_until="networkidle")
+                    page.locator('[data-view="system"]').click()
+                    row = page.locator(
+                        ".system-row",
+                        has=page.get_by_role("heading", name="Seld updates", exact=True),
+                    )
+                    assert row.count() == 1
+                    assert row.locator(".system-state").inner_text() == expected_status
+                    actions = row.get_by_role("link")
+                    if expected_action is None:
+                        assert actions.count() == 0
+                    else:
+                        action = row.get_by_role("link", name=expected_action, exact=True)
+                        assert action.get_attribute("href").startswith("codex://new?")
+                current_update.update(
+                    state="available",
+                    candidate={"sha": "3" * 40, "verified": True, "ci_checks": 8},
+                    transaction={
+                        "token": "018f6a20-7b3c-7d42-8a19-2e5f603b91c4",
+                        "to_sha": "2" * 40,
+                        "outcome": "rolled_back",
+                    },
+                )
+                page.reload(wait_until="networkidle")
+                page.locator('[data-view="system"]').click()
+                row = page.locator(
+                    ".system-row",
+                    has=page.get_by_role("heading", name="Seld updates", exact=True),
+                )
+                assert row.locator(".system-state").inner_text() == "Update ready"
+                assert (
+                    row.get_by_role("link", name="Review update in ChatGPT", exact=True).count()
+                    == 1
+                )
+                assert update_requests == []
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
 
 
 class SemanticReviewTransport:

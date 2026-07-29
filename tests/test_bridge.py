@@ -23,6 +23,7 @@ from urllib.request import ProxyHandler, Request, urlopen
 
 import pytest
 
+import continuity_kernel.update as self_update
 from continuity_kernel import __version__, bridge, bridge_projection, mcp_server
 from continuity_kernel import control_queue as control_queue_module
 from continuity_kernel.config import data_dir
@@ -273,6 +274,215 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
             "review_url": review_url,
             "state": "ready",
         }
+
+
+def test_snapshot_projects_only_cached_update_state_and_chatgpt_review_link(
+    vault: Vault,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_sha = "1" * 40
+    candidate_sha = "2" * 40
+    check_revision = "3" * 64
+    calls = {"status": 0}
+
+    def cached_status() -> dict[str, Any]:
+        calls["status"] += 1
+        return {
+            "state": "available",
+            "installed": {"supported": True, "sha": installed_sha, "version": __version__},
+            "candidate": {"sha": candidate_sha, "verified": True, "ci_checks": 8},
+            "checked_at": "2026-07-29T08:00:00Z",
+            "check_revision": check_revision,
+            "error_code": None,
+            "next_check_after": "2026-07-29T14:00:00Z",
+            "transaction": None,
+        }
+
+    def forbidden(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        raise AssertionError("Bridge projection must not check, apply, or recover an update")
+
+    monkeypatch.setattr(self_update, "status", cached_status)
+    monkeypatch.setattr(self_update, "check", forbidden)
+    monkeypatch.setattr(self_update, "apply", forbidden)
+    monkeypatch.setattr(self_update, "recover", forbidden)
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )
+
+    assert calls == {"status": 1}
+    assert snapshot["update"] == {
+        "state": "available",
+        "installed": {"supported": True, "sha": installed_sha, "version": __version__},
+        "candidate": {"sha": candidate_sha, "verified": True, "ci_checks": 8},
+        "checked_at": "2026-07-29T08:00:00Z",
+        "check_revision": check_revision,
+        "error_code": None,
+        "next_check_after": "2026-07-29T14:00:00Z",
+        "transaction": None,
+        "action_url": snapshot["update"]["action_url"],
+    }
+    action = parse_qs(urlsplit(snapshot["update"]["action_url"]).query)
+    assert action["originUrl"] == [bridge_projection.REPOSITORY_URL]
+    assert action["path"] == [str(vault.root)]
+    assert "gsv --json update status" in action["prompt"][0]
+    assert "explicitly approve" in action["prompt"][0]
+    assert "Do not install anything" in action["prompt"][0]
+
+
+@pytest.mark.parametrize(
+    ("state", "outcome"),
+    (
+        ("interrupted", None),
+        ("available", "installed_bridge_repair"),
+        ("available", "repair_required"),
+        ("available", "rolled_back"),
+        ("interrupted", "installed"),
+        ("interrupted", "rolled_back"),
+    ),
+)
+def test_snapshot_projects_chatgpt_recovery_link_for_saved_update_outcomes(
+    vault: Vault,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    outcome: str | None,
+) -> None:
+    monkeypatch.setattr(
+        self_update,
+        "status",
+        lambda: {
+            "state": state,
+            "installed": {"supported": True, "sha": "1" * 40},
+            "candidate": {"sha": "2" * 40},
+            "checked_at": "2026-07-29T08:00:00Z",
+            "check_revision": "3" * 64,
+            "error_code": None,
+            "next_check_after": None,
+            "transaction": {
+                "token": "018f6a20-7b3c-7d42-8a19-2e5f603b91c4",
+                "outcome": outcome,
+            },
+        },
+    )
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )
+
+    prompt = parse_qs(urlsplit(snapshot["update"]["action_url"]).query)["prompt"][0]
+    assert "without starting or approving a different update" in prompt
+    assert "gsv --json update recover" in prompt
+
+
+def test_snapshot_offers_new_candidate_after_an_older_candidate_rolled_back(
+    vault: Vault,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        self_update,
+        "status",
+        lambda: {
+            "state": "available",
+            "installed": {"supported": True, "sha": "1" * 40},
+            "candidate": {"sha": "3" * 40, "verified": True, "ci_checks": 8},
+            "checked_at": "2026-07-29T08:00:00Z",
+            "check_revision": "4" * 64,
+            "error_code": None,
+            "next_check_after": None,
+            "transaction": {
+                "token": "018f6a20-7b3c-7d42-8a19-2e5f603b91c4",
+                "to_sha": "2" * 40,
+                "outcome": "rolled_back",
+            },
+        },
+    )
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )
+
+    prompt = parse_qs(urlsplit(snapshot["update"]["action_url"]).query)["prompt"][0]
+    assert "Review the cached Seld update" in prompt
+    assert "Do not install anything" in prompt
+
+
+@pytest.mark.parametrize(
+    ("state", "recovery_command", "expected"),
+    (
+        ("interrupted", "exact token recovery", "still unresolved"),
+        ("current", None, "confirmation-only"),
+    ),
+)
+def test_snapshot_recovery_prompt_distinguishes_unresolved_and_resolved_rollback(
+    vault: Vault,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    recovery_command: str | None,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(
+        self_update,
+        "status",
+        lambda: {
+            "state": state,
+            "installed": {"supported": True, "sha": "1" * 40},
+            "candidate": None,
+            "checked_at": "2026-07-29T08:00:00Z",
+            "check_revision": "3" * 64,
+            "error_code": None,
+            "next_check_after": None,
+            "transaction": {
+                "token": "018f6a20-7b3c-7d42-8a19-2e5f603b91c4",
+                "to_sha": "2" * 40,
+                "outcome": "rolled_back",
+                "recovery_command": recovery_command,
+            },
+        },
+    )
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )
+
+    prompt = parse_qs(urlsplit(snapshot["update"]["action_url"]).query)["prompt"][0]
+    assert expected in prompt
+    assert "If status is `interrupted` or `recovery_command` is present" in prompt
+
+
+def test_snapshot_update_projection_fails_closed_without_hiding_the_bridge(
+    vault: Vault,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unreadable() -> dict[str, Any]:
+        raise ValidationError("malformed cached receipt")
+
+    monkeypatch.setattr(self_update, "status", unreadable)
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={"available": True, "ready": True},
+    )
+
+    assert snapshot["doctor"]["healthy"] is True
+    assert snapshot["update"] == {
+        "state": "unavailable",
+        "installed": None,
+        "candidate": None,
+        "checked_at": None,
+        "check_revision": None,
+        "error_code": "cached_update_status_unreadable",
+        "next_check_after": None,
+        "transaction": None,
+    }
 
 
 def test_snapshot_projects_source_coverage_and_degrades_impossible_timeline(
@@ -1332,6 +1542,22 @@ def test_bridge_ui_tokens_and_dependency_free_orb_contract() -> None:
     assert 'urlKey = "new_hand_url"' in javascript
     assert "renderCodexAction" in javascript
     assert '"new_mind_url"' in javascript
+    assert "updateSystemRow(snapshot)" in javascript
+    assert 'update.action_url.startsWith("codex://new?")' in javascript
+    assert "/api/v1/update" not in javascript
+    for update_state in (
+        "available",
+        "current",
+        "installed",
+        "interrupted",
+        "not_ready",
+        "repair",
+        "rolled_back",
+        "unavailable",
+        "unchecked",
+        "unsupported",
+    ):
+        assert re.search(rf"^  {update_state}: \{{", javascript, re.MULTILINE)
     assert "Nothing needs you right now" in javascript
     assert "more · See everything" in javascript
     assert "more not shown." in javascript

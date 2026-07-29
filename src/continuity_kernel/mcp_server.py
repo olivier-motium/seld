@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import IO, Any, Final
 
+import continuity_kernel.update as self_update
 from continuity_kernel import __version__
 from continuity_kernel.config import resolve_vault
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
@@ -238,6 +239,8 @@ def _call(
             operation_binding = capture_operation_binding(vault.root)
     if name == "gsv_status":
         return vault.status()
+    if name == "gsv_update_status":
+        return self_update.status()
     if name == "gsv_context":
         return {
             "context": vault.context_pack(max_characters=_integer(values, "max_characters", 48_000))
@@ -562,6 +565,15 @@ TASK_REMOVE_REFS = {
 
 TOOLS: Final = [
     _tool("gsv_status", "Read vault identity, counts, and digest.", {}, read_only=True),
+    _tool(
+        "gsv_update_status",
+        (
+            "Read installed revision and host-cached update evidence. This tool never uses the "
+            "network and cannot install or approve an update."
+        ),
+        {},
+        read_only=True,
+    ),
     _tool(
         "gsv_context",
         "Read the bounded current context pack at the start of substantive work.",

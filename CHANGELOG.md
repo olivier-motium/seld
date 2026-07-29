@@ -39,6 +39,11 @@ decision loop.
 - Add the private Bridge with read-only record views plus bounded intent and
   review-turn routes, including authenticated loopback access and responsive
   states.
+- Add approval-gated self-update for the official macOS `uv` source install.
+  Pulse can notice a newer reviewed public-main revision, while Bridge and MCP
+  remain cache-only. Exact-SHA installation preserves the prior environment
+  until fresh-process vault, ChatGPT, and Bridge checks pass, with an
+  independent recovery entrypoint across interrupted swaps.
 - Make live-Bridge upgrades quiesce before executable replacement and restore
   the previous Bridge best-effort on rollback.
 - Make bare `gsv` open the configured Bridge and make setup install Codex

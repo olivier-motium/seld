@@ -25,7 +25,10 @@ The public Pulse uses the same small primitives as an interactive Seld hand:
    NOW changes only through fresh CAS and exact readback.
 6. An acknowledged Bridge receipt comes after its semantic integration or an
    explicit AI judgment that canon should not change.
-7. Sustained work gets at most one durable outcome and one visible ChatGPT task.
+7. The task reads cached `gsv update status` and invokes non-forced `gsv update
+   check` at most once per wake; the model decides whether the result deserves
+   attention.
+8. Sustained work gets at most one durable outcome and one visible ChatGPT task.
 
 The structural Pulse task is not part of the person's life Portfolio. Bridge
 and guided all-open review exclude it from commitments and outcome coverage.
@@ -73,6 +76,21 @@ At seven elapsed minutes the task starts no new acquisition. At eight minutes
 it stops acquiring and completes only the smallest honest judgment and readback
 already in hand. Only this exact Pulse task writes NOW during autonomous
 operation.
+
+## Update awareness
+
+`gsv update status` is an offline read of installed provenance, the cached
+public-main check, and any update transaction. Once per wake, Pulse may call
+`gsv update check` without `--force`. The CLI makes a GitHub request only when
+its host-local six-hour cache is due, so repeated heartbeats do not become a
+network poller. Pulse does not call GitHub directly or retry a failed check.
+
+The AI decides whether an available update, failed check, unsupported install,
+or interrupted transaction should be shown now. An ordinary available update
+can remain quiet; a transaction that needs recovery may deserve a visible
+interactive hand. In every case, Pulse may only surface the evidence and point
+to `$gsv-update`. It never runs `gsv update apply` or `gsv update recover`, and
+it never changes an installed executable during an unattended wake.
 
 ## Unattended boundary
 

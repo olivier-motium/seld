@@ -1,0 +1,4 @@
+interface:
+  display_name: "Update Seld"
+  short_description: "Review and install a verified Seld update"
+  default_prompt: "Use $gsv-update to review and safely install the checked Seld update."

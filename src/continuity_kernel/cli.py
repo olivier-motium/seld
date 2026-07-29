@@ -12,6 +12,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
+import continuity_kernel.update as self_update
 from continuity_kernel import __version__
 from continuity_kernel.bridge import (
     bridge_status,
@@ -207,6 +208,28 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 "stopped": True,
             }
         raise AssertionError("unreachable Bridge command")
+    if args.command == "update":
+        if args.update_command == "status":
+            return self_update.status()
+        if args.update_command == "check":
+            return self_update.check(force=args.force)
+        vault = Vault(resolve_vault(explicit_vault))
+        if args.update_command == "apply":
+            return self_update.apply(
+                vault,
+                from_sha=args.from_sha,
+                to_sha=args.to_sha,
+                expected_check_revision=args.expected_check_revision,
+                approval_ref=args.approval_ref,
+            )
+        if args.update_command == "recover":
+            return self_update.recover(
+                vault,
+                token=args.token,
+                expected_vault_digest=args.expected_vault_digest,
+                approval_ref=args.approval_ref,
+            )
+        raise AssertionError("unreachable update command")
     if args.command == "backup":
         if args.backup_command == "verify":
             return Vault.verify_backup(Path(args.path))
@@ -354,6 +377,19 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
         and result.get("cleanup_complete") is False
     ):
         return 3, "Seld cleanup is incomplete; follow result.next and retry."
+    if (
+        args.command == "update"
+        and args.update_command == "check"
+        and result.get("state") in {"unavailable", "unsupported"}
+    ):
+        return 3, "Seld could not complete the update check; inspect result.error_code."
+    if args.command == "update" and args.update_command in {"apply", "recover"}:
+        if result.get("repair_required") is True:
+            return 3, "Seld update recovery needs attention; follow result.recovery_command."
+        if result.get("outcome") == "installed_bridge_repair":
+            return 4, "Seld updated, but the Bridge needs repair; follow result.recovery_command."
+        if args.update_command == "apply" and result.get("rolled_back") is True:
+            return 3, "The approved update failed and Seld restored the previous installation."
     return None
 
 
@@ -909,6 +945,46 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("install", "status", "uninstall"):
         command = codex_commands.add_parser(name)
         command.add_argument("--codex-home", default=str(codex_home()))
+
+    update = commands.add_parser(
+        "update",
+        help="Check, approve, and recover exact-revision Seld source updates.",
+    )
+    update_commands = update.add_subparsers(dest="update_command", required=True)
+    update_commands.add_parser(
+        "status",
+        help="Read installed provenance and cached update state without using the network.",
+    )
+    update_check = update_commands.add_parser(
+        "check",
+        help="Run the bounded public-main check when its local cache is due.",
+    )
+    update_check.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore the six-hour cache for this interactive check.",
+    )
+    update_apply = update_commands.add_parser(
+        "apply",
+        help="Install one checked revision after explicit approval in the current ChatGPT task.",
+    )
+    update_apply.add_argument("--from-sha", required=True)
+    update_apply.add_argument("--to-sha", required=True)
+    update_apply.add_argument("--expected-check-revision", required=True)
+    update_apply.add_argument("--approval-ref", required=True)
+    update_recover = update_commands.add_parser(
+        "recover",
+        help="Finish or restore the one interrupted update named by its recovery token.",
+    )
+    update_recover.add_argument("--token", required=True)
+    update_recover.add_argument(
+        "--expected-vault-digest",
+        help="Bind an explicitly approved ambiguous recovery to the current vault digest.",
+    )
+    update_recover.add_argument(
+        "--approval-ref",
+        help="Current ChatGPT task reference required with --expected-vault-digest.",
+    )
 
     mcp = commands.add_parser("mcp", help="Run the local MCP server.")
     mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)

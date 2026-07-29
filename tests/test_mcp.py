@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 
+import continuity_kernel.update as self_update
 from continuity_kernel import mcp_server
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED, EMPTY_REVISION, ControlQueue
 from continuity_kernel.operations import OperationLedger
@@ -275,10 +276,29 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         "gsv_thread_list",
         "gsv_thread_show",
         "gsv_thread_update",
+        "gsv_update_status",
     }
     if not CONTROL_STORE_SUPPORTED:
         expected.difference_update(mcp_server.OPERATION_TOOL_NAMES)
     assert names == expected
+
+
+def test_update_mcp_surface_is_cache_only_and_cannot_apply_or_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cached = {"state": "available", "candidate": {"to_sha": "a" * 40}}
+    monkeypatch.setattr(self_update, "status", lambda: cached)
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="MCP update status")
+
+    assert mcp_server._call("gsv_update_status", {}, vault=vault) == cached
+    tools = {tool["name"]: tool for tool in mcp_server.TOOLS}
+    description = tools["gsv_update_status"]["description"]
+    assert "never uses the network" in description
+    assert "cannot install or approve" in description
+    assert "gsv_update_check" not in tools
+    assert "gsv_update_apply" not in tools
 
 
 def test_task_schema_distinguishes_codex_hand_from_gsv_workthread_without_narrowing_type() -> None:
