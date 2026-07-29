@@ -29,6 +29,7 @@ from typing import Any, cast
 _APPROVAL_REF = "codex:019f8a30-f5db-7b80-b53f-0377296f2d3c"
 _FIXTURE_MARKER = ".seld-self-update-e2e-revision"
 _RECOVERY_LAUNCHER = "seld-recover"
+_SIGKILL = int(getattr(signal, "SIGKILL", signal.SIGTERM))
 _ADAPTER = r"""
 from __future__ import annotations
 
@@ -625,9 +626,9 @@ def _crash_recovery_scenario(
             raise RuntimeError("crash hook marker does not belong to the apply process")
         if not _is_executable(recovery):
             raise RuntimeError("stable Seld recovery launcher was absent at the crash boundary")
-        process.send_signal(signal.SIGKILL)
+        process.send_signal(_SIGKILL)
         stdout, stderr = process.communicate(timeout=30)
-        if process.returncode != -signal.SIGKILL:
+        if process.returncode != -_SIGKILL:
             raise RuntimeError(
                 "interrupted update did not terminate by SIGKILL: "
                 f"returncode={process.returncode}; stdout={stdout[-1000:]}; "

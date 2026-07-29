@@ -67,6 +67,11 @@ REQUIRED_CHECK_NAMES: Final = frozenset(
     }
 )
 
+# These members are absent from Windows typeshed because they are POSIX-only.
+# Every call site below is reached only after the updater has rejected Windows.
+_POSIX_OS = cast(Any, os)
+_SIGKILL: Final[int] = int(getattr(signal, "SIGKILL", signal.SIGTERM))
+
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _REVISION = re.compile(r"^[0-9a-f]{64}$")
 _APPROVAL_REF = re.compile(
@@ -1315,7 +1320,7 @@ def _run_command(
     except subprocess.TimeoutExpired as exc:
         timed_out = exc
         _terminate_process_tree(process)
-        returncode = process.returncode if process.returncode is not None else -signal.SIGKILL
+        returncode = process.returncode if process.returncode is not None else -_SIGKILL
     for reader in readers:
         reader.join(timeout=2.0)
     if any(reader.is_alive() for reader in readers):
@@ -1344,7 +1349,7 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
         return
     process_group = process.pid
     try:
-        os.killpg(process_group, signal.SIGTERM)
+        _POSIX_OS.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
         if process.poll() is None:
             process.wait(timeout=2.0)
@@ -1358,7 +1363,7 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
         time.sleep(0.05)
     else:
         with suppress(ProcessLookupError):
-            os.killpg(process_group, signal.SIGKILL)
+            _POSIX_OS.killpg(process_group, _SIGKILL)
     if process.poll() is None:
         process.wait(timeout=2.0)
     deadline = time.monotonic() + 2.0
@@ -1370,7 +1375,7 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
 
 def _process_group_exists(process_group: int) -> bool:
     try:
-        os.killpg(process_group, 0)
+        _POSIX_OS.killpg(process_group, 0)
     except ProcessLookupError:
         return False
     return True
@@ -1553,7 +1558,7 @@ def _publish_recovery_launcher(transaction: dict[str, Any], content: bytes) -> N
     descriptor, raw_staged = tempfile.mkstemp(prefix=".seld-recover.stage-", dir=bin_dir)
     staged = Path(raw_staged)
     try:
-        os.fchmod(descriptor, 0o700)
+        _POSIX_OS.fchmod(descriptor, 0o700)
         with os.fdopen(descriptor, "wb", closefd=True) as stream:
             descriptor = -1
             stream.write(content)
