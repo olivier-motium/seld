@@ -15,6 +15,14 @@ receipts, recovery, and no-replay delivery.
 
 ## Begin with the person
 
+Before synthesizing context or changing `MIND.md`, call `gsv_document_show` for
+the current Mind and `gsv_resident_context_status`. When imported resident
+guidance is present, read it with `gsv_resident_guidance_show`. Treat the
+existing Mind and the user-context, preferences, provenance, corrections, and
+uncertainty in that guidance as retained context. The installed Seld tools
+remain authoritative for mechanics, but onboarding must augment this retained
+context rather than replace it with a cleaner new summary.
+
 Read [context intake](references/context-intake.md). Ask one compact, skippable
 batch:
 
@@ -27,9 +35,15 @@ batch:
 
 Accept pasted notes and user-selected local files. Never ask for passwords,
 tokens, financial credentials, second factors, or unnecessary raw transcripts.
-Reflect a provisional picture immediately. Persist only the context the person
-accepts, through `gsv_document_update` against the exact current `MIND.md`
-revision, then read it back.
+Reflect a provisional picture immediately. Show what would be added, corrected,
+or left unchanged. Persist only the context the person accepts, through
+`gsv_document_update` against the exact current `MIND.md` revision, then read it
+back. Because that tool replaces the complete document, the proposed content
+must preserve every retained statement that the person did not explicitly
+correct or remove, including its provenance and uncertainty. If a lossless
+merge is ambiguous or would exceed the supported document boundary, stop
+before the write and ask one focused question; never trade existing context for
+a successful onboarding step.
 
 ## Connect where life happens
 
@@ -43,9 +57,13 @@ root grant only after showing the path and receiving fresh approval.
 
 Use one setup wave:
 
-1. Call `gsv_source_list`, then show one combined checklist for the selected
-   ChatGPT apps, custom MCP apps, local read tools, and required macOS
-   permissions.
+1. Call `gsv_source_list`. Treat `gsv` — Seld on this computer — as source
+   zero and keep it selected whenever the person is onboarding this vault. If
+   the Seld MCP tools are missing in the current task, use the installed local
+   `gsv --vault <exact-root>` CLI against the same vault; absence from one task
+   is not evidence that the Mind was uninstalled or lost. Then show one
+   combined checklist for the selected ChatGPT apps, custom MCP apps, local
+   read tools, and required macOS permissions.
 2. Let the person complete OAuth, credentials, 2FA, legal terms, administrator
    approval, and OS privacy prompts personally.
 3. After the person confirms the set, call `gsv_source_select` against the exact
@@ -69,6 +87,24 @@ Use one setup wave:
    back.
 8. Record retention, interruption, and action boundaries in accepted Mind
    context. Do not copy raw provider bodies.
+
+For selected Apple Messages or WhatsApp, use Seld's host-local delivery
+surface. Before any baseline, call `gsv_local_source_staged_status`. If this
+vault contains a `pending` or `completion_pending` checkpoint for the selected
+source, call `gsv_local_source_adopt_staged` with the returned exact migration
+and source revisions and disposition `adopt_verified_prefix`. Re-read until it
+reports `adopted`, then poll and process the during-cutover delta. A mismatch,
+`host_conflict`, `needs_reproof`, or unavailable store stops that source; never
+fall back to a forward baseline because doing so could skip the migration gap.
+
+Only when staged status proves there is no checkpoint for that source and the
+host has no earlier Seld delivery receipt, confirm the account and permission
+boundary and call `gsv_local_source_baseline` once to begin forward-only. Then
+use `gsv_local_source_poll` for the canary. The poll does not advance its
+checkpoint. After the model has written and read back its explicit semantic
+disposition, call `gsv_local_source_acknowledge` with the exact token,
+source-state revision, result references, actor, and confirmed account binding.
+Never import existing message history merely to establish a baseline.
 
 Seld supports any user-enabled ChatGPT app or MCP tool that can satisfy the
 same bounded read contract. The catalog supplies first-class recipes for
@@ -110,6 +146,16 @@ reads selected sources and authors every judgment. The Pulse policy forbids
 Computer Use. Seld's MCP server does not expose it, although a separately
 installed Computer Use plugin may still be visible in the ordinary ChatGPT
 task; explain that host boundary before registration.
+
+Install and verify the separate mechanical sense sweep before presenting
+autonomy as ready. It may wake on a fixed cadence and append content-free
+source-due or WorkThread-recheck evidence. It never runs semantic recall, reads
+provider bodies, or decides meaning. Optional QMD setup and refresh remain
+explicit recall operations outside this five-second mechanical path. Use the
+supported scheduler plan, install, status, and asynchronous canary surfaces;
+require the exact owned receipt revision for mutation and refuse a foreign job
+or plist. The AI Pulse remains the only layer that interprets those delivered
+facts.
 
 ## Finish with a useful first view
 

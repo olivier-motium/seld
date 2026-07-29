@@ -18,13 +18,16 @@ from urllib.error import URLError
 import pytest
 
 import continuity_kernel.update as self_update
-from continuity_kernel import cli
+from continuity_kernel import cli, codex_integration, whatsapp
 from continuity_kernel.errors import ConflictError, SetupError, ValidationError
 from continuity_kernel.vault import Vault
 
 FROM_SHA = "1" * 40
 TO_SHA = "2" * 40
-APPROVAL_REF = "codex:019f8a30-f5db-7b80-b53f-0377296f2d3c"
+APPROVAL_REF = "codex:019f0000-0000-7000-8000-000000000777"
+NATIVE_BEFORE = "4" * 64
+NATIVE_CANDIDATE = "5" * 64
+NATIVE_RESTORED = "6" * 64
 SOURCE_UPDATE_RUNTIME_ONLY = pytest.mark.skipif(
     os.name == "nt", reason="source self-update is macOS-only"
 )
@@ -67,11 +70,11 @@ def _check_receipt(*, checked_at: str | None = None) -> dict[str, Any]:
 
 
 def _transaction_receipt(tmp_path: Path, vault: Vault) -> dict[str, Any]:
-    token = "019f8a30-f5db-7b80-b53f-0377296f2d3c"
+    token = "019f0000-0000-7000-8000-000000000778"
     tool_dir = tmp_path / "tools"
     vault_status = vault.status()
     return {
-        "format_version": self_update.TRANSACTION_FORMAT_VERSION,
+        "format_version": self_update.LEGACY_TRANSACTION_FORMAT_VERSION,
         "token": token,
         "from_sha": FROM_SHA,
         "to_sha": TO_SHA,
@@ -97,6 +100,127 @@ def _transaction_receipt(tmp_path: Path, vault: Vault) -> dict[str, Any]:
         "bridge_instance_before": None,
         "backup": None,
     }
+
+
+def _absent_native_evidence(tmp_path: Path) -> dict[str, Any]:
+    return {
+        "native_bridge_was_installed": False,
+        "native_bridge_application": str(tmp_path / "Applications/Seld.app"),
+        "native_bridge_revision_before": "absent",
+        "native_bridge_revision_current": "absent",
+    }
+
+
+def _absent_native_status(tmp_path: Path) -> dict[str, Any]:
+    return {
+        "application": str(tmp_path / "Applications/Seld.app"),
+        "healthy": False,
+        "installed": False,
+        "owned": False,
+        "ownership_revision": "absent",
+    }
+
+
+def _with_absent_native(transaction: dict[str, Any], tmp_path: Path) -> dict[str, Any]:
+    transaction["format_version"] = self_update.TRANSACTION_FORMAT_VERSION
+    transaction.update(_absent_native_evidence(tmp_path))
+    return transaction
+
+
+def _with_owned_native(transaction: dict[str, Any], tmp_path: Path) -> dict[str, Any]:
+    transaction["format_version"] = self_update.TRANSACTION_FORMAT_VERSION
+    transaction.update(
+        native_bridge_was_installed=True,
+        native_bridge_application=str(tmp_path / "Applications/Seld.app"),
+        native_bridge_revision_before=NATIVE_BEFORE,
+        native_bridge_revision_current=NATIVE_BEFORE,
+    )
+    return transaction
+
+
+def _native_status(
+    transaction: dict[str, Any],
+    *,
+    revision: str,
+    current: bool,
+) -> dict[str, Any]:
+    return {
+        "application": transaction["native_bridge_application"],
+        "current": current,
+        "healthy": True,
+        "installed": True,
+        "owned": True,
+        "ownership_revision": revision,
+        "vault": transaction["vault"],
+        "vault_id": transaction["vault_id"],
+    }
+
+
+def _legacy_owned_native_status(
+    transaction: dict[str, Any],
+    tmp_path: Path,
+    *,
+    revision: str,
+    current: bool,
+    **changes: Any,
+) -> dict[str, Any]:
+    payload = {
+        "application": str(tmp_path / "Applications/Seld.app"),
+        "current": current,
+        "healthy": True,
+        "installed": True,
+        "owned": True,
+        "ownership_revision": revision,
+        "receipt_revision": "7" * 64,
+        "vault": transaction["vault"],
+        "vault_id": transaction["vault_id"],
+    }
+    payload.update(changes)
+    return payload
+
+
+def _json_command(payload: dict[str, Any]) -> self_update.CommandResult:
+    encoded = json.dumps({"ok": True, "result": payload}).encode("utf-8")
+    return self_update.CommandResult(0, encoded, b"")
+
+
+def _write_receipt_bound_mcp(
+    tmp_path: Path,
+    vault: Vault,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    service_label: str | None,
+) -> Path:
+    home = tmp_path / "codex-home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "data"))
+    marketplace = codex_integration._marketplace_root(home.resolve())
+    mcp = marketplace / self_update.INSTALLED_MCP_RELATIVE
+    mcp.parent.mkdir(parents=True)
+    environment = {"GSV_VAULT": str(vault.root), "UNRELATED_SETTING": "ignored"}
+    if service_label is not None:
+        environment[whatsapp.SERVICE_LABEL_ENV] = service_label
+    mcp.write_text(
+        json.dumps({"mcpServers": {"gsv": {"env": environment}}}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest = codex_integration._tree_manifest(marketplace)
+    receipt = {
+        "cleanup_pending": [],
+        "codex_home": str(home.resolve()),
+        "format_version": codex_integration.RECEIPT_FORMAT_VERSION,
+        "integration_active": True,
+        "marketplace_digest": codex_integration._tree_digest_from_manifest(manifest),
+        "marketplace_manifest": manifest,
+        "marketplace_owned": True,
+        "marketplace_root": str(marketplace),
+        "plugin_owned": True,
+    }
+    receipt_path = codex_integration._receipt_path(home.resolve())
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
+    return mcp
 
 
 def _github_fetcher(
@@ -499,11 +623,16 @@ def test_rollback_restores_missing_stable_launcher_after_partial_uv_install(
     monkeypatch.setattr(self_update, "_runtime_reads_vault", lambda *_args: True)
     monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
 
+    def runner(command: list[str], _environment: Any, _timeout: float) -> self_update.CommandResult:
+        if command[-2:] == ["bridge", "native-status"]:
+            return _json_command(_absent_native_status(tmp_path))
+        return self_update.CommandResult(0, b"", b"")
+
     result = self_update._rollback_after_failure(
         vault,
         transaction,
         ValidationError("synthetic partial install"),
-        runner=lambda *_args: self_update.CommandResult(0, b"", b""),
+        runner=runner,
     )
 
     assert result["outcome"] == "rolled_back"
@@ -788,9 +917,19 @@ def test_apply_verifies_backup_before_any_candidate_preflight(
 
     monkeypatch.setattr(vault, "create_backup", backup)
     monkeypatch.setattr(self_update, "_preflight_candidate", preflight)
+    monkeypatch.setattr(
+        self_update,
+        "_native_bridge_before",
+        lambda *_args: _absent_native_evidence(tmp_path),
+    )
     monkeypatch.setattr(self_update, "_runtime_sha", lambda *_args: FROM_SHA)
     monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(self_update, "_verify_active_runtime", verify)
+    monkeypatch.setattr(
+        self_update,
+        "_verify_unchanged_native_bridge",
+        lambda *_args, **_kwargs: None,
+    )
 
     result = self_update._apply_locked(
         vault,
@@ -833,10 +972,29 @@ def test_concurrent_vault_write_during_preflight_is_retained(
 
     monkeypatch.setattr(self_update, "_preflight_candidate", preflight)
     monkeypatch.setattr(self_update, "_install_candidate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        self_update,
+        "_native_bridge_before",
+        lambda *_args: _absent_native_evidence(tmp_path),
+    )
     monkeypatch.setattr(self_update, "_runtime_command", lambda _root: ["/synthetic/gsv"])
     monkeypatch.setattr(self_update, "_runtime_sha", lambda *_args: FROM_SHA)
     monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
+
+    def runner(command: list[str], _environment: Any, _timeout: float) -> self_update.CommandResult:
+        if command[-2:] == ["bridge", "native-status"]:
+            return _json_command(
+                {
+                    "application": str(tmp_path / "Applications/Seld.app"),
+                    "error_code": None,
+                    "healthy": False,
+                    "installed": False,
+                    "owned": False,
+                    "ownership_revision": "absent",
+                }
+            )
+        return self_update.CommandResult(0, b"", b"")
 
     result = self_update._apply_locked(
         vault,
@@ -844,7 +1002,7 @@ def test_concurrent_vault_write_during_preflight_is_retained(
         to_sha=TO_SHA,
         expected_check_revision=self_update._receipt_revision(receipt),
         approval_ref=APPROVAL_REF,
-        runner=lambda *_args: self_update.CommandResult(0, b"", b""),
+        runner=runner,
     )
 
     assert result["outcome"] == "installed"
@@ -877,6 +1035,867 @@ def test_candidate_setup_cannot_report_success_after_mutating_canonical_bytes(
         )
 
 
+def test_update_anchors_only_a_current_owned_native_app(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from continuity_kernel import bridge_launcher
+
+    installed = _installed(tmp_path)
+    application = tmp_path / "Applications/Seld.app"
+    observed = {
+        "application": str(application),
+        "current": True,
+        "healthy": True,
+        "installed": True,
+        "owned": True,
+        "ownership_revision": NATIVE_BEFORE,
+        "vault": str(vault.root),
+        "vault_id": vault.identity()["vault_id"],
+    }
+    monkeypatch.setattr(bridge_launcher, "native_bridge_status", lambda **_kwargs: observed)
+
+    assert self_update._native_bridge_before(vault, installed) == {
+        "native_bridge_application": str(application),
+        "native_bridge_revision_before": NATIVE_BEFORE,
+        "native_bridge_revision_current": NATIVE_BEFORE,
+        "native_bridge_was_installed": True,
+    }
+
+    observed.update(current=False)
+    with pytest.raises(SetupError, match="needs repair before self-update"):
+        self_update._native_bridge_before(vault, installed)
+
+    observed.update(current=True, owned=False, error_code="foreign_install")
+    with pytest.raises(SetupError, match="needs repair before self-update"):
+        self_update._native_bridge_before(vault, installed)
+
+
+def test_foreign_native_app_blocks_update_before_backup_or_transaction(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from continuity_kernel import bridge, bridge_launcher
+
+    installed = _installed(tmp_path)
+    monkeypatch.setattr(self_update, "installed_provenance", lambda: installed)
+    receipt = _check_receipt()
+    self_update._write_receipt(self_update._check_path(), receipt)
+    monkeypatch.setattr(
+        bridge,
+        "bridge_status",
+        lambda: {"running": False, "health_unavailable": False, "instance_id": None},
+    )
+    monkeypatch.setattr(
+        bridge_launcher,
+        "native_bridge_status",
+        lambda **_kwargs: {
+            "application": str(tmp_path / "Applications/Seld.app"),
+            "current": False,
+            "error_code": "foreign_install",
+            "healthy": False,
+            "installed": True,
+            "owned": False,
+            "ownership_revision": "absent",
+        },
+    )
+    monkeypatch.setattr(
+        vault,
+        "create_backup",
+        lambda: pytest.fail("foreign native state must fail before backup"),
+    )
+
+    with pytest.raises(SetupError, match="needs repair before self-update"):
+        self_update._apply_locked(
+            vault,
+            from_sha=FROM_SHA,
+            to_sha=TO_SHA,
+            expected_check_revision=self_update._receipt_revision(receipt),
+            approval_ref=APPROVAL_REF,
+            runner=lambda *_args: pytest.fail("foreign native state must not run commands"),
+        )
+
+    assert not self_update._transaction_path().exists()
+
+
+@SOURCE_UPDATE_RUNTIME_ONLY
+def test_candidate_native_app_activation_is_last_and_exact_cas(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction = _with_owned_native(_transaction_receipt(tmp_path, vault), tmp_path)
+    self_update._write_receipt(self_update._transaction_path(), transaction)
+    monkeypatch.setattr(self_update, "_runtime_command", lambda _root: ["/candidate/bin/gsv"])
+    monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
+    events: list[str] = []
+    statuses = iter(
+        (
+            _native_status(transaction, revision=NATIVE_BEFORE, current=False),
+            _native_status(transaction, revision=NATIVE_CANDIDATE, current=True),
+        )
+    )
+
+    def runner(command: list[str], environment: Any, _timeout: float) -> self_update.CommandResult:
+        if "setup" in command:
+            events.append("setup")
+            return self_update.CommandResult(0, b"", b"")
+        if command[-2:] == ["bridge", "native-status"]:
+            events.append("native-status")
+            return _json_command(next(statuses))
+        if "native-install" in command:
+            events.append("native-install")
+            assert command[-2:] == ["--expected-revision", NATIVE_BEFORE]
+            assert str(environment["PATH"]).split(os.pathsep, 1)[0] == "/candidate/bin"
+            return _json_command(
+                {
+                    **_native_status(
+                        transaction,
+                        revision=NATIVE_CANDIDATE,
+                        current=True,
+                    ),
+                    "changed": True,
+                }
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = self_update._finish_candidate(
+        vault,
+        transaction,
+        runner=runner,
+        recovering=False,
+    )
+    persisted = self_update._read_transaction(required=True)
+
+    assert result["outcome"] == "installed"
+    assert result["native_bridge_revision_before"] == NATIVE_BEFORE
+    assert result["native_bridge_revision_current"] == NATIVE_CANDIDATE
+    assert events == ["setup", "native-status", "native-install", "native-status"]
+    assert persisted is not None
+    assert persisted["phase"] == "complete"
+    assert persisted["native_bridge_revision_current"] == NATIVE_CANDIDATE
+
+
+def test_update_does_not_create_or_adopt_an_unselected_native_app(
+    vault: Vault,
+    tmp_path: Path,
+) -> None:
+    transaction = _with_absent_native(
+        _transaction_receipt(tmp_path, vault),
+        tmp_path,
+    )
+    self_update._write_receipt(self_update._transaction_path(), transaction)
+
+    def runner(command: list[str], _environment: Any, _timeout: float) -> self_update.CommandResult:
+        if command[-2:] == ["bridge", "native-status"]:
+            return _json_command(
+                {
+                    "application": transaction["native_bridge_application"],
+                    "healthy": False,
+                    "installed": False,
+                    "owned": False,
+                    "ownership_revision": "absent",
+                }
+            )
+        raise AssertionError(f"an absent native app must not be installed: {command}")
+
+    reconciled = self_update._reconcile_native_bridge(
+        vault,
+        transaction,
+        command=["/candidate/bin/gsv"],
+        expected_sha=TO_SHA,
+        phase="activating_native_bridge",
+        complete_phase="native_bridge_activated",
+        runner=runner,
+    )
+
+    assert reconciled["phase"] == "native_bridge_activated"
+    assert reconciled["native_bridge_revision_current"] == "absent"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("native_bridge_application", "relative/Seld.app"),
+        ("native_bridge_revision_current", "absent"),
+    ),
+)
+def test_update_rejects_invalid_installed_native_transaction_evidence(
+    vault: Vault,
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    transaction = _with_owned_native(_transaction_receipt(tmp_path, vault), tmp_path)
+    transaction[field] = value
+
+    with pytest.raises(ValidationError, match="native"):
+        self_update._validate_transaction(transaction)
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (
+        "candidate_installed",
+        "activating_native_bridge",
+        "native_bridge_activated",
+        "restoring_native_bridge",
+        "native_bridge_restored",
+    ),
+)
+def test_current_update_transaction_requires_complete_native_evidence(
+    vault: Vault,
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    transaction = _with_absent_native(_transaction_receipt(tmp_path, vault), tmp_path)
+    transaction["phase"] = phase
+    for field in (
+        "native_bridge_was_installed",
+        "native_bridge_application",
+        "native_bridge_revision_before",
+        "native_bridge_revision_current",
+    ):
+        transaction.pop(field)
+
+    with pytest.raises(ValidationError, match="native-app evidence is incomplete"):
+        self_update._validate_transaction(transaction)
+
+
+def test_legacy_update_transaction_cannot_claim_native_lifecycle_phase(
+    vault: Vault,
+    tmp_path: Path,
+) -> None:
+    transaction = _transaction_receipt(tmp_path, vault)
+    self_update._validate_transaction(transaction)
+    transaction["phase"] = "activating_native_bridge"
+    with pytest.raises(ValidationError, match=r"legacy.*native-app evidence"):
+        self_update._validate_transaction(transaction)
+
+
+@SOURCE_UPDATE_RUNTIME_ONLY
+def test_legacy_candidate_recovery_reconciles_owned_old_native_before_cleanup(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction = _transaction_receipt(tmp_path, vault)
+    active = Path(transaction["active_environment"])
+    previous = Path(transaction["previous_environment"])
+    active.mkdir(parents=True)
+    previous.mkdir()
+    (active / "candidate").write_text("candidate", encoding="utf-8")
+    (previous / "previous").write_text("previous", encoding="utf-8")
+    self_update._write_receipt(self_update._transaction_path(), transaction)
+    monkeypatch.setattr(self_update, "_runtime_sha", lambda *_args: TO_SHA)
+    monkeypatch.setattr(self_update, "_runtime_command", lambda _root: ["/candidate/bin/gsv"])
+    monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
+    legacy_matches: list[Path] = []
+    monkeypatch.setattr(
+        self_update,
+        "_require_native_app_matches_legacy_runtime",
+        lambda _status, _transaction, *, legacy_environment: legacy_matches.append(
+            legacy_environment
+        ),
+    )
+    events: list[str] = []
+    statuses = iter(
+        (
+            _legacy_owned_native_status(
+                transaction,
+                tmp_path,
+                revision=NATIVE_BEFORE,
+                current=False,
+            ),
+            _legacy_owned_native_status(
+                transaction,
+                tmp_path,
+                revision=NATIVE_BEFORE,
+                current=False,
+            ),
+            _legacy_owned_native_status(
+                transaction,
+                tmp_path,
+                revision=NATIVE_CANDIDATE,
+                current=True,
+            ),
+        )
+    )
+
+    def runner(command: list[str], _environment: Any, _timeout: float) -> self_update.CommandResult:
+        if "setup" in command:
+            events.append("setup")
+            return self_update.CommandResult(0, b"", b"")
+        if command[-2:] == ["bridge", "native-status"]:
+            events.append("native-status")
+            return _json_command(next(statuses))
+        if "native-install" in command:
+            events.append("native-install")
+            assert previous.is_dir()
+            assert command[-2:] == ["--expected-revision", NATIVE_BEFORE]
+            return _json_command(
+                {
+                    **_legacy_owned_native_status(
+                        transaction,
+                        tmp_path,
+                        revision=NATIVE_CANDIDATE,
+                        current=True,
+                    ),
+                    "changed": True,
+                }
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = self_update.recover(vault, token=transaction["token"], runner=runner)
+    persisted = self_update._read_transaction(required=True)
+
+    assert result["outcome"] == "installed"
+    assert events == [
+        "setup",
+        "native-status",
+        "native-status",
+        "native-install",
+        "native-status",
+    ]
+    assert legacy_matches == [previous]
+    assert not previous.exists()
+    assert persisted is not None
+    assert persisted["format_version"] == self_update.TRANSACTION_FORMAT_VERSION
+    assert persisted["native_bridge_revision_before"] == NATIVE_BEFORE
+    assert persisted["native_bridge_revision_current"] == NATIVE_CANDIDATE
+
+
+def test_legacy_native_matcher_binds_receipt_to_preserved_runtime(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from continuity_kernel import bridge_launcher
+
+    transaction = _transaction_receipt(tmp_path, vault)
+    active = Path(transaction["active_environment"])
+    previous = Path(transaction["previous_environment"])
+    active_executable = active / "bin/gsv"
+    previous_executable = previous / "bin/gsv"
+    active_executable.parent.mkdir(parents=True)
+    previous_executable.parent.mkdir(parents=True)
+    active_executable.write_text("candidate", encoding="utf-8")
+    previous_executable.write_text("previous", encoding="utf-8")
+    runtime_root = previous / "lib/python3.11/site-packages/continuity_kernel"
+    runtime_root.mkdir(parents=True)
+    receipt = {
+        "executable": str(active_executable.resolve(strict=True)),
+        "executable_sha256": "8" * 64,
+        "source_runtime_digest": "9" * 64,
+    }
+    status_payload = _legacy_owned_native_status(
+        transaction,
+        tmp_path,
+        revision=NATIVE_BEFORE,
+        current=False,
+    )
+    monkeypatch.setattr(
+        self_update,
+        "_runtime_command",
+        lambda root: [str(previous_executable if root == previous else active_executable)],
+    )
+    monkeypatch.setattr(self_update, "_environment_runtime_root", lambda _root: runtime_root)
+    monkeypatch.setattr(bridge_launcher, "_owned_receipt", lambda _application: receipt)
+    monkeypatch.setattr(bridge_launcher, "_receipt_revision", lambda _receipt: "7" * 64)
+    monkeypatch.setattr(bridge_launcher, "_sha256_file", lambda _path: "8" * 64)
+    monkeypatch.setattr(bridge_launcher, "_source_runtime_manifest", lambda _root: [])
+    monkeypatch.setattr(bridge_launcher, "_tree_digest", lambda _manifest: "9" * 64)
+
+    self_update._require_native_app_matches_legacy_runtime(
+        status_payload,
+        transaction,
+        legacy_environment=previous,
+    )
+
+    receipt["source_runtime_digest"] = "a" * 64
+    with pytest.raises(SetupError, match="preserved legacy runtime"):
+        self_update._require_native_app_matches_legacy_runtime(
+            status_payload,
+            transaction,
+            legacy_environment=previous,
+        )
+
+
+@SOURCE_UPDATE_RUNTIME_ONLY
+def test_legacy_candidate_recovery_restores_native_after_lost_commit_response(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction = _transaction_receipt(tmp_path, vault)
+    active = Path(transaction["active_environment"])
+    previous = Path(transaction["previous_environment"])
+    active.mkdir(parents=True)
+    previous.mkdir()
+    (active / "candidate").write_text("candidate", encoding="utf-8")
+    (previous / "previous").write_text("previous", encoding="utf-8")
+    self_update._write_receipt(self_update._transaction_path(), transaction)
+    monkeypatch.setattr(
+        self_update,
+        "_runtime_sha",
+        lambda root, _runner: FROM_SHA if root == previous else TO_SHA,
+    )
+    monkeypatch.setattr(self_update, "_runtime_reads_vault", lambda *_args: True)
+    monkeypatch.setattr(self_update, "_runtime_command", lambda _root: ["/runtime/bin/gsv"])
+    monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        self_update,
+        "_require_native_app_matches_legacy_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    statuses = iter(
+        (
+            _legacy_owned_native_status(
+                transaction,
+                tmp_path,
+                revision=NATIVE_BEFORE,
+                current=False,
+            ),
+            _legacy_owned_native_status(
+                transaction,
+                tmp_path,
+                revision=NATIVE_BEFORE,
+                current=False,
+            ),
+            _legacy_owned_native_status(
+                transaction,
+                tmp_path,
+                revision=NATIVE_CANDIDATE,
+                current=True,
+            ),
+            _legacy_owned_native_status(
+                transaction,
+                tmp_path,
+                revision=NATIVE_CANDIDATE,
+                current=False,
+            ),
+            _legacy_owned_native_status(
+                transaction,
+                tmp_path,
+                revision=NATIVE_RESTORED,
+                current=True,
+            ),
+        )
+    )
+    native_installs = 0
+
+    def runner(command: list[str], _environment: Any, _timeout: float) -> self_update.CommandResult:
+        nonlocal native_installs
+        if "bridge" in command and "stop" in command:
+            return self_update.CommandResult(0, b"", b"")
+        if "setup" in command:
+            return self_update.CommandResult(0, b"", b"")
+        if command[-2:] == ["bridge", "native-status"]:
+            return _json_command(next(statuses))
+        if "native-install" in command:
+            native_installs += 1
+            if native_installs == 1:
+                return self_update.CommandResult(86, b"", b"synthetic lost response")
+            assert command[-2:] == ["--expected-revision", NATIVE_CANDIDATE]
+            return _json_command(
+                {
+                    **_legacy_owned_native_status(
+                        transaction,
+                        tmp_path,
+                        revision=NATIVE_RESTORED,
+                        current=True,
+                    ),
+                    "changed": True,
+                }
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = self_update.recover(vault, token=transaction["token"], runner=runner)
+    persisted = self_update._read_transaction(required=True)
+
+    assert result["outcome"] == "rolled_back"
+    assert native_installs == 2
+    assert (active / "previous").read_text(encoding="utf-8") == "previous"
+    assert persisted is not None
+    assert persisted["format_version"] == self_update.TRANSACTION_FORMAT_VERSION
+    assert persisted["native_bridge_revision_current"] == NATIVE_RESTORED
+
+
+@SOURCE_UPDATE_RUNTIME_ONLY
+@pytest.mark.parametrize(
+    "failure",
+    ("foreign", "wrong-vault", "unhealthy", "ambiguous", "stale"),
+)
+def test_legacy_candidate_native_probe_fails_closed_and_retains_prior_runtime(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    transaction = _transaction_receipt(tmp_path, vault)
+    active = Path(transaction["active_environment"])
+    previous = Path(transaction["previous_environment"])
+    failed = Path(transaction["failed_environment"])
+    active.mkdir(parents=True)
+    previous.mkdir()
+    (active / "candidate").write_text("candidate", encoding="utf-8")
+    (previous / "previous").write_text("previous", encoding="utf-8")
+    self_update._write_receipt(self_update._transaction_path(), transaction)
+    monkeypatch.setattr(
+        self_update,
+        "_runtime_sha",
+        lambda root, _runner: FROM_SHA if root == previous else TO_SHA,
+    )
+    monkeypatch.setattr(self_update, "_runtime_reads_vault", lambda *_args: True)
+    monkeypatch.setattr(self_update, "_runtime_command", lambda _root: ["/runtime/bin/gsv"])
+    monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
+    base = _legacy_owned_native_status(
+        transaction,
+        tmp_path,
+        revision=NATIVE_BEFORE,
+        current=failure == "ambiguous",
+    )
+    if failure == "foreign":
+        base.update(healthy=False, owned=False, error_code="foreign_install")
+    elif failure == "wrong-vault":
+        base["vault"] = str(tmp_path / "other-vault")
+    elif failure == "unhealthy":
+        base.update(healthy=False, error_code="tampered_install")
+    restored = dict(base)
+    restored["current"] = False
+    statuses = iter((base, restored))
+
+    def match_legacy(*_args: Any, **_kwargs: Any) -> None:
+        if failure == "stale":
+            raise SetupError("synthetic stale legacy app")
+        pytest.fail("only stale healthy state should reach legacy-runtime matching")
+
+    monkeypatch.setattr(
+        self_update,
+        "_require_native_app_matches_legacy_runtime",
+        match_legacy,
+    )
+    native_install_seen = False
+
+    def runner(command: list[str], _environment: Any, _timeout: float) -> self_update.CommandResult:
+        nonlocal native_install_seen
+        if "bridge" in command and "stop" in command:
+            return self_update.CommandResult(0, b"", b"")
+        if "setup" in command:
+            return self_update.CommandResult(0, b"", b"")
+        if command[-2:] == ["bridge", "native-status"]:
+            return _json_command(next(statuses))
+        if "native-install" in command:
+            native_install_seen = True
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = self_update.recover(vault, token=transaction["token"], runner=runner)
+
+    assert result["outcome"] == "repair_required"
+    assert result["error_code"] == "native_bridge_restore_failed"
+    assert native_install_seen is False
+    assert (active / "previous").read_text(encoding="utf-8") == "previous"
+    assert failed.is_dir()
+    assert not previous.exists()
+
+
+@SOURCE_UPDATE_RUNTIME_ONLY
+def test_recovery_adopts_committed_native_activation_without_replay(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction = _with_owned_native(_transaction_receipt(tmp_path, vault), tmp_path)
+    transaction["phase"] = "activating_native_bridge"
+    active = Path(transaction["active_environment"])
+    previous = Path(transaction["previous_environment"])
+    active.mkdir(parents=True)
+    previous.mkdir()
+    self_update._write_receipt(self_update._transaction_path(), transaction)
+    monkeypatch.setattr(self_update, "_runtime_sha", lambda *_args: TO_SHA)
+    monkeypatch.setattr(self_update, "_runtime_command", lambda _root: ["/candidate/bin/gsv"])
+    monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
+    native_installs = 0
+
+    def runner(command: list[str], _environment: Any, _timeout: float) -> self_update.CommandResult:
+        nonlocal native_installs
+        if "setup" in command:
+            return self_update.CommandResult(0, b"", b"")
+        if command[-2:] == ["bridge", "native-status"]:
+            return _json_command(
+                _native_status(transaction, revision=NATIVE_CANDIDATE, current=True)
+            )
+        if "native-install" in command:
+            native_installs += 1
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = self_update.recover(vault, token=transaction["token"], runner=runner)
+    persisted = self_update._read_transaction(required=True)
+
+    assert result["outcome"] == "installed"
+    assert native_installs == 0
+    assert persisted is not None
+    assert persisted["native_bridge_revision_current"] == NATIVE_CANDIDATE
+    assert not previous.exists()
+
+
+@SOURCE_UPDATE_RUNTIME_ONLY
+def test_candidate_native_failure_restores_prior_app_before_cleanup(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction = _with_owned_native(_transaction_receipt(tmp_path, vault), tmp_path)
+    active = Path(transaction["active_environment"])
+    previous = Path(transaction["previous_environment"])
+    active.mkdir(parents=True)
+    previous.mkdir()
+    (active / "candidate").write_text("candidate", encoding="utf-8")
+    (previous / "previous").write_text("previous", encoding="utf-8")
+    self_update._write_receipt(self_update._transaction_path(), transaction)
+    monkeypatch.setattr(
+        self_update,
+        "_runtime_sha",
+        lambda root, _runner: FROM_SHA if root == previous else TO_SHA,
+    )
+    monkeypatch.setattr(self_update, "_runtime_reads_vault", lambda *_args: True)
+    monkeypatch.setattr(self_update, "_runtime_command", lambda _root: ["/runtime/bin/gsv"])
+    monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
+    setup_calls = 0
+    status_calls = 0
+    native_install_calls = 0
+    statuses = iter(
+        (
+            _native_status(transaction, revision=NATIVE_BEFORE, current=False),
+            _native_status(transaction, revision=NATIVE_CANDIDATE, current=True),
+            _native_status(transaction, revision=NATIVE_CANDIDATE, current=False),
+            _native_status(transaction, revision=NATIVE_RESTORED, current=True),
+        )
+    )
+
+    def runner(command: list[str], _environment: Any, _timeout: float) -> self_update.CommandResult:
+        nonlocal native_install_calls, setup_calls, status_calls
+        if "bridge" in command and "stop" in command:
+            return self_update.CommandResult(0, b"", b"")
+        if "setup" in command:
+            setup_calls += 1
+            return self_update.CommandResult(0, b"", b"")
+        if command[-2:] == ["bridge", "native-status"]:
+            status_calls += 1
+            return _json_command(next(statuses))
+        if "native-install" in command:
+            native_install_calls += 1
+            if native_install_calls == 1:
+                # The app committed, but the child died before returning its JSON receipt.
+                return self_update.CommandResult(86, b"", b"synthetic response failure")
+            assert command[-2:] == ["--expected-revision", NATIVE_CANDIDATE]
+            return _json_command(
+                {
+                    **_native_status(
+                        transaction,
+                        revision=NATIVE_RESTORED,
+                        current=True,
+                    ),
+                    "changed": True,
+                }
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    with pytest.raises(SetupError, match="native-install") as failed:
+        self_update._finish_candidate(
+            vault,
+            transaction,
+            runner=runner,
+            recovering=False,
+        )
+    interrupted = self_update._read_transaction(required=True)
+    assert interrupted is not None
+    result = self_update._rollback_after_failure(
+        vault,
+        interrupted,
+        failed.value,
+        runner=runner,
+    )
+    persisted = self_update._read_transaction(required=True)
+
+    assert result["outcome"] == "rolled_back"
+    assert result["native_bridge_revision_current"] == NATIVE_RESTORED
+    assert setup_calls == 2
+    assert status_calls == 4
+    assert native_install_calls == 2
+    assert (active / "previous").read_text(encoding="utf-8") == "previous"
+    assert persisted is not None
+    assert persisted["native_bridge_revision_current"] == NATIVE_RESTORED
+
+
+@SOURCE_UPDATE_RUNTIME_ONLY
+def test_rollback_reinstalls_owned_native_app_for_restored_runtime(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction = _with_owned_native(_transaction_receipt(tmp_path, vault), tmp_path)
+    transaction.update(
+        phase="native_bridge_activated",
+        native_bridge_revision_current=NATIVE_CANDIDATE,
+    )
+    active = Path(transaction["active_environment"])
+    previous = Path(transaction["previous_environment"])
+    active.mkdir(parents=True)
+    previous.mkdir()
+    (active / "candidate").write_text("candidate", encoding="utf-8")
+    (previous / "previous").write_text("previous", encoding="utf-8")
+    self_update._write_receipt(self_update._transaction_path(), transaction)
+    monkeypatch.setattr(
+        self_update,
+        "_runtime_sha",
+        lambda root, _runner: FROM_SHA if root == previous else TO_SHA,
+    )
+    monkeypatch.setattr(self_update, "_runtime_reads_vault", lambda *_args: True)
+    monkeypatch.setattr(self_update, "_runtime_command", lambda _root: ["/restored/bin/gsv"])
+    monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
+    events: list[str] = []
+    statuses = iter(
+        (
+            _native_status(transaction, revision=NATIVE_CANDIDATE, current=True),
+            _native_status(transaction, revision=NATIVE_CANDIDATE, current=False),
+            _native_status(transaction, revision=NATIVE_RESTORED, current=True),
+        )
+    )
+
+    def runner(command: list[str], _environment: Any, _timeout: float) -> self_update.CommandResult:
+        if "bridge" in command and "stop" in command:
+            events.append("bridge-stop")
+            return self_update.CommandResult(0, b"", b"")
+        if "setup" in command:
+            events.append("setup")
+            return self_update.CommandResult(0, b"", b"")
+        if command[-2:] == ["bridge", "native-status"]:
+            events.append("native-status")
+            return _json_command(next(statuses))
+        if "native-install" in command:
+            events.append("native-install")
+            assert command[-2:] == ["--expected-revision", NATIVE_CANDIDATE]
+            return _json_command(
+                {
+                    **_native_status(
+                        transaction,
+                        revision=NATIVE_RESTORED,
+                        current=True,
+                    ),
+                    "changed": True,
+                }
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = self_update._rollback_after_failure(
+        vault,
+        transaction,
+        ValidationError("synthetic post-activation failure"),
+        runner=runner,
+    )
+    persisted = self_update._read_transaction(required=True)
+
+    assert result["outcome"] == "rolled_back"
+    assert result["native_bridge_revision_current"] == NATIVE_RESTORED
+    assert events == [
+        "bridge-stop",
+        "native-status",
+        "setup",
+        "native-status",
+        "native-install",
+        "native-status",
+    ]
+    assert persisted is not None
+    assert persisted["native_bridge_revision_current"] == NATIVE_RESTORED
+    assert (active / "previous").read_text(encoding="utf-8") == "previous"
+
+
+def test_update_reads_only_receipt_bound_whatsapp_service_label(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_receipt_bound_mcp(
+        tmp_path,
+        vault,
+        monkeypatch,
+        service_label="ai.example.cutover-wacli",
+    )
+
+    assert self_update._installed_whatsapp_service_label(vault) == ("ai.example.cutover-wacli")
+
+
+def test_update_omits_unsupplied_whatsapp_service_label(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_receipt_bound_mcp(tmp_path, vault, monkeypatch, service_label=None)
+    monkeypatch.setenv(whatsapp.SERVICE_LABEL_ENV, "ai.ambient.must-not-win")
+
+    assert self_update._installed_whatsapp_service_label(vault) is None
+    assert whatsapp.SERVICE_LABEL_ENV not in self_update._setup_environment(
+        _transaction_receipt(tmp_path, vault)
+    )
+
+
+@pytest.mark.parametrize("failure", ("changed", "wrong-vault", "secret-looking"))
+def test_update_rejects_untrusted_installed_whatsapp_service_label(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    service_label = (
+        "ai.sk-" + "proj-AbCdEfGhIjKlMnOpQrStUvWxYz123456"
+        if failure == "secret-looking"
+        else "ai.example.cutover-wacli"
+    )
+    mcp = _write_receipt_bound_mcp(
+        tmp_path,
+        vault,
+        monkeypatch,
+        service_label=service_label,
+    )
+    if failure == "changed":
+        mcp.write_text("{}\n", encoding="utf-8")
+    elif failure == "wrong-vault":
+        payload = json.loads(mcp.read_text(encoding="utf-8"))
+        payload["mcpServers"]["gsv"]["env"]["GSV_VAULT"] = str(tmp_path / "other")
+        mcp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        marketplace = mcp.parents[2]
+        manifest = codex_integration._tree_manifest(marketplace)
+        receipt_path = codex_integration._receipt_path(Path(os.environ["CODEX_HOME"]).resolve())
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["marketplace_manifest"] = manifest
+        receipt["marketplace_digest"] = codex_integration._tree_digest_from_manifest(manifest)
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        self_update._installed_whatsapp_service_label(vault)
+
+
+def test_update_transaction_rejects_invalid_whatsapp_service_label(
+    vault: Vault,
+    tmp_path: Path,
+) -> None:
+    transaction = _transaction_receipt(tmp_path, vault)
+    transaction["whatsapp_service_label"] = "ai.example service"
+
+    with pytest.raises(ValidationError, match="bounded non-secret launchd service label"):
+        self_update._validate_transaction(transaction)
+
+
 @pytest.mark.parametrize("finish", ("candidate", "restored"))
 def test_update_setup_always_binds_the_transaction_vault(
     vault: Vault,
@@ -886,15 +1905,19 @@ def test_update_setup_always_binds_the_transaction_vault(
 ) -> None:
     transaction = _transaction_receipt(tmp_path, vault)
     transaction["phase"] = "candidate_installed"
+    transaction["whatsapp_service_label"] = "ai.example.cutover-wacli"
     self_update._write_receipt(self_update._transaction_path(), transaction)
     monkeypatch.setattr(self_update, "_runtime_command", lambda _root: ["/synthetic/gsv"])
     monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv(whatsapp.SERVICE_LABEL_ENV, "ai.ambient.must-not-win")
     commands: list[list[str]] = []
+    environments: list[dict[str, str]] = []
 
     def fail_setup(
-        command: list[str], _environment: Any, _timeout: float
+        command: list[str], environment: Any, _timeout: float
     ) -> self_update.CommandResult:
         commands.append(command)
+        environments.append(dict(environment))
         return self_update.CommandResult(86, b"", b"")
 
     if finish == "candidate":
@@ -920,6 +1943,7 @@ def test_update_setup_always_binds_the_transaction_vault(
             "--no-bridge",
         ]
     ]
+    assert environments[0][whatsapp.SERVICE_LABEL_ENV] == "ai.example.cutover-wacli"
 
 
 def test_update_refuses_to_stop_a_bridge_for_another_vault(
@@ -1318,10 +2342,15 @@ def test_recovery_reanchors_routine_writes_after_a_completed_activation_audit(
     monkeypatch.setattr(self_update, "_verify_external_launcher", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
 
+    def runner(command: list[str], _environment: Any, _timeout: float) -> self_update.CommandResult:
+        if command[-2:] == ["bridge", "native-status"]:
+            return _json_command(_absent_native_status(tmp_path))
+        return self_update.CommandResult(0, b"", b"")
+
     result = self_update.recover(
         vault,
         token=transaction["token"],
-        runner=lambda *_args: self_update.CommandResult(0, b"", b""),
+        runner=runner,
     )
 
     assert result["outcome"] == "installed"
@@ -1382,12 +2411,20 @@ def test_ambiguous_vault_drift_requires_exact_fresh_approval_before_reanchoring(
         )
 
     monkeypatch.setattr(self_update, "_verify_active_runtime", lambda *_args, **_kwargs: None)
+
+    def recovery_runner(
+        command: list[str], _environment: Any, _timeout: float
+    ) -> self_update.CommandResult:
+        if command[-2:] == ["bridge", "native-status"]:
+            return _json_command(_absent_native_status(tmp_path))
+        return self_update.CommandResult(0, b"", b"")
+
     completed = self_update.recover(
         vault,
         token=transaction["token"],
         expected_vault_digest=current_digest,
         approval_ref=APPROVAL_REF,
-        runner=lambda *_args: self_update.CommandResult(0, b"", b""),
+        runner=recovery_runner,
     )
     resolved = self_update._read_transaction(required=True)
 
@@ -1430,6 +2467,8 @@ def test_recovery_rolls_back_when_interrupted_candidate_setup_fails(
         if "setup" in command:
             candidate_setup += 1
             return self_update.CommandResult(86 if candidate_setup == 1 else 0, b"", b"")
+        if command[-2:] == ["bridge", "native-status"]:
+            return _json_command(_absent_native_status(tmp_path))
         return self_update.CommandResult(0, b"", b"")
 
     result = self_update.recover(vault, token=transaction["token"], runner=runner)
@@ -1512,7 +2551,7 @@ def test_cli_update_recovery_forwards_exact_vault_approval(
 
     monkeypatch.setattr(self_update, "recover", recover)
     digest = "4" * 64
-    token = "019f8a30-f5db-7b80-b53f-0377296f2d3c"
+    token = "019f0000-0000-7000-8000-000000000778"
 
     assert (
         cli.main(
@@ -1582,7 +2621,7 @@ def test_cli_update_result_failures_keep_the_structured_result(
             "update",
             "recover",
             "--token",
-            "019f8a30-f5db-7b80-b53f-0377296f2d3c",
+            "019f0000-0000-7000-8000-000000000778",
         ]
 
     assert cli.main(arguments) == exit_code

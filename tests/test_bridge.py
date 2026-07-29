@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.client import BadStatusLine, HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,7 +37,7 @@ from continuity_kernel.control_queue import (
 from continuity_kernel.errors import MutationCommittedError, SetupError, ValidationError
 from continuity_kernel.operations import OperationLedger
 from continuity_kernel.portfolio import ABSENT_PORTFOLIO_REVISION, portfolio_item
-from continuity_kernel.records import review_coverage_ref, review_option_ref
+from continuity_kernel.records import format_time, review_coverage_ref, review_option_ref
 from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
 from continuity_kernel.vault import Vault, doctor_dict
 
@@ -276,6 +277,104 @@ def test_snapshot_projects_authored_records_and_codex_links(vault: Vault) -> Non
         }
 
 
+def test_task_links_resume_only_the_explicit_valid_active_chatgpt_task(vault: Vault) -> None:
+    valid_hand = "019f0000-0000-7000-8000-000000000777"
+    historical_hand = "019f0000-0000-7000-8000-000000000001"
+    vault.create_task(
+        identifier="bound-task",
+        title="Bound task",
+        outcome="Continue in the exact authored ChatGPT task.",
+        status="doing",
+        next_actor="agent",
+        next_action="Resume the existing hand.",
+        active_thread_id=valid_hand,
+    )
+    vault.create_task(
+        identifier="unbound-task",
+        title="Unbound task",
+        outcome="Start a new ChatGPT task only because no binding exists.",
+    )
+    vault.create_task(
+        identifier="malformed-binding",
+        title="Malformed binding",
+        outcome="Fail closed instead of inferring a task from history.",
+        status="doing",
+        next_actor="agent",
+        next_action="Repair the malformed binding.",
+        active_thread_id="not-a-chatgpt-task",
+        codex_episode_ids=(historical_hand,),
+    )
+
+    snapshot = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration={
+            "available": True,
+            "instructions_installed": True,
+            "plugin_installed": True,
+            "ready": True,
+        },
+    )
+    by_id = {task["identifier"]: task for task in snapshot["tasks"]}
+
+    assert by_id["bound-task"]["codex_url"] == f"codex://threads/{valid_hand}"
+    assert by_id["unbound-task"]["codex_url"].startswith("codex://new?")
+    assert "codex_url" not in by_id["malformed-binding"]
+    assert "does not open a duplicate task" in by_id["malformed-binding"]["codex_issue"]
+
+
+def test_briefing_age_uses_the_current_now_write_receipt_not_prose(vault: Vault) -> None:
+    integration = {"available": False, "ready": False}
+    initial = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration=integration,
+    )
+    assert initial["now"]["observed_at"] is None
+    assert initial["now"]["freshness"] == "unknown"
+
+    before = vault.read_document("NOW.md")
+    vault.write_document(
+        "NOW.md",
+        "# Now\n\nA fresh briefing with no timestamp in its prose.\n",
+        expected_revision=before["revision"],
+    )
+    fresh = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration=integration,
+    )
+    assert fresh["now"]["freshness"] == "current"
+    assert fresh["now"]["observed_at"] is not None
+    assert "Observed" not in fresh["now"]["content"]
+    assert "Updated" not in fresh["now"]["content"]
+
+    journal = vault.root / "journal/events.jsonl"
+    events = journal.read_text(encoding="utf-8").splitlines()
+    latest = json.loads(events[-1])
+    latest["observed_at"] = "not-a-time"
+    events[-1] = json.dumps(latest, separators=(",", ":"), sort_keys=True)
+    journal.write_text("\n".join(events) + "\n", encoding="utf-8")
+    malformed = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration=integration,
+    )
+    assert malformed["now"]["observed_at"] is None
+    assert malformed["now"]["freshness"] == "unknown"
+
+    latest["observed_at"] = format_time(datetime.now(UTC) - timedelta(days=2))
+    events[-1] = json.dumps(latest, separators=(",", ":"), sort_keys=True)
+    journal.write_text("\n".join(events) + "\n", encoding="utf-8")
+    old = bridge.bridge_snapshot(
+        vault,
+        doctor=doctor_dict(vault.doctor()),
+        integration=integration,
+    )
+    assert old["now"]["observed_at"] == latest["observed_at"]
+    assert old["now"]["freshness"] == "stale"
+
+
 def test_snapshot_projects_only_cached_update_state_and_chatgpt_review_link(
     vault: Vault,
     monkeypatch: pytest.MonkeyPatch,
@@ -361,7 +460,7 @@ def test_snapshot_projects_chatgpt_recovery_link_for_saved_update_outcomes(
             "error_code": None,
             "next_check_after": None,
             "transaction": {
-                "token": "018f6a20-7b3c-7d42-8a19-2e5f603b91c4",
+                "token": "018f6a20-" + "7b3c-7d42-8a19-2e5f603b91c4",
                 "outcome": outcome,
             },
         },
@@ -394,7 +493,7 @@ def test_snapshot_offers_new_candidate_after_an_older_candidate_rolled_back(
             "error_code": None,
             "next_check_after": None,
             "transaction": {
-                "token": "018f6a20-7b3c-7d42-8a19-2e5f603b91c4",
+                "token": "018f6a20-" + "7b3c-7d42-8a19-2e5f603b91c4",
                 "to_sha": "2" * 40,
                 "outcome": "rolled_back",
             },
@@ -438,7 +537,7 @@ def test_snapshot_recovery_prompt_distinguishes_unresolved_and_resolved_rollback
             "error_code": None,
             "next_check_after": None,
             "transaction": {
-                "token": "018f6a20-7b3c-7d42-8a19-2e5f603b91c4",
+                "token": "018f6a20-" + "7b3c-7d42-8a19-2e5f603b91c4",
                 "to_sha": "2" * 40,
                 "outcome": "rolled_back",
                 "recovery_command": recovery_command,
@@ -999,15 +1098,22 @@ def test_missing_secure_pinned_storage_degrades_only_the_control_lane(
     assert not (server.vault.root / ".gsv/control").exists()
 
 
-@pytest.mark.parametrize("status", ["done", "dropped"])
+@pytest.mark.parametrize("status", ["done", "dropped", "superseded"])
 def test_terminal_history_gets_new_hand_but_never_resume_or_first_run(
     vault: Vault, status: str
 ) -> None:
+    if status == "superseded":
+        vault.create_task(
+            identifier="terminal-replacement",
+            title="Replacement outcome",
+            outcome="The replacement remains available as open work.",
+        )
     terminal = vault.create_task(
         identifier=f"terminal-{status}",
         title=f"Terminal {status}",
         outcome="The exact outcome remains in the closed record.",
         status=status,
+        superseded_by=("terminal-replacement" if status == "superseded" else None),
     )
 
     snapshot = bridge.bridge_snapshot(

@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Protocol
 
 from continuity_kernel.errors import ValidationError
-from continuity_kernel.records import Task, WorkThread
+from continuity_kernel.records import (
+    TERMINAL_TASK_STATUSES,
+    TERMINAL_THREAD_STATUSES,
+    Task,
+    WorkThread,
+)
 
 
 class _VaultContextSource(Protocol):
@@ -157,11 +162,15 @@ def build_context_pack(source: _VaultContextSource, *, max_characters: int = 48_
     mind = source.read_document("MIND.md")["content"]
     now = source.read_document("NOW.md")["content"]
     open_tasks = sorted(
-        (task for task in source.list_tasks() if task.status not in {"done", "dropped"}),
+        (task for task in source.list_tasks() if task.status not in TERMINAL_TASK_STATUSES),
         key=lambda task: task.identifier,
     )
     active_threads = sorted(
-        (thread for thread in source.list_threads() if thread.status != "closed"),
+        (
+            thread
+            for thread in source.list_threads()
+            if thread.status not in TERMINAL_THREAD_STATUSES
+        ),
         key=lambda thread: thread.identifier,
     )
     task_blocks = [_task_context_block(task) for task in open_tasks]

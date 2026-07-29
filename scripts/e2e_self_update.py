@@ -26,10 +26,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-_APPROVAL_REF = "codex:019f8a30-f5db-7b80-b53f-0377296f2d3c"
-_FIXTURE_MARKER = ".seld-self-update-e2e-revision"
+_APPROVAL_REF = "codex:019f0000-0000-7000-8000-000000000777"
+_FIXTURE_MARKER = "src/continuity_kernel/_self_update_e2e_revision.py"
 _RECOVERY_LAUNCHER = "seld-recover"
 _SIGKILL = int(getattr(signal, "SIGKILL", signal.SIGTERM))
+_WHATSAPP_SERVICE_LABEL_ENV = "GSV_WHATSAPP_SERVICE_LABEL"
+_SYNTHETIC_WHATSAPP_SERVICE_LABEL = "ai.example.cutover-wacli"
 _ADAPTER = r"""
 from __future__ import annotations
 
@@ -152,6 +154,62 @@ def _candidate_failure_runner(to_sha: str):
     return run, lambda: candidate_setup_failed
 
 
+def _post_native_commit_failure_runner(to_sha: str):
+    # Fail the updater only after the candidate native command committed.
+
+    base = update._run_command
+    installed = update.installed_provenance()
+    if installed.environment is None:
+        raise RuntimeError("installed Seld has no environment for native failure injection")
+    active = Path(installed.environment)
+    expected_revisions: list[str] = []
+    installed_revisions: list[str] = []
+    injected = False
+
+    def run(command: list[str], environment: Any, timeout: float):
+        nonlocal injected
+        is_native_install = "native-install" in command
+        active_sha = None
+        if is_native_install:
+            try:
+                active_sha = update._environment_sha(active)
+            except Exception:
+                active_sha = None
+            try:
+                revision_index = command.index("--expected-revision") + 1
+                expected_revisions.append(command[revision_index])
+            except (IndexError, ValueError):
+                raise RuntimeError("native install did not carry its exact CAS revision") from None
+        completed = base(command, environment, timeout)
+        if is_native_install and completed.returncode == 0:
+            try:
+                payload = json.loads(completed.stdout)
+                result = payload["result"]
+                revision = result["ownership_revision"]
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("native install returned no ownership revision") from exc
+            if not isinstance(revision, str):
+                raise RuntimeError("native install returned an invalid ownership revision")
+            installed_revisions.append(revision)
+            if active_sha == to_sha and not injected:
+                injected = True
+                return update.CommandResult(
+                    87,
+                    completed.stdout,
+                    b"injected failure after candidate native installation committed",
+                )
+        return completed
+
+    def evidence() -> dict[str, Any]:
+        return {
+            "candidate_commit_injected": injected,
+            "expected_revisions": expected_revisions,
+            "installed_revisions": installed_revisions,
+        }
+
+    return run, evidence
+
+
 def _pause_before_candidate_runner(marker: Path):
     base = update._run_command
     installed = update.installed_provenance()
@@ -193,6 +251,7 @@ def main() -> int:
     parser.add_argument("--to-sha")
     parser.add_argument("--approval-ref")
     parser.add_argument("--inject-candidate-failure", action="store_true")
+    parser.add_argument("--inject-post-native-commit-failure", action="store_true")
     parser.add_argument("--normalize-source-provenance", action="store_true")
     parser.add_argument("--pause-before-candidate", type=Path)
     args = parser.parse_args()
@@ -243,8 +302,13 @@ def main() -> int:
 
     runner = None
     injected = lambda: False
+    native_injection = lambda: {}
     if args.inject_candidate_failure:
         runner, injected = _candidate_failure_runner(args.to_sha)
+    if args.inject_post_native_commit_failure:
+        if runner is not None:
+            raise RuntimeError("candidate and native failure hooks are mutually exclusive")
+        runner, native_injection = _post_native_commit_failure_runner(args.to_sha)
     if args.pause_before_candidate is not None:
         if runner is not None:
             raise RuntimeError("the crash and activation-failure hooks are mutually exclusive")
@@ -259,10 +323,16 @@ def main() -> int:
     )
     if args.inject_candidate_failure and not injected():
         raise RuntimeError("the candidate activation failure was not injected")
+    native_evidence = native_injection()
+    if args.inject_post_native_commit_failure and not native_evidence.get(
+        "candidate_commit_injected"
+    ):
+        raise RuntimeError("the post-native-commit failure was not injected")
     print(
         json.dumps(
             {
                 "check_revision": revision,
+                "native_injection": native_evidence,
                 "result": result,
                 "stale_check_rejected": stale_rejected,
             },
@@ -282,6 +352,7 @@ class _PreparedInstall:
     before: dict[str, Any]
     environment: dict[str, str]
     gsv: Path
+    native_before: dict[str, Any] | None
     paths: dict[str, Path]
     python: Path
     vault: Path
@@ -296,12 +367,17 @@ def main() -> int:
         help="exact Seld candidate tree to turn into the two local revisions",
     )
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help="also prove the owned macOS app lifecycle inside the isolated HOME",
+    )
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
 
     root = Path(tempfile.mkdtemp(prefix="seld-self-update-e2e-")).resolve()
     try:
-        report = run_e2e(root, args.source.resolve())
+        report = run_e2e(root, args.source.resolve(), native=args.native)
         encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
         if args.report is not None:
             args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -315,9 +391,11 @@ def main() -> int:
             shutil.rmtree(root, ignore_errors=True)
 
 
-def run_e2e(root: Path, source: Path) -> dict[str, Any]:
+def run_e2e(root: Path, source: Path, *, native: bool = False) -> dict[str, Any]:
     if os.name == "nt":
         raise RuntimeError("source self-update is not supported on Windows")
+    if native and sys.platform != "darwin":
+        raise RuntimeError("the native self-update proof is available only on macOS")
     uv = shutil.which("uv")
     codex = shutil.which("codex")
     git = shutil.which("git")
@@ -334,7 +412,7 @@ def run_e2e(root: Path, source: Path) -> dict[str, Any]:
     _git(fixture, "add", "--all")
     _git(fixture, "commit", "--quiet", "-m", "fixture revision A")
     revision_a = _git(fixture, "rev-parse", "HEAD").strip()
-    (fixture / _FIXTURE_MARKER).write_text("revision B\n", encoding="utf-8")
+    (fixture / _FIXTURE_MARKER).write_text('REVISION = "B"\n', encoding="utf-8")
     _git(fixture, "add", _FIXTURE_MARKER)
     _git(fixture, "commit", "--quiet", "-m", "fixture revision B")
     revision_b = _git(fixture, "rev-parse", "HEAD").strip()
@@ -352,6 +430,7 @@ def run_e2e(root: Path, source: Path) -> dict[str, Any]:
         revision_b=revision_b,
         adapter=adapter,
         inject_failure=False,
+        native=native,
     )
     rollback = _scenario(
         root / "rollback",
@@ -362,6 +441,7 @@ def run_e2e(root: Path, source: Path) -> dict[str, Any]:
         revision_b=revision_b,
         adapter=adapter,
         inject_failure=True,
+        native=native,
     )
     crash_recovery = _crash_recovery_scenario(
         root / "crash-recovery",
@@ -371,10 +451,12 @@ def run_e2e(root: Path, source: Path) -> dict[str, Any]:
         revision_a=revision_a,
         revision_b=revision_b,
         adapter=adapter,
+        native=native,
     )
     return {
         "crash_recovery": crash_recovery,
         "isolated_execution": True,
+        "native_lifecycle": native,
         "fixture": {
             "from_sha": revision_a,
             "to_sha": revision_b,
@@ -400,6 +482,7 @@ def _scenario(
     revision_b: str,
     adapter: Path,
     inject_failure: bool,
+    native: bool,
 ) -> dict[str, Any]:
     prepared = _prepare_revision_a(
         root,
@@ -407,6 +490,7 @@ def _scenario(
         codex=codex,
         repository_url=repository_url,
         revision_a=revision_a,
+        native=native,
     )
     before = prepared.before
     environment = prepared.environment
@@ -432,7 +516,9 @@ def _scenario(
         _APPROVAL_REF,
     ]
     if inject_failure:
-        apply_command.append("--inject-candidate-failure")
+        apply_command.append(
+            "--inject-post-native-commit-failure" if native else "--inject-candidate-failure"
+        )
     try:
         availability: dict[str, Any] | None = None
         if inject_failure:
@@ -446,6 +532,11 @@ def _scenario(
                 timeout=1200,
             )
         after = _fresh_health(gsv, environment, vault, paths["codex"])
+        whatsapp_service_label_preserved = (
+            _installed_mcp_service_label(paths) == _SYNTHETIC_WHATSAPP_SERVICE_LABEL
+        )
+        if not whatsapp_service_label_preserved:
+            raise RuntimeError("self-update did not preserve the installed WhatsApp service label")
         expected_sha = revision_a if inject_failure else revision_b
         inspected = _json_process(
             [
@@ -477,6 +568,59 @@ def _scenario(
         restored_byte_for_byte = _tree_manifest(paths["tools"] / "gsv") == environment_before
         if inject_failure and not restored_byte_for_byte:
             raise RuntimeError("rollback did not restore revision A byte-for-byte")
+        native_after: dict[str, Any] | None = None
+        native_result: dict[str, Any] | None = None
+        if native:
+            if prepared.native_before is None:
+                raise RuntimeError("native proof did not retain revision A ownership evidence")
+            native_before_revision = str(prepared.native_before["ownership_revision"])
+            native_after = _fresh_native_status(gsv, environment, vault, paths)
+            native_after_revision = str(native_after["ownership_revision"])
+            transaction = applied.get("result")
+            if not isinstance(transaction, dict):
+                raise RuntimeError("native update returned no transaction result")
+            if transaction.get("native_bridge_revision_before") != native_before_revision:
+                raise RuntimeError("native update did not anchor revision A ownership")
+            if transaction.get("native_bridge_revision_current") != native_after_revision:
+                raise RuntimeError("native update did not persist its final ownership revision")
+            if inject_failure:
+                injection = applied.get("native_injection")
+                if not isinstance(injection, dict):
+                    raise RuntimeError("native rollback returned no commit-boundary evidence")
+                expected_revisions = injection.get("expected_revisions")
+                installed_revisions = injection.get("installed_revisions")
+                if (
+                    injection.get("candidate_commit_injected") is not True
+                    or not isinstance(expected_revisions, list)
+                    or not isinstance(installed_revisions, list)
+                    or len(expected_revisions) != 2
+                    or len(installed_revisions) != 2
+                    or expected_revisions[0] != native_before_revision
+                    or expected_revisions[1] != installed_revisions[0]
+                    or installed_revisions[1] != native_after_revision
+                    or installed_revisions[0] == native_before_revision
+                    or installed_revisions[0] == native_after_revision
+                ):
+                    raise RuntimeError(
+                        "native rollback did not reinstall revision A from the committed "
+                        "candidate's exact CAS revision"
+                    )
+                native_result = {
+                    "candidate_commit_revision": installed_revisions[0],
+                    "restored_current": native_after.get("current") is True,
+                    "restored_revision": native_after_revision,
+                    "restore_expected_revision": expected_revisions[1],
+                    "revision_a": native_before_revision,
+                }
+            else:
+                if native_after_revision == native_before_revision:
+                    raise RuntimeError("native update did not advance the owned application")
+                native_result = {
+                    "advanced": True,
+                    "current": native_after.get("current") is True,
+                    "revision_a": native_before_revision,
+                    "revision_b": native_after_revision,
+                }
         result = {
             "bridge_healthy": after["bridge_healthy"],
             "chatgpt_integration_ready": after["chatgpt_integration_ready"],
@@ -486,12 +630,22 @@ def _scenario(
             "stale_check_rejected": applied.get("stale_check_rejected") is True,
             "vault_digest_preserved": before["digest"] == after["digest"],
             "vault_id_preserved": before["vault_id"] == after["vault_id"],
+            "whatsapp_service_label_preserved": whatsapp_service_label_preserved,
         }
         if inject_failure:
             result["environment_restored_byte_for_byte"] = restored_byte_for_byte
         else:
             result["candidate_environment_replaced_prior"] = not restored_byte_for_byte
             result["continuous_executable"] = availability
+        if native:
+            assert native_after is not None and native_result is not None
+            native_result["uninstall"] = _prove_native_uninstall(
+                gsv,
+                environment,
+                paths,
+                native_after,
+            )
+            result["native"] = native_result
         return result
     finally:
         _run(
@@ -509,6 +663,7 @@ def _prepare_revision_a(
     codex: Path,
     repository_url: str,
     revision_a: str,
+    native: bool,
 ) -> _PreparedInstall:
     paths = {
         name: root / name
@@ -542,6 +697,7 @@ def _prepare_revision_a(
     if not gsv.is_symlink() or not python.exists():
         raise RuntimeError("isolated uv source install did not create the expected Seld tool")
     _json_cli(gsv, environment, ["demo", "--output", str(vault)])
+    environment[_WHATSAPP_SERVICE_LABEL_ENV] = _SYNTHETIC_WHATSAPP_SERVICE_LABEL
     setup = _json_cli(
         gsv,
         environment,
@@ -556,10 +712,26 @@ def _prepare_revision_a(
     )
     if setup.get("setup_complete") is not True:
         raise RuntimeError("revision A did not complete isolated setup")
+    if _installed_mcp_service_label(paths) != _SYNTHETIC_WHATSAPP_SERVICE_LABEL:
+        raise RuntimeError("revision A did not bind the synthetic WhatsApp service label")
+    environment.pop(_WHATSAPP_SERVICE_LABEL_ENV, None)
+    native_before = None
+    if native:
+        installed_native = _json_cli(
+            gsv,
+            environment,
+            ["--vault", str(vault), "bridge", "native-install"],
+        )
+        native_before = _fresh_native_status(gsv, environment, vault, paths)
+        if installed_native.get("changed") is not True or installed_native.get(
+            "ownership_revision"
+        ) != native_before.get("ownership_revision"):
+            raise RuntimeError("revision A did not install one exact owned native application")
     return _PreparedInstall(
         before=_fresh_health(gsv, environment, vault, paths["codex"]),
         environment=environment,
         gsv=gsv,
+        native_before=native_before,
         paths=paths,
         python=python,
         vault=vault,
@@ -575,6 +747,7 @@ def _crash_recovery_scenario(
     revision_a: str,
     revision_b: str,
     adapter: Path,
+    native: bool,
 ) -> dict[str, Any]:
     prepared = _prepare_revision_a(
         root,
@@ -582,6 +755,7 @@ def _crash_recovery_scenario(
         codex=codex,
         repository_url=repository_url,
         revision_a=revision_a,
+        native=native,
     )
     environment = prepared.environment
     gsv = prepared.gsv
@@ -589,6 +763,12 @@ def _crash_recovery_scenario(
     vault = prepared.vault
     pause_marker = root / "paused-before-candidate.json"
     recovery = paths["bin"] / _RECOVERY_LAUNCHER
+    native_before = prepared.native_before
+    native_manifest_before: dict[str, str] | None = None
+    if native:
+        if native_before is None:
+            raise RuntimeError("native crash proof did not retain revision A ownership")
+        native_manifest_before = _tree_manifest(Path(str(native_before["application"])))
     command = [
         str(prepared.python),
         str(adapter),
@@ -656,6 +836,22 @@ def _crash_recovery_scenario(
             or transaction.get("phase") != "previous_preserved"
         ):
             raise RuntimeError("stable recovery launcher did not expose the interrupted token")
+        native_interrupted: dict[str, Any] | None = None
+        if native:
+            assert native_before is not None and native_manifest_before is not None
+            native_interrupted = _json_cli(recovery, hostile, ["bridge", "native-status"])
+            if (
+                native_interrupted.get("installed") is not True
+                or native_interrupted.get("owned") is not True
+                or native_interrupted.get("healthy") is not True
+                or native_interrupted.get("current") is not False
+                or native_interrupted.get("ownership_revision")
+                != native_before.get("ownership_revision")
+                or native_interrupted.get("receipt_revision")
+                != native_before.get("receipt_revision")
+                or _tree_manifest(Path(str(native_before["application"]))) != native_manifest_before
+            ):
+                raise RuntimeError("SIGKILL-before-candidate did not leave native revision A")
 
         now = _json_cli(
             recovery,
@@ -687,6 +883,13 @@ def _crash_recovery_scenario(
             raise RuntimeError(f"crash recovery did not roll back revision A: {recovered}")
 
         after = _fresh_health(gsv, environment, vault, paths["codex"])
+        whatsapp_service_label_preserved = (
+            _installed_mcp_service_label(paths) == _SYNTHETIC_WHATSAPP_SERVICE_LABEL
+        )
+        if not whatsapp_service_label_preserved:
+            raise RuntimeError(
+                "crash recovery did not preserve the installed WhatsApp service label"
+            )
         inspected = _json_process(
             [
                 str(paths["tools"] / "gsv/bin/python"),
@@ -703,6 +906,16 @@ def _crash_recovery_scenario(
         observed_sha = inspected.get("provenance", {}).get("sha")
         if observed_sha != revision_a:
             raise RuntimeError("fresh crash-recovered runtime did not restore revision A")
+        native_after: dict[str, Any] | None = None
+        if native:
+            assert native_before is not None and native_manifest_before is not None
+            native_after = _fresh_native_status(gsv, environment, vault, paths)
+            if (
+                native_after.get("ownership_revision") != native_before.get("ownership_revision")
+                or native_after.get("receipt_revision") != native_before.get("receipt_revision")
+                or _tree_manifest(Path(str(native_after["application"]))) != native_manifest_before
+            ):
+                raise RuntimeError("crash recovery replayed or replaced native revision A")
         observed_now = _json_cli(
             gsv,
             environment,
@@ -733,14 +946,30 @@ def _crash_recovery_scenario(
             ["--vault", str(vault), "update", "recover", "--token", token],
         )
         bridge_after_replay = _json_cli(gsv, environment, ["bridge", "status"])
+        native_after_replay = (
+            _fresh_native_status(gsv, environment, vault, paths) if native else None
+        )
         no_replay = (
             replay.get("outcome") == "rolled_back"
             and _tree_manifest(active) == before_replay
             and bridge_before_replay.get("instance_id") == bridge_after_replay.get("instance_id")
+            and (
+                not native
+                or (
+                    native_before is not None
+                    and native_after_replay is not None
+                    and native_after_replay.get("ownership_revision")
+                    == native_before.get("ownership_revision")
+                    and native_after_replay.get("receipt_revision")
+                    == native_before.get("receipt_revision")
+                    and _tree_manifest(Path(str(native_after_replay["application"])))
+                    == native_manifest_before
+                )
+            )
         )
         if not no_replay:
             raise RuntimeError("terminal recovery replayed candidate installation or setup")
-        return {
+        result = {
             "bridge_healthy": after["bridge_healthy"],
             "chatgpt_integration_ready": after["chatgpt_integration_ready"],
             "direct_gsv_launcher_restored": True,
@@ -755,7 +984,27 @@ def _crash_recovery_scenario(
             "vault_change_preserved": observed_now.get("revision") == changed.get("revision"),
             "vault_digest_changed_legitimately": prepared.before["digest"] != after["digest"],
             "vault_id_preserved": prepared.before["vault_id"] == after["vault_id"],
+            "whatsapp_service_label_preserved": whatsapp_service_label_preserved,
         }
+        if native:
+            assert (
+                native_after_replay is not None
+                and native_before is not None
+                and native_interrupted is not None
+            )
+            result["native"] = {
+                "bundle_remained_revision_a": True,
+                "interrupted_runtime_current": native_interrupted.get("current") is True,
+                "no_reinstall_or_replay": True,
+                "revision_a": native_before["ownership_revision"],
+                "uninstall": _prove_native_uninstall(
+                    gsv,
+                    environment,
+                    paths,
+                    native_after_replay,
+                ),
+            }
+        return result
     finally:
         if process.poll() is None:
             process.kill()
@@ -798,6 +1047,97 @@ def _fresh_health(
         "digest": status["digest"],
         "vault_id": status["vault_id"],
     }
+
+
+def _fresh_native_status(
+    gsv: Path,
+    environment: dict[str, str],
+    vault: Path,
+    paths: dict[str, Path],
+) -> dict[str, Any]:
+    status = _json_cli(gsv, environment, ["bridge", "native-status"])
+    expected_application = paths["home"] / "Applications/Seld.app"
+    if (
+        status.get("application") != str(expected_application)
+        or status.get("installed") is not True
+        or status.get("owned") is not True
+        or status.get("healthy") is not True
+        or status.get("current") is not True
+        or status.get("vault") != str(vault)
+        or status.get("ownership_revision") in {None, "absent"}
+        or not expected_application.is_dir()
+    ):
+        raise RuntimeError("isolated native Seld application is not healthy and current")
+    return status
+
+
+def _prove_native_uninstall(
+    gsv: Path,
+    environment: dict[str, str],
+    paths: dict[str, Path],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    revision = current.get("ownership_revision")
+    if not isinstance(revision, str) or revision == "absent":
+        raise RuntimeError("native uninstall requires one exact current ownership revision")
+    removed = _json_cli(
+        gsv,
+        environment,
+        ["bridge", "native-uninstall", "--expected-revision", revision],
+    )
+    absent = _json_cli(gsv, environment, ["bridge", "native-status"])
+    application = paths["home"] / "Applications/Seld.app"
+    residue = sorted(
+        path.name
+        for pattern in (".Seld.app.previous-*", ".Seld.app.uninstall-*", ".seld-native-*")
+        for path in application.parent.glob(pattern)
+    )
+    lifecycle = paths["data"] / "native-bridge/state/lifecycle.json"
+    authority = paths["data"] / "native-bridge/state/ownership.json"
+    try:
+        authority_state = json.loads(authority.read_text(encoding="utf-8")).get("state")
+        lifecycle_state = json.loads(lifecycle.read_text(encoding="utf-8"))
+    except (AttributeError, json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError("native uninstall left no valid idle/absent lifecycle state") from exc
+    checks = {
+        "absent_application": absent.get("application") == str(application),
+        "absent_installed": absent.get("installed") is False,
+        "absent_owned": absent.get("owned") is False,
+        "application_removed": not os.path.lexists(application),
+        "authority_absent": authority_state == "absent",
+        "lifecycle_idle": lifecycle_state == {"format_version": 1, "state": "idle"},
+        "removed": removed.get("removed") is True,
+        "revision_advanced": (
+            removed.get("ownership_revision") == absent.get("ownership_revision")
+        ),
+        "temporary_residue_absent": not residue,
+    }
+    failed = sorted(name for name, passed in checks.items() if not passed)
+    if failed:
+        raise RuntimeError(
+            "exact native uninstall left application or lifecycle residue: " + ", ".join(failed)
+        )
+    return {
+        "absent_state_cas_retained": True,
+        "application_removed": True,
+        "expected_revision": revision,
+        "lifecycle_operation_residue": False,
+        "ownership_revision": absent["ownership_revision"],
+        "temporary_residue": [],
+    }
+
+
+def _installed_mcp_service_label(paths: dict[str, Path]) -> object:
+    home = paths["codex"].resolve()
+    identity = hashlib.sha256(str(home).encode("utf-8")).hexdigest()[:16]
+    mcp = paths["data"] / "marketplaces" / identity / "plugins/gsv/.mcp.json"
+    payload = json.loads(mcp.read_text(encoding="utf-8"))
+    servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+    server = servers.get("gsv") if isinstance(servers, dict) else None
+    environment = server.get("env") if isinstance(server, dict) else None
+    if not isinstance(environment, dict):
+        raise RuntimeError("installed Seld MCP configuration has no environment")
+    return environment.get(_WHATSAPP_SERVICE_LABEL_ENV)
 
 
 def _isolated_environment(root: Path, paths: dict[str, Path], codex: Path) -> dict[str, str]:

@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, cast
 from urllib.parse import urlencode
 
 import continuity_kernel.update as self_update
 from continuity_kernel import __version__
+from continuity_kernel.atomic import open_regular_file
 from continuity_kernel.codex_turn_transport import (
     START_REVIEW_CHOICE,
     START_REVIEW_SUBJECT,
@@ -26,6 +29,7 @@ from continuity_kernel.records import (
     MAX_RECORD_BYTES,
     REVIEW_WORK_THREAD_ID,
     TERMINAL_TASK_STATUSES,
+    TERMINAL_THREAD_STATUSES,
     Entity,
     Record,
     Task,
@@ -34,11 +38,27 @@ from continuity_kernel.records import (
     parse_entity,
     parse_task,
     parse_thread,
+    parse_time,
     record_dict,
+    stored_time,
 )
 from continuity_kernel.vault import Vault, doctor_dict
 
 REPOSITORY_URL: Final = "https://github.com/olivier-motium/seld"
+BRIEFING_STALE_AFTER: Final = timedelta(hours=24)
+BRIEFING_FUTURE_TOLERANCE: Final = timedelta(minutes=5)
+MAX_BRIEFING_JOURNAL_TAIL_BYTES: Final = 512 * 1024
+MAX_JOURNAL_EVENT_BYTES: Final = 64 * 1024
+_JOURNAL_EVENT_KEYS: Final = frozenset(
+    {
+        "after_revision",
+        "before_revision",
+        "event_id",
+        "identifier",
+        "observed_at",
+        "operation",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -217,16 +237,25 @@ def project_snapshot(
     for item in task_records:
         task = record_dict(item)
         if codex_ready and item.status not in TERMINAL_TASK_STATUSES:
-            task["codex_url"] = codex_deep_link(
-                vault.root,
-                f"Resume the Seld commitment `{item.identifier}`. Load its exact current record "
-                "and revision before deciding or changing anything.",
-            )
+            if item.active_thread_id is None:
+                task["codex_url"] = codex_deep_link(
+                    vault.root,
+                    f"Resume the Seld commitment `{item.identifier}`. Load its exact current "
+                    "record and revision before deciding or changing anything.",
+                )
+            elif is_canonical_uuid(item.active_thread_id):
+                task["codex_url"] = codex_thread_deep_link(item.active_thread_id)
+            else:
+                task["codex_issue"] = (
+                    "This work item has an invalid saved ChatGPT task binding. Repair the "
+                    "binding before continuing so Seld does not open a duplicate task."
+                )
         tasks.append(task)
     threads = [record_dict(item) for item in thread_records]
     entities = [record_dict(item) for item in entity_records]
     mind = vault.read_document("MIND.md")
-    now = vault.read_document("NOW.md")
+    now: dict[str, Any] = dict(vault.read_document("NOW.md"))
+    now.update(_briefing_metadata(vault, revision=now["revision"]))
     try:
         direction: dict[str, Any] | None = direction_dict(vault.get_direction())
     except NotFoundError:
@@ -413,7 +442,10 @@ def _project_portfolio(
     thread_by_id = {thread.identifier: thread for thread in threads}
     current_owners_by_task: dict[str, list[WorkThread]] = {}
     for candidate in threads:
-        if candidate.identifier == REVIEW_WORK_THREAD_ID or candidate.status == "closed":
+        if (
+            candidate.identifier == REVIEW_WORK_THREAD_ID
+            or candidate.status in TERMINAL_THREAD_STATUSES
+        ):
             continue
         for task_id_value in candidate.task_ids:
             current_owners_by_task.setdefault(task_id_value, []).append(candidate)
@@ -573,7 +605,9 @@ def _project_portfolio(
                     and not pending_starts
                 ),
                 "prepared": len(inspected_review.current_subject_task_ids) > 1,
-                "hand_url": (f"codex://threads/{active_thread_id}" if active_thread_id else None),
+                "hand_url": (
+                    codex_thread_deep_link(active_thread_id) if active_thread_id else None
+                ),
                 "issue": issue,
                 "pending_intent": (pending_intents[0] if len(pending_intents) == 1 else None),
                 "question": session.waiting_on,
@@ -856,3 +890,76 @@ def codex_deep_link(vault: Path, prompt: str) -> str:
         }
     )
     return f"codex://new?{query}"
+
+
+def codex_thread_deep_link(thread_id: str) -> str:
+    """Build the verified exact-task deep link without accepting inferred identifiers."""
+
+    if not is_canonical_uuid(thread_id):
+        raise ValidationError("ChatGPT task binding must be a canonical UUID")
+    return f"codex://threads/{thread_id}"
+
+
+def _briefing_metadata(
+    vault: Vault,
+    *,
+    revision: str,
+    observed_now: datetime | None = None,
+) -> dict[str, str | None]:
+    """Bind briefing age to the canonical NOW write receipt, never its prose."""
+
+    observed_at = _current_now_observed_at(vault, revision=revision)
+    if observed_at is None:
+        return {"freshness": "unknown", "observed_at": None}
+    reference = observed_now or datetime.now(UTC)
+    observed = parse_time(observed_at)
+    if observed > reference + BRIEFING_FUTURE_TOLERANCE:
+        return {"freshness": "unknown", "observed_at": observed_at}
+    freshness = "stale" if reference - observed > BRIEFING_STALE_AFTER else "current"
+    return {"freshness": freshness, "observed_at": observed_at}
+
+
+def _current_now_observed_at(vault: Vault, *, revision: str) -> str | None:
+    """Read the latest canonical NOW mutation receipt from a stable journal tail."""
+
+    journal = vault.root / "journal/events.jsonl"
+    try:
+        with open_regular_file(journal, label="vault journal") as (descriptor, snapshot):
+            start = max(0, snapshot.size - MAX_BRIEFING_JOURNAL_TAIL_BYTES)
+            os.lseek(descriptor, start, os.SEEK_SET)
+            remaining = snapshot.size - start
+            chunks: list[bytes] = []
+            while remaining:
+                block = os.read(descriptor, min(64 * 1024, remaining))
+                if not block:
+                    break
+                chunks.append(block)
+                remaining -= len(block)
+            encoded = b"".join(chunks)
+        if len(encoded) != snapshot.size - start or not encoded.endswith(b"\n"):
+            return None
+        if start:
+            separator = encoded.find(b"\n")
+            if separator < 0:
+                return None
+            encoded = encoded[separator + 1 :]
+        for line in reversed(encoded.splitlines()):
+            if not line or len(line) > MAX_JOURNAL_EVENT_BYTES:
+                return None
+            payload = json.loads(line)
+            if not isinstance(payload, dict) or set(payload) != _JOURNAL_EVENT_KEYS:
+                return None
+            if payload.get("identifier") != "NOW.md":
+                continue
+            if (
+                payload.get("operation") != "document.update"
+                or payload.get("after_revision") != revision
+            ):
+                return None
+            observed_at = payload.get("observed_at")
+            if not isinstance(observed_at, str):
+                return None
+            return stored_time(observed_at, "NOW observation time")
+    except (json.JSONDecodeError, OSError, UnicodeError, ValidationError):
+        return None
+    return None

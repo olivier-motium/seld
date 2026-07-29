@@ -15,6 +15,7 @@ from continuity_kernel.records import (
     MAX_RECORD_BYTES,
     REVIEW_WORK_THREAD_ID,
     TERMINAL_TASK_STATUSES,
+    TERMINAL_THREAD_STATUSES,
     TIMESTAMP,
     ReviewOption,
     Task,
@@ -28,12 +29,18 @@ from continuity_kernel.records import (
     task_id,
 )
 
-PORTFOLIO_FORMAT_VERSIONS: Final = frozenset({1, 2})
+PORTFOLIO_RICH_FORMAT_VERSION: Final = 3
+PORTFOLIO_FORMAT_VERSIONS: Final = frozenset({1, 2, PORTFOLIO_RICH_FORMAT_VERSION})
 ABSENT_PORTFOLIO_REVISION: Final = "absent"
 MAX_PORTFOLIO_ITEMS: Final = 10_000
 MAX_GUIDED_REVIEW_OUTCOMES: Final = 512
 MAX_DIRECTION_AIMS_PER_ITEM: Final = 100
 MAX_REASON_BYTES: Final = 8 * 1024
+MAX_SOURCE_POSITION: Final = 1_000_000
+MAX_PORTFOLIO_REFS: Final = 100
+MAX_PORTFOLIO_HISTORY: Final = 500
+MAX_PORTFOLIO_REF_LENGTH: Final = 1_000
+MAX_PORTFOLIO_HISTORY_LENGTH: Final = 2_000
 SHA256_REVISION = re.compile(r"^[0-9a-f]{64}$")
 META = re.compile(r"^<!-- gsv-portfolio:(\{.*\}) -->$")
 
@@ -53,6 +60,9 @@ class PortfolioItem:
     work_thread_revision: str | None = None
     direction_aim_ids: tuple[str, ...] = ()
     unaligned_reason: str | None = None
+    source_position: int | None = None
+    source_task_updated_at: str | None = None
+    source_thread_updated_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +73,12 @@ class Portfolio:
     revision: str
     direction_revision: str | None = None
     format_version: int = 1
+    source_direction_updated_at: str | None = None
+    refs: tuple[str, ...] = ()
+    observed_at: str | None = None
+    recorded_at: str | None = None
+    review_after: str | None = None
+    history: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -106,11 +122,34 @@ def new_portfolio(
     items: tuple[PortfolioItem, ...],
     direction_revision: str | None = None,
     observed_at: datetime | None = None,
+    source_direction_updated_at: str | None = None,
+    refs: tuple[str, ...] = (),
+    source_observed_at: str | None = None,
+    recorded_at: str | None = None,
+    review_after: str | None = None,
+    history: tuple[str, ...] = (),
 ) -> Portfolio:
-    format_version = 2 if direction_revision is not None else 1
+    rich = any(
+        (
+            source_direction_updated_at is not None,
+            refs,
+            source_observed_at is not None,
+            recorded_at is not None,
+            review_after is not None,
+            history,
+            any(_item_has_source_fields(item) for item in items),
+        )
+    )
+    format_version = (
+        PORTFOLIO_RICH_FORMAT_VERSION if rich else (2 if direction_revision is not None else 1)
+    )
     candidate = Portfolio(
         summary=body_text(summary, "Portfolio summary", required=True),
-        items=portfolio_items(items, require_alignment=format_version == 2),
+        items=portfolio_items(
+            items,
+            require_alignment=format_version >= 2,
+            require_source_anchors=format_version == PORTFOLIO_RICH_FORMAT_VERSION,
+        ),
         updated_at=format_time(observed_at or datetime.now(UTC)),
         revision="",
         direction_revision=(
@@ -119,16 +158,26 @@ def new_portfolio(
             else None
         ),
         format_version=format_version,
+        source_direction_updated_at=source_direction_updated_at,
+        refs=refs,
+        observed_at=source_observed_at,
+        recorded_at=recorded_at,
+        review_after=review_after,
+        history=history,
     )
     return parse_portfolio(render_portfolio(candidate))
 
 
 def render_portfolio(portfolio: Portfolio) -> str:
-    if portfolio.format_version not in PORTFOLIO_FORMAT_VERSIONS:
-        raise ValidationError(f"unsupported Portfolio version: {portfolio.format_version}")
-    if (portfolio.direction_revision is None) != (portfolio.format_version == 1):
-        raise ValidationError("Portfolio version 2 requires one exact Direction revision")
-    items = portfolio_items(portfolio.items, require_alignment=portfolio.format_version == 2)
+    version = _format_version(portfolio.format_version)
+    if (portfolio.direction_revision is None) != (version == 1):
+        raise ValidationError("Portfolio versions 2 and 3 require one exact Direction revision")
+    _validate_version_content(portfolio)
+    items = portfolio_items(
+        portfolio.items,
+        require_alignment=version >= 2,
+        require_source_anchors=version == PORTFOLIO_RICH_FORMAT_VERSION,
+    )
     updated_at = _stored_time(portfolio.updated_at)
     metadata = {
         "items": [
@@ -144,7 +193,16 @@ def render_portfolio(portfolio: Portfolio) -> str:
                         "direction_aim_ids": list(item.direction_aim_ids),
                         "unaligned_reason": item.unaligned_reason,
                     }
-                    if portfolio.format_version == 2
+                    if version >= 2
+                    else {}
+                ),
+                **(
+                    {
+                        "source_position": item.source_position,
+                        "source_task_updated_at": item.source_task_updated_at,
+                        "source_thread_updated_at": item.source_thread_updated_at,
+                    }
+                    if version == PORTFOLIO_RICH_FORMAT_VERSION
                     else {}
                 ),
             }
@@ -152,11 +210,25 @@ def render_portfolio(portfolio: Portfolio) -> str:
         ],
         "kind": "portfolio",
         "updated_at": updated_at,
-        "version": portfolio.format_version,
+        "version": version,
     }
-    if portfolio.format_version == 2:
+    if version >= 2:
         metadata["direction_revision"] = _revision(
             portfolio.direction_revision, "Direction revision"
+        )
+    if version == PORTFOLIO_RICH_FORMAT_VERSION:
+        metadata.update(
+            {
+                "history": list(_history(portfolio.history)),
+                "observed_at": _source_time(portfolio.observed_at, "Portfolio observed_at"),
+                "recorded_at": _source_time(portfolio.recorded_at, "Portfolio recorded_at"),
+                "refs": list(_refs(portfolio.refs)),
+                "review_after": _source_time(portfolio.review_after, "Portfolio review_after"),
+                "source_direction_updated_at": _source_time(
+                    portfolio.source_direction_updated_at,
+                    "Portfolio source_direction_updated_at",
+                ),
+            }
         )
     header = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     summary = body_text(portfolio.summary, "Portfolio summary", required=True)
@@ -182,9 +254,21 @@ def parse_portfolio(markdown: str) -> Portfolio:
         raise ValidationError("Portfolio metadata is invalid JSON") from exc
     if not isinstance(metadata, dict) or metadata.get("kind") != "portfolio":
         raise ValidationError("expected a Portfolio record")
-    version = metadata.get("version")
-    if version not in PORTFOLIO_FORMAT_VERSIONS:
-        raise ValidationError(f"unsupported Portfolio version: {version}")
+    version = _format_version(metadata.get("version"))
+    expected = {"items", "kind", "updated_at", "version"}
+    if version >= 2:
+        expected.add("direction_revision")
+    if version == PORTFOLIO_RICH_FORMAT_VERSION:
+        expected |= {
+            "history",
+            "observed_at",
+            "recorded_at",
+            "refs",
+            "review_after",
+            "source_direction_updated_at",
+        }
+    if set(metadata) != expected:
+        raise ValidationError("Portfolio metadata has an unsupported shape")
     if lines[2:5] != ["# Portfolio", "", "## Working summary"]:
         raise ValidationError("Portfolio sections must be exactly the working summary")
     raw_items = metadata.get("items")
@@ -192,21 +276,57 @@ def parse_portfolio(markdown: str) -> Portfolio:
         raise ValidationError("Portfolio items must be a list")
     items = portfolio_items(
         tuple(_parse_item(value, format_version=version) for value in raw_items),
-        require_alignment=version == 2,
+        require_alignment=version >= 2,
+        require_source_anchors=version == PORTFOLIO_RICH_FORMAT_VERSION,
     )
     summary = body_text("\n".join(lines[5:]).strip(), "Portfolio summary", required=True)
-    return Portfolio(
+    portfolio = Portfolio(
         summary=summary,
         items=items,
         updated_at=_stored_time(metadata.get("updated_at")),
         revision=sha256_bytes(encoded),
         direction_revision=(
             _revision(metadata.get("direction_revision"), "Direction revision")
-            if version == 2
+            if version >= 2
             else None
         ),
         format_version=version,
+        source_direction_updated_at=(
+            _source_time(
+                metadata.get("source_direction_updated_at"),
+                "Portfolio source_direction_updated_at",
+            )
+            if version == PORTFOLIO_RICH_FORMAT_VERSION
+            else None
+        ),
+        refs=(
+            _refs(_metadata_string_list(metadata, "refs"))
+            if version == PORTFOLIO_RICH_FORMAT_VERSION
+            else ()
+        ),
+        observed_at=(
+            _source_time(metadata.get("observed_at"), "Portfolio observed_at")
+            if version == PORTFOLIO_RICH_FORMAT_VERSION
+            else None
+        ),
+        recorded_at=(
+            _source_time(metadata.get("recorded_at"), "Portfolio recorded_at")
+            if version == PORTFOLIO_RICH_FORMAT_VERSION
+            else None
+        ),
+        review_after=(
+            _source_time(metadata.get("review_after"), "Portfolio review_after")
+            if version == PORTFOLIO_RICH_FORMAT_VERSION
+            else None
+        ),
+        history=(
+            _history(_metadata_string_list(metadata, "history"))
+            if version == PORTFOLIO_RICH_FORMAT_VERSION
+            else ()
+        ),
     )
+    _validate_version_content(portfolio)
+    return portfolio
 
 
 def portfolio_item(
@@ -219,6 +339,9 @@ def portfolio_item(
     work_thread_revision: object = None,
     direction_aim_ids: object = (),
     unaligned_reason: object = None,
+    source_position: object = None,
+    source_task_updated_at: object = None,
+    source_thread_updated_at: object = None,
 ) -> PortfolioItem:
     if not isinstance(task_id_value, str):
         raise ValidationError("Portfolio task ID must be a string")
@@ -238,6 +361,13 @@ def portfolio_item(
         raise ValidationError("Portfolio Direction aim IDs must be strings")
     if unaligned_reason is not None and not isinstance(unaligned_reason, str):
         raise ValidationError("Portfolio unaligned reason must be a string or null")
+    clean_source_position = _optional_source_position(source_position)
+    clean_source_task_updated_at = _optional_source_time(
+        source_task_updated_at, "Portfolio source_task_updated_at"
+    )
+    clean_source_thread_updated_at = _optional_source_time(
+        source_thread_updated_at, "Portfolio source_thread_updated_at"
+    )
     clean_thread = _optional_thread_id(work_thread_id)
     clean_thread_revision = _optional_revision(work_thread_revision)
     if (clean_thread is None) != (clean_thread_revision is None):
@@ -257,11 +387,17 @@ def portfolio_item(
         work_thread_revision=clean_thread_revision,
         direction_aim_ids=clean_aim_ids,
         unaligned_reason=clean_unaligned,
+        source_position=clean_source_position,
+        source_task_updated_at=clean_source_task_updated_at,
+        source_thread_updated_at=clean_source_thread_updated_at,
     )
 
 
 def portfolio_items(
-    values: tuple[PortfolioItem, ...], *, require_alignment: bool = False
+    values: tuple[PortfolioItem, ...],
+    *,
+    require_alignment: bool = False,
+    require_source_anchors: bool = False,
 ) -> tuple[PortfolioItem, ...]:
     if len(values) > MAX_PORTFOLIO_ITEMS:
         raise ValidationError("Portfolio contains too many items")
@@ -275,6 +411,9 @@ def portfolio_items(
             work_thread_revision=item.work_thread_revision,
             direction_aim_ids=item.direction_aim_ids,
             unaligned_reason=item.unaligned_reason,
+            source_position=item.source_position,
+            source_task_updated_at=item.source_task_updated_at,
+            source_thread_updated_at=item.source_thread_updated_at,
         )
         for item in values
     )
@@ -295,18 +434,68 @@ def portfolio_items(
                 "Portfolio version 2 requires Direction aim IDs or an explicit "
                 f"unaligned reason for {missing}"
             )
+    if require_source_anchors:
+        missing_source = next(
+            (
+                item.task_id
+                for item in clean
+                if item.source_position is None or item.source_task_updated_at is None
+            ),
+            None,
+        )
+        if missing_source is not None:
+            raise ValidationError(
+                "Portfolio version 3 requires source position and task timestamp for "
+                f"{missing_source}"
+            )
+        positions = [item.source_position for item in clean]
+        if len(set(positions)) != len(positions):
+            raise ValidationError("Portfolio source positions must be unique")
+        mismatched_thread = next(
+            (
+                item.task_id
+                for item in clean
+                if (item.work_thread_id is None) != (item.source_thread_updated_at is None)
+            ),
+            None,
+        )
+        if mismatched_thread is not None:
+            raise ValidationError(
+                "Portfolio version 3 source thread timestamp must match its thread anchor for "
+                f"{mismatched_thread}"
+            )
     return clean
 
 
 def portfolio_dict(portfolio: Portfolio) -> dict[str, Any]:
-    return {
-        "items": [asdict(item) for item in portfolio.items],
+    items: list[dict[str, Any]] = []
+    for item in portfolio.items:
+        value = asdict(item)
+        if portfolio.format_version != PORTFOLIO_RICH_FORMAT_VERSION:
+            value.pop("source_position")
+            value.pop("source_task_updated_at")
+            value.pop("source_thread_updated_at")
+        items.append(value)
+    result: dict[str, Any] = {
+        "items": items,
         "revision": portfolio.revision,
         "summary": portfolio.summary,
         "updated_at": portfolio.updated_at,
         "direction_revision": portfolio.direction_revision,
         "format_version": portfolio.format_version,
     }
+    if portfolio.format_version == PORTFOLIO_RICH_FORMAT_VERSION:
+        result.update(
+            {
+                "history": list(portfolio.history),
+                "observed_at": portfolio.observed_at,
+                "recorded_at": portfolio.recorded_at,
+                "refs": list(portfolio.refs),
+                "review_after": portfolio.review_after,
+                "source_direction_updated_at": portfolio.source_direction_updated_at,
+            }
+        )
+    return result
 
 
 def inspect_portfolio_state(
@@ -385,7 +574,7 @@ def _inspect_review(
         and has_review_session_signal(task)
         and (review_thread is None or task.identifier not in review_thread.task_ids)
     ]
-    if review_thread is not None and review_thread.status == "closed":
+    if review_thread is not None and review_thread.status in TERMINAL_THREAD_STATUSES:
         issue = "review WorkThread is closed"
     elif review_thread is not None:
         candidates = [
@@ -456,7 +645,7 @@ def _inspect_review(
         if issue is not None:
             state = (
                 "unavailable"
-                if review_thread is not None and review_thread.status == "closed"
+                if review_thread is not None and review_thread.status in TERMINAL_THREAD_STATUSES
                 else "conflict"
             )
         else:
@@ -548,7 +737,7 @@ def _inspect_review(
 def _task_owners(threads: dict[str, WorkThread]) -> dict[str, tuple[WorkThread, ...]]:
     owners: dict[str, list[WorkThread]] = {}
     for thread in threads.values():
-        if thread.identifier == REVIEW_WORK_THREAD_ID or thread.status == "closed":
+        if thread.identifier == REVIEW_WORK_THREAD_ID or thread.status in TERMINAL_THREAD_STATUSES:
             continue
         for identifier in thread.task_ids:
             owners.setdefault(identifier, []).append(thread)
@@ -598,10 +787,18 @@ def _parse_item(value: object, *, format_version: int) -> PortfolioItem:
         "work_thread_id",
         "work_thread_revision",
     }
-    if format_version == 2:
+    if format_version >= 2:
         allowed |= {"direction_aim_ids", "unaligned_reason"}
+    if format_version == PORTFOLIO_RICH_FORMAT_VERSION:
+        allowed |= {
+            "source_position",
+            "source_task_updated_at",
+            "source_thread_updated_at",
+        }
     if set(value) - allowed:
         raise ValidationError("Portfolio item contains unsupported fields")
+    if format_version == PORTFOLIO_RICH_FORMAT_VERSION and set(value) != allowed:
+        raise ValidationError("Portfolio version 3 item has an unsupported shape")
     return portfolio_item(
         task_id_value=_string(value, "task_id"),
         task_revision=_string(value, "task_revision"),
@@ -609,9 +806,24 @@ def _parse_item(value: object, *, format_version: int) -> PortfolioItem:
         reason=_string(value, "reason"),
         work_thread_id=_optional_string(value, "work_thread_id"),
         work_thread_revision=_optional_string(value, "work_thread_revision"),
-        direction_aim_ids=(_string_list(value, "direction_aim_ids") if format_version == 2 else ()),
+        direction_aim_ids=(_string_list(value, "direction_aim_ids") if format_version >= 2 else ()),
         unaligned_reason=(
-            _optional_string(value, "unaligned_reason") if format_version == 2 else None
+            _optional_string(value, "unaligned_reason") if format_version >= 2 else None
+        ),
+        source_position=(
+            _integer(value, "source_position")
+            if format_version == PORTFOLIO_RICH_FORMAT_VERSION
+            else None
+        ),
+        source_task_updated_at=(
+            _string(value, "source_task_updated_at")
+            if format_version == PORTFOLIO_RICH_FORMAT_VERSION
+            else None
+        ),
+        source_thread_updated_at=(
+            _optional_string(value, "source_thread_updated_at")
+            if format_version == PORTFOLIO_RICH_FORMAT_VERSION
+            else None
         ),
     )
 
@@ -629,6 +841,13 @@ def _optional_string(value: dict[str, object], key: str) -> str | None:
         return None
     if not isinstance(item, str):
         raise ValidationError(f"Portfolio item field {key} must be a string or null")
+    return item
+
+
+def _integer(value: dict[str, object], key: str) -> int:
+    item = value.get(key)
+    if isinstance(item, bool) or not isinstance(item, int):
+        raise ValidationError(f"Portfolio item field {key} must be an integer")
     return item
 
 
@@ -692,3 +911,156 @@ def _stored_time(value: object) -> str:
         raise ValidationError("Portfolio updated_at must be an ISO-8601 UTC timestamp")
     parse_time(value)
     return value
+
+
+def _format_version(value: object) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in PORTFOLIO_FORMAT_VERSIONS
+    ):
+        raise ValidationError(f"unsupported Portfolio version: {value}")
+    return value
+
+
+def _validate_version_content(portfolio: Portfolio) -> None:
+    rich_items = any(_item_has_source_fields(item) for item in portfolio.items)
+    rich_top = any(
+        (
+            portfolio.source_direction_updated_at is not None,
+            portfolio.refs,
+            portfolio.observed_at is not None,
+            portfolio.recorded_at is not None,
+            portfolio.review_after is not None,
+            portfolio.history,
+        )
+    )
+    if portfolio.format_version in {1, 2}:
+        if rich_items or rich_top:
+            raise ValidationError(
+                f"Portfolio version {portfolio.format_version} cannot contain version 3 "
+                "continuity fields"
+            )
+        return
+    if not rich_items and not rich_top:
+        raise ValidationError("Portfolio version 3 requires continuity fields")
+    source_direction = parse_time(
+        _source_time(
+            portfolio.source_direction_updated_at,
+            "Portfolio source_direction_updated_at",
+        )
+    )
+    observed = parse_time(_source_time(portfolio.observed_at, "Portfolio observed_at"))
+    recorded = parse_time(_source_time(portfolio.recorded_at, "Portfolio recorded_at"))
+    updated = parse_time(_stored_time(portfolio.updated_at))
+    review_after = parse_time(_source_time(portfolio.review_after, "Portfolio review_after"))
+    if source_direction > updated or observed > updated or recorded > updated:
+        raise ValidationError("Portfolio version 3 has an invalid continuity timeline")
+    if review_after <= updated:
+        raise ValidationError("Portfolio review_after must be later than updated_at")
+    _refs(portfolio.refs)
+    _history(portfolio.history)
+    items = portfolio_items(
+        portfolio.items,
+        require_alignment=True,
+        require_source_anchors=True,
+    )
+    positions: list[int] = []
+    for item in items:
+        if item.source_position is None:  # Defensive after strict item validation above.
+            raise ValidationError("Portfolio version 3 item has no source position")
+        positions.append(item.source_position)
+        source_task = parse_time(
+            _source_time(
+                item.source_task_updated_at,
+                "Portfolio source_task_updated_at",
+            )
+        )
+        if source_task > updated:
+            raise ValidationError("Portfolio source task timestamp is later than updated_at")
+        if item.source_thread_updated_at is not None:
+            source_thread = parse_time(
+                _source_time(
+                    item.source_thread_updated_at,
+                    "Portfolio source_thread_updated_at",
+                )
+            )
+            if source_thread > updated:
+                raise ValidationError("Portfolio source thread timestamp is later than updated_at")
+    if positions != sorted(positions):
+        raise ValidationError("Portfolio version 3 items must follow source position order")
+
+
+def _item_has_source_fields(item: PortfolioItem) -> bool:
+    return any(
+        (
+            item.source_position is not None,
+            item.source_task_updated_at is not None,
+            item.source_thread_updated_at is not None,
+        )
+    )
+
+
+def _optional_source_position(value: object) -> int | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= MAX_SOURCE_POSITION
+    ):
+        raise ValidationError(
+            f"Portfolio source_position must be an integer from 1 to {MAX_SOURCE_POSITION}"
+        )
+    return value
+
+
+def _optional_source_time(value: object, label: str) -> str | None:
+    return None if value is None else _source_time(value, label)
+
+
+def _source_time(value: object, label: str) -> str:
+    if not isinstance(value, str) or TIMESTAMP.fullmatch(value) is None:
+        raise ValidationError(f"{label} must be an ISO-8601 UTC timestamp")
+    parse_time(value)
+    return value
+
+
+def _refs(values: object) -> tuple[str, ...]:
+    if isinstance(values, str) or not isinstance(values, (tuple, list)):
+        raise ValidationError("Portfolio refs must be an array")
+    if len(values) > MAX_PORTFOLIO_REFS:
+        raise ValidationError("Portfolio contains too many refs")
+    clean = tuple(
+        _single_line(value, MAX_PORTFOLIO_REF_LENGTH, "Portfolio ref") for value in values
+    )
+    if len(set(clean)) != len(clean):
+        raise ValidationError("Portfolio refs must be unique")
+    return clean
+
+
+def _history(values: object) -> tuple[str, ...]:
+    if isinstance(values, str) or not isinstance(values, (tuple, list)):
+        raise ValidationError("Portfolio history must be an array")
+    if not values or len(values) > MAX_PORTFOLIO_HISTORY:
+        raise ValidationError("Portfolio history must contain 1 to 500 entries")
+    return tuple(
+        _single_line(value, MAX_PORTFOLIO_HISTORY_LENGTH, "Portfolio history entry")
+        for value in values
+    )
+
+
+def _single_line(value: object, maximum: int, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f"{label} must be text")
+    clean = " ".join(value.split())
+    if not clean or len(clean) > maximum or "\x00" in clean:
+        raise ValidationError(f"{label} is invalid")
+    return clean
+
+
+def _metadata_string_list(metadata: dict[str, object], key: str) -> tuple[str, ...]:
+    value = metadata.get(key)
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValidationError(f"Portfolio {key} must be a string array")
+    return tuple(value)

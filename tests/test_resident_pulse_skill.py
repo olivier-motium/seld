@@ -31,6 +31,7 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
     registration = _skill_text("gsv-pulse", "references/registration.md")
     sources = _skill_text("gsv-pulse", "references/source-acquisition.md")
     onboard = _skill_text("gsv-onboard")
+    source_catalog = _skill_text("gsv-onboard", "references/source-catalog.md")
     updater = _skill_text("gsv-update")
     updater_metadata = _skill_text("gsv-update", "agents/openai.yaml")
     resident = _skill_text("gsv")
@@ -57,6 +58,12 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
         "invoke `gsv update check` at most once in the wake",
         "never pass `--force`",
         "Never run `gsv update apply` or `gsv update recover` in Pulse",
+        "gsv_signal_list",
+        "gsv_signal_acknowledge",
+        "gsv_local_source_poll",
+        "gsv_local_source_acknowledge",
+        "gsv_recall_search",
+        "Leave unhandled frozen inputs pending",
     ):
         assert marker in pulse
 
@@ -84,8 +91,28 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
         "core hashes bindings, cursors, and references",
         "Register one resident Pulse",
         "model reads selected sources and authors every judgment",
+        "Treat `gsv` — Seld on this computer — as source zero",
+        "gsv_local_source_staged_status",
+        "gsv_local_source_adopt_staged",
+        "adopt_verified_prefix",
+        "during-cutover delta",
+        "never fall back to a forward baseline",
+        "gsv_local_source_baseline",
+        "mechanical sense sweep",
+        "never runs semantic recall",
+        "provider bodies, or decides meaning",
     ):
         assert marker in onboard
+
+    assert onboard.index("gsv_local_source_staged_status") < onboard.index(
+        "gsv_local_source_baseline"
+    )
+    for marker in (
+        "Check staged status first",
+        "adopt a verified imported prefix",
+        "only when there is no staged checkpoint or prior receipt",
+    ):
+        assert source_catalog.count(marker) == 2
 
     for marker in (
         "gsv_source_list",
@@ -117,6 +144,38 @@ def test_resident_pulse_skill_keeps_judgment_in_the_ai_layer() -> None:
     assert "$gsv-update" in updater_metadata
 
     assert "Ordinary hands do not write `NOW.md`" in resident
+    assert "gsv_recall_search" in resident
+    assert "gsv_signal_append" in resident
+    assert "exact canonical `record_ref`" in resident
+    assert "matching `change_type`" in resident
+    assert "event key when one exists" not in resident
+    assert "ordinary task never acknowledges its own input" in resident
+    for marker in (
+        "page `gsv_task_list` from its first page through `next_cursor: null`",
+        "discard those pages and restart once",
+        "literal compact excerpts, not full records",
+        "call `gsv_task_show` for every possible intervention",
+    ):
+        assert marker in resident
+
+
+def test_onboarding_augments_imported_mind_without_replacing_retained_context() -> None:
+    onboard = _skill_text("gsv-onboard")
+
+    for marker in (
+        "Before synthesizing context or changing `MIND.md`",
+        "gsv_document_show",
+        "gsv_resident_context_status",
+        "gsv_resident_guidance_show",
+        "augment this retained context rather than replace it",
+        "must preserve every retained statement",
+        "including its provenance and uncertainty",
+        "If a lossless merge is ambiguous",
+        "stop before the write",
+    ):
+        assert marker in onboard
+
+    assert onboard.index("gsv_document_show") < onboard.index("gsv_document_update")
 
 
 def test_seld_mcp_surface_is_closed_to_provider_and_computer_actions() -> None:

@@ -98,6 +98,24 @@ configured vault.
 Restart the ChatGPT desktop app after first setup so the new marketplace, plugin, and managed
 instructions are loaded.
 
+## Optional QMD acceleration
+
+Seld's bounded Markdown recall works without QMD. For semantic acceleration, install a clean
+QMD 2.5.3 or newer runtime under Node.js 22 or newer using QMD's supported global install path:
+
+```bash
+npm install -g '@tobilu/qmd@^2.5.3'
+gsv recall status
+gsv recall rebuild
+```
+
+Seld invokes QMD only from `/opt/homebrew/bin/qmd`, `/usr/local/bin/qmd`, or an explicit absolute
+`--executable` path; it does not trust a PATH-only executable. Each vault gets its own disposable,
+privacy-screened snapshot and collection binding. A first rebuild may download local models and use
+substantial disk and compute. If QMD is absent, broken, stale, or points at another collection,
+`gsv recall search` stays on bounded Markdown recall and reports that fallback honestly. QMD never
+becomes canonical state.
+
 ## Controlled prebuilt install
 
 Obtain a candidate binary and its expected checksum through the approved

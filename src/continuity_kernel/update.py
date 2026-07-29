@@ -27,8 +27,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from continuity_kernel import __version__
+from continuity_kernel import __version__, whatsapp
 from continuity_kernel.atomic import (
+    PinnedPathRoot,
     atomic_write,
     durable_publish_new,
     exclusive_lock,
@@ -36,15 +37,17 @@ from continuity_kernel.atomic import (
     read_regular_file,
     sha256_bytes,
 )
-from continuity_kernel.config import data_dir
+from continuity_kernel.config import codex_home, data_dir
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.errors import ConflictError, SetupError, ValidationError
+from continuity_kernel.privacy import AwarenessDecision, screen_local_content
 from continuity_kernel.vault import Vault
 
 REPOSITORY_URL: Final = "https://github.com/olivier-motium/seld.git"
 API_ROOT: Final = "https://api.github.com/repos/olivier-motium/seld"
 CHECK_FORMAT_VERSION: Final = 1
-TRANSACTION_FORMAT_VERSION: Final = 1
+LEGACY_TRANSACTION_FORMAT_VERSION: Final = 1
+TRANSACTION_FORMAT_VERSION: Final = 2
 CHECK_INTERVAL: Final = timedelta(hours=6)
 NETWORK_TIMEOUT_SECONDS: Final = 8.0
 MAX_NETWORK_BYTES: Final = 2 * 1024 * 1024
@@ -52,8 +55,10 @@ MAX_RECEIPT_BYTES: Final = 128 * 1024
 MAX_RECOVERY_LAUNCHER_BYTES: Final = 16 * 1024
 COMMAND_TIMEOUT_SECONDS: Final = 10 * 60
 MAX_COMMAND_OUTPUT_BYTES: Final = 256 * 1024
+MAX_INSTALLED_MCP_BYTES: Final = 64 * 1024
 UPDATE_LOCK_TIMEOUT_SECONDS: Final = 0.25
 RECOVERY_LAUNCHER_NAME: Final = "seld-recover"
+INSTALLED_MCP_RELATIVE: Final = "plugins/gsv/.mcp.json"
 REQUIRED_CHECK_NAMES: Final = frozenset(
     {
         "Chromium Bridge acceptance",
@@ -98,10 +103,22 @@ _TRANSACTION_PHASES = frozenset(
         "candidate_installed",
         "setting_up_candidate",
         "verifying_candidate",
+        "activating_native_bridge",
+        "native_bridge_activated",
         "recovering",
         "restoring_previous",
         "previous_restored",
+        "restoring_native_bridge",
+        "native_bridge_restored",
         "complete",
+    }
+)
+_NATIVE_TRANSACTION_PHASES: Final = frozenset(
+    {
+        "activating_native_bridge",
+        "native_bridge_activated",
+        "restoring_native_bridge",
+        "native_bridge_restored",
     }
 )
 
@@ -467,6 +484,87 @@ def installed_provenance() -> InstallProvenance:
     )
 
 
+def _validated_whatsapp_service_label(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(
+            f"{whatsapp.SERVICE_LABEL_ENV} must be a bounded non-secret launchd service label"
+        )
+    try:
+        label = whatsapp.resolve_service_label(value)
+        screening = screen_local_content(label.encode("utf-8", errors="strict"))
+    except (UnicodeError, ValidationError) as exc:
+        raise ValidationError(
+            f"{whatsapp.SERVICE_LABEL_ENV} must be a bounded non-secret launchd service label"
+        ) from exc
+    if screening.decision is not AwarenessDecision.CONTENT_ALLOWED:
+        raise ValidationError(
+            f"{whatsapp.SERVICE_LABEL_ENV} must be a bounded non-secret launchd service label"
+        )
+    return label
+
+
+def _installed_whatsapp_service_label(vault: Vault) -> str | None:
+    """Read one non-secret setup value from the receipt-bound installed plugin.
+
+    Update commands run outside the generated MCP environment, so ambient
+    process variables are not installation authority. The installed v2 receipt
+    and its exact .mcp.json digest are the only accepted source for this value.
+    """
+
+    # Import lazily to avoid making updater import order depend on Codex setup.
+    from continuity_kernel import codex_integration
+
+    home = codex_home()
+    receipt = codex_integration._load_receipt(home)
+    if not receipt or receipt.get("integration_active") is not True:
+        return None
+    if (
+        receipt.get("format_version") != codex_integration.RECEIPT_FORMAT_VERSION
+        or receipt.get("marketplace_owned") is not True
+        or receipt.get("plugin_owned") is not True
+        or receipt.get("install_transition") is not None
+        or receipt.get("uninstall_phase") is not None
+    ):
+        raise ValidationError(
+            "the installed ChatGPT integration cannot prove a stable Seld launch configuration"
+        )
+    manifest = receipt.get("marketplace_manifest")
+    expected_mcp = manifest.get(INSTALLED_MCP_RELATIVE) if isinstance(manifest, dict) else None
+    if not isinstance(expected_mcp, str) or not expected_mcp.startswith("file:"):
+        raise ValidationError(
+            "the installed ChatGPT integration cannot prove its Seld MCP configuration"
+        )
+    marketplace_root = codex_integration._marketplace_root(home)
+    pinned = PinnedPathRoot(marketplace_root)
+    try:
+        encoded = pinned.read_regular_file(
+            INSTALLED_MCP_RELATIVE,
+            label="installed Seld MCP configuration",
+            max_bytes=MAX_INSTALLED_MCP_BYTES,
+        )
+    finally:
+        pinned.close()
+    if encoded is None or f"file:{sha256_bytes(encoded)}" != expected_mcp:
+        raise ValidationError(
+            "the installed Seld MCP configuration changed after its ownership receipt"
+        )
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError("the installed Seld MCP configuration is invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValidationError("the installed Seld MCP configuration is invalid")
+    servers = payload.get("mcpServers")
+    server = servers.get("gsv") if isinstance(servers, dict) else None
+    environment = server.get("env") if isinstance(server, dict) else None
+    if not isinstance(environment, dict) or environment.get("GSV_VAULT") != str(vault.root):
+        raise ValidationError("the installed Seld MCP configuration belongs to a different vault")
+    configured = environment.get(whatsapp.SERVICE_LABEL_ENV)
+    if configured is None:
+        return None
+    return _validated_whatsapp_service_label(configured)
+
+
 def _apply_locked(
     vault: Vault,
     *,
@@ -517,6 +615,7 @@ def _apply_locked(
         raise ConflictError(
             f"the reserved Seld recovery launcher path already exists: {recovery_launcher_target}"
         )
+    whatsapp_service_label = _installed_whatsapp_service_label(vault)
     active = Path(installed.environment)
     token = str(uuid.uuid4())
     previous = active.parent / f".gsv.previous.{token}"
@@ -531,6 +630,7 @@ def _apply_locked(
         or bridge_before.get("vault_id") != before["vault_id"]
     ):
         raise ConflictError("the live Bridge belongs to a different Seld vault")
+    native_before = _native_bridge_before(vault, installed)
     transaction: dict[str, Any] = {
         "format_version": TRANSACTION_FORMAT_VERSION,
         "token": token,
@@ -554,6 +654,8 @@ def _apply_locked(
         "vault_digest": before["digest"],
         "bridge_was_running": bridge_before.get("running") is True,
         "bridge_instance_before": bridge_before.get("instance_id"),
+        **native_before,
+        "whatsapp_service_label": whatsapp_service_label,
         "backup": None,
         "error_code": None,
         "recovery_command": None,
@@ -638,7 +740,7 @@ def _finish_candidate(
         setup_arguments.append("--no-bridge")
     with exclusive_lock(vault.state / "locks/global.lock"):
         transaction = _protect_vault_for_activation(vault, transaction)
-        setup = runner(setup_arguments, _child_environment(), COMMAND_TIMEOUT_SECONDS)
+        setup = runner(setup_arguments, _setup_environment(transaction), COMMAND_TIMEOUT_SECONDS)
         if setup.returncode == 4:
             _verify_repair_install(vault, transaction, runner=runner)
             vault_audit = _vault_audit(vault, transaction)
@@ -649,6 +751,23 @@ def _finish_candidate(
                 vault, transaction, runner=runner, expected_sha=str(transaction["to_sha"])
             )
             vault_audit = _vault_audit(vault, transaction)
+    transaction = _upgrade_legacy_native_recovery(
+        vault,
+        transaction,
+        command=candidate,
+        legacy_environment=Path(_required_string(transaction, "previous_environment")),
+        active_runtime_is_legacy=False,
+        runner=runner,
+    )
+    transaction = _reconcile_native_bridge(
+        vault,
+        transaction,
+        command=candidate,
+        expected_sha=str(transaction["to_sha"]),
+        phase="activating_native_bridge",
+        complete_phase="native_bridge_activated",
+        runner=runner,
+    )
     recovery_launcher_error = None
     try:
         _cleanup_recovery_launcher(transaction)
@@ -736,6 +855,16 @@ def _rollback_after_failure(
                 _stop_runtime_bridge(active, runner)
             except SetupError:
                 return _mark_repair_required(transaction, "candidate_bridge_stop_failed")
+        try:
+            transaction = _adopt_committed_candidate_native_bridge(
+                vault,
+                transaction,
+                active=active,
+                runner=runner,
+            )
+        except (OSError, SetupError, ValidationError, ConflictError):
+            latest = _read_transaction(required=True) or transaction
+            return _mark_repair_required(latest, "native_bridge_rollback_anchor_failed")
         if os.path.lexists(failed):
             return _mark_repair_required(transaction, "failed_environment_path_conflict")
         move_no_replace(active, failed)
@@ -758,6 +887,8 @@ def _candidate_may_have_started_bridge(transaction: dict[str, Any]) -> bool:
     return transaction.get("phase") in {
         "setting_up_candidate",
         "verifying_candidate",
+        "activating_native_bridge",
+        "native_bridge_activated",
         "recovering",
     }
 
@@ -785,7 +916,11 @@ def _finish_restored(
             setup_arguments.append("--no-bridge")
         with exclusive_lock(vault.state / "locks/global.lock"):
             transaction = _protect_vault_for_activation(vault, transaction)
-            setup = runner(setup_arguments, _child_environment(), COMMAND_TIMEOUT_SECONDS)
+            setup = runner(
+                setup_arguments,
+                _setup_environment(transaction),
+                COMMAND_TIMEOUT_SECONDS,
+            )
             if setup.returncode != 0:
                 return _mark_repair_required(transaction, "previous_setup_failed")
             _verify_active_runtime(
@@ -797,8 +932,29 @@ def _finish_restored(
             vault_audit = _vault_audit(vault, transaction)
     except _ActivationVaultChanged:
         return _mark_vault_reapproval_required(vault, transaction)
-    except (OSError, SetupError, ValidationError):
+    except (OSError, SetupError, ValidationError, ConflictError):
         return _mark_repair_required(transaction, "previous_health_failed")
+    try:
+        transaction = _upgrade_legacy_native_recovery(
+            vault,
+            transaction,
+            command=command,
+            legacy_environment=active,
+            active_runtime_is_legacy=True,
+            runner=runner,
+        )
+        transaction = _reconcile_native_bridge(
+            vault,
+            transaction,
+            command=command,
+            expected_sha=str(transaction["from_sha"]),
+            phase="restoring_native_bridge",
+            complete_phase="native_bridge_restored",
+            runner=runner,
+        )
+    except (OSError, SetupError, ValidationError, ConflictError):
+        latest = _read_transaction(required=True) or transaction
+        return _mark_repair_required(latest, "native_bridge_restore_failed")
     failed = Path(_required_string(transaction, "failed_environment"))
     cleanup_error = None
     if failed.is_dir() and not failed.is_symlink():
@@ -852,6 +1008,7 @@ def _finish_unchanged(
     *,
     runner: CommandRunner,
 ) -> dict[str, Any]:
+    active = Path(_required_string(transaction, "active_environment"))
     try:
         _verify_external_launcher(transaction, repair_missing=False)
         with exclusive_lock(vault.state / "locks/global.lock"):
@@ -863,11 +1020,24 @@ def _finish_unchanged(
                 expected_sha=str(transaction["from_sha"]),
             )
             vault_audit = _vault_audit(vault, transaction)
-        _cleanup_recovery_launcher(transaction)
     except _ActivationVaultChanged:
         return _mark_vault_reapproval_required(vault, transaction)
-    except (OSError, SetupError, ValidationError):
+    except (OSError, SetupError, ValidationError, ConflictError):
         return _mark_repair_required(transaction, "unchanged_runtime_health_failed")
+    try:
+        if transaction.get("format_version") == LEGACY_TRANSACTION_FORMAT_VERSION:
+            transaction = _upgrade_legacy_native_recovery(
+                vault,
+                transaction,
+                command=_runtime_command(active),
+                legacy_environment=active,
+                active_runtime_is_legacy=True,
+                runner=runner,
+            )
+        _verify_unchanged_native_bridge(vault, transaction, runner=runner)
+        _cleanup_recovery_launcher(transaction)
+    except (OSError, SetupError, ValidationError, ConflictError):
+        return _mark_repair_required(transaction, "native_bridge_state_changed")
     transaction = _advance_transaction(
         transaction,
         phase="complete",
@@ -877,6 +1047,382 @@ def _finish_unchanged(
         **vault_audit,
     )
     return _transaction_result(transaction)
+
+
+def _native_bridge_before(
+    vault: Vault,
+    installed: InstallProvenance,
+) -> dict[str, Any]:
+    """Anchor the exact native-app authority before any update mutation."""
+
+    from continuity_kernel.bridge_launcher import native_bridge_status
+
+    if installed.launcher is None:
+        raise ValidationError("installed Seld paths are incomplete")
+    try:
+        status_payload = native_bridge_status(executable=Path(installed.launcher))
+    except (OSError, SetupError, ValidationError) as exc:
+        raise SetupError("the native Seld app state could not be verified before update") from exc
+    application = _native_application(status_payload.get("application"))
+    ownership_revision = _native_revision(
+        status_payload.get("ownership_revision"),
+        "native Seld ownership revision",
+    )
+    if status_payload.get("installed") is False:
+        if status_payload.get("owned") is True or status_payload.get("error_code") is not None:
+            raise SetupError("the native Seld app needs repair before self-update")
+        return {
+            "native_bridge_was_installed": False,
+            "native_bridge_application": application,
+            "native_bridge_revision_before": ownership_revision,
+            "native_bridge_revision_current": ownership_revision,
+        }
+    if (
+        status_payload.get("installed") is not True
+        or status_payload.get("owned") is not True
+        or status_payload.get("healthy") is not True
+        or status_payload.get("current") is not True
+    ):
+        raise SetupError("the native Seld app needs repair before self-update")
+    if status_payload.get("vault") != str(vault.root) or status_payload.get(
+        "vault_id"
+    ) != vault.identity().get("vault_id"):
+        raise ConflictError("the native Seld app belongs to a different Seld vault")
+    if ownership_revision == "absent":
+        raise ValidationError("the installed native Seld app has no ownership revision")
+    return {
+        "native_bridge_was_installed": True,
+        "native_bridge_application": application,
+        "native_bridge_revision_before": ownership_revision,
+        "native_bridge_revision_current": ownership_revision,
+    }
+
+
+def _upgrade_legacy_native_recovery(
+    vault: Vault,
+    transaction: dict[str, Any],
+    *,
+    command: list[str],
+    legacy_environment: Path,
+    active_runtime_is_legacy: bool,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    """Observe legacy native state and upgrade its receipt before cleanup."""
+
+    if transaction.get("format_version") != LEGACY_TRANSACTION_FORMAT_VERSION:
+        return transaction
+    status_payload = _runtime_native_status(command, transaction, runner)
+    application = _native_application(status_payload.get("application"))
+    ownership_revision = _native_revision(
+        status_payload.get("ownership_revision"),
+        "legacy native Seld ownership revision",
+    )
+    if status_payload.get("installed") is False:
+        if status_payload.get("owned") is True or status_payload.get("error_code") is not None:
+            raise SetupError("legacy native Seld state is not safely absent")
+        evidence = {
+            "native_bridge_was_installed": False,
+            "native_bridge_application": application,
+            "native_bridge_revision_before": ownership_revision,
+            "native_bridge_revision_current": ownership_revision,
+        }
+    else:
+        _require_owned_native_status(vault, status_payload)
+        if ownership_revision == "absent":
+            raise ValidationError("the installed native Seld app has no ownership revision")
+        if active_runtime_is_legacy:
+            if status_payload.get("current") is not True:
+                raise SetupError("legacy native Seld app does not match the restored runtime")
+        else:
+            if status_payload.get("current") is not False:
+                raise ConflictError("legacy native Seld app state is ambiguous")
+            _require_native_app_matches_legacy_runtime(
+                status_payload,
+                transaction,
+                legacy_environment=legacy_environment,
+            )
+        evidence = {
+            "native_bridge_was_installed": True,
+            "native_bridge_application": application,
+            "native_bridge_revision_before": ownership_revision,
+            "native_bridge_revision_current": ownership_revision,
+        }
+    return _advance_transaction(
+        transaction,
+        phase=str(transaction["phase"]),
+        format_version=TRANSACTION_FORMAT_VERSION,
+        **evidence,
+    )
+
+
+def _require_native_app_matches_legacy_runtime(
+    status_payload: Mapping[str, Any],
+    transaction: dict[str, Any],
+    *,
+    legacy_environment: Path,
+) -> None:
+    """Prove a healthy owned app was built from the preserved v1 runtime."""
+
+    from continuity_kernel.bridge_launcher import (
+        _owned_receipt,
+        _sha256_file,
+        _source_runtime_manifest,
+        _tree_digest,
+    )
+    from continuity_kernel.bridge_launcher import (
+        _receipt_revision as native_receipt_revision,
+    )
+
+    application = Path(_native_application(status_payload.get("application")))
+    receipt = _owned_receipt(application)
+    observed_receipt_revision = _clean_revision(
+        status_payload.get("receipt_revision"),
+        "legacy native Seld receipt revision",
+    )
+    if native_receipt_revision(receipt) != observed_receipt_revision:
+        raise ConflictError("legacy native Seld receipt changed during recovery")
+    active = Path(_required_string(transaction, "active_environment"))
+    active_executable = str(Path(_runtime_command(active)[0]).resolve(strict=True))
+    legacy_executable = Path(_runtime_command(legacy_environment)[0])
+    if receipt.get("executable") != active_executable or receipt.get(
+        "executable_sha256"
+    ) != _sha256_file(legacy_executable):
+        raise SetupError("native Seld app does not match the preserved legacy executable")
+    runtime_root = _environment_runtime_root(legacy_environment)
+    runtime_digest = _tree_digest(_source_runtime_manifest(runtime_root))
+    if receipt.get("source_runtime_digest") != runtime_digest:
+        raise SetupError("native Seld app does not match the preserved legacy runtime")
+
+
+def _environment_runtime_root(environment: Path) -> Path:
+    if os.name == "nt":
+        candidates = [environment / "Lib/site-packages/continuity_kernel"]
+    else:
+        candidates = list(environment.glob("lib/python*/site-packages/continuity_kernel"))
+    present = [candidate for candidate in candidates if candidate.is_dir()]
+    if len(present) != 1:
+        raise SetupError("preserved Seld environment has no unique runtime package")
+    return present[0]
+
+
+def _adopt_committed_candidate_native_bridge(
+    vault: Vault,
+    transaction: dict[str, Any],
+    *,
+    active: Path,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    """Read back a candidate app commit before its runtime is moved aside."""
+
+    if transaction.get("native_bridge_was_installed") is not True or transaction.get(
+        "phase"
+    ) not in {"activating_native_bridge", "native_bridge_activated"}:
+        return transaction
+    command = _runtime_command(active)
+    status_payload = _runtime_native_status(command, transaction, runner)
+    if _native_application(status_payload.get("application")) != transaction.get(
+        "native_bridge_application"
+    ):
+        raise ConflictError("the native Seld app path changed during rollback")
+    _require_owned_native_status(vault, status_payload)
+    if status_payload.get("current") is not True:
+        return transaction
+    observed_revision = _native_revision(
+        status_payload.get("ownership_revision"),
+        "candidate native Seld ownership revision",
+    )
+    if observed_revision == "absent":
+        raise ValidationError("the installed native Seld app has no ownership revision")
+    if observed_revision == transaction.get("native_bridge_revision_current"):
+        return transaction
+    return _advance_transaction(
+        transaction,
+        phase=str(transaction["phase"]),
+        native_bridge_revision_current=observed_revision,
+    )
+
+
+def _reconcile_native_bridge(
+    vault: Vault,
+    transaction: dict[str, Any],
+    *,
+    command: list[str],
+    expected_sha: str,
+    phase: str,
+    complete_phase: str,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    """Make an owned native app match one already-verified active runtime."""
+
+    if "native_bridge_was_installed" not in transaction:
+        # Version-one transactions created before native lifecycle integration
+        # remain recoverable; they never claimed to manage the app.
+        return transaction
+    expected_runtime = (
+        transaction.get("to_sha")
+        if phase == "activating_native_bridge"
+        else transaction.get("from_sha")
+    )
+    if expected_sha != expected_runtime:
+        raise ValidationError("native Seld activation is bound to the wrong runtime revision")
+    transaction = _advance_transaction(transaction, phase=phase)
+    status_payload = _runtime_native_status(command, transaction, runner)
+    application = _native_application(status_payload.get("application"))
+    if application != transaction.get("native_bridge_application"):
+        raise ConflictError("the native Seld app path changed during self-update")
+    observed_revision = _native_revision(
+        status_payload.get("ownership_revision"),
+        "current native Seld ownership revision",
+    )
+    recorded_revision = _native_revision(
+        transaction.get("native_bridge_revision_current"),
+        "recorded native Seld ownership revision",
+    )
+    if transaction.get("native_bridge_was_installed") is not True:
+        if (
+            status_payload.get("installed") is not False
+            or status_payload.get("owned") is True
+            or status_payload.get("error_code") is not None
+            or observed_revision != recorded_revision
+        ):
+            raise ConflictError("native Seld app state changed during self-update")
+        return _advance_transaction(transaction, phase=complete_phase)
+    _require_owned_native_status(vault, status_payload)
+    if status_payload.get("current") is True:
+        return _advance_transaction(
+            transaction,
+            phase=complete_phase,
+            native_bridge_revision_current=observed_revision,
+        )
+    if observed_revision != recorded_revision:
+        raise ConflictError("native Seld ownership changed during self-update")
+    installed_payload = _run_json(
+        command,
+        [
+            "--vault",
+            str(vault.root),
+            "bridge",
+            "native-install",
+            "--expected-revision",
+            observed_revision,
+        ],
+        _native_runtime_environment(command, transaction),
+        runner,
+    )
+    installed_revision = _native_revision(
+        installed_payload.get("ownership_revision"),
+        "installed native Seld ownership revision",
+    )
+    if (
+        _native_application(installed_payload.get("application")) != application
+        or installed_payload.get("vault") != str(vault.root)
+        or installed_payload.get("vault_id") != transaction.get("vault_id")
+        or installed_revision == "absent"
+    ):
+        raise SetupError("native Seld installation returned mismatched ownership evidence")
+    verified = _runtime_native_status(command, transaction, runner)
+    _require_owned_native_status(vault, verified)
+    if (
+        verified.get("current") is not True
+        or _native_application(verified.get("application")) != application
+        or _native_revision(
+            verified.get("ownership_revision"),
+            "verified native Seld ownership revision",
+        )
+        != installed_revision
+    ):
+        raise SetupError("native Seld installation did not verify against the active runtime")
+    return _advance_transaction(
+        transaction,
+        phase=complete_phase,
+        native_bridge_revision_current=installed_revision,
+    )
+
+
+def _verify_unchanged_native_bridge(
+    vault: Vault,
+    transaction: dict[str, Any],
+    *,
+    runner: CommandRunner,
+) -> None:
+    if "native_bridge_was_installed" not in transaction:
+        return
+    active = Path(_required_string(transaction, "active_environment"))
+    command = _runtime_command(active)
+    status_payload = _runtime_native_status(command, transaction, runner)
+    if _native_application(status_payload.get("application")) != transaction.get(
+        "native_bridge_application"
+    ):
+        raise ConflictError("the native Seld app path changed during self-update")
+    observed_revision = _native_revision(
+        status_payload.get("ownership_revision"),
+        "current native Seld ownership revision",
+    )
+    if observed_revision != transaction.get("native_bridge_revision_before"):
+        raise ConflictError("native Seld ownership changed during self-update")
+    if transaction.get("native_bridge_was_installed") is True:
+        _require_owned_native_status(vault, status_payload)
+        if status_payload.get("current") is not True:
+            raise SetupError("the native Seld app no longer matches the restored runtime")
+    elif (
+        status_payload.get("installed") is not False
+        or status_payload.get("owned") is True
+        or status_payload.get("error_code") is not None
+    ):
+        raise ConflictError("native Seld app state changed during self-update")
+
+
+def _runtime_native_status(
+    command: list[str],
+    transaction: Mapping[str, Any],
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    return _run_json(
+        command,
+        ["bridge", "native-status"],
+        _native_runtime_environment(command, transaction),
+        runner,
+    )
+
+
+def _native_runtime_environment(
+    command: list[str], transaction: Mapping[str, Any]
+) -> dict[str, str]:
+    environment = _setup_environment(transaction)
+    executable_parent = str(Path(command[0]).parent)
+    current_path = environment.get("PATH")
+    environment["PATH"] = (
+        executable_parent if not current_path else f"{executable_parent}{os.pathsep}{current_path}"
+    )
+    return environment
+
+
+def _require_owned_native_status(vault: Vault, status_payload: Mapping[str, Any]) -> None:
+    if (
+        status_payload.get("installed") is not True
+        or status_payload.get("owned") is not True
+        or status_payload.get("healthy") is not True
+    ):
+        raise SetupError("the owned native Seld app could not be verified")
+    if status_payload.get("vault") != str(vault.root) or status_payload.get(
+        "vault_id"
+    ) != vault.identity().get("vault_id"):
+        raise ConflictError("the native Seld app belongs to a different Seld vault")
+
+
+def _native_application(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise ValidationError("native Seld application path is invalid")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValidationError("native Seld application path must be absolute")
+    return str(path)
+
+
+def _native_revision(value: object, label: str) -> str:
+    if value == "absent":
+        return "absent"
+    return _clean_revision(value, label)
 
 
 def _verify_active_runtime(
@@ -1401,6 +1947,15 @@ def _child_environment() -> dict[str, str]:
     return environment
 
 
+def _setup_environment(transaction: Mapping[str, Any]) -> dict[str, str]:
+    environment = _child_environment()
+    environment.pop(whatsapp.SERVICE_LABEL_ENV, None)
+    configured = transaction.get("whatsapp_service_label")
+    if configured is not None:
+        environment[whatsapp.SERVICE_LABEL_ENV] = _validated_whatsapp_service_label(configured)
+    return environment
+
+
 def _isolated_preflight_environment(root: Path) -> dict[str, str]:
     environment = _child_environment()
     home = root / "home"
@@ -1747,12 +2302,19 @@ def _transaction_summary(value: dict[str, Any] | None) -> dict[str, Any] | None:
             "updated_at",
             "error_code",
             "recovery_command",
+            "native_bridge_was_installed",
+            "native_bridge_revision_before",
+            "native_bridge_revision_current",
         )
     }
 
 
 def _validate_transaction(value: dict[str, Any]) -> None:
-    if value.get("format_version") != TRANSACTION_FORMAT_VERSION:
+    format_version = value.get("format_version")
+    if format_version not in {
+        LEGACY_TRANSACTION_FORMAT_VERSION,
+        TRANSACTION_FORMAT_VERSION,
+    }:
         raise ValidationError("unsupported Seld update transaction")
     token = _uuid(value.get("token"), "update token")
     from_sha = _clean_sha(value.get("from_sha"), "transaction installed revision")
@@ -1795,6 +2357,35 @@ def _validate_transaction(value: dict[str, Any]) -> None:
     _clean_revision(value.get("vault_digest"), "transaction vault digest")
     if not isinstance(value.get("bridge_was_running"), bool):
         raise ValidationError("Seld update transaction Bridge state is invalid")
+    native_keys = (
+        "native_bridge_was_installed",
+        "native_bridge_application",
+        "native_bridge_revision_before",
+        "native_bridge_revision_current",
+    )
+    native_fields_present = tuple(key in value for key in native_keys)
+    if format_version == TRANSACTION_FORMAT_VERSION:
+        if not all(native_fields_present):
+            raise ValidationError("Seld update transaction native-app evidence is incomplete")
+        native_was_installed = value.get("native_bridge_was_installed")
+        if not isinstance(native_was_installed, bool):
+            raise ValidationError("Seld update transaction native-app state is invalid")
+        _native_application(value.get("native_bridge_application"))
+        native_before = _native_revision(
+            value.get("native_bridge_revision_before"),
+            "transaction native-app ownership revision",
+        )
+        native_current = _native_revision(
+            value.get("native_bridge_revision_current"),
+            "transaction current native-app ownership revision",
+        )
+        if native_was_installed and "absent" in {native_before, native_current}:
+            raise ValidationError("installed native Seld app has an absent ownership revision")
+    elif any(native_fields_present) or phase in _NATIVE_TRANSACTION_PHASES:
+        raise ValidationError("legacy Seld update transaction has invalid native-app evidence")
+    whatsapp_service_label = value.get("whatsapp_service_label")
+    if whatsapp_service_label is not None:
+        _validated_whatsapp_service_label(whatsapp_service_label)
     error_code = value.get("error_code")
     if error_code is not None and (
         not isinstance(error_code, str) or not error_code or len(error_code) > 128
@@ -1982,6 +2573,9 @@ def _transaction_result(transaction: dict[str, Any]) -> dict[str, Any]:
         "transaction_revision": _receipt_revision(transaction),
         "vault_changed": transaction.get("vault_changed"),
         "vault_digest_after": transaction.get("vault_digest_after"),
+        "native_bridge_was_installed": transaction.get("native_bridge_was_installed"),
+        "native_bridge_revision_before": transaction.get("native_bridge_revision_before"),
+        "native_bridge_revision_current": transaction.get("native_bridge_revision_current"),
     }
 
 

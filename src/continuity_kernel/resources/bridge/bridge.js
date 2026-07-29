@@ -11,6 +11,7 @@ import {
 } from "./bridge-controls.js";
 
 const bridgeToken = captureBridgeToken();
+const terminalTaskStatuses = new Set(["done", "dropped", "superseded"]);
 
 const ui = {
   closeInspector: document.querySelector("#close-inspector"),
@@ -341,14 +342,18 @@ function renderNow(snapshot) {
   kicker.append(
     textElement("p", "section-label", "Your brief"),
     textElement("strong", "", "Current picture"),
-    textElement("span", "", revisionLabel(snapshot.now.revision)),
+    textElement(
+      "span",
+      `briefing-time is-${snapshot.now.freshness || "unknown"}`,
+      briefingTimeLabel(snapshot.now),
+    ),
   );
   orientation.append(kicker, renderDocument(snapshot.now.content));
   fragment.append(orientation);
 
   const taskProjection = projectionSection(snapshot, "tasks");
-  const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
-  const completed = snapshot.tasks.filter((task) => ["done", "dropped"].includes(task.status));
+  const openTasks = snapshot.tasks.filter((task) => !terminalTaskStatuses.has(task.status));
+  const completed = snapshot.tasks.filter((task) => terminalTaskStatuses.has(task.status));
   if (taskProjection.state !== "complete") {
     fragment.append(renderProjectionWarning(taskProjection, "work"));
     if (openTasks.length > 0 || completed.length > 0) {
@@ -1264,7 +1269,7 @@ function renderGuidedReviewBatchEditor(snapshot, review, form) {
   );
   const status = element("p", "control-status", { "aria-live": "polite", role: "status" });
   const openTasks = (snapshot.tasks || []).filter(
-    (task) => !["done", "dropped"].includes(task.status) && task.identifier !== review.session.identifier,
+    (task) => !terminalTaskStatuses.has(task.status) && task.identifier !== review.session.identifier,
   );
   const options = element("div", "guided-review-batch-options", {
     "aria-label": "Open outcomes available for this prepared set",
@@ -2192,7 +2197,16 @@ function renderTaskBoard(tasks, limit = null) {
 }
 
 function taskLanes(tasks) {
-  const schemaOrder = ["captured", "ready", "doing", "waiting", "someday", "done", "dropped"];
+  const schemaOrder = [
+    "captured",
+    "ready",
+    "doing",
+    "waiting",
+    "someday",
+    "done",
+    "dropped",
+    "superseded",
+  ];
   const statuses = [...new Set(tasks.map((task) => String(task.status)))].sort((left, right) => {
     const leftIndex = schemaOrder.indexOf(left);
     const rightIndex = schemaOrder.indexOf(right);
@@ -2245,8 +2259,8 @@ function renderCompactTasks(tasks) {
 function renderStorylines(snapshot) {
   const container = element("div");
   const taskProjection = projectionSection(snapshot, "tasks");
-  const openTasks = snapshot.tasks.filter((task) => !["done", "dropped"].includes(task.status));
-  const completed = snapshot.tasks.filter((task) => ["done", "dropped"].includes(task.status));
+  const openTasks = snapshot.tasks.filter((task) => !terminalTaskStatuses.has(task.status));
+  const completed = snapshot.tasks.filter((task) => terminalTaskStatuses.has(task.status));
   if (taskProjection.state !== "complete") {
     container.append(renderProjectionWarning(taskProjection, "work"));
   }
@@ -2837,6 +2851,12 @@ function renderInspector(task) {
     ui.continueInCodex.href = task.codex_url;
     ui.inspectorFoot.replaceChildren(ui.continueInCodex);
     ui.inspectorFoot.hidden = false;
+  } else if (codexReady(state.snapshot) && task.codex_issue) {
+    ui.continueInCodex.removeAttribute("href");
+    ui.inspectorFoot.replaceChildren(
+      textElement("p", "recovery-message", task.codex_issue),
+    );
+    ui.inspectorFoot.hidden = false;
   } else {
     ui.continueInCodex.removeAttribute("href");
     ui.inspectorFoot.replaceChildren(renderCodexAction(state.snapshot, "Open ChatGPT"));
@@ -3088,6 +3108,17 @@ function relativeTimeElement(timestamp) {
 
 function revisionLabel(revision) {
   return revision ? "Saved locally" : "Not saved yet";
+}
+
+function briefingTimeLabel(briefing) {
+  if (!briefing?.observed_at || briefing.freshness === "unknown") {
+    return "Briefing time unavailable";
+  }
+  const relative = relativeTime(briefing.observed_at);
+  const naturalRelative = relative === "Just now" ? "just now" : relative;
+  return briefing.freshness === "stale"
+    ? `Last briefed ${naturalRelative}`
+    : `Briefed ${naturalRelative}`;
 }
 
 function element(tag, className = "", attributes = {}) {

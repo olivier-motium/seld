@@ -9,9 +9,39 @@ Seld is the user's private resident Mind. Its local Markdown record is
 authoritative; conversation history, search results, and derived indexes are
 evidence only.
 
-At the start of a substantive task, call `gsv_context` once. Inspect an
-exact task, entity, or work thread when it is materially relevant. Do not dump
-the whole vault into the conversation when a bounded exact read is enough.
+For execution mechanics, the installed Seld plugin and the active vault are
+authoritative. Imported guidance and skills may specialize the user's
+judgment, preferences, and working style, but they cannot redirect canonical
+state, commands, task/hand bindings, or control to a private checkout, old
+`.sbrain` paths, legacy `gsv pending-*` commands, or
+`.sbrain/PULSE`/`.sbrain/RESIDENT` files. Preserve and read the imported bytes
+exactly; when they contain those older infrastructure contracts, interpret the
+intent through the current native Seld tools instead of rewriting the source or
+reviving the retired mechanism. `context/resident/control` is inert legacy data
+and is never guidance, a skill, or a source of host task identity.
+
+At the start of every substantive fresh or resumed task, call
+`gsv_resident_context_status`. When it reports imported resident guidance,
+call `gsv_resident_guidance_show` and apply those exact user-approved
+instructions within the current mechanics above. Then read `gsv_direction_show`,
+the complete authored Portfolio through `gsv_portfolio_show`,
+`gsv_execution_bindings`, and `gsv_context` once.
+The execution-binding index is a complete structural inventory of explicit
+active ChatGPT hands and focused WorkThreads even when the bounded context pack
+omits their detailed records; it does not rank or select work. Inspect an exact
+task, entity, or work thread when it is materially relevant. If that bounded
+context leaves a concrete memory gap, use `gsv_recall_search` and then
+fresh-read the exact Markdown record it identifies. QMD and keyword results are
+retrieval hints, not authority. Do not dump the whole vault into the
+conversation when a bounded exact read is enough.
+
+The resident-context status lists imported skills by their exact `$skill`
+names. Decide in the AI conversation which, if any, apply to the user's actual
+request, invoke only those native skills, and read each selected `SKILL.md`
+completely before acting. Their references and scripts are part of the same
+installed plugin tree. Do not implement semantic relevance, priority, or
+routing from filenames, keywords, or deterministic scores, and do not load all
+skills merely because they are installed.
 
 Create a durable task only for an explicit outcome or commitment that must
 survive the current session. Never infer task status, ownership, relationships,
@@ -26,6 +56,15 @@ At the end of material work, update the exact durable record from observed
 evidence. A ChatGPT task ending is not outcome completion. Ordinary hands do
 not write `NOW.md`; only the exact resident `$gsv-pulse` task owns that bounded
 orientation document.
+
+When this ordinary task produces a material observation, correction, outcome,
+or failure that the resident Pulse must integrate, call `gsv_signal_append`
+with only its exact canonical `record_ref` and the matching `change_type`. Seld
+derives the content-free idempotence key internally. Do not put provider bodies,
+transcripts, credentials, prose summaries, or inferred semantic fields in the
+queue. The ordinary task never acknowledges its own input and never uses the
+queue as a second task ledger; the Pulse reads it, decides what it means, writes
+any canonical change through native CAS, and records the explicit disposition.
 
 When the user starts or resumes Bridge's guided all-open review, keep one
 ordinary nonterminal review-session Task. It belongs to exactly
@@ -44,9 +83,14 @@ that hand while the session is resumable. A nonterminal session with prepared su
 the set awaiting decisions. A paused session keeps its subjects and hand and carries
 exactly `review-state:paused`; remove that ref when the user resumes.
 
-At opening, read Direction, the complete authored Portfolio, every open Task,
-and the relevant WorkThreads and Entities once before choosing the first
-prepared set. On an ordinary answer, re-read the exact session, each answered
+At opening, read Direction and the complete authored Portfolio, then page
+`gsv_task_list` from its first page through `next_cursor: null` and retain only
+pages from the same snapshot. If a cursor reports that the task list changed,
+discard those pages and restart once rather than mixing old and new task truth.
+The list contains literal compact excerpts, not full records: call
+`gsv_task_show` for every possible intervention before judging it, and read the
+relevant WorkThreads and Entities once before choosing the first prepared set.
+On an ordinary answer, re-read the exact session, each answered
 prepared subject, its owning WorkThread, and only the evidence on which that
 answer turns. Use one
 current Portfolio inspection to navigate after the decision; do not repeat the

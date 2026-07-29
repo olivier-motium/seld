@@ -293,10 +293,45 @@ def run_e2e(
         raise RuntimeError("stale-write proof did not fail closed")
 
     orphan = vault / "tasks/.fresh-session-proof.md.tmp-crash"
-    orphan.write_bytes(b"partial interrupted write")
-    doctor = _cli(installed, environment, ["doctor", "--repair"])
-    if not doctor["healthy"] or orphan.exists():
-        raise RuntimeError("crash-recovery doctor did not remove the orphan safely")
+    orphan_bytes = b"partial interrupted write"
+    orphan.write_bytes(orphan_bytes)
+    doctor_run = _run(
+        [str(installed), "--json", "doctor", "--repair"],
+        environment,
+        check=False,
+    )
+    doctor_payload = json.loads(doctor_run.stdout)
+    doctor = doctor_payload.get("result")
+    expected_orphan = "tasks/.fresh-session-proof.md.tmp-crash"
+    issues = doctor.get("issues") if isinstance(doctor, dict) else None
+    orphan_issue = (
+        next(
+            (
+                issue
+                for issue in issues
+                if isinstance(issue, dict)
+                and issue.get("code") == "orphan-temp"
+                and issue.get("path") == expected_orphan
+            ),
+            None,
+        )
+        if isinstance(issues, list)
+        else None
+    )
+    if (
+        doctor_run.returncode != 3
+        or doctor_payload.get("ok") is not False
+        or not isinstance(doctor, dict)
+        or doctor.get("healthy") is not False
+        or not isinstance(orphan_issue, dict)
+        or orphan_issue.get("repairable") is not False
+        or orphan.read_bytes() != orphan_bytes
+    ):
+        raise RuntimeError("doctor did not preserve the unowned crash-looking file safely")
+    orphan.unlink()
+    recovered_doctor = _cli(installed, environment, ["doctor", "--repair"])
+    if recovered_doctor["healthy"] is not True:
+        raise RuntimeError("doctor did not recover after exact owner cleanup")
 
     source_digest_at_backup = _cli(installed, environment, ["status"])["digest"]
     backup = _cli(installed, environment, ["backup", "create"])

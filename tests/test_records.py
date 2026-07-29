@@ -311,7 +311,7 @@ def test_terminal_review_session_cannot_retain_current_navigation(
         )
 
 
-def test_closed_thread_invariant_is_enforced_during_parse() -> None:
+def test_terminal_thread_invariant_is_enforced_during_parse() -> None:
     thread = new_thread(
         identifier="thread:closed-invariant",
         title="Closed invariant",
@@ -322,7 +322,7 @@ def test_closed_thread_invariant_is_enforced_during_parse() -> None:
     )
     malformed = render_thread(thread).replace('"status":"active"', '"status":"closed"')
 
-    with pytest.raises(ValidationError, match="closed threads"):
+    with pytest.raises(ValidationError, match="terminal threads"):
         parse_thread(malformed)
 
 

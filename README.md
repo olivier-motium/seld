@@ -300,9 +300,10 @@ gsv demo
 ```
 
 The demo proves that a fresh process recovers an exact saved update, an older
-copy cannot overwrite newer work, an interrupted save can be repaired, and a
-verified backup restores the same records. Its provider data is synthetic. It
-does not claim that a live connector was tested.
+copy cannot overwrite newer work, unknown crash residue is retained for review,
+and a verified backup restores the same records. It then removes only the exact
+synthetic residue it created. Its provider data is synthetic, and it does not
+claim that a live connector was tested.
 
 ## Everyday commands
 

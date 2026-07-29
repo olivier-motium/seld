@@ -12,10 +12,11 @@ from typing import Any, cast
 import pytest
 
 import continuity_kernel.update as self_update
-from continuity_kernel import mcp_server
+from continuity_kernel import mcp_server, resident_import
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED, EMPTY_REVISION, ControlQueue
+from continuity_kernel.errors import ConflictError, ValidationError
 from continuity_kernel.operations import OperationLedger
-from continuity_kernel.records import format_time
+from continuity_kernel.records import Task, format_time, record_dict
 from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
 from continuity_kernel.vault import Vault
 
@@ -68,6 +69,41 @@ def _close(process: subprocess.Popen[str]) -> None:
     assert process.wait(timeout=10) == 0
 
 
+class _TaskListVault:
+    def __init__(self, tasks: list[Task]) -> None:
+        self.tasks = tasks
+
+    def list_tasks(self, *, status: str | None = None) -> list[Task]:
+        return [task for task in self.tasks if status is None or task.status == status]
+
+    def get_task(self, identifier: str) -> Task:
+        return next(task for task in self.tasks if task.identifier == identifier)
+
+
+def _task_list_record(index: int, *, revision: str | None = None) -> Task:
+    timestamp = "2026-07-28T10:00:00Z"
+    return Task(
+        identifier=f"task-{index:04d}",
+        title=f"Task {index:04d}",
+        status="doing",
+        next_actor="agent",
+        outcome=(f"Literal outcome {index}.\n" * 80).strip(),
+        next_action=(f"Literal next action {index}.\n" * 80).strip(),
+        waiting_on=(f"Literal dependency {index}.\n" * 80).strip(),
+        rank=index,
+        active_thread_id=f"hand-{index:04d}",
+        refs=tuple(f"test:reference-{index}-{item}" for item in range(50)),
+        created_at=timestamp,
+        updated_at=timestamp,
+        revision=revision or f"{index + 1:064x}",
+        project=f"project-{index % 7}",
+        workspace=f"/synthetic/workspace/{index}",
+        codex_episode_ids=(f"episode-{index:04d}",),
+        state_changed_at=timestamp,
+        history=tuple(f"Synthetic history {index}-{item} " + "x" * 900 for item in range(5)),
+    )
+
+
 def test_two_independent_mcp_sessions_share_durable_state(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     Vault(vault).initialize(name="MCP test")
@@ -107,6 +143,454 @@ def test_two_independent_mcp_sessions_share_durable_state(tmp_path: Path) -> Non
     assert any(tool["name"] == "gsv_task_create" for tool in tools["result"]["tools"])
     assert created["result"]["structuredContent"]["identifier"] == "cross-session-proof"
     assert resumed["result"]["structuredContent"]["next_action"] == ("Read from a second process.")
+
+
+def test_task_list_pages_large_ledgers_without_history_or_silent_snapshot_drift() -> None:
+    tasks = [_task_list_record(index) for index in reversed(range(313))]
+    fake = _TaskListVault(tasks)
+    bound = cast(Vault, fake)
+    unbounded_bytes = len(
+        json.dumps(
+            {"tasks": [record_dict(task) for task in tasks]},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    assert unbounded_bytes > 1024 * 1024
+
+    arguments: dict[str, Any] = {"limit": 50, "status": "doing"}
+    seen: list[str] = []
+    pages: list[dict[str, Any]] = []
+    while True:
+        page = mcp_server._call("gsv_task_list", arguments, vault=bound)
+        pages.append(page)
+        encoded = json.dumps(page, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        assert len(encoded) <= mcp_server.TASK_LIST_MAX_PAGE_BYTES
+        for task in page["tasks"]:
+            assert {
+                "history",
+                "refs",
+                "codex_episode_ids",
+                "entity_links",
+                "workspace",
+            }.isdisjoint(task)
+            assert task["history_count"] == 5
+            assert task["reference_count"] == 50
+            assert task["codex_episode_count"] == 1
+            assert set(task["truncated_fields"]) == {
+                "next_action",
+                "outcome",
+                "waiting_on",
+            }
+            seen.append(cast(str, task["identifier"]))
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+        arguments = {"cursor": cursor, "limit": 50, "status": "doing"}
+
+    expected = [task.identifier for task in sorted(tasks, key=lambda item: item.identifier)]
+    assert seen == expected
+    assert len(seen) == len(set(seen)) == 313
+    assert len(pages) > 1
+    assert {page["snapshot_revision"] for page in pages} == {pages[0]["snapshot_revision"]}
+    assert sum(cast(int, page["returned"]) for page in pages) == 313
+
+    repeated = mcp_server._call(
+        "gsv_task_list",
+        {"limit": 50, "status": "doing"},
+        vault=bound,
+    )
+    assert repeated == pages[0]
+    transport = mcp_server._handle(
+        {
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "arguments": {"limit": 50, "status": "doing"},
+                "name": "gsv_task_list",
+            },
+        },
+        vault=bound,
+    )
+    assert transport is not None
+    assert (
+        len(json.dumps(transport, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        <= mcp_server.TASK_LIST_MAX_PAGE_BYTES * 4
+    )
+    exact = mcp_server._call("gsv_task_show", {"id": seen[0]}, vault=bound)
+    assert len(exact["history"]) == 5
+    assert len(exact["refs"]) == 50
+
+    cursor = cast(str, pages[0]["next_cursor"])
+    fake.tasks[0] = _task_list_record(312, revision="f" * 64)
+    with pytest.raises(ConflictError, match="changed during pagination"):
+        mcp_server._call(
+            "gsv_task_list",
+            {"cursor": cursor, "limit": 50, "status": "doing"},
+            vault=bound,
+        )
+
+
+def test_task_list_cursor_contract_is_strict_and_fresh_process_portable(tmp_path: Path) -> None:
+    vault_path = tmp_path / "paged-task-vault"
+    vault = Vault(vault_path)
+    vault.initialize(name="Paged tasks")
+    for index in range(61):
+        vault.create_task(
+            identifier=f"paged-{index:03d}",
+            title=f"Paged task {index:03d}",
+            outcome=f"Remain visible on page {index}.",
+            status="doing",
+            next_actor="agent",
+            next_action="Continue exact pagination.",
+        )
+    expected = [task.identifier for task in vault.list_tasks(status="doing")]
+
+    first = _start(vault_path)
+    try:
+        _exchange(first, "initialize", 1)
+        first_page = _exchange(
+            first,
+            "tools/call",
+            2,
+            {
+                "name": "gsv_task_list",
+                "arguments": {"limit": 13, "status": "doing"},
+            },
+        )["result"]["structuredContent"]
+    finally:
+        _close(first)
+
+    seen = [task["identifier"] for task in first_page["tasks"]]
+    cursor = first_page["next_cursor"]
+    second = _start(vault_path)
+    try:
+        _exchange(second, "initialize", 1)
+        request_id = 2
+        while cursor is not None:
+            page = _exchange(
+                second,
+                "tools/call",
+                request_id,
+                {
+                    "name": "gsv_task_list",
+                    "arguments": {"cursor": cursor, "limit": 13, "status": "doing"},
+                },
+            )["result"]["structuredContent"]
+            seen.extend(task["identifier"] for task in page["tasks"])
+            cursor = page["next_cursor"]
+            request_id += 1
+    finally:
+        _close(second)
+
+    assert seen == expected
+    assert len(seen) == len(set(seen)) == 61
+
+    tool = next(tool for tool in mcp_server.TOOLS if tool["name"] == "gsv_task_list")
+    properties = tool["inputSchema"]["properties"]
+    assert set(properties) == {"cursor", "limit", "status"}
+    assert properties["limit"] == {
+        "maximum": mcp_server.TASK_LIST_MAX_LIMIT,
+        "minimum": 1,
+        "type": "integer",
+    }
+    assert "gsv_task_show" in tool["description"]
+
+    with pytest.raises(ValidationError, match="limit must be"):
+        mcp_server._call("gsv_task_list", {"limit": 0}, vault=vault)
+    with pytest.raises(ValidationError, match="cursor is invalid"):
+        mcp_server._call("gsv_task_list", {"cursor": "not-a-cursor"}, vault=vault)
+    with pytest.raises(ValidationError, match="status filter"):
+        mcp_server._call(
+            "gsv_task_list",
+            {"cursor": first_page["next_cursor"], "limit": 13},
+            vault=vault,
+        )
+
+
+def test_resident_activation_mcp_surfaces_are_exact_bounded_and_fresh_process(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "resident-mcp-vault"
+    vault = Vault(vault_path)
+    vault.initialize(name="Resident MCP")
+    resident = vault_path / "context/resident"
+    skill = resident / "skills/exact-native/scripts"
+    skill.mkdir(parents=True)
+    guidance = "# Resident guidance\n\nExact MCP guidance.\n"
+    (resident / "AGENTS.md").write_text(guidance, encoding="utf-8")
+    (skill.parent / "SKILL.md").write_text(
+        "---\nname: exact-native\ndescription: Exact native skill.\n---\n\n# Exact\n",
+        encoding="utf-8",
+    )
+    (skill / "check.py").write_text("print('native')\n", encoding="utf-8")
+    control = resident / "control"
+    control.mkdir()
+    (control / "RESIDENT").write_text("legacy-private-hand\n", encoding="utf-8")
+    task = vault.create_task(
+        identifier="resident-mcp-task",
+        title="Resident MCP task",
+        outcome="Remain visible through the structural index.",
+        status="doing",
+        next_actor="agent",
+        next_action="Read the activation tools.",
+        active_thread_id="resident-mcp-hand",
+    )
+    vault.create_thread(
+        identifier="thread:resident-mcp",
+        title="Resident MCP thread",
+        purpose="Carry the activation proof.",
+        summary="The proof is current.",
+        focus_task_id=task.identifier,
+        task_ids=(task.identifier,),
+    )
+
+    process = _start(vault_path)
+    try:
+        _exchange(process, "initialize", 1)
+        names = {tool["name"] for tool in _exchange(process, "tools/list", 2)["result"]["tools"]}
+        status = _exchange(
+            process,
+            "tools/call",
+            3,
+            {"name": "gsv_resident_context_status", "arguments": {}},
+        )["result"]["structuredContent"]
+        shown = _exchange(
+            process,
+            "tools/call",
+            4,
+            {"name": "gsv_resident_guidance_show", "arguments": {}},
+        )["result"]["structuredContent"]
+        bindings = _exchange(
+            process,
+            "tools/call",
+            5,
+            {"name": "gsv_execution_bindings", "arguments": {}},
+        )["result"]["structuredContent"]
+    finally:
+        _close(process)
+
+    assert {
+        "gsv_execution_bindings",
+        "gsv_resident_context_status",
+        "gsv_resident_guidance_show",
+    }.issubset(names)
+    assert shown["content"] == guidance
+    assert status["skills_total"] == 1
+    assert status["skills"][0]["name"] == "exact-native"
+    assert status["excluded_paths"] == ["context/resident/control"]
+    assert "legacy-private-hand" not in repr(status)
+    assert bindings["active_hands"][0]["task_id"] == task.identifier
+    assert bindings["focused_threads"][0]["focus_task_id"] == task.identifier
+    tools = {tool["name"]: tool for tool in mcp_server.TOOLS}
+    for name in {
+        "gsv_execution_bindings",
+        "gsv_resident_context_status",
+        "gsv_resident_guidance_show",
+    }:
+        assert tools[name]["annotations"]["readOnlyHint"] is True
+
+
+def test_fresh_mcp_process_rejects_fields_outside_new_read_surface_schemas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault_path = tmp_path / "strict-read-surface-vault"
+    host_data = tmp_path / "host-data"
+    nonexistent_store = tmp_path / "nonexistent-store"
+    monkeypatch.setenv("GSV_DATA_DIR", str(host_data))
+    Vault(vault_path).initialize(name="Strict MCP reads")
+    process = _start(vault_path)
+    cases = (
+        (
+            "gsv_resident_context_status",
+            {"unexpected_private_payload": "synthetic"},
+            "unexpected_private_payload",
+        ),
+        (
+            "gsv_resident_guidance_show",
+            {"unexpected_private_payload": "synthetic"},
+            "unexpected_private_payload",
+        ),
+        (
+            "gsv_execution_bindings",
+            {"unexpected_private_payload": "synthetic"},
+            "unexpected_private_payload",
+        ),
+        (
+            "gsv_local_source_status",
+            {"source": "apple_messages", "store_root": str(nonexistent_store)},
+            "store_root",
+        ),
+        (
+            "gsv_local_source_baseline",
+            {"source": "apple_messages", "store_root": str(nonexistent_store)},
+            "store_root",
+        ),
+        (
+            "gsv_local_source_staged_status",
+            {"store_root": str(nonexistent_store)},
+            "store_root",
+        ),
+        (
+            "gsv_local_source_adopt_staged",
+            {
+                "disposition": "adopt_verified_prefix",
+                "expected_migration_revision": "a" * 64,
+                "expected_source_revision": "b" * 64,
+                "source": "apple_messages",
+                "store_root": str(nonexistent_store),
+            },
+            "store_root",
+        ),
+        (
+            "gsv_local_source_poll",
+            {"source": "apple_messages", "store_root": str(nonexistent_store)},
+            "store_root",
+        ),
+        (
+            "gsv_local_source_rebaseline",
+            {
+                "disposition": "forward_only_reset",
+                "expected_checkpoint_digest": "sha256:" + "a" * 64,
+                "expected_sequence": 0,
+                "source": "apple_messages",
+                "store_root": str(nonexistent_store),
+            },
+            "store_root",
+        ),
+        (
+            "gsv_local_source_acknowledge",
+            {
+                "account_binding": "synthetic-account",
+                "actor_ref": "codex:synthetic",
+                "disposition": "accepted",
+                "expected_source_revision": "absent",
+                "result_refs": ["task:synthetic@revision"],
+                "source": "apple_messages",
+                "store_root": str(nonexistent_store),
+                "token": "synthetic-token",
+            },
+            "store_root",
+        ),
+        (
+            "gsv_recall_status",
+            {"index_root": str(tmp_path / "foreign-index")},
+            "index_root",
+        ),
+        (
+            "gsv_recall_search",
+            {"index_root": str(tmp_path / "foreign-index"), "query": "synthetic"},
+            "index_root",
+        ),
+    )
+    try:
+        _exchange(process, "initialize", 1)
+        for request_id, (name, arguments, extra) in enumerate(cases, start=2):
+            response = _exchange(
+                process,
+                "tools/call",
+                request_id,
+                {"name": name, "arguments": arguments},
+            )["result"]
+            assert response["isError"] is True
+            assert response["content"] == [
+                {
+                    "type": "text",
+                    "text": f"{name} arguments has unknown field {extra}",
+                }
+            ]
+        missing = _exchange(
+            process,
+            "tools/call",
+            len(cases) + 2,
+            {"name": "gsv_local_source_baseline", "arguments": {}},
+        )["result"]
+        assert missing["content"] == [
+            {
+                "type": "text",
+                "text": "source must be a non-empty string",
+            }
+        ]
+        wrong_type = _exchange(
+            process,
+            "tools/call",
+            len(cases) + 3,
+            {"name": "gsv_recall_status", "arguments": {"timeout_seconds": "slow"}},
+        )["result"]
+        assert wrong_type["content"] == [
+            {"type": "text", "text": "timeout_seconds must be an integer"}
+        ]
+    finally:
+        _close(process)
+    assert not host_data.exists()
+    assert not nonexistent_store.exists()
+
+
+def test_entity_relationship_mcp_mutation_survives_a_fresh_process(tmp_path: Path) -> None:
+    vault_path = tmp_path / "entity-mcp-vault"
+    vault = Vault(vault_path)
+    vault.initialize(name="Entity MCP")
+    person = vault.create_entity(
+        identifier="person:mcp-owner",
+        title="MCP owner",
+        entity_type="person",
+        summary="One exact identity.",
+    )
+    vault.create_entity(
+        identifier="company:mcp-studio",
+        title="MCP studio",
+        entity_type="company",
+        summary="One exact organization.",
+    )
+
+    first = _start(vault_path)
+    _exchange(first, "initialize", 1)
+    linked = _exchange(
+        first,
+        "tools/call",
+        2,
+        {
+            "name": "gsv_entity_link",
+            "arguments": {
+                "id": person.identifier,
+                "expected_revision": person.revision,
+                "predicate": "works-at",
+                "target_id": "company:mcp-studio",
+                "refs": ["source:mcp-test"],
+                "note": "Authored through MCP",
+            },
+        },
+    )
+    _close(first)
+
+    second = _start(vault_path)
+    _exchange(second, "initialize", 1)
+    reread = _exchange(
+        second,
+        "tools/call",
+        2,
+        {"name": "gsv_entity_show", "arguments": {"id": person.identifier}},
+    )
+    _close(second)
+
+    linked_payload = linked["result"]["structuredContent"]
+    reread_payload = reread["result"]["structuredContent"]
+    assert linked_payload["revision"] == reread_payload["revision"]
+    assert reread_payload["relationships"] == [
+        {
+            "predicate": "works-at",
+            "recorded_at": reread_payload["updated_at"],
+            "refs": ["source:mcp-test"],
+            "status": "current",
+            "target": "company:mcp-studio",
+            "valid_from": None,
+            "valid_to": None,
+        }
+    ]
+    assert any("Authored through MCP" in item for item in reread_payload["history"])
 
 
 @pytest.mark.skipif(
@@ -245,17 +729,29 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
     expected = {
         "gsv_backup_create",
         "gsv_context",
+        "gsv_execution_bindings",
         "gsv_direction_set",
         "gsv_direction_show",
         "gsv_doctor",
         "gsv_document_show",
         "gsv_document_update",
         "gsv_entity_create",
+        "gsv_entity_link",
         "gsv_entity_list",
+        "gsv_entity_merge",
+        "gsv_entity_resolve",
         "gsv_entity_show",
+        "gsv_entity_unlink",
         "gsv_entity_update",
         "gsv_local_file_grant_list",
         "gsv_local_file_read",
+        "gsv_local_source_acknowledge",
+        "gsv_local_source_adopt_staged",
+        "gsv_local_source_baseline",
+        "gsv_local_source_poll",
+        "gsv_local_source_rebaseline",
+        "gsv_local_source_staged_status",
+        "gsv_local_source_status",
         "gsv_operation_accept",
         "gsv_operation_archive_closed",
         "gsv_operation_list",
@@ -264,16 +760,30 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         "gsv_portfolio_migrate_review_session",
         "gsv_portfolio_set",
         "gsv_portfolio_show",
+        "gsv_pulse_status",
+        "gsv_pulse_sweep",
+        "gsv_recall_search",
+        "gsv_recall_status",
+        "gsv_resident_context_status",
+        "gsv_resident_guidance_show",
         "gsv_status",
         "gsv_source_list",
         "gsv_source_record",
         "gsv_source_select",
+        "gsv_signal_acknowledge",
+        "gsv_signal_append",
+        "gsv_signal_compact",
+        "gsv_signal_list",
+        "gsv_signal_show",
+        "gsv_signal_status",
         "gsv_task_create",
         "gsv_task_list",
         "gsv_task_show",
         "gsv_task_update",
         "gsv_thread_create",
         "gsv_thread_list",
+        "gsv_thread_merge",
+        "gsv_thread_resolve",
         "gsv_thread_show",
         "gsv_thread_update",
         "gsv_update_status",
@@ -281,6 +791,150 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
     if not CONTROL_STORE_SUPPORTED:
         expected.difference_update(mcp_server.OPERATION_TOOL_NAMES)
     assert names == expected
+
+
+def test_mcp_local_source_migration_routes_only_vault_staged_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Staged MCP")
+    captured: dict[str, object] = {}
+
+    def staged_status(selected: Vault) -> dict[str, object]:
+        assert selected.root == vault.root
+        return {"checkpoints": [], "migration_revision": "a" * 64}
+
+    def adopt_staged(selected: Vault, **values: object) -> dict[str, object]:
+        assert selected.root == vault.root
+        captured.update(values)
+        return {"adopted": True, "source": values["source"]}
+
+    monkeypatch.setattr(
+        resident_import,
+        "staged_local_source_checkpoint_status",
+        staged_status,
+    )
+    monkeypatch.setattr(
+        resident_import,
+        "adopt_staged_local_source_checkpoint",
+        adopt_staged,
+    )
+
+    status = mcp_server._call("gsv_local_source_staged_status", {}, vault=vault)
+    adopted = mcp_server._call(
+        "gsv_local_source_adopt_staged",
+        {
+            "disposition": "adopt_verified_prefix",
+            "expected_migration_revision": "a" * 64,
+            "expected_source_revision": "b" * 64,
+            "source": "apple_messages",
+        },
+        vault=vault,
+    )
+
+    assert status["migration_revision"] == "a" * 64
+    assert adopted == {"adopted": True, "source": "apple_messages"}
+    assert captured == {
+        "disposition": "adopt_verified_prefix",
+        "expected_migration_revision": "a" * 64,
+        "expected_source_revision": "b" * 64,
+        "source": "apple_messages",
+    }
+    with pytest.raises(ValidationError, match="unknown field prior_cursor"):
+        mcp_server._call(
+            "gsv_local_source_adopt_staged",
+            {
+                "disposition": "adopt_verified_prefix",
+                "expected_migration_revision": "a" * 64,
+                "expected_source_revision": "b" * 64,
+                "prior_cursor": "raw-provider-cursor",
+                "source": "apple_messages",
+            },
+            vault=vault,
+        )
+
+
+def test_fresh_mcp_reports_an_absent_staged_local_source_migration(tmp_path: Path) -> None:
+    vault_path = tmp_path / "fresh-staged-mcp"
+    vault = Vault(vault_path)
+    vault.initialize(name="Fresh staged MCP")
+    process = _start(vault_path)
+    try:
+        _exchange(process, "initialize", 1)
+        response = _exchange(
+            process,
+            "tools/call",
+            2,
+            {"name": "gsv_local_source_staged_status", "arguments": {}},
+        )["result"]
+    finally:
+        _close(process)
+
+    assert response["isError"] is False
+    status = json.loads(response["content"][0]["text"])
+    assert status == {
+        "checkpoints": [],
+        "migration_revision": resident_import.ABSENT_LOCAL_SOURCE_MIGRATION_REVISION,
+        "source_revision": vault.get_source_snapshot().revision,
+        "vault_id": vault.identity()["vault_id"],
+    }
+    assert not (vault_path / ".gsv/migrations/local-source-checkpoints.json").exists()
+
+
+def test_mcp_pulse_sweep_is_provider_free_and_visible_to_a_fresh_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault_path = tmp_path / "pulse-mcp-vault"
+    vault = Vault(vault_path)
+    vault.initialize(name="Pulse MCP")
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host-data"))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    swept = mcp_server._call("gsv_pulse_sweep", {}, vault=vault)
+    process = _start(vault_path)
+    try:
+        _exchange(process, "initialize", 1)
+        status = _exchange(
+            process,
+            "tools/call",
+            2,
+            {"name": "gsv_pulse_status", "arguments": {}},
+        )["result"]["structuredContent"]
+        names = {tool["name"] for tool in _exchange(process, "tools/list", 3)["result"]["tools"]}
+    finally:
+        _close(process)
+
+    assert swept["status"] == "complete"
+    assert status["heartbeat"]["observed_at"] == swept["observed_at"]
+    assert status["heartbeat"]["sequence"] == 1
+    assert not any(name.startswith("gsv_scheduler_") for name in names)
+    assert {"gsv_pulse_status", "gsv_pulse_sweep"}.issubset(names)
+
+    tools = {tool["name"]: tool for tool in mcp_server.TOOLS}
+    assert tools["gsv_pulse_status"]["annotations"]["readOnlyHint"] is True
+    assert tools["gsv_pulse_sweep"]["annotations"]["readOnlyHint"] is False
+
+
+def test_mcp_signal_append_rejects_arbitrary_provider_envelopes(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "signal-vault")
+    vault.initialize(name="Signal privacy")
+
+    with pytest.raises(ValidationError, match="unknown field envelope"):
+        mcp_server._call(
+            "gsv_signal_append",
+            {
+                "change_type": "observation",
+                "envelope": {"body": "raw provider body", "token": "sk-live-secret"},
+                "record_ref": f"task:launch@{'a' * 64}",
+            },
+            vault=vault,
+        )
+
+    tool = next(tool for tool in mcp_server.TOOLS if tool["name"] == "gsv_signal_append")
+    properties = tool["inputSchema"]["properties"]
+    assert set(properties) == {"change_type", "record_ref"}
 
 
 def test_update_mcp_surface_is_cache_only_and_cannot_apply_or_check(
