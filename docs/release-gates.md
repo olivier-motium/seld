@@ -111,6 +111,19 @@ dependency, privacy, backup/restore, Bridge, MCP, and uninstall gates passed.
 Fable 5 Max and an independent hostile security review both returned `READY`
 with no Blocker or High finding.
 
+PR 18's first exact-head run exposed a Windows-only mypy portability gap: the
+POSIX recovery calls were already unreachable after Windows refusal, but their
+attributes were not hidden from Windows typeshed. Commit
+`f711d530b68d3548574f7b8e1f03bd2356805532` keeps the same runtime boundary and
+types those POSIX-only members explicitly. Its updater module has SHA-256
+`682a4e99790246e09cac8b72e89eefeb63187ada1ada8367366953d571afd05a`.
+That tree passed native and `--platform win32` mypy, 239 focused updater and
+surface tests, the full suite with 976 passed and 4 skipped at 80.61% branch
+coverage, the zero-finding privacy scan, all 23 browser cases, and a fresh real
+source-update proof with 658 five-millisecond availability probes and zero
+gaps. The amended exact-head GitHub matrix remains a separate publication
+receipt.
+
 This packet proves the updater's local installed-path, interruption, and
 rollback contracts for the official macOS source channel. Remote publication
 still requires exact-head PR checks, a verified public-main commit, and a
