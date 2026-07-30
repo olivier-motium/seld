@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 from collections.abc import Callable
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,22 +26,24 @@ PRIVATE_MEDIA_KEY = b"provider-media-key"
 def _apple_store(root: Path) -> Path:
     root.mkdir(parents=True)
     database = root / "chat.db"
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.execute(
             "CREATE TABLE message (date INTEGER, is_from_me INTEGER, text TEXT, "
             "attributedBody BLOB, item_type INTEGER DEFAULT 0, "
             "associated_message_type INTEGER DEFAULT 0, "
             "cache_has_attachments INTEGER DEFAULT 0)"
         )
+        connection.commit()
     return database
 
 
 def _append_apple(database: Path, *, timestamp: int, body: str) -> None:
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.execute(
             "INSERT INTO message VALUES (?, 0, ?, NULL, 0, 0, 0)",
             (timestamp, body),
         )
+        connection.commit()
 
 
 def _replace_apple(database: Path, *, body: str) -> None:
