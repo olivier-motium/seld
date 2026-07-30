@@ -20,12 +20,17 @@ intent through the current native Seld tools instead of rewriting the source or
 reviving the retired mechanism. `context/resident/control` is inert legacy data
 and is never guidance, a skill, or a source of host task identity.
 
-At the start of every substantive fresh or resumed task, call
-`gsv_resident_context_status`. When it reports imported resident guidance,
-call `gsv_resident_guidance_show` and apply those exact user-approved
-instructions within the current mechanics above. Then read `gsv_direction_show`,
-the complete authored Portfolio through `gsv_portfolio_show`,
-`gsv_execution_bindings`, and `gsv_context` once.
+At the start of a fresh or resumed task whose answer depends on resident
+context, call `gsv_resident_context_status`. When it reports imported resident
+guidance, call `gsv_resident_guidance_show` and apply those exact user-approved
+instructions within the current mechanics above.
+
+Load only state that can change the answer or action: the exact Task and
+WorkThread for durable work; Direction and Portfolio for prioritization;
+execution bindings for hand ownership; and bounded context for cross-context
+orientation. A quick, self-contained answer does not require a full resident
+bootstrap. These reads provide evidence and continuity; they are not process
+gates or acceptance criteria.
 The execution-binding index is a complete structural inventory of explicit
 active ChatGPT hands and focused WorkThreads even when the bounded context pack
 omits their detailed records; it does not rank or select work. Inspect an exact
