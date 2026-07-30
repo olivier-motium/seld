@@ -56,7 +56,7 @@ ABSENT_BINDING_REVISION: Final = "absent"
 MAX_BINDING_BYTES: Final = 32 * 1024
 MAX_RUNTIME_BYTES: Final = 32 * 1024 * 1024
 MAX_INTERPRETER_BYTES: Final = 512 * 1024 * 1024
-MAX_MCP_OUTPUT_BYTES: Final = 64 * 1024
+MAX_MCP_OUTPUT_BYTES: Final = 256 * 1024
 # One poll can perform identity plus five sequential channel GETs. The
 # companion caps each request at five seconds and permits one provider-directed
 # retry of at most two seconds, so the host bound must cover the 72-second
@@ -442,6 +442,8 @@ def _runtime_snapshot(path: Path) -> tuple[_FileIdentity, _FileIdentity | None]:
     runtime = _file_identity(expanded, listed, max_bytes=MAX_RUNTIME_BYTES, label="Discord runtime")
     first_line = read_regular_file(expanded, label="Discord runtime", max_bytes=MAX_RUNTIME_BYTES)
     interpreter = _shebang_interpreter(first_line.splitlines()[0] if first_line else b"")
+    if interpreter is None:
+        raise ValidationError("Discord runtime must declare one pinned interpreter")
     return runtime, interpreter
 
 
@@ -1196,6 +1198,7 @@ def _item_projection(value: object, *, max_content_chars: int) -> dict[str, Any]
 
 
 def _ack_projection(value: dict[str, Any]) -> dict[str, Any]:
+    _source_header(value)
     if value.get("source") != SOURCE_ID or value.get("acknowledged") is not True:
         raise ValidationError("Discord acknowledgement response is invalid")
     already = _boolean(value.get("alreadyAcknowledged"), "Discord idempotence flag")

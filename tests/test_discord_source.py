@@ -82,6 +82,7 @@ def load():
 
 def save(state):
     STATE.parent.mkdir(parents=True, exist_ok=True)
+    state["private_channels"] = os.environ["DISCORD_CHANNEL_IDS"].split(",")
     STATE.write_text(json.dumps(state))
     STATE.with_suffix(".envkeys").write_text(json.dumps(sorted(os.environ)))
 
@@ -218,7 +219,8 @@ def tool_result(name, arguments):
         committed = checkpoint(state)
         if CORRUPT_ACK:
             committed["cursorBinding"] = cursor("c")
-        return {{"source":"discord","acknowledged":True,"alreadyAcknowledged":already,
+        return {{"source":"discord","recipeVersion":"2",
+                "acknowledged":True,"alreadyAcknowledged":already,
                 "checkpoint":committed}}
     raise RuntimeError("unsupported tool")
 
@@ -314,6 +316,14 @@ def test_binding_is_cas_bound_owner_only_and_contains_no_provider_secret(
     with pytest.raises(ValidationError, match="non-symlinked"):
         DiscordSourceBridge(other_vault).bind(link, expected_revision="absent")
 
+    native = tmp_path / "native-runtime"
+    native.write_text("not a supported companion runtime\n")
+    native.chmod(0o700)
+    native_vault = Vault(tmp_path / "native-vault")
+    native_vault.initialize(name="Native")
+    with pytest.raises(ValidationError, match="pinned interpreter"):
+        DiscordSourceBridge(native_vault).bind(native, expected_revision="absent")
+
     runtime.write_text(runtime.read_text() + "\n# drift\n")
     assert bridge.binding_status()["runtimeCurrent"] is False
     unbound = bridge.unbind(expected_revision=str(bound["bindingRevision"]))
@@ -385,7 +395,9 @@ def test_baseline_record_ack_and_fresh_process_idempotence(
     vault_bytes = b"".join(path.read_bytes() for path in vault.root.rglob("*") if path.is_file())
     for encoded in (host_bytes, vault_bytes):
         assert TOKEN.encode() not in encoded
-        assert CHANNEL.encode() not in encoded
+    assert CHANNEL.encode() in bridge.state_path.read_bytes()
+    assert CHANNEL.encode() not in bridge.binding_path.read_bytes()
+    assert CHANNEL.encode() not in vault_bytes
 
     current = vault.source_status()
     assert current["sources"][0]["freshness"] == "current"
