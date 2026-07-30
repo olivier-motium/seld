@@ -153,6 +153,8 @@ def test_generated_mcp_environment_preserves_only_valid_explicit_service_label(
     vault.mkdir()
     monkeypatch.setenv(whatsapp.SERVICE_LABEL_ENV, "ai.example.wacli-sync")
     monkeypatch.setenv("UNRELATED_PROVIDER_SECRET", "must-not-copy")
+    monkeypatch.setenv("DISCORD_USER_TOKEN", "must-remain-session-only")
+    monkeypatch.setenv("DISCORD_CHANNEL_IDS", "111111111111111111")
 
     assert _generated_mcp_environment(vault) == {
         integration.GSV_DATA_DIR_ENV: str(data_dir()),
@@ -510,6 +512,7 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
         "asana",
         "atlassian",
         "box",
+        "discord",
         "figma",
         "github",
         "gmail",

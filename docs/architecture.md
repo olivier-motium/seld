@@ -52,6 +52,22 @@ cloud placeholders, and passes content through the privacy screen. The portable
 source ledger retains only a fingerprint of the current grant set, so any grant
 change makes earlier coverage require a new bounded read.
 
+Discord uses a dedicated companion bridge because its provider cursor must not
+be confused with Seld's portable source receipt. A CLI-only, compare-and-swap
+host record binds one exact self-contained executable, its interpreter, and
+its three-tool inventory to one physical vault. On POSIX hosts Seld opens and
+re-hashes the bound artifact, then gives that already-open file to the pinned
+interpreter, closing the artifact's verify-to-execute path race. Seld launches it with a
+minimal environment containing exactly one caller-supplied token, the exact
+channel allowlist, and a vault-specific private state path. The generated
+ChatGPT MCP manifest contains none of those values. Status verifies the
+transient account identity and channel-set digest. Poll performs one bounded
+GET-only read and stages a checkpoint; Seld independently validates the
+privacy-minimized projection and delivery binding. Only after a matching
+portable `SOURCES.md` receipt is committed and fresh-read may acknowledgement
+advance the companion cursor. Pending work replays or is safely reread from
+the last committed cursor after restart.
+
 The packaged `gsv-onboard`, `gsv-pulse`, and `gsv-update` skills compose
 document, Task, WorkThread, Portfolio, source, operation, Bridge, and updater
 surfaces. Deterministic code on those paths protects identity, privacy, bounds,

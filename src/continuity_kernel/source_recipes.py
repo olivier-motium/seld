@@ -239,7 +239,7 @@ RECIPES: Final = {
         _recipe(
             "discord",
             "Discord",
-            version="1",
+            version="2",
             identity="discord.account.identity",
             read="discord.messages.recent_read",
             ttl_hours=6,

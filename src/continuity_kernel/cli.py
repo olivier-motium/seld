@@ -45,6 +45,7 @@ from continuity_kernel.config import (
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
 from continuity_kernel.direction import direction_aim, direction_dict
+from continuity_kernel.discord_source import DiscordSourceBridge
 from continuity_kernel.errors import ContinuityError, SetupError, ValidationError
 from continuity_kernel.local_source_delivery import (
     FORWARD_ONLY_RESET,
@@ -362,6 +363,30 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 error_code=args.error_code,
             )
         raise AssertionError("unreachable source command")
+    if args.command == "discord-source":
+        discord_bridge = DiscordSourceBridge(vault)
+        if args.discord_source_command == "binding-status":
+            return discord_bridge.binding_status()
+        if args.discord_source_command == "bind":
+            return discord_bridge.bind(
+                Path(args.runtime).expanduser().absolute(),
+                expected_revision=args.expected_revision,
+            )
+        if args.discord_source_command == "unbind":
+            return discord_bridge.unbind(expected_revision=args.expected_revision)
+        if args.discord_source_command == "status":
+            return discord_bridge.status()
+        if args.discord_source_command == "poll":
+            return discord_bridge.poll(
+                limit=args.limit,
+                max_content_chars=args.max_content_chars,
+            )
+        if args.discord_source_command == "acknowledge":
+            return discord_bridge.acknowledge(
+                ack_token=args.ack_token,
+                expected_source_revision=args.expected_source_revision,
+            )
+        raise AssertionError("unreachable Discord source command")
     if args.command == "local-source":
         delivery = LocalSourceDelivery(
             vault,
@@ -1222,6 +1247,46 @@ def _parser() -> argparse.ArgumentParser:
     source_record.add_argument("--cursor")
     source_record.add_argument("--evidence-ref", action="append", default=[])
     source_record.add_argument("--error-code", choices=SOURCE_ERROR_CODES)
+
+    discord_source = commands.add_parser(
+        "discord-source",
+        help="Bind and operate Seld's GET-only Discord ingestion companion.",
+    )
+    discord_source_commands = discord_source.add_subparsers(
+        dest="discord_source_command",
+        required=True,
+    )
+    discord_source_commands.add_parser(
+        "binding-status",
+        help="Show the content-free host-local companion binding revision.",
+    )
+    discord_bind = discord_source_commands.add_parser(
+        "bind",
+        help="CAS-bind one exact local companion executable; no credentials are stored.",
+    )
+    discord_bind.add_argument("--runtime", required=True)
+    discord_bind.add_argument("--expected-revision", required=True)
+    discord_unbind = discord_source_commands.add_parser(
+        "unbind",
+        help="CAS-remove the host-local companion binding without touching Discord or its token.",
+    )
+    discord_unbind.add_argument("--expected-revision", required=True)
+    discord_source_commands.add_parser(
+        "status",
+        help="Verify runtime, account identity, confinement, and checkpoint health.",
+    )
+    discord_poll = discord_source_commands.add_parser(
+        "poll",
+        help="Read one bounded transient delivery without advancing the checkpoint.",
+    )
+    discord_poll.add_argument("--limit", type=int, default=5)
+    discord_poll.add_argument("--max-content-chars", type=int, default=280)
+    discord_ack = discord_source_commands.add_parser(
+        "acknowledge",
+        help="Advance only after a matching Discord source receipt is durably readable.",
+    )
+    discord_ack.add_argument("--ack-token", required=True)
+    discord_ack.add_argument("--expected-source-revision", required=True)
 
     local_source = commands.add_parser(
         "local-source",
