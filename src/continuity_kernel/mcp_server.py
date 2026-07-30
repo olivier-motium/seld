@@ -16,6 +16,7 @@ from continuity_kernel import __version__, resident_import
 from continuity_kernel.config import resolve_vault
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.direction import direction_aim, direction_dict
+from continuity_kernel.discord_source import DiscordSourceBridge
 from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
 from continuity_kernel.local_source_delivery import (
     FORWARD_ONLY_RESET,
@@ -312,6 +313,18 @@ def _call(
             cursor=_optional_string(values, "cursor"),
             evidence_refs=_strings(values, "evidence_refs"),
             error_code=_optional_string(values, "error_code"),
+        )
+    if name == "gsv_discord_source_status":
+        return DiscordSourceBridge(vault).status()
+    if name == "gsv_discord_source_poll":
+        return DiscordSourceBridge(vault).poll(
+            limit=_integer(values, "limit", 5),
+            max_content_chars=_integer(values, "max_content_chars", 280),
+        )
+    if name == "gsv_discord_source_acknowledge":
+        return DiscordSourceBridge(vault).acknowledge(
+            ack_token=_string(values, "ack_token"),
+            expected_source_revision=_string(values, "expected_source_revision"),
         )
     if name == "gsv_local_source_status":
         return LocalSourceDelivery(vault).status(_string(values, "source"))
@@ -1185,6 +1198,42 @@ TOOLS: Final = [
             },
         },
         ("expected_revision", "source", "actor_ref", "result"),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_discord_source_status",
+        (
+            "Verify the exact host-bound GET-only Discord companion, configured account identity, "
+            "channel-set confinement, and content-free checkpoint health. Tokens and channel IDs "
+            "are inherited transiently and never returned or stored by Seld."
+        ),
+        {},
+        read_only=True,
+    ),
+    _tool(
+        "gsv_discord_source_poll",
+        (
+            "Read or replay one bounded privacy-minimized Discord delta through the exact "
+            "CLI-bound companion. This stages a private acknowledgement but does not advance it; "
+            "record the returned source receipt with gsv_source_record first."
+        ),
+        {
+            "limit": {"maximum": 25, "minimum": 1, "type": "integer"},
+            "max_content_chars": {"maximum": 500, "minimum": 0, "type": "integer"},
+        },
+        read_only=False,
+    ),
+    _tool(
+        "gsv_discord_source_acknowledge",
+        (
+            "Fresh-read the exact Seld Discord receipt and advance the companion checkpoint only "
+            "when its account, tool, cursor, coverage, completeness, and delivery binding match."
+        ),
+        {
+            "ack_token": TEXT,
+            "expected_source_revision": TEXT,
+        },
+        ("ack_token", "expected_source_revision"),
         read_only=False,
     ),
     _tool(

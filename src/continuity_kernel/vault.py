@@ -2338,6 +2338,14 @@ class Vault:
             local_fingerprint = source_fingerprint(local_binding, "local-file authority")
             if local_fingerprint is not None:
                 current_tools[LOCAL_FILE_SOURCE_ID] = local_fingerprint
+        if "discord" in snapshot.selected_sources:
+            # Local import avoids making the core vault depend on a provider
+            # bridge at module-import time.
+            from continuity_kernel.discord_source import current_discord_tool_fingerprint
+
+            discord_fingerprint = current_discord_tool_fingerprint(self)
+            if discord_fingerprint is not None:
+                current_tools["discord"] = discord_fingerprint
         return source_snapshot_dict(
             snapshot,
             current_host_fingerprint=host_fingerprint,

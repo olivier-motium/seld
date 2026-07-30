@@ -17,6 +17,7 @@ def test_supported_source_set_is_explicit_and_versioned() -> None:
         "atlassian",
         "box",
         "codex_activity",
+        "discord",
         "figma",
         "github",
         "gmail",
@@ -36,7 +37,10 @@ def test_supported_source_set_is_explicit_and_versioned() -> None:
         "teams",
         "whatsapp",
     }
-    assert {recipe.recipe_version for recipe in RECIPES.values()} == {"1"}
+    assert RECIPES["discord"].recipe_version == "2"
+    assert {recipe.recipe_version for source, recipe in RECIPES.items() if source != "discord"} == {
+        "1"
+    }
     assert all(recipe.read_limit > 0 for recipe in RECIPES.values())
     assert all(recipe.proof_ttl.total_seconds() > 0 for recipe in RECIPES.values())
 
@@ -54,6 +58,7 @@ def test_consumer_source_ecosystem_has_bounded_read_recipes() -> None:
         "asana",
         "atlassian",
         "box",
+        "discord",
         "figma",
         "gmail",
         "google_calendar",

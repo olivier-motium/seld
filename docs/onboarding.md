@@ -41,15 +41,17 @@ source later by running `$gsv-onboard` again.
 activity, Gmail, Google Calendar, Google Drive and Sheets, Outlook mail and
 calendar, Slack, Teams, GitHub, Asana, Atlassian, Box, Figma, Notion,
 SharePoint, local files, Apple Messages, WhatsApp, Shopify, Instagram, and
-optional screen context.
+Discord, plus optional screen context.
 
 The catalog describes capabilities, not pre-authenticated accounts. The actual
 read surface comes from the source the user enabled:
 
 - supported ChatGPT apps for services available in the user's plan and region;
 - custom MCP servers for services such as Shopify or Instagram;
-- bounded local read tools for local files or Apple Messages; and
-- the separately enabled WhatsApp read tool.
+- bounded local read tools for local files or Apple Messages;
+- the separately enabled WhatsApp read tool; and
+- Seld's exact host-bound Discord companion, which inherits one token and an
+  exact channel allowlist from the private process environment.
 
 Selecting `local_files` does not grant a directory. After the user approves one
 exact root, the interactive task runs
@@ -58,6 +60,15 @@ CLI-only. A fresh task reads the host-local grant through
 `gsv_local_file_grant_list`, then passes its opaque ID and one relative path to
 `gsv_local_file_read`. Deselecting local files revokes every root grant for that
 vault.
+
+Discord setup is deliberately separate from Seld's generated MCP manifest, so
+the token and raw channel IDs are never written into the plugin, vault, or
+binding receipt. The local CLI binds one exact `discord-mcp` executable; Seld's
+own MCP then exposes status, bounded poll, and explicit acknowledgement. Bot
+mode is recommended. Discord states that automating a normal user account
+outside its OAuth2/bot API is forbidden and can result in account termination,
+so user-token mode proceeds only after a visible warning and explicit informed
+opt-in. Seld's GET-only confinement does not change that terms risk.
 
 Seld never falls back to browser scraping when a source tool is missing. It
 reports the gap and continues with the sources that are available. Provider and

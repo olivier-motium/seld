@@ -254,9 +254,9 @@ The macOS source distribution includes:
 
 The source catalog includes ChatGPT activity, Gmail, Google Calendar, Google
 Drive and Sheets, Outlook, Slack, Teams, GitHub, Asana, Atlassian, Box, Figma,
-Notion, SharePoint, local files, Apple Messages, WhatsApp, Shopify, Instagram,
-and optional screen context. The user enables the relevant ChatGPT app, custom
-MCP server, or local read tool. Onboarding confirms the intended account and
+Notion, SharePoint, local files, Apple Messages, WhatsApp, Discord, Shopify,
+Instagram, and optional screen context. The user enables the relevant ChatGPT
+app, custom MCP server, or local read tool. Onboarding confirms the intended account and
 performs a bounded read before recording the AI-authored coverage horizon. Seld
 marks a source current only while the successful read remains within its
 recipe's freshness window on the computer and recipe version that produced it.

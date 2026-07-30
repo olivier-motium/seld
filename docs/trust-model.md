@@ -27,6 +27,15 @@
   in an owner-only host record bound to one exact vault-directory identity and
   selected root; grant changes or same-path vault replacement make earlier
   source proof require revalidation, and MCP cannot create or revoke a grant.
+- Selecting `discord` grants no provider authority. A CLI-only host receipt
+  binds one exact bundled GET-only companion runtime. On POSIX the verified
+  open artifact, rather than a later path lookup, is handed to its pinned
+  interpreter. The token exists only in the caller-owned process environment;
+  raw channel IDs remain confined to that environment and the owner-only
+  companion checkpoint. Neither enters the
+  portable vault or generated MCP manifest. Poll cannot advance its
+  cursor until Seld fresh-reads a matching account/tool/cursor/coverage/delivery
+  receipt, and a changed executable, account, or channel set fails closed.
 - A loopback caller without the current per-launch bearer cannot read the
   Bridge snapshot or health identity.
 - A stale, forged, or PID-reused Bridge receipt cannot cause Seld to signal an
