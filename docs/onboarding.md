@@ -23,10 +23,10 @@ inputs, source boundaries, revisions, privacy checks, receipts, and readback.
    context. The user enables the relevant host-owned ChatGPT apps, custom MCP
    servers, Seld-managed connectors, or local read tools in one setup wave and
    completes authentication personally. A host-owned app keeps its own
-   account-bound authentication. A connector implementation using `gsv-auth`
-   keeps separate portable metadata and OS-keyring custody. A local directory
-   gets its own path-specific grant after the user reviews the exact root and
-   exclusions.
+   account-bound authentication. The built-in Google, Microsoft, Slack, and
+   Discord profiles use `gsv-auth` portable metadata and OS-keyring custody
+   instead. A local directory gets its own path-specific grant after the user
+   reviews the exact root and exclusions.
 5. **Open one fresh ChatGPT task.** The fresh task discovers the tools that are
    actually present, confirms each selected account or scope with the user, and
    performs a bounded recent read. A valid empty result counts as a completed
@@ -51,7 +51,8 @@ read surface comes from the source the user enabled:
 
 - supported ChatGPT apps for services available in the user's plan and region;
 - custom MCP servers for services such as Shopify or Instagram;
-- Seld-managed connector implementations using standalone `gsv-auth` custody;
+- Seld-managed Google, Microsoft, Slack, and Discord connector implementations
+  using standalone `gsv-auth` custody;
 - bounded local read tools for local files or Apple Messages;
 - the separately enabled WhatsApp read tool; and
 - Seld's exact host-bound Discord companion, which resolves one explicitly
@@ -88,6 +89,16 @@ Codex, OpenCode, or Open Interpreter. Standalone OAuth opens the provider's own
 consent page from `gsv-auth`; non-OAuth credentials enter through hidden local
 input. MCP can show only redacted connection availability. See
 [Standalone connector authentication](connector-auth.md).
+
+`gsv-auth profiles` lists the exact built-in sources, endpoints, scopes, and
+credential kinds. The user registers the public provider client, runs the local
+OAuth or hidden credential command, and confirms the provider account. The
+agent may explain commands and inspect redacted status, but it may not perform
+consent, enter or reuse credentials or second factors, or change provider
+applications, accounts, permissions, access, or security settings. A Seld-
+managed Slack read additionally uses one exact private-process
+`SLACK_CHANNEL_ID`, makes one bounded conversation-history request, and does
+not claim thread-reply coverage.
 
 ## What source verification means
 
@@ -170,9 +181,10 @@ new computer.
 
 For a Seld-managed connector, run `gsv-auth status` first. Reauthorize only the
 affected connection, or restore an exact matching vault backup and then import
-its separate age-encrypted credential archive. Imported connections remain
-unverified until the onboarding task confirms identity and completes a bounded
-provider read.
+its separate age-encrypted credential archive. Reconfigure host-local Slack or
+Discord channel policy separately. Imported connections remain unverified
+until the onboarding task confirms identity and completes a bounded provider
+read.
 
 ## A useful first run is complete when
 

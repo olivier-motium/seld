@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from email.message import Message
 from io import BytesIO
@@ -15,6 +16,7 @@ import pytest
 
 import continuity_kernel.connector_http as connector_http
 import continuity_kernel.connector_sources as connector_sources
+from continuity_kernel.connections import render_connection_snapshot
 from continuity_kernel.connector_auth import (
     AccountMetadata,
     ClientKind,
@@ -26,10 +28,11 @@ from continuity_kernel.connector_auth import (
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_credentials import OAuthCredential
 from continuity_kernel.connector_identifiers import ConnectionId, parse_connection_id
-from continuity_kernel.connector_oauth import OAuthTokenType
+from continuity_kernel.connector_oauth import OAuthTokenEndpointError, OAuthTokenType
+from continuity_kernel.connector_profiles import get_profile
 from continuity_kernel.connector_secrets import InMemorySecretStore
 from continuity_kernel.connector_sources import read_connector_source
-from continuity_kernel.errors import SetupError, ValidationError
+from continuity_kernel.errors import ConflictError, SetupError, ValidationError
 from continuity_kernel.vault import Vault
 
 BASE_TIME = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
@@ -51,20 +54,33 @@ def _prepared(
     if provider == "google":
         authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth"
         default_token_endpoint = "https://oauth2.googleapis.com/token"
-    else:
+    elif provider == "microsoft":
         authorization_endpoint = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
         default_token_endpoint = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    else:
+        assert provider == "slack"
+        authorization_endpoint = "https://slack.com/oauth/v2_user/authorize"
+        default_token_endpoint = "https://slack.com/api/oauth.v2.user.access"
+    scopes = get_profile(provider).scopes
     metadata = ConnectionMetadata(
         connection_id=connection_id,
         provider=provider,
         source_ids=(source_id,),
         credential_kind=CredentialKind.OAUTH2,
         account=AccountMetadata(label="Synthetic account"),
-        scopes=("connector.read",),
+        scopes=scopes,
         client=ClientMetadata(
             kind=ClientKind.PUBLIC,
             identifier="synthetic-client",
-            redirect_uris=("http://127.0.0.1:49152/callback",),
+            redirect_uris=(
+                "http://localhost:49152/oauth/callback"
+                if provider == "slack"
+                else (
+                    "http://127.0.0.1:49152"
+                    if provider == "google"
+                    else "http://127.0.0.1:49152/callback"
+                ),
+            ),
             authorization_endpoint=authorization_endpoint,
             token_endpoint=token_endpoint or default_token_endpoint,
         ),
@@ -92,7 +108,7 @@ def _prepared(
             access_token=TOKEN,
             refresh_token=None,
             token_type=OAuthTokenType.BEARER,
-            scopes=("connector.read",),
+            scopes=scopes,
             issued_at=BASE_TIME,
             expires_at=None,
         ),
@@ -173,12 +189,25 @@ def test_google_gmail_delivery_records_only_hashed_receipt_metadata(
         manager=manager,
         get_json=get_json,
     )
+    actual_state = manager.tokens.state
+    state_lock_timeouts: list[float] = []
+
+    def state_with_budget(
+        connection: ConnectionId,
+        *,
+        lock_timeout_seconds: float = 10.0,
+    ) -> object:
+        state_lock_timeouts.append(lock_timeout_seconds)
+        return actual_state(connection, lock_timeout_seconds=lock_timeout_seconds)
+
+    monkeypatch.setattr(manager.tokens, "state", state_with_budget)
     delivery = read_connector_source(
         vault,
         connection_id=str(connection_id),
         source_id="gmail",
         limit=2,
         observed_at=BASE_TIME,
+        timeout_seconds=3.0,
     )
 
     assert delivery["result"] == "success"
@@ -205,8 +234,10 @@ def test_google_gmail_delivery_records_only_hashed_receipt_metadata(
         assert private_value not in stored
     assert len(calls) == 3
     timeouts = [call[2] for call in calls]
-    assert all(0 < timeout <= 15.0 for timeout in timeouts)
+    assert all(0 < timeout <= 3.0 for timeout in timeouts)
     assert timeouts == sorted(timeouts, reverse=True)
+    assert len(state_lock_timeouts) == 1
+    assert 0 <= state_lock_timeouts[0] <= 3.0
 
 
 def test_microsoft_mail_uses_fixed_bounds_and_hashes_partial_pagination(
@@ -329,6 +360,38 @@ def test_untrusted_oauth_endpoint_is_rejected_before_secret_resolution(
         )
 
 
+def test_write_scope_is_rejected_before_secret_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault, _manager, connection_id = _prepared(
+        tmp_path,
+        source_id="slack",
+        provider="slack",
+        marker="q",
+    )
+    snapshot = vault.get_connection_snapshot()
+    connection = snapshot.connection(connection_id)
+    assert connection is not None
+    unsafe = replace(connection, scopes=(*connection.scopes, "chat:write"))
+    (vault.root / "CONNECTIONS.md").write_text(
+        render_connection_snapshot(replace(snapshot, connections=(unsafe,))),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SLACK_CHANNEL_ID", "C123456789")
+
+    def fail_manager(observed_vault: Vault) -> ConnectorAuthManager:
+        del observed_vault
+        pytest.fail("secret resolution was reached")
+
+    monkeypatch.setattr(connector_sources, "ConnectorAuthManager", fail_manager)
+    with pytest.raises(ValidationError, match="read-only source profile"):
+        read_connector_source(
+            vault,
+            connection_id=str(connection_id),
+            source_id="slack",
+        )
+
+
 def test_keyring_failure_returns_only_fixed_auth_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -347,7 +410,7 @@ def test_keyring_failure_returns_only_fixed_auth_receipt(
         del url, headers, timeout
         pytest.fail("provider transport was reached")
 
-    monkeypatch.setattr(manager, "resolve_oauth_access_token", fail_resolve)
+    monkeypatch.setattr(manager, "resolve_oauth_access_token_state", fail_resolve)
     _install_reader(
         monkeypatch,
         vault=vault,
@@ -362,6 +425,43 @@ def test_keyring_failure_returns_only_fixed_auth_receipt(
     assert failure["result"] == "failure"
     assert failure["errorCode"] == "auth_required"
     assert "private keyring" not in json.dumps(failure, sort_keys=True)
+
+
+def test_slack_invalid_refresh_token_returns_expired_auth_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault, manager, connection_id = _prepared(
+        tmp_path,
+        source_id="slack",
+        provider="slack",
+        marker="r",
+    )
+    monkeypatch.setenv("SLACK_CHANNEL_ID", "C123456789")
+
+    def invalid_refresh(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OAuthTokenEndpointError(
+            error="invalid_refresh_token",
+            description=None,
+            status_code=200,
+        )
+
+    monkeypatch.setattr(manager, "resolve_oauth_access_token_state", invalid_refresh)
+    _install_reader(
+        monkeypatch,
+        vault=vault,
+        manager=manager,
+        get_json=lambda *_args: pytest.fail("provider read was reached"),
+    )
+
+    failure = read_connector_source(
+        vault,
+        connection_id=str(connection_id),
+        source_id="slack",
+    )
+
+    assert failure["result"] == "failure"
+    assert failure["errorCode"] == "auth_expired"
 
 
 def test_gmail_uses_one_deadline_across_followup_requests(
@@ -382,7 +482,7 @@ def test_gmail_uses_one_deadline_across_followup_requests(
             return {"emailAddress": "account@example.test"}
         pytest.fail("expired operation budget allowed a followup request")
 
-    times = iter((100.0, 100.0, 101.0, 102.0, 116.0))
+    times = iter((100.0, 100.0, 101.0, 102.0, 116.0, 116.0))
     monkeypatch.setattr(connector_sources, "monotonic", lambda: next(times))
     _install_reader(
         monkeypatch,
@@ -643,6 +743,198 @@ def test_private_provider_failures_reduce_to_fixed_error_receipts(
     assert PRIVATE_BODY not in json.dumps(malformed, sort_keys=True)
 
 
+def test_slack_reads_one_exact_channel_with_portable_user_oauth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, manager, connection_id = _prepared(
+        tmp_path,
+        source_id="slack",
+        provider="slack",
+        marker="m",
+    )
+    channel_id = "C123456789"
+    team_id = "T123456789"
+    user_id = "U123456789"
+    slack_timestamp = f"{int(BASE_TIME.timestamp())}.000001"
+    calls: list[str] = []
+    monkeypatch.setenv("SLACK_CHANNEL_ID", channel_id)
+    monkeypatch.setenv("SLACK_TOKEN", "ambient-token-must-not-be-used")
+
+    def get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
+        assert headers["Authorization"] == f"Bearer {TOKEN}"
+        assert 0 < timeout <= 15.0
+        calls.append(url)
+        parsed = urlsplit(url)
+        if parsed.path == "/api/auth.test":
+            return {"ok": True, "team_id": team_id, "user_id": user_id}
+        if parsed.path == "/api/conversations.history":
+            assert parse_qs(parsed.query) == {
+                "channel": [channel_id],
+                "limit": ["15"],
+            }
+            return {
+                "ok": True,
+                "messages": [
+                    {
+                        "type": "message",
+                        "user": user_id,
+                        "text": "x" * 600,
+                        "ts": slack_timestamp,
+                    }
+                ],
+                "has_more": True,
+                "response_metadata": {"next_cursor": "private-cursor"},
+            }
+        pytest.fail("unexpected fixed Slack endpoint")
+
+    _install_reader(monkeypatch, vault=vault, manager=manager, get_json=get_json)
+    delivery = read_connector_source(
+        vault,
+        connection_id=str(connection_id),
+        source_id="slack",
+        limit=25,
+        observed_at=BASE_TIME,
+    )
+
+    assert delivery["result"] == "success"
+    items = cast(list[dict[str, object]], delivery["items"])
+    assert len(items) == 1
+    assert items[0]["text"] == "x" * 500
+    assert items[0]["timestamp"] == "2026-07-30T09:00:00.000001Z"
+    assert str(items[0]["channelRef"]).startswith("sha256:")
+    assert str(items[0]["authorRef"]).startswith("sha256:")
+    record = cast(dict[str, object], delivery["record"])
+    assert record["completeness"] == "partial"
+    assert len(calls) == 2
+    serialized_delivery = json.dumps(delivery, sort_keys=True)
+    for private_value in (
+        TOKEN,
+        "ambient-token-must-not-be-used",
+        channel_id,
+        team_id,
+        user_id,
+        slack_timestamp,
+        "private-cursor",
+    ):
+        assert private_value not in serialized_delivery
+    _record_delivery(vault, delivery)
+    stored = (vault.root / "SOURCES.md").read_text(encoding="utf-8")
+    assert "x" * 100 not in stored
+
+
+def test_slack_requires_ok_and_rejects_bot_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SLACK_CHANNEL_ID", "C123456789")
+    for marker, identity, expected_error in (
+        ("n", {"ok": False, "error": "invalid_auth"}, "auth_expired"),
+        (
+            "o",
+            {
+                "ok": True,
+                "team_id": "T123456789",
+                "user_id": "U123456789",
+                "bot_id": "B123456789",
+            },
+            "read_failed",
+        ),
+    ):
+        vault, manager, connection_id = _prepared(
+            tmp_path,
+            source_id="slack",
+            provider="slack",
+            marker=marker,
+        )
+
+        def get_json(
+            url: str,
+            headers: Mapping[str, str],
+            timeout: float,
+            identity_payload: object = identity,
+        ) -> object:
+            del headers, timeout
+            assert url.endswith("/auth.test")
+            return identity_payload
+
+        _install_reader(monkeypatch, vault=vault, manager=manager, get_json=get_json)
+        failure = read_connector_source(
+            vault,
+            connection_id=str(connection_id),
+            source_id="slack",
+            observed_at=BASE_TIME,
+        )
+        assert failure["result"] == "failure"
+        assert failure["errorCode"] == expected_error
+
+
+def test_slack_history_error_and_credential_rotation_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SLACK_CHANNEL_ID", "C123456789")
+    vault, manager, connection_id = _prepared(
+        tmp_path,
+        source_id="slack",
+        provider="slack",
+        marker="p",
+    )
+    history_calls = 0
+
+    def get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
+        nonlocal history_calls
+        del headers, timeout
+        if url.endswith("/auth.test"):
+            return {"ok": True, "team_id": "T123456789", "user_id": "U123456789"}
+        history_calls += 1
+        return {"ok": False, "error": "missing_scope"}
+
+    _install_reader(monkeypatch, vault=vault, manager=manager, get_json=get_json)
+    denied = read_connector_source(
+        vault,
+        connection_id=str(connection_id),
+        source_id="slack",
+        observed_at=BASE_TIME,
+    )
+    assert denied["errorCode"] == "permission_denied"
+    assert history_calls == 1
+
+    def rotating_get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
+        del headers, timeout
+        if url.endswith("/auth.test"):
+            return {"ok": True, "team_id": "T123456789", "user_id": "U123456789"}
+        current = manager.tokens.state(connection_id)
+        assert current is not None
+        manager.store_oauth_credential(
+            connection_id,
+            OAuthCredential(
+                access_token="rotated-access-token",
+                refresh_token=None,
+                token_type=OAuthTokenType.BEARER,
+                scopes=(
+                    "channels:history",
+                    "groups:history",
+                    "im:history",
+                    "mpim:history",
+                ),
+                issued_at=BASE_TIME,
+                expires_at=None,
+            ),
+            expected_token_version=current.version,
+        )
+        return {"ok": False, "error": "missing_scope"}
+
+    monkeypatch.setattr(connector_sources, "http_get_json", rotating_get_json)
+    with pytest.raises(ConflictError, match="credential changed"):
+        read_connector_source(
+            vault,
+            connection_id=str(connection_id),
+            source_id="slack",
+            observed_at=BASE_TIME,
+        )
+
+
 class _RedirectHandler(Protocol):
     def http_error_302(self, *args: object, **kwargs: object) -> object: ...
 
@@ -659,6 +951,53 @@ class _RedirectOpener:
         self.timeout = timeout
         reject = cast(Callable[..., object], self.handler.http_error_302)
         return reject(request, object(), 302, "Found", {})
+
+
+class _JSONResponse:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def __enter__(self) -> _JSONResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+
+    def getcode(self) -> int:
+        return 200
+
+    def read(self, size: int) -> bytes:
+        assert size == connector_http.MAX_RESPONSE_BYTES + 1
+        return self.body
+
+
+class _SuccessOpener:
+    def __init__(self, response: _JSONResponse) -> None:
+        self.response = response
+        self.request: Request | None = None
+
+    def open(self, request: object, *, timeout: float) -> _JSONResponse:
+        assert isinstance(request, Request)
+        assert timeout == 3.0
+        self.request = request
+        return self.response
+
+
+def test_http_boundary_allows_the_exact_slack_history_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opener = _SuccessOpener(_JSONResponse(b'{"ok":true,"messages":[]}'))
+    monkeypatch.setattr(connector_http, "build_opener", lambda *handlers: opener)
+
+    result = connector_http.get_json(
+        "https://slack.com/api/conversations.history?channel=C123456789&limit=15",
+        {"Accept": "application/json", "Authorization": "Bearer synthetic"},
+        3.0,
+    )
+
+    assert result == {"ok": True, "messages": []}
+    assert opener.request is not None
+    assert opener.request.get_method() == "GET"
 
 
 def test_http_boundary_rejects_redirects_without_network(
@@ -682,3 +1021,14 @@ def test_http_boundary_rejects_redirects_without_network(
         )
     assert openers[0].method == "GET"
     assert openers[0].timeout == 3.0
+
+    for unsafe_url in (
+        "https://slack.com/api/chat.postMessage",
+        ("https://slack.com/api/conversations.history?channel=C123456789&limit=15&cursor=attacker"),
+    ):
+        with pytest.raises(ValidationError, match="not allowed"):
+            connector_http.get_json(
+                unsafe_url,
+                {"Accept": "application/json", "Authorization": "Bearer synthetic"},
+                3.0,
+            )

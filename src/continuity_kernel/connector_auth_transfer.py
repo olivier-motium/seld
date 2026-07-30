@@ -63,6 +63,7 @@ def export_auth_archive(
     records: list[dict[str, object]] = []
     for metadata in snapshot.connections:
         credential = manager.tokens.read(metadata.connection_id).value
+        manager.validate_import_credential(metadata, credential)
         records.append(
             {
                 "credential": base64.b64encode(credential).decode("ascii"),
@@ -128,6 +129,7 @@ def import_auth_archive(
         raise ConflictError("portable connection records differ from the auth archive")
 
     for item, credential in records:
+        manager.validate_import_credential(item, credential)
         manager.tokens.validate_import(item.connection_id, credential)
 
     if initial_snapshot:
@@ -157,7 +159,7 @@ def import_auth_archive(
     imported: list[ConnectionMetadata] = []
     for item, credential in records:
         try:
-            manager.tokens.ensure_imported(item.connection_id, credential)
+            manager.ensure_imported_credential(item, credential)
         except Exception as import_error:
             raise DegradedIntegrityError(
                 "connector auth import is incomplete; rerun the same archive"

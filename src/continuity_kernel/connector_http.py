@@ -14,7 +14,7 @@ from continuity_kernel.errors import ContinuityError, ValidationError
 
 MAX_RESPONSE_BYTES: Final = 1024 * 1024
 _ALLOWED_HOSTS: Final = frozenset(
-    {"gmail.googleapis.com", "www.googleapis.com", "graph.microsoft.com"}
+    {"gmail.googleapis.com", "www.googleapis.com", "graph.microsoft.com", "slack.com"}
 )
 _GMAIL_PROFILE: Final = "/gmail/v1/users/me/profile"
 _GMAIL_MESSAGES: Final = "/gmail/v1/users/me/messages"
@@ -26,6 +26,8 @@ _GOOGLE_DRIVE_FILES: Final = "/drive/v3/files"
 _GRAPH_ME: Final = "/v1.0/me"
 _GRAPH_MESSAGES: Final = "/v1.0/me/messages"
 _GRAPH_CALENDAR_VIEW: Final = "/v1.0/me/calendar/calendarView"
+_SLACK_AUTH_TEST: Final = "/api/auth.test"
+_SLACK_CONVERSATIONS_HISTORY: Final = "/api/conversations.history"
 
 JsonGetter = Callable[[str, Mapping[str, str], float], object]
 
@@ -197,6 +199,11 @@ def _allowed_query_keys(host: str, path: str) -> frozenset[str] | None:
             return frozenset({"$top", "$select", "$orderby"})
         if path == _GRAPH_CALENDAR_VIEW:
             return frozenset({"startDateTime", "endDateTime", "$top"})
+    if host == "slack.com":
+        if path == _SLACK_AUTH_TEST:
+            return frozenset()
+        if path == _SLACK_CONVERSATIONS_HISTORY:
+            return frozenset({"channel", "limit"})
     return None
 
 

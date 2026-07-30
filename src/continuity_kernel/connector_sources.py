@@ -1,8 +1,10 @@
-"""Read-only Google Workspace and Microsoft Graph connector source readers."""
+"""Read-only Google Workspace, Microsoft Graph, and Slack source readers."""
 
 from __future__ import annotations
 
 import math
+import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -31,6 +33,7 @@ from continuity_kernel.connector_http import (
 )
 from continuity_kernel.connector_identifiers import ConnectionId, parse_connection_id
 from continuity_kernel.connector_oauth import OAuthTokenEndpointError, OAuthTransportError
+from continuity_kernel.connector_token_store import TokenState
 from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
 from continuity_kernel.records import format_time
 from continuity_kernel.source_state import SourceCompleteness
@@ -43,6 +46,7 @@ SUPPORTED_SOURCE_IDS: Final = frozenset(
         "google_drive",
         "outlook_mail",
         "outlook_calendar",
+        "slack",
     }
 )
 _SOURCE_PROVIDERS: Final[Mapping[str, str]] = MappingProxyType(
@@ -52,6 +56,7 @@ _SOURCE_PROVIDERS: Final[Mapping[str, str]] = MappingProxyType(
         "google_drive": "google",
         "outlook_mail": "microsoft",
         "outlook_calendar": "microsoft",
+        "slack": "slack",
     }
 )
 _OAUTH_ENDPOINTS: Final[Mapping[str, tuple[str, str]]] = MappingProxyType(
@@ -64,12 +69,78 @@ _OAUTH_ENDPOINTS: Final[Mapping[str, tuple[str, str]]] = MappingProxyType(
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
             "https://login.microsoftonline.com/common/oauth2/v2.0/token",
         ),
+        "slack": (
+            "https://slack.com/oauth/v2_user/authorize",
+            "https://slack.com/api/oauth.v2.user.access",
+        ),
+    }
+)
+_PROVIDER_ALLOWED_SCOPES: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
+    {
+        "google": frozenset(
+            {
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/calendar.readonly",
+                "https://www.googleapis.com/auth/drive.metadata.readonly",
+            }
+        ),
+        "microsoft": frozenset(
+            {
+                "offline_access",
+                "User.Read",
+                "Mail.Read",
+                "Calendars.Read",
+            }
+        ),
+        "slack": frozenset(
+            {
+                "channels:history",
+                "groups:history",
+                "mpim:history",
+                "im:history",
+            }
+        ),
+    }
+)
+_SOURCE_REQUIRED_SCOPES: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
+    {
+        "gmail": frozenset({"https://www.googleapis.com/auth/gmail.readonly"}),
+        "google_calendar": frozenset({"https://www.googleapis.com/auth/calendar.readonly"}),
+        "google_drive": frozenset({"https://www.googleapis.com/auth/drive.metadata.readonly"}),
+        "outlook_mail": frozenset(
+            {
+                "offline_access",
+                "User.Read",
+                "Mail.Read",
+            }
+        ),
+        "outlook_calendar": frozenset(
+            {
+                "offline_access",
+                "User.Read",
+                "Calendars.Read",
+            }
+        ),
+        "slack": frozenset(
+            {
+                "channels:history",
+                "groups:history",
+                "mpim:history",
+                "im:history",
+            }
+        ),
     }
 )
 _GOOGLE_GMAIL_BASE: Final = "https://gmail.googleapis.com/gmail/v1/users/me"
 _GOOGLE_CALENDAR_BASE: Final = "https://www.googleapis.com/calendar/v3"
 _GOOGLE_DRIVE_BASE: Final = "https://www.googleapis.com/drive/v3"
 _GRAPH_BASE: Final = "https://graph.microsoft.com/v1.0"
+_SLACK_BASE: Final = "https://slack.com/api"
+_SLACK_CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,31}$")
+_SLACK_ERROR = re.compile(r"^[a-z0-9_]{1,128}$")
+_SLACK_TIMESTAMP = re.compile(r"^(?P<seconds>[0-9]{10,12})\.(?P<microseconds>[0-9]{6})$")
+_SLACK_MAX_LIMIT: Final = 15
+_SLACK_PREVIEW_CHARS: Final = 500
 _MAX_LIMIT: Final = 25
 _MAX_PROVIDER_ID_BYTES: Final = 2_048
 _MAX_TRANSIENT_BYTES: Final = 8_192
@@ -91,6 +162,12 @@ class _ReadResult:
     evidence_refs: list[str]
 
 
+class _SlackAPIError(ValidationError):
+    def __init__(self, error: str) -> None:
+        self.error = error
+        super().__init__("Slack provider rejected the read")
+
+
 @dataclass(frozen=True)
 class _OperationBudget:
     deadline: float
@@ -100,6 +177,11 @@ class _OperationBudget:
         if seconds <= 0:
             raise ConnectorTimeoutError("connector operation timed out")
         return seconds
+
+    def lock_timeout(self) -> float:
+        """Return the non-negative time left for a fail-closed state recheck."""
+
+        return max(0.0, self.deadline - monotonic())
 
 
 def read_connector_source(
@@ -128,12 +210,13 @@ def read_connector_source(
     if observed_at is not None and (observed_at.tzinfo is None or observed_at.utcoffset() is None):
         raise ValidationError("connector observation time must be timezone-aware")
     observed = (observed_at or datetime.now(UTC)).astimezone(UTC)
+    slack_channel_id = _slack_channel_id() if source_id == "slack" else None
     tool_binding = _digest(_TOOL_NAMESPACE, source_id)
     budget = _OperationBudget(monotonic() + timeout_seconds)
 
     auth_manager = ConnectorAuthManager(vault)
     try:
-        access_token = auth_manager.resolve_oauth_access_token(
+        resolved_access = auth_manager.resolve_oauth_access_token_state(
             clean_connection_id,
             expected_connection_revision=connection_revision,
             minimum_validity_seconds=60,
@@ -173,8 +256,28 @@ def read_connector_source(
             "auth_required",
         )
 
+    access_token = resolved_access.access_token
+
     def getter(url: str, headers: Mapping[str, str], _timeout_seconds: float) -> object:
         return http_get_json(url, headers, budget.remaining())
+
+    def provider_failure(error_code: str) -> dict[str, object]:
+        _assert_read_state_current(
+            vault,
+            auth_manager=auth_manager,
+            connection_id=clean_connection_id,
+            source_revision=source_revision,
+            connection_revision=connection_revision,
+            token_state=resolved_access.state,
+            lock_timeout_seconds=budget.lock_timeout(),
+        )
+        return _failure(
+            source_id,
+            source_revision,
+            clean_connection_id,
+            tool_binding,
+            error_code,
+        )
 
     try:
         if _SOURCE_PROVIDERS[source_id] == "google":
@@ -186,7 +289,7 @@ def read_connector_source(
                 observed_at=observed,
                 timeout_seconds=budget.remaining(),
             )
-        else:
+        elif _SOURCE_PROVIDERS[source_id] == "microsoft":
             result = _read_microsoft(
                 source_id,
                 access_token=access_token,
@@ -195,67 +298,42 @@ def read_connector_source(
                 observed_at=observed,
                 timeout_seconds=budget.remaining(),
             )
+        else:
+            assert slack_channel_id is not None
+            result = _read_slack(
+                access_token=access_token,
+                channel_id=slack_channel_id,
+                getter=getter,
+                limit=limit,
+                observed_at=observed,
+                timeout_seconds=budget.remaining(),
+            )
+    except _SlackAPIError as exc:
+        return provider_failure(_slack_error_code(exc.error))
     except ConnectorHTTPError as exc:
-        return _failure(
-            source_id,
-            source_revision,
-            clean_connection_id,
-            tool_binding,
-            _http_error_code(exc.status_code),
-        )
+        return provider_failure(_http_error_code(exc.status_code))
     except HTTPError as exc:
-        return _failure(
-            source_id,
-            source_revision,
-            clean_connection_id,
-            tool_binding,
-            _http_error_code(exc.code),
-        )
+        return provider_failure(_http_error_code(exc.code))
     except (ConnectorTimeoutError, TimeoutError):
-        return _failure(
-            source_id,
-            source_revision,
-            clean_connection_id,
-            tool_binding,
-            "timeout",
-        )
+        return provider_failure("timeout")
     except (ConnectorRedirectError, ConnectorResponseError):
-        return _failure(
-            source_id,
-            source_revision,
-            clean_connection_id,
-            tool_binding,
-            "read_failed",
-        )
+        return provider_failure("read_failed")
     except ConnectorTransportError:
-        return _failure(
-            source_id,
-            source_revision,
-            clean_connection_id,
-            tool_binding,
-            "provider_unavailable",
-        )
+        return provider_failure("provider_unavailable")
     except (URLError, OSError):
-        return _failure(
-            source_id,
-            source_revision,
-            clean_connection_id,
-            tool_binding,
-            "provider_unavailable",
-        )
+        return provider_failure("provider_unavailable")
     except ValidationError:
-        return _failure(
-            source_id,
-            source_revision,
-            clean_connection_id,
-            tool_binding,
-            "read_failed",
-        )
+        return provider_failure("read_failed")
 
-    if vault.get_source_snapshot().revision != source_revision:
-        raise ConflictError("source selection changed during connector read")
-    if vault.get_connection_snapshot().revision != connection_revision:
-        raise ConflictError("connection changed during connector read")
+    _assert_read_state_current(
+        vault,
+        auth_manager=auth_manager,
+        connection_id=clean_connection_id,
+        source_revision=source_revision,
+        connection_revision=connection_revision,
+        token_state=resolved_access.state,
+        lock_timeout_seconds=budget.lock_timeout(),
+    )
     return _success(
         source_id,
         source_revision,
@@ -300,7 +378,37 @@ def _preflight(
     )
     if actual_endpoints != expected_endpoints:
         raise ValidationError("connection OAuth endpoints do not match the built-in provider")
+    scopes = frozenset(connection.scopes)
+    if not _SOURCE_REQUIRED_SCOPES[source_id].issubset(scopes) or not scopes.issubset(
+        _PROVIDER_ALLOWED_SCOPES[expected_provider]
+    ):
+        raise ValidationError("connection scopes do not match the read-only source profile")
     return clean_connection_id, source_snapshot.revision, connection_snapshot.revision
+
+
+def _assert_read_state_current(
+    vault: Vault,
+    *,
+    auth_manager: ConnectorAuthManager,
+    connection_id: ConnectionId,
+    source_revision: str,
+    connection_revision: str,
+    token_state: TokenState,
+    lock_timeout_seconds: float,
+) -> None:
+    if vault.get_source_snapshot().revision != source_revision:
+        raise ConflictError("source selection changed during connector read")
+    if vault.get_connection_snapshot().revision != connection_revision:
+        raise ConflictError("connection changed during connector read")
+    try:
+        current_token_state = auth_manager.tokens.state(
+            connection_id,
+            lock_timeout_seconds=lock_timeout_seconds,
+        )
+    except (ConflictError, OSError, SetupError, ValidationError) as exc:
+        raise ConflictError("credential state could not be rechecked after connector read") from exc
+    if current_token_state != token_state:
+        raise ConflictError("credential changed during connector read")
 
 
 def _read_google(
@@ -594,6 +702,81 @@ def _read_microsoft(
     raise ValidationError("connector source is unsupported")
 
 
+def _read_slack(
+    *,
+    access_token: str,
+    channel_id: str,
+    getter: JsonGetter,
+    limit: int,
+    observed_at: datetime,
+    timeout_seconds: float,
+) -> _ReadResult:
+    identity = _request_slack_json(
+        getter,
+        f"{_SLACK_BASE}/auth.test",
+        access_token=access_token,
+        timeout_seconds=timeout_seconds,
+    )
+    if identity.get("bot_id") is not None:
+        raise ValidationError("Slack source requires a user OAuth token")
+    team_id = _provider_id(identity.get("team_id"), "Slack workspace ID")
+    user_id = _provider_id(identity.get("user_id"), "Slack user ID")
+    account_binding = _digest(_ACCOUNT_NAMESPACE, f"slack:user:{team_id}:{user_id}")
+    bounded_limit = min(limit, _SLACK_MAX_LIMIT)
+    history = _request_slack_json(
+        getter,
+        (
+            f"{_SLACK_BASE}/conversations.history?"
+            f"{_query((('channel', channel_id), ('limit', str(bounded_limit))))}"
+        ),
+        access_token=access_token,
+        timeout_seconds=timeout_seconds,
+    )
+    messages = _object_items(history, "messages", bounded_limit, optional=True)
+    has_more = history.get("has_more", False)
+    if not isinstance(has_more, bool):
+        raise ValidationError("Slack pagination flag is invalid")
+    next_cursor = _slack_next_cursor(history.get("response_metadata"))
+    items: list[dict[str, object]] = []
+    evidence_refs: list[str] = []
+    channel_ref = _digest(_EVIDENCE_NAMESPACE, f"slack:channel:{channel_id}")
+    for message in messages:
+        if message.get("type") != "message":
+            raise ValidationError("Slack message type is invalid")
+        timestamp_value = _provider_id(message.get("ts"), "Slack message timestamp")
+        author = message.get("user") or message.get("bot_id")
+        author_ref = (
+            ""
+            if author is None
+            else _digest(
+                _EVIDENCE_NAMESPACE,
+                f"slack:author:{_provider_id(author, 'Slack message author')}",
+            )
+        )
+        text = _optional_text(message.get("text"), "Slack message text", _MAX_SNIPPET_BYTES)
+        evidence_refs.append(
+            _digest(_EVIDENCE_NAMESPACE, f"slack:message:{channel_id}:{timestamp_value}")
+        )
+        items.append(
+            {
+                "channelRef": channel_ref,
+                "authorRef": author_ref,
+                "timestamp": _slack_timestamp(timestamp_value),
+                "text": text[:_SLACK_PREVIEW_CHARS],
+            }
+        )
+    return _ReadResult(
+        items=items,
+        account_binding=account_binding,
+        completeness=_page_completeness(
+            next_cursor,
+            incomplete=has_more,
+        ),
+        covered_through=format_time(observed_at),
+        evidence_refs=evidence_refs,
+    )
+
+
 def _read_outlook_mail(
     account_binding: str,
     *,
@@ -725,6 +908,28 @@ def _request_json(
     return _required_object(value, "provider JSON response")
 
 
+def _request_slack_json(
+    getter: JsonGetter,
+    url: str,
+    *,
+    access_token: str,
+    timeout_seconds: float,
+) -> dict[str, object]:
+    payload = _request_json(
+        getter,
+        url,
+        access_token=access_token,
+        timeout_seconds=timeout_seconds,
+    )
+    if payload.get("ok") is not True:
+        error = payload.get("error")
+        clean_error = (
+            error if isinstance(error, str) and _SLACK_ERROR.fullmatch(error) else "unknown"
+        )
+        raise _SlackAPIError(clean_error)
+    return payload
+
+
 def _object_items(
     payload: Mapping[str, object],
     key: str,
@@ -844,6 +1049,36 @@ def _page_marker(value: object, label: str) -> str | None:
     return _required_text(value, label, _MAX_TRANSIENT_BYTES)
 
 
+def _slack_channel_id() -> str:
+    channel_id = os.environ.get("SLACK_CHANNEL_ID", "")
+    if _SLACK_CHANNEL_ID.fullmatch(channel_id) is None:
+        raise ValidationError("SLACK_CHANNEL_ID must name one exact Slack conversation")
+    return channel_id
+
+
+def _slack_next_cursor(value: object) -> str | None:
+    if value is None:
+        return None
+    metadata = _required_object(value, "Slack response metadata")
+    cursor = metadata.get("next_cursor")
+    if cursor in {None, ""}:
+        return None
+    return _required_text(cursor, "Slack page marker", _MAX_TRANSIENT_BYTES)
+
+
+def _slack_timestamp(value: str) -> str:
+    matched = _SLACK_TIMESTAMP.fullmatch(value)
+    if matched is None:
+        raise ValidationError("Slack message timestamp is invalid")
+    try:
+        observed = datetime.fromtimestamp(int(matched["seconds"]), UTC).replace(
+            microsecond=int(matched["microseconds"])
+        )
+    except (OSError, OverflowError, ValueError) as exc:
+        raise ValidationError("Slack message timestamp is invalid") from exc
+    return format_time(observed)
+
+
 def _page_completeness(marker: str | None, *, incomplete: bool = False) -> SourceCompleteness:
     if marker is None and not incomplete:
         return SourceCompleteness.COMPLETE
@@ -894,7 +1129,10 @@ def _http_error_code(status_code: int) -> str:
 
 
 def _token_error_code(error: OAuthTokenEndpointError) -> str:
-    if error.error == "invalid_grant" or error.status_code in {401, 403}:
+    if error.error in {"invalid_grant", "invalid_refresh_token"} or error.status_code in {
+        401,
+        403,
+    }:
         return "auth_expired"
     if error.status_code in {408, 504}:
         return "timeout"
@@ -903,6 +1141,29 @@ def _token_error_code(error: OAuthTokenEndpointError) -> str:
     if 500 <= error.status_code <= 599:
         return "provider_unavailable"
     return "auth_required"
+
+
+def _slack_error_code(error: str) -> str:
+    if error in {
+        "account_inactive",
+        "invalid_auth",
+        "not_authed",
+        "token_expired",
+        "token_revoked",
+    }:
+        return "auth_expired"
+    if error in {
+        "channel_not_found",
+        "missing_scope",
+        "no_permission",
+        "not_in_channel",
+    }:
+        return "permission_denied"
+    if error == "ratelimited":
+        return "rate_limited"
+    if error in {"fatal_error", "internal_error", "service_unavailable"}:
+        return "provider_unavailable"
+    return "read_failed"
 
 
 def _success(

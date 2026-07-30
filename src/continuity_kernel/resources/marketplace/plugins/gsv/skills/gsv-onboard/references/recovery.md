@@ -14,10 +14,15 @@ Pulse or silently replace another active hand.
 ## Stale or failed source
 
 Preserve the last successful coverage boundary, open one fresh ChatGPT task,
-and repeat the selected source's identity plus bounded-read check. Let the
-person reauthenticate only in the provider-owned app when it requests it. A
-failed recheck is current evidence of stale or unavailable coverage, not an
-empty source.
+and repeat the selected source's identity plus bounded-read check. For a
+host-owned app, let the person reauthenticate only in that provider-owned app.
+For a Seld-managed profile, inspect `gsv-auth status`, then let the person rerun
+`gsv-auth oauth <connection-id>` or the hidden credential command. The agent
+must not perform consent, enter or reuse credentials or second factors, or
+change provider account, application, access, permission, or security settings.
+A restored auth archive does not restore Slack or Discord channel policy; the
+person configures that host-private policy again. A failed recheck is current
+evidence of stale or unavailable coverage, not an empty source.
 
 For a same-host migration, read `local-source staged-status`, then use
 `local-source adopt-staged` only with its exact migration and source revisions

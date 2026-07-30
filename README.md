@@ -260,6 +260,9 @@ The macOS source distribution includes:
 - a host-agnostic connector-auth library and `gsv-auth` CLI with OS-keyring
   custody, public-client OAuth with PKCE, serialized refresh, redacted MCP
   status, and explicit age-encrypted credential transfer;
+- finite portable profiles and fixed read-only adapters for Gmail, Google
+  Calendar, Google Drive metadata, Outlook mail, Outlook Calendar, Slack, and
+  the bot-only Discord companion;
 - the resident Pulse skill, which lets the AI read selected sources, reason
   over fresh changes and durable context, and author the current Mind through
   exact compare-and-swap writes; and
@@ -275,6 +278,9 @@ Instagram, and optional screen context. The user enables either a host-owned
 ChatGPT app, a custom MCP server, a Seld-managed connector, or a local read
 tool. Host-owned app authentication remains specific to that host account;
 connector implementations using `gsv-auth` use Seld's portable custody instead.
+The built-in portable profiles currently cover Google, Microsoft, Slack, and
+Discord; catalog-only sources still need their host-owned app or custom MCP
+reader until a concrete Seld adapter is shipped.
 Onboarding confirms the intended account and performs a bounded read before
 recording the AI-authored coverage horizon. Seld marks a source current only
 while the successful read remains within its recipe's freshness window on the

@@ -23,6 +23,7 @@ def test_connector_reader_mcp_is_finite_and_not_a_credentialed_proxy(
         "google_drive",
         "outlook_calendar",
         "outlook_mail",
+        "slack",
     ]
 
     observed: dict[str, object] = {}

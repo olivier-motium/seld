@@ -66,6 +66,7 @@ credential:
 
 ```bash
 gsv-auth status
+gsv-auth profiles
 ```
 
 The adapter is loaded only when connector custody is inspected or changed. An
@@ -77,6 +78,12 @@ Open Interpreter login. It never imports an existing browser or AI-host
 session. A provider-specific connector still needs its own public OAuth client
 registration or credential, granted by the user through that provider's normal
 consent flow.
+
+The built-in profiles cover Gmail, Google Calendar, Google Drive metadata,
+Outlook mail, Outlook Calendar, one exact Slack conversation, and the Discord
+bot companion. Their profile-owned endpoints, scopes, source IDs, and
+credential kinds cannot be replaced from the CLI. Catalog-only sources continue
+to use a host-owned app or custom MCP server until an audited Seld reader exists.
 
 Encrypted credential transfer additionally requires the open-source `age`
 executable. On macOS it can be installed separately with `brew install age`.

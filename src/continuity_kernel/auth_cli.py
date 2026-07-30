@@ -9,6 +9,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from continuity_kernel.config import resolve_vault
 from continuity_kernel.connector_auth import (
@@ -22,6 +23,7 @@ from continuity_kernel.connector_auth import (
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_auth_transfer import export_auth_archive, import_auth_archive
 from continuity_kernel.connector_identifiers import new_connection_id, parse_connection_id
+from continuity_kernel.connector_profiles import PROFILES, get_profile, list_profiles
 from continuity_kernel.connector_secrets import MAX_SECRET_BYTES
 from continuity_kernel.errors import ContinuityError, ValidationError
 from continuity_kernel.vault import Vault
@@ -47,6 +49,8 @@ def main(arguments: list[str] | None = None) -> int:
 def _dispatch(args: argparse.Namespace, manager: ConnectorAuthManager) -> dict[str, object]:
     if args.command == "status":
         return manager.status()
+    if args.command == "profiles":
+        return {"profiles": list_profiles()}
     if args.command == "add":
         return _add(args, manager)
     if args.command == "credential":
@@ -81,14 +85,50 @@ def _dispatch(args: argparse.Namespace, manager: ConnectorAuthManager) -> dict[s
 
 def _add(args: argparse.Namespace, manager: ConnectorAuthManager) -> dict[str, object]:
     now = datetime.now(UTC)
-    kind = CredentialKind(args.kind)
+    if args.profile is not None:
+        if any(
+            value is not None
+            for value in (
+                args.provider,
+                args.source,
+                args.kind,
+                args.scope,
+                args.authorization_endpoint,
+                args.token_endpoint,
+            )
+        ):
+            raise ValidationError("profile-owned connector fields cannot be overridden")
+        profile = get_profile(args.profile)
+        provider = profile.provider
+        source_ids = profile.source_ids
+        kind = profile.credential_kind
+        scopes = profile.scopes
+        authorization_endpoint = profile.authorization_endpoint
+        token_endpoint = profile.token_endpoint
+    else:
+        if args.provider is None or args.source is None or args.kind is None:
+            raise ValidationError("manual add requires --provider, --source, and --kind")
+        provider = args.provider
+        source_ids = tuple(args.source)
+        kind = CredentialKind(args.kind)
+        if kind is CredentialKind.OAUTH2:
+            raise ValidationError("manual OAuth is unsupported; use a built-in profile")
+        scopes = tuple(args.scope or ())
+        authorization_endpoint = args.authorization_endpoint
+        token_endpoint = args.token_endpoint
     if kind is CredentialKind.OAUTH2:
+        if args.client_id is None or args.redirect_uri is None:
+            raise ValidationError("OAuth connections require --client-id and --redirect-uri")
+        if args.profile == "google":
+            _validate_google_redirect(args.redirect_uri)
+        elif args.profile == "slack":
+            _validate_slack_redirect(args.redirect_uri)
         client = ClientMetadata(
             kind=ClientKind.PUBLIC,
             identifier=args.client_id,
             redirect_uris=(args.redirect_uri,),
-            authorization_endpoint=args.authorization_endpoint,
-            token_endpoint=args.token_endpoint,
+            authorization_endpoint=authorization_endpoint,
+            token_endpoint=token_endpoint,
         )
     else:
         if any(
@@ -104,14 +144,14 @@ def _add(args: argparse.Namespace, manager: ConnectorAuthManager) -> dict[str, o
         client = ClientMetadata(kind=ClientKind.EXTERNAL)
     metadata = ConnectionMetadata(
         connection_id=new_connection_id(),
-        provider=args.provider,
-        source_ids=tuple(args.source),
+        provider=provider,
+        source_ids=source_ids,
         credential_kind=kind,
         account=AccountMetadata(
             fingerprint=args.account_fingerprint,
             label=args.label,
         ),
-        scopes=tuple(args.scope),
+        scopes=scopes,
         client=client,
         health=ConnectionHealth.UNKNOWN,
         created_at=now,
@@ -172,6 +212,48 @@ def _read_secret() -> bytes:
     return value
 
 
+def _validate_slack_redirect(redirect_uri: str) -> None:
+    try:
+        parsed = urlsplit(redirect_uri)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValidationError("Slack profile redirect URI is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "localhost"
+        or port in {None, 0}
+        or parsed.path != "/oauth/callback"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValidationError(
+            "Slack profile requires an exact registered http://localhost:<port>/oauth/callback"
+        )
+
+
+def _validate_google_redirect(redirect_uri: str) -> None:
+    try:
+        parsed = urlsplit(redirect_uri)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValidationError("Google profile redirect URI is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1"}
+        or port is None
+        or parsed.path
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValidationError(
+            "Google profile requires http://127.0.0.1:<port> or http://[::1]:<port>"
+        )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gsv-auth",
@@ -181,14 +263,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--vault")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status", help="Show redacted portable and host-local status.")
+    commands.add_parser("profiles", help="List finite built-in connector profiles.")
 
     add = commands.add_parser("add", help="Create portable non-secret connection metadata.")
-    add.add_argument("--provider", required=True)
-    add.add_argument("--source", action="append", required=True)
-    add.add_argument("--kind", required=True, choices=tuple(item.value for item in CredentialKind))
+    add.add_argument("--profile", choices=tuple(sorted(PROFILES)))
+    add.add_argument("--provider")
+    add.add_argument("--source", action="append")
+    add.add_argument("--kind", choices=tuple(item.value for item in CredentialKind))
     add.add_argument("--label")
     add.add_argument("--account-fingerprint")
-    add.add_argument("--scope", action="append", default=[])
+    add.add_argument("--scope", action="append")
     add.add_argument("--client-id")
     add.add_argument("--authorization-endpoint")
     add.add_argument("--token-endpoint")
@@ -205,7 +289,10 @@ def _parser() -> argparse.ArgumentParser:
     oauth.add_argument("connection_id")
     oauth.add_argument("--timeout", type=float, default=180.0)
 
-    remove = commands.add_parser("remove", help="Revoke host custody, then remove metadata.")
+    remove = commands.add_parser(
+        "remove",
+        help="CAS-revoke metadata, clear host custody, then remove the record.",
+    )
     remove.add_argument("connection_id")
     remove.add_argument("--expected-revision", required=True)
 

@@ -8,6 +8,14 @@ OS-keyring custody. It never copies a ChatGPT, OpenAI, browser, Codex, OpenCode,
 or Open Interpreter session. Neither path moves semantic judgment into
 deterministic code.
 
+`gsv-auth profiles` is the authority for the finite built-in Google, Microsoft,
+Slack, and Discord profile shapes. The person registers the provider client or
+bot, reviews scopes, performs OAuth consent, and enters any credential through
+the hidden local prompt. The agent may explain the flow and read redacted
+status, but it never consents, enters or reuses credentials or second factors,
+or changes provider applications, accounts, permissions, access, or security
+settings.
+
 For every selected source in the fresh setup task:
 
 1. Find the actual exposed tool and match it to a logical recipe capability.
@@ -43,6 +51,13 @@ For a Seld-managed connector, `gsv_connection_list` may confirm only the
 portable connection ID and redacted host availability. It cannot reveal or
 mutate a credential. A restored age-encrypted credential remains `unverified`
 until the identity check and bounded read above succeed.
+
+Use `gsv_connector_source_read` with the exact portable connection ID for the
+implemented Gmail, Google Calendar, Google Drive, Outlook mail, Outlook
+Calendar, or Slack source. Slack additionally requires one exact private-
+process `SLACK_CHANNEL_ID`; it reads only that conversation and does not claim
+thread replies. The reader's connection, credential state, and source selection
+must remain unchanged through the provider call.
 
 External sends, posts, edits, reactions, bookings, purchases, and account
 changes remain outside this read contract and require a fresh interactive user

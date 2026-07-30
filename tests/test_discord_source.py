@@ -543,6 +543,7 @@ def test_binding_preflights_exact_portable_discord_authority(
         source_ids=source_ids,
         credential_kind=credential_kind,
         health=health,
+        store_credential=health is not ConnectionHealth.REVOKED,
     )
     with pytest.raises(ValidationError, match=message):
         bridge.bind(

@@ -1,17 +1,23 @@
 # Outlook Email connection check
 
-Use this note after Outlook Email is selected and its app tools appear in a
-fresh ChatGPT task. Microsoft owns sign-in, tenant selection, consent, and
-conditional-access checks.
+Use this note after Outlook Email is selected and either its host-owned app or a
+Seld-managed `microsoft` connection is available. The person owns sign-in,
+tenant/account selection, consent, conditional access, and second factors.
 
-1. Ask for the exact expected mailbox and, where relevant, tenant. Use a
-   read-only profile call when available. Verify the tenant only from an
-   immutable tenant-bearing result, never from the email domain alone.
-2. Read one bounded recent mail window. A successful empty result counts.
+1. Ask for the expected mailbox and, where relevant, tenant. With a host-owned
+   app, use a read-only profile call when available. With Seld-managed auth, the
+   person confirms the account shown by Microsoft; the reader returns a stable
+   hashed Graph account binding, not a raw mailbox or tenant identifier.
+2. For Seld-managed auth, call `gsv_connector_source_read` with the exact
+   `microsoft` connection ID and source `outlook_mail`. Read one bounded recent
+   mail window. A successful empty result counts.
 3. Do not draft, send, forward, move, flag, archive, delete, or change read
-   state. Outlook Email, Calendar, Teams, and SharePoint remain separate grants.
-4. Missing tools get one new-task retry after enablement. Auth, wrong-mailbox,
-   tenant, admin, or conditional-access failures return to ChatGPT settings or
-   the administrator before another probe.
-5. Return the identity status and bounded-read facts to `$gsv-onboard` for the
+   state. One Microsoft profile grants the fixed Outlook mail and calendar
+   scopes, but each logical source needs its own read and receipt. Teams and
+   SharePoint are not implemented by this profile.
+4. Missing host tools get one new-task retry after enablement. For Seld-managed
+   auth, inspect redacted status and let the person handle OAuth, wrong-mailbox,
+   tenant, administrator, or conditional-access failures. Never reuse another
+   AI host or browser session.
+5. Return the identity basis and bounded-read facts to `$gsv-onboard` for the
    exact source-state read, CAS write, and readback.

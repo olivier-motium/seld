@@ -76,9 +76,11 @@ split. `CONNECTIONS.md` carries versioned non-secret provider, account, scope,
 client-registration, and health metadata under vault compare-and-swap. Secret
 material stays outside the vault in an approved operating-system keyring,
 addressed by a vault-scoped connection ID through a bounded two-slot token
-publisher. Provider refresh and publication share one per-connection lock, so
-concurrent connector calls cannot fan out a token refresh or overwrite a newer
-credential.
+publisher. Credential publication, refresh, import, and deletion share one
+per-connection lifecycle lock. Removal first commits a terminal portable
+`revoked` checkpoint, then deletes custody under that lifecycle lock, so
+concurrent connector calls cannot fan out a refresh, overwrite a newer
+credential, or resurrect an interrupted removal.
 
 `gsv-auth` is the human setup and transfer adapter. OAuth uses a native
 authorization-code flow for public clients with PKCE, exact state, a one-shot
@@ -87,6 +89,26 @@ credentials enter only through hidden input or stdin, never an argument. A
 connector runtime may resolve a credential internally; Bridge and MCP expose
 only redacted availability through `gsv_connection_list`. No Seld path reads or
 copies an OpenAI, ChatGPT, browser, Codex, or other AI-host session.
+
+The finite built-in profile registry pins Google, Microsoft, Slack, and Discord
+to their implemented sources, credential kinds, scopes, and provider endpoints.
+Google requests an offline refreshable desktop grant; Microsoft requests
+offline Graph mail and calendar access; Slack implements its user-token PKCE
+dialect and accepts either rotating or valid long-lived user tokens; Discord is
+bot bearer only. Google, Microsoft, and Slack reads share one fixed-destination
+HTTPS GET boundary, but each source adapter keeps its concrete request and
+projection. There is no provider SDK, generic authenticated proxy, plugin
+loader, resident auth service, or environment-token fallback.
+
+Every read names one connection ID. The runtime validates the connection's
+provider, source set, scopes, endpoints, provider-reported granted scopes, and
+selected-source revision before secret resolution; after the provider call it
+rechecks the connection and exact credential state before returning transient
+items. Slack additionally validates
+one exact host-private channel ID before secret resolution, calls only
+`auth.test` and `conversations.history`, and never claims thread replies. Raw
+provider identifiers, cursors, tokens, bodies, and errors do not enter the
+portable receipt.
 
 Vault backups include `CONNECTIONS.md` but exclude keyring values and host-local
 token pointers. Moving credentials is a separate explicit age-encrypted export

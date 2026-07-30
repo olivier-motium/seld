@@ -74,6 +74,12 @@ Use one setup wave:
    reuse credentials or second factors, or change account, access, or security
    settings. Never copy or reuse a ChatGPT, OpenAI, browser, Codex, OpenCode, or
    Open Interpreter session.
+   For Gmail, Google Calendar, Google Drive, Outlook mail, Outlook Calendar,
+   Slack, or Discord, first run `gsv-auth profiles` and prefer the matching
+   built-in Seld profile when the person wants portable custody. The person
+   registers the public client or bot and runs the OAuth or hidden credential
+   command. Do not turn their blanket approval into authority to perform those
+   provider-owned account or credential steps.
 3. After the person confirms the set, call `gsv_source_select` against the exact
    returned source-state revision. This stores only the selection and purges
    coverage for anything deselected; it does not claim a provider is live.
@@ -128,6 +134,16 @@ and `gsv_discord_source_acknowledge` in that order. A poll stages but never
 advances its private cursor. Record and fresh-read the matching content-free
 receipt before acknowledgement. On restart, replay a pending delivery; never
 poll past it or invent a new baseline.
+
+For a selected Seld-managed Google, Microsoft, or Slack source, read its provider
+note, inspect only redacted `gsv_connection_list` status, and call
+`gsv_connector_source_read` with the exact connection ID and logical source.
+Google's one profile covers Gmail, Calendar, and Drive, while Microsoft covers
+Outlook mail and calendar; each logical source still gets its own read and
+receipt. Slack uses one exact private-process `SLACK_CHANNEL_ID`, returns at
+most 15 items from that conversation, and does not expand thread replies. A
+missing channel policy or wrong identity is a setup gap, never permission to
+fall back to an ambient Slack token or a host-owned session.
 
 Seld supports any user-enabled ChatGPT app or MCP tool that can satisfy the
 same bounded read contract. The catalog supplies first-class recipes for

@@ -137,6 +137,19 @@ credential. OAuth token requests refuse redirects, bound response sizes, and
 use one exact loopback origin assembled by Seld rather than trusting the HTTP
 Host header.
 
+Built-in profiles are finite and provider-pinned. Google, Microsoft, and Slack
+reader traffic is limited to concrete read-only HTTPS GET endpoints and fixed
+query shapes; there is no caller-supplied URL or write method. A read resolves
+only its explicit connection ID, rejects ambient provider credentials, and
+rechecks connection plus credential state after the provider call. Slack
+accepts only user OAuth, requires one exact host-private channel ID, and does
+not broaden `conversations.history` into thread replies. Discord accepts only
+an explicitly bound bot credential through its separately pinned companion.
+Provider-reported OAuth grants are constrained to the matching built-in
+read-only profile before storage, import, refresh, or use. Removal commits a
+terminal revoked state before deleting host custody; interrupted removal is
+retryable and no credential publisher may reactivate that record.
+
 The encrypted transfer archive necessarily contains credentials after
 decryption. Seld sends plaintext to `age` over a pipe and never publishes a
 plaintext archive, but the user remains responsible for the age identity and

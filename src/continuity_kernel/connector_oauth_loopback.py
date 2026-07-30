@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import selectors
 import socket
 import time
 from dataclasses import dataclass
@@ -44,6 +45,10 @@ class _OneShotServer(HTTPServer):
 class _IPv6OneShotServer(_OneShotServer):
     address_family = socket.AF_INET6
 
+    def server_bind(self) -> None:
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        super().server_bind()
+
 
 class _CallbackHandler(BaseHTTPRequestHandler):
     server: _OneShotServer
@@ -83,8 +88,14 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 class BoundLoopbackCallback:
     """A pre-bound callback whose origin is never derived from request headers."""
 
-    def __init__(self, server: _OneShotServer, *, host: str, path: str) -> None:
-        self._server = server
+    def __init__(
+        self,
+        servers: tuple[_OneShotServer, ...],
+        *,
+        host: str,
+        path: str,
+    ) -> None:
+        self._servers = servers
         self._host = host
         self._path = path
         self._closed = False
@@ -97,18 +108,39 @@ class BoundLoopbackCallback:
         port: int = 0,
         path: str = "/oauth/callback",
     ) -> BoundLoopbackCallback:
-        if host not in {"127.0.0.1", "::1"}:
-            raise ValidationError("OAuth callback host must be a loopback IP")
-        if not path.startswith("/") or "?" in path or "#" in path or "\x00" in path:
+        if host not in {"127.0.0.1", "::1", "localhost"}:
+            raise ValidationError("OAuth callback host must be loopback")
+        if (path and not path.startswith("/")) or "?" in path or "#" in path or "\x00" in path:
             raise ValidationError("OAuth callback path is invalid")
-        server_type = _IPv6OneShotServer if host == "::1" else _OneShotServer
-        server = server_type((host, port), _CallbackHandler)
-        server.expected_path = path
-        return cls(server, host=host, path=path)
+        if host == "localhost":
+            try:
+                ipv4 = _OneShotServer(("127.0.0.1", port), _CallbackHandler)
+            except OSError as exc:
+                raise ValidationError("OAuth callback could not bind the registered port") from exc
+            servers: tuple[_OneShotServer, ...] = (ipv4,)
+            actual_port = int(ipv4.server_address[1])
+            if socket.has_ipv6:
+                try:
+                    ipv6 = _IPv6OneShotServer(("::1", actual_port), _CallbackHandler)
+                except OSError as exc:
+                    ipv4.server_close()
+                    raise ValidationError(
+                        "OAuth localhost callback could not bind both loopback families"
+                    ) from exc
+                servers = (ipv4, ipv6)
+        else:
+            server_type = _IPv6OneShotServer if host == "::1" else _OneShotServer
+            try:
+                servers = (server_type((host, port), _CallbackHandler),)
+            except OSError as exc:
+                raise ValidationError("OAuth callback could not bind the loopback port") from exc
+        for server in servers:
+            server.expected_path = path or "/"
+        return cls(servers, host=host, path=path)
 
     @property
     def redirect_uri(self) -> str:
-        address = self._server.server_address
+        address = self._servers[0].server_address
         port = int(address[1])
         host = f"[{self._host}]" if self._host == "::1" else self._host
         return f"http://{host}:{port}{self._path}"
@@ -120,31 +152,50 @@ class BoundLoopbackCallback:
     ) -> None:
         if config.redirect_uri != self.redirect_uri:
             raise ValidationError("OAuth configuration is not bound to this callback listener")
-        self._server.config = config
-        self._server.attempt = attempt
+        for server in self._servers:
+            server.config = config
+            server.attempt = attempt
 
     def wait_for_code(self, *, timeout_seconds: float) -> str:
         if timeout_seconds <= 0:
             raise ValidationError("OAuth callback timeout must be positive")
         deadline = time.monotonic() + timeout_seconds
         try:
-            while self._server.authorization_code is None and self._server.callback_error is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise OAuthCallbackError("OAuth callback timed out")
-                self._server.timeout = remaining
-                self._server.handle_request()
-            if self._server.callback_error is not None:
-                raise self._server.callback_error
-            assert self._server.authorization_code is not None
-            return self._server.authorization_code
+            with selectors.DefaultSelector() as selector:
+                for server in self._servers:
+                    selector.register(server, selectors.EVENT_READ, data=server)
+                return self._wait_for_ready_callback(selector, deadline)
         finally:
             self.close()
+
+    def _wait_for_ready_callback(
+        self,
+        selector: selectors.BaseSelector,
+        deadline: float,
+    ) -> str:
+        while True:
+            for server in self._servers:
+                if server.callback_error is not None:
+                    raise server.callback_error
+                if server.authorization_code is not None:
+                    return server.authorization_code
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OAuthCallbackError("OAuth callback timed out")
+            ready = selector.select(remaining)
+            if not ready:
+                raise OAuthCallbackError("OAuth callback timed out")
+            for key, _events in ready:
+                callback_server = key.data
+                assert isinstance(callback_server, _OneShotServer)
+                callback_server.timeout = 0
+                callback_server.handle_request()
 
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            self._server.server_close()
+            for server in self._servers:
+                server.server_close()
 
 
 def begin_authorization(config: OAuthClientConfig) -> OAuthAuthorizationAttempt:

@@ -25,12 +25,14 @@ from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_credentials import OAuthCredential
 from continuity_kernel.connector_identifiers import parse_connection_id
 from continuity_kernel.connector_oauth import OAuthTokenEndpointError, OAuthTokenType
+from continuity_kernel.connector_profiles import get_profile
 from continuity_kernel.connector_secrets import InMemorySecretStore
-from continuity_kernel.errors import ConflictError, ValidationError
+from continuity_kernel.errors import ConflictError, SetupError, ValidationError
 from continuity_kernel.vault import Vault
 
 BASE_TIME = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
 CONNECTION_ID = parse_connection_id("con-" + "c" * 32)
+GOOGLE_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
 
 def _manager(tmp_path: Path, *, redirect_port: int = 0) -> ConnectorAuthManager:
@@ -42,11 +44,11 @@ def _manager(tmp_path: Path, *, redirect_port: int = 0) -> ConnectorAuthManager:
         source_ids=("gmail",),
         credential_kind=CredentialKind.OAUTH2,
         account=AccountMetadata(label="Synthetic account"),
-        scopes=("mail.read",),
+        scopes=(GOOGLE_SCOPE,),
         client=ClientMetadata(
             kind=ClientKind.PUBLIC,
             identifier="public-client",
-            redirect_uris=(f"http://127.0.0.1:{redirect_port}/oauth/callback",),
+            redirect_uris=(f"http://127.0.0.1:{redirect_port}",),
             authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
             token_endpoint="https://oauth2.googleapis.com/token",
         ),
@@ -72,7 +74,7 @@ def _expired_credential() -> OAuthCredential:
         access_token="expired-access",
         refresh_token="single-use-refresh",
         token_type=OAuthTokenType.BEARER,
-        scopes=("mail.read",),
+        scopes=(GOOGLE_SCOPE,),
         issued_at=BASE_TIME,
         expires_at=BASE_TIME + timedelta(minutes=5),
     )
@@ -133,9 +135,11 @@ def test_concurrent_refresh_uses_a_rotating_provider_token_once(
     assert "fresh-access" not in json.dumps(manager.status(), sort_keys=True)
 
 
-def test_invalid_grant_preserves_secret_and_marks_reauthorization(
+@pytest.mark.parametrize("provider_error", ["invalid_grant", "invalid_refresh_token"])
+def test_invalid_refresh_preserves_secret_and_marks_reauthorization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    provider_error: str,
 ) -> None:
     manager = _manager(tmp_path)
     original = manager.store_oauth_credential(
@@ -153,7 +157,7 @@ def test_invalid_grant_preserves_secret_and_marks_reauthorization(
         assert endpoint == "https://oauth2.googleapis.com/token"
         assert fields["refresh_token"] == "single-use-refresh"
         assert 0 < timeout_seconds <= 15.0
-        return 400, b'{"error":"invalid_grant"}'
+        return 400, json.dumps({"error": provider_error}).encode()
 
     monkeypatch.setattr(connector_oauth, "_post_form", invalid_grant)
     with pytest.raises(OAuthTokenEndpointError) as failure:
@@ -162,7 +166,7 @@ def test_invalid_grant_preserves_secret_and_marks_reauthorization(
             observed_at=BASE_TIME + timedelta(hours=1),
         )
 
-    assert failure.value.error == "invalid_grant"
+    assert failure.value.error == provider_error
     assert manager.tokens.state(CONNECTION_ID) == original
     assert manager.tokens.read(CONNECTION_ID).value == _expired_credential().to_bytes()
     connection = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
@@ -233,10 +237,13 @@ def test_native_loopback_flow_ignores_host_header_and_persists_result(
         state = query["state"][0]
         assert redirect.port is not None and redirect.port > 0
         assert query["code_challenge_method"] == ["S256"]
+        assert query["access_type"] == ["offline"]
+        assert query["prompt"] == ["consent"]
+        assert redirect.path == ""
 
         def callback() -> None:
             connection = http.client.HTTPConnection("127.0.0.1", redirect.port, timeout=5)
-            target = f"{redirect.path}?code=one-time-code&state={state}"
+            target = f"/?code=one-time-code&state={state}"
             connection.putrequest("GET", target, skip_host=True)
             connection.putheader("Host", "attacker.invalid")
             connection.endheaders()
@@ -260,7 +267,10 @@ def test_native_loopback_flow_ignores_host_header_and_persists_result(
         assert len(fields["code_verifier"]) >= 43
         assert fields["redirect_uri"].startswith("http://127.0.0.1:")
         assert timeout_seconds == 30.0
-        return 200, b'{"access_token":"loopback-access","token_type":"Bearer"}'
+        return 200, (
+            b'{"access_token":"loopback-access","token_type":"Bearer",'
+            b'"refresh_token":"loopback-refresh","expires_in":3600}'
+        )
 
     monkeypatch.setattr("continuity_kernel.connector_auth_manager.webbrowser.open", open_browser)
     monkeypatch.setattr(connector_oauth, "_post_form", exchange)
@@ -273,3 +283,141 @@ def test_native_loopback_flow_ignores_host_header_and_persists_result(
     assert isinstance(status, list)
     assert status[0]["host_credential"] == "available"
     assert status[0]["health"] == "unverified"
+
+
+def test_oauth_credential_rejects_provider_grants_outside_the_profile(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    overbroad = OAuthCredential(
+        access_token="overbroad-access",
+        refresh_token="overbroad-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=(GOOGLE_SCOPE, "https://www.googleapis.com/auth/gmail.modify"),
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    with pytest.raises(ValidationError, match="outside its read-only profile"):
+        manager.store_oauth_credential(
+            CONNECTION_ID,
+            overbroad,
+            expected_token_version=0,
+        )
+    assert manager.tokens.state(CONNECTION_ID) is None
+
+
+def test_microsoft_accepts_canonical_short_grants_without_offline_access(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Microsoft scopes")
+    profile = get_profile("microsoft")
+    metadata = ConnectionMetadata(
+        connection_id=CONNECTION_ID,
+        provider=profile.provider,
+        source_ids=profile.source_ids,
+        credential_kind=profile.credential_kind,
+        account=AccountMetadata(label="Synthetic Microsoft"),
+        scopes=profile.scopes,
+        client=ClientMetadata(
+            kind=ClientKind.PUBLIC,
+            identifier="public-microsoft-client",
+            redirect_uris=("http://localhost:0/oauth/callback",),
+            authorization_endpoint=profile.authorization_endpoint,
+            token_endpoint=profile.token_endpoint,
+        ),
+        health=ConnectionHealth.UNVERIFIED,
+        created_at=BASE_TIME,
+        updated_at=BASE_TIME,
+        version=1,
+    )
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=metadata,
+        observed_at=BASE_TIME,
+    )
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    credential = OAuthCredential(
+        access_token="microsoft-access",
+        refresh_token="microsoft-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=("Mail.Read", "User.Read"),
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    stored = manager.store_oauth_credential(
+        CONNECTION_ID,
+        credential,
+        expected_token_version=0,
+    )
+
+    assert stored.version == 1
+    assert OAuthCredential.from_bytes(manager.tokens.read(CONNECTION_ID).value) == credential
+
+
+def test_stale_removal_preserves_credential_before_retryable_revocation(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    manager.store_oauth_credential(
+        CONNECTION_ID,
+        _expired_credential(),
+        expected_token_version=0,
+    )
+    stale_revision = manager.vault.get_connection_snapshot().revision
+    manager.mark_verified(CONNECTION_ID)
+
+    with pytest.raises(ConflictError, match="reload before removing"):
+        manager.remove(CONNECTION_ID, expected_revision=stale_revision)
+
+    assert manager.tokens.read(CONNECTION_ID).value == _expired_credential().to_bytes()
+    current_revision = manager.vault.get_connection_snapshot().revision
+    removed = manager.remove(CONNECTION_ID, expected_revision=current_revision)
+    assert removed["connections"] == []
+    assert manager.tokens.state(CONNECTION_ID) is None
+
+
+def test_interrupted_removal_leaves_a_terminal_retryable_revocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    manager.store_oauth_credential(
+        CONNECTION_ID,
+        _expired_credential(),
+        expected_token_version=0,
+    )
+    actual_delete = manager.tokens.delete
+    fail_once = True
+
+    def interrupted_delete(connection_id: object) -> bool:
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise SetupError("synthetic keyring interruption")
+        return actual_delete(parse_connection_id(connection_id))
+
+    monkeypatch.setattr(manager.tokens, "delete", interrupted_delete)
+    revision = manager.vault.get_connection_snapshot().revision
+    with pytest.raises(SetupError, match="synthetic keyring interruption"):
+        manager.remove(CONNECTION_ID, expected_revision=revision)
+
+    interrupted = manager.vault.get_connection_snapshot()
+    connection = interrupted.connection(CONNECTION_ID)
+    assert connection is not None
+    assert connection.health is ConnectionHealth.REVOKED
+    assert manager.tokens.read(CONNECTION_ID).value == _expired_credential().to_bytes()
+    with pytest.raises(ValidationError, match="revoked"):
+        manager.resolve_oauth_access_token(CONNECTION_ID)
+    with pytest.raises(ValidationError, match="cannot be restored"):
+        manager.mark_verified(CONNECTION_ID)
+
+    removed = manager.remove(CONNECTION_ID, expected_revision=interrupted.revision)
+    assert removed["connections"] == []
+    assert manager.tokens.state(CONNECTION_ID) is None

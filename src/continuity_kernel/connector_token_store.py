@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import os
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,10 +77,32 @@ class AtomicTokenStore:
         self.root = Path(os.path.abspath(expanded))
         self.secrets = secrets_store
 
-    def state(self, connection_id: ConnectionId) -> TokenState | None:
+    @contextmanager
+    def exclusive_lifecycle(
+        self,
+        connection_id: ConnectionId,
+        *,
+        lock_timeout_seconds: float = 10.0,
+    ) -> Iterator[None]:
+        """Serialize metadata-aware operations for one connection."""
+
         clean_id = parse_connection_id(connection_id)
+        _validate_lock_timeout(lock_timeout_seconds)
         self._prepare()
-        with exclusive_lock(self._lock_path(clean_id)):
+        lifecycle_path = self.root / "locks" / f"{clean_id}.lifecycle.lock"
+        with exclusive_lock(lifecycle_path, timeout=lock_timeout_seconds):
+            yield
+
+    def state(
+        self,
+        connection_id: ConnectionId,
+        *,
+        lock_timeout_seconds: float = 10.0,
+    ) -> TokenState | None:
+        clean_id = parse_connection_id(connection_id)
+        _validate_lock_timeout(lock_timeout_seconds)
+        self._prepare()
+        with exclusive_lock(self._lock_path(clean_id), timeout=lock_timeout_seconds):
             return self._load_unlocked(clean_id)
 
     def read(self, connection_id: ConnectionId) -> ResolvedToken:
@@ -386,6 +410,16 @@ def _token_bytes(value: object) -> bytes:
     if not isinstance(value, bytes) or not value or len(value) > MAX_TOKEN_BUNDLE_BYTES:
         raise ValidationError("token bundle is empty or exceeds its size bound")
     return bytes(value)
+
+
+def _validate_lock_timeout(value: float) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValidationError("connector credential lock timeout must be non-negative and finite")
 
 
 def _decode_state(encoded: bytes, *, expected_connection_id: ConnectionId) -> TokenState:

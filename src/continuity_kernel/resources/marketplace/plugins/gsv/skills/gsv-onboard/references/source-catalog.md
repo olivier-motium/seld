@@ -15,12 +15,12 @@ back to `$gsv-onboard` in either case.
 | --- | --- | --- |
 | Seld on this computer | Installed Seld MCP or exact-vault local CLI | Verify the vault identity and one bounded `gsv_context` read; this is source zero and remains available when a task-local plugin is absent. |
 | ChatGPT activity | Installed Seld/ChatGPT task tools | Confirm the current task/account context and read recent relevant activity. |
-| [Gmail](providers/gmail.md) | Gmail app in ChatGPT | Confirm the Google account; read a small recent mail window. |
-| [Google Calendar](providers/google-calendar.md) | Google Calendar app | Confirm the calendar identity; read a bounded current window. |
-| [Google Drive](providers/google-drive.md) | Google Drive app | Confirm the account; search or read a small recent set. |
+| [Gmail](providers/gmail.md) | Gmail app or Seld-managed `google` profile | Confirm the Google account; read a small recent mail window. |
+| [Google Calendar](providers/google-calendar.md) | Google Calendar app or Seld-managed `google` profile | Confirm the calendar identity; read a bounded current window. |
+| [Google Drive](providers/google-drive.md) | Google Drive app or Seld-managed `google` profile | Confirm the account; search or read a small recent metadata set. |
 | Google Sheets | Google Drive/Sheets app tools | Confirm the account; read only the named sheet/range needed. |
-| [Outlook mail](providers/outlook-email.md) and [calendar](providers/outlook-calendar.md) | Outlook apps | Confirm the mailbox/calendar; read a bounded recent mail or calendar window. |
-| [Slack](providers/slack.md) | Slack app | Confirm the workspace; read a small recent channel, thread, or DM window. |
+| [Outlook mail](providers/outlook-email.md) and [calendar](providers/outlook-calendar.md) | Outlook apps or Seld-managed `microsoft` profile | Confirm the mailbox/calendar; read a bounded recent mail or calendar window. |
+| [Slack](providers/slack.md) | Slack app, or Seld-managed `slack` profile with one exact host-private channel ID | Confirm the workspace/member; read at most 15 recent items from that one conversation. The Seld-managed reader does not expand thread replies. |
 | [Microsoft Teams](providers/teams.md) | Teams app | Confirm the tenant/account; read a small recent chat window. |
 | [GitHub](providers/github.md) | GitHub app or official hosted MCP | Confirm the account/organization; read bounded recent repository activity. |
 | [Asana](providers/asana.md) | Asana app | Confirm the workspace/account; read a bounded current task or project window. |

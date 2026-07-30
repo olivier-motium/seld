@@ -538,7 +538,6 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
         )
         assert f"providers/{provider_name}.md" in source_catalog
         assert "$gsv-onboard" in provider_text
-        assert "fresh ChatGPT task" in provider_text
     pulse = generated_marketplace / "plugins/gsv/skills/gsv-pulse"
     assert (pulse / "SKILL.md").is_file()
     assert {path.name for path in (pulse / "references").iterdir() if path.is_file()} == {

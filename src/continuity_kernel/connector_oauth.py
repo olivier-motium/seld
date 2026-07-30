@@ -17,7 +17,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from continuity_kernel.errors import ContinuityError
 
-_LOOPBACK_HOSTS: Final = frozenset({"127.0.0.1", "::1"})
+_LOOPBACK_HOSTS: Final = frozenset({"127.0.0.1", "::1", "localhost"})
 _PKCE_ALLOWED: Final = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 )
@@ -29,6 +29,12 @@ _RESERVED_AUTH_PARAMETERS: Final = frozenset(
 
 class OAuthTokenType(StrEnum):
     BEARER = "Bearer"
+
+
+class OAuthDialect(StrEnum):
+    STANDARD = "standard"
+    GOOGLE = "google"
+    SLACK_USER = "slack_user"
 
 
 class ConnectorOAuthError(ContinuityError): ...
@@ -64,6 +70,7 @@ class OAuthClientConfig:
     client_id: str
     redirect_uri: str
     scopes: tuple[str, ...] = ()
+    dialect: OAuthDialect = OAuthDialect.STANDARD
 
     def __post_init__(self) -> None:
         _validate_https_endpoint(self.authorization_endpoint, "authorization endpoint")
@@ -72,6 +79,22 @@ class OAuthClientConfig:
             raise OAuthConfigurationError("OAuth client_id must not be empty")
         _validate_loopback_redirect(self.redirect_uri)
         _validate_scopes(self.scopes)
+        if self.dialect is OAuthDialect.GOOGLE:
+            redirect = urlsplit(self.redirect_uri)
+            if redirect.hostname not in {"127.0.0.1", "::1"} or redirect.path:
+                raise OAuthConfigurationError(
+                    "Google OAuth requires an exact loopback IP redirect without a path"
+                )
+        elif self.dialect is OAuthDialect.SLACK_USER:
+            redirect = urlsplit(self.redirect_uri)
+            if (
+                redirect.hostname != "localhost"
+                or redirect.port in {None, 0}
+                or redirect.path != "/oauth/callback"
+            ):
+                raise OAuthConfigurationError(
+                    "Slack OAuth requires an exact registered localhost callback with a fixed port"
+                )
 
 
 @dataclass(frozen=True, repr=False)
@@ -134,7 +157,14 @@ def build_authorization_url(config: OAuthClientConfig, *, state: str, pkce: PKCE
         ("code_challenge_method", "S256"),
     ]
     if config.scopes:
-        parameters.append(("scope", " ".join(config.scopes)))
+        separator = "," if config.dialect is OAuthDialect.SLACK_USER else " "
+        parameters.append(("scope", separator.join(config.scopes)))
+    if config.dialect is OAuthDialect.GOOGLE:
+        if any(name in {"access_type", "prompt"} for name, _value in existing):
+            raise OAuthConfigurationError(
+                "Google authorization endpoint contains reserved provider parameters"
+            )
+        parameters.extend((("access_type", "offline"), ("prompt", "consent")))
     return urlunsplit(endpoint._replace(query=urlencode(parameters)))
 
 
@@ -208,7 +238,7 @@ def refresh_access_token(
         "client_id": config.client_id,
         "refresh_token": refresh_token,
     }
-    if scopes is not None:
+    if scopes is not None and config.dialect is OAuthDialect.STANDARD:
         _validate_scopes(scopes)
         if scopes:
             fields["scope"] = " ".join(scopes)
@@ -242,7 +272,8 @@ def _request_token(
                 error="token_endpoint_error", description=None, status_code=status
             ) from exc
         raise
-    if not 200 <= status < 300 or "error" in payload:
+    slack_rejected = config.dialect is OAuthDialect.SLACK_USER and payload.get("ok") is not True
+    if not 200 <= status < 300 or "error" in payload or slack_rejected:
         error = payload.get("error")
         description = payload.get("error_description")
         raise OAuthTokenEndpointError(
@@ -250,7 +281,7 @@ def _request_token(
             description=description if isinstance(description, str) else None,
             status_code=status,
         )
-    return _parse_token_set(payload, preserved_refresh_token)
+    return _parse_token_set(payload, preserved_refresh_token, config.dialect)
 
 
 def _post_form(
@@ -275,13 +306,16 @@ def _post_form(
 
 
 def _parse_token_set(
-    payload: dict[str, object], preserved_refresh_token: str | None
+    payload: dict[str, object],
+    preserved_refresh_token: str | None,
+    dialect: OAuthDialect,
 ) -> OAuthTokenSet:
     access_token = payload.get("access_token")
     if not isinstance(access_token, str) or not access_token:
         raise OAuthTransportError("OAuth token response has no usable access_token")
     token_type = payload.get("token_type")
-    if not isinstance(token_type, str) or token_type.casefold() != "bearer":
+    expected_token_type = "user" if dialect is OAuthDialect.SLACK_USER else "bearer"
+    if not isinstance(token_type, str) or token_type.casefold() != expected_token_type:
         raise OAuthTransportError("OAuth token response has unsupported token_type")
 
     if "refresh_token" not in payload:
@@ -291,6 +325,8 @@ def _parse_token_set(
         if not isinstance(refresh_value, str) or not refresh_value:
             raise OAuthTransportError("OAuth token response has an invalid refresh_token")
         refresh_token = refresh_value
+    if dialect is OAuthDialect.GOOGLE and refresh_token is None:
+        raise OAuthTransportError("Google OAuth response has no usable refresh_token")
 
     expires_value = payload.get("expires_in")
     if expires_value is None:
@@ -300,10 +336,20 @@ def _parse_token_set(
     else:
         expires_in = expires_value
     scope_value = payload.get("scope")
+    if scope_value is None and dialect is OAuthDialect.SLACK_USER:
+        authed_user = payload.get("authed_user")
+        if isinstance(authed_user, dict):
+            scope_value = authed_user.get("scope")
     if scope_value is None:
+        if dialect is OAuthDialect.SLACK_USER and preserved_refresh_token is None:
+            raise OAuthTransportError("Slack OAuth token response has no usable user scope")
         scopes = None
     elif isinstance(scope_value, str):
-        scopes = tuple(scope_value.split())
+        if dialect is OAuthDialect.SLACK_USER:
+            scopes = tuple(item.strip() for item in scope_value.split(","))
+        else:
+            scopes = tuple(scope_value.split())
+        _validate_scopes(scopes)
     else:
         raise OAuthTransportError("OAuth token response has an invalid scope")
     return OAuthTokenSet(
@@ -369,7 +415,7 @@ def _validate_loopback_redirect(redirect_uri: str) -> None:
         or parsed.fragment
     ):
         raise OAuthConfigurationError(
-            "OAuth redirect URI must be an exact HTTP loopback IP URI with an explicit port"
+            "OAuth redirect URI must be an exact HTTP loopback URI with an explicit port"
         )
 
 

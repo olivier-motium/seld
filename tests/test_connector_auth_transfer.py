@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import shutil
 import subprocess
 from datetime import UTC, datetime
@@ -19,9 +20,12 @@ from continuity_kernel.connector_auth import (
 )
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_auth_transfer import export_auth_archive, import_auth_archive
+from continuity_kernel.connector_credentials import OAuthCredential
 from continuity_kernel.connector_identifiers import parse_connection_id
+from continuity_kernel.connector_oauth import OAuthTokenType
+from continuity_kernel.connector_profiles import get_profile
 from continuity_kernel.connector_secrets import InMemorySecretStore
-from continuity_kernel.errors import MutationCommittedError
+from continuity_kernel.errors import MutationCommittedError, ValidationError
 from continuity_kernel.vault import Vault
 
 SENTINEL = b"synthetic-portable-secret-never-in-vault"
@@ -205,3 +209,86 @@ def test_import_resumes_after_metadata_was_committed_but_reported_as_failed(
     resumed = import_auth_archive(target_manager, encrypted, identity=identity)
     assert resumed["imported"] is True
     assert target_manager.resolve_credential(CONNECTION_ID) == SENTINEL
+
+
+def test_import_rejects_an_overbroad_oauth_grant_before_mutating_custody(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="OAuth import scope boundary")
+    now = datetime.now(UTC)
+    profile = get_profile("slack")
+    metadata = ConnectionMetadata(
+        connection_id=CONNECTION_ID,
+        provider=profile.provider,
+        source_ids=profile.source_ids,
+        credential_kind=profile.credential_kind,
+        account=AccountMetadata(label="Synthetic Slack"),
+        scopes=profile.scopes,
+        client=ClientMetadata(
+            kind=ClientKind.PUBLIC,
+            identifier="public-slack-client",
+            redirect_uris=("http://localhost:49152/oauth/callback",),
+            authorization_endpoint=profile.authorization_endpoint,
+            token_endpoint=profile.token_endpoint,
+        ),
+        health=ConnectionHealth.UNVERIFIED,
+        created_at=now,
+        updated_at=now,
+        version=1,
+    )
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=metadata,
+        observed_at=now,
+    )
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    before = vault.get_connection_snapshot()
+    overbroad = OAuthCredential(
+        access_token="overbroad-slack-token",
+        refresh_token=None,
+        token_type=OAuthTokenType.BEARER,
+        scopes=(*profile.scopes, "chat:write"),
+        issued_at=now,
+        expires_at=None,
+    ).to_bytes()
+    plaintext = connector_auth_transfer._encode_archive(
+        {
+            "connection_revision": before.revision,
+            "connections": [
+                {
+                    "credential": base64.b64encode(overbroad).decode("ascii"),
+                    "metadata": metadata.to_dict(),
+                }
+            ],
+            "format_version": connector_auth_transfer.AUTH_ARCHIVE_FORMAT_VERSION,
+            "vault_id": manager.vault_id,
+        }
+    )
+
+    def decrypt(
+        arguments: tuple[str, ...],
+        content: bytes,
+        *,
+        executable: Path | None,
+        output_bound: int,
+    ) -> bytes:
+        del arguments, content, executable, output_bound
+        return plaintext
+
+    monkeypatch.setattr(connector_auth_transfer, "_run_age", decrypt)
+    encrypted = tmp_path / "auth.age"
+    encrypted.write_bytes(b"synthetic ciphertext")
+    identity = tmp_path / "identity.txt"
+    identity.write_text("synthetic identity", encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="outside its read-only profile"):
+        import_auth_archive(manager, encrypted, identity=identity)
+
+    assert vault.get_connection_snapshot() == before
+    assert manager.tokens.state(CONNECTION_ID) is None
