@@ -236,6 +236,14 @@ RECIPES: Final = {
             read="wacli.messages.recent_read",
             ttl_hours=6,
         ),
+        _recipe(
+            "discord",
+            "Discord",
+            version="1",
+            identity="discord.account.identity",
+            read="discord.messages.recent_read",
+            ttl_hours=6,
+        ),
     )
 }
 
