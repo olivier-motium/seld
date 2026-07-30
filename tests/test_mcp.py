@@ -13,6 +13,15 @@ import pytest
 
 import continuity_kernel.update as self_update
 from continuity_kernel import mcp_server, resident_import
+from continuity_kernel.connector_auth import (
+    AccountMetadata,
+    ClientKind,
+    ClientMetadata,
+    ConnectionHealth,
+    ConnectionMetadata,
+    CredentialKind,
+)
+from continuity_kernel.connector_identifiers import parse_connection_id
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED, EMPTY_REVISION, ControlQueue
 from continuity_kernel.errors import ConflictError, ValidationError
 from continuity_kernel.operations import OperationLedger
@@ -732,6 +741,7 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
     expected = {
         "gsv_backup_create",
         "gsv_context",
+        "gsv_connection_list",
         "gsv_execution_bindings",
         "gsv_direction_set",
         "gsv_direction_show",
@@ -797,6 +807,44 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
     if not CONTROL_STORE_SUPPORTED:
         expected.difference_update(mcp_server.OPERATION_TOOL_NAMES)
     assert names == expected
+
+
+def test_mcp_connection_list_is_redacted_and_rejects_secret_arguments(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "connection-mcp-vault")
+    vault.initialize(name="Connection MCP")
+    now = datetime.now(UTC)
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=ConnectionMetadata(
+            connection_id=parse_connection_id("con-" + "m" * 32),
+            provider="github",
+            source_ids=("github",),
+            credential_kind=CredentialKind.API_KEY,
+            account=AccountMetadata(fingerprint="sha256:" + "a" * 64, label="Synthetic"),
+            scopes=(),
+            client=ClientMetadata(kind=ClientKind.EXTERNAL, identifier="private-client-id"),
+            health=ConnectionHealth.READY,
+            created_at=now,
+            updated_at=now,
+            last_verified_at=now,
+            version=1,
+        ),
+        observed_at=now,
+    )
+
+    result = mcp_server._call("gsv_connection_list", {}, vault=vault)
+    serialized = json.dumps(result, sort_keys=True)
+
+    assert result["connections"][0]["host_credential"] == "missing"
+    assert "private-client-id" not in serialized
+    assert "sha256:" not in serialized
+    assert "secret://" not in serialized
+    with pytest.raises(ValidationError, match="unknown field token"):
+        mcp_server._call(
+            "gsv_connection_list",
+            {"token": "must-not-be-accepted"},
+            vault=vault,
+        )
 
 
 def test_mcp_local_source_migration_routes_only_vault_staged_state(

@@ -4,10 +4,12 @@ The recipe names below are logical capabilities. Tool names vary by ChatGPT
 app, custom MCP server, and version. Verify the actual task-local tool shape
 instead of hard-coding a marketplace label.
 
-For a listed ChatGPT app, open only that source's linked connection note after
-the person selects it. The app is installed separately and owns OAuth; the
-Seld note adds identity checks, a bounded read, recovery, and the handoff back
-to `$gsv-onboard`.
+For a listed source, open only its linked connection note after the person
+selects it. A host-owned ChatGPT app is installed separately and owns its
+non-portable OAuth. A connector implementation using Seld-managed auth instead
+uses `gsv-auth` and the OS keyring; it never imports the host app's session.
+The Seld note adds identity checks, a bounded read, recovery, and the handoff
+back to `$gsv-onboard` in either case.
 
 | Source | Setup surface | Bounded verification |
 | --- | --- | --- |
@@ -36,6 +38,7 @@ to `$gsv-onboard`.
 | Screen context | Optional local derived-context tool | Ask for a fresh per-flow approval; retain derived signals, never frames. |
 
 If a listed first-party app is unavailable for the person's plan, region, or
-workspace, a custom MCP app may satisfy the same recipe. Do not substitute
-browser scraping, ask for credentials in chat, or weaken the read-only Pulse
-boundary.
+workspace, a custom MCP app or implemented Seld-managed connector may satisfy
+the same recipe. Do not claim that auth metadata alone implements a provider
+reader. Do not substitute browser scraping, ask for credentials in chat, reuse
+an AI-host login, or weaken the read-only Pulse boundary.

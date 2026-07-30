@@ -14,6 +14,7 @@ from typing import IO, Any, Final
 import continuity_kernel.update as self_update
 from continuity_kernel import __version__, resident_import
 from continuity_kernel.config import resolve_vault
+from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.direction import direction_aim, direction_dict
 from continuity_kernel.discord_source import DiscordSourceBridge
@@ -295,6 +296,8 @@ def _call(
         return doctor_dict(vault.doctor(repair=False))
     if name == "gsv_source_list":
         return {"catalog": list_recipes(), "state": vault.source_status()}
+    if name == "gsv_connection_list":
+        return ConnectorAuthManager(vault).status()
     if name == "gsv_source_select":
         return vault.select_sources(
             expected_revision=_string(values, "expected_revision"),
@@ -1133,6 +1136,15 @@ TOOLS: Final = [
             },
         },
         ("grant_id", "relative_path"),
+        read_only=True,
+    ),
+    _tool(
+        "gsv_connection_list",
+        (
+            "List portable connector metadata and redacted host credential availability. "
+            "Authentication and secret resolution remain in the local gsv-auth/connector runtime."
+        ),
+        {},
         read_only=True,
     ),
     _tool(

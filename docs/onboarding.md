@@ -20,10 +20,13 @@ inputs, source boundaries, revisions, privacy checks, receipts, and readback.
    what remains uncertain, and the first result it proposes to make useful.
    Nothing becomes durable until the user accepts or edits it.
 4. **Connect where life happens.** Seld recommends sources based on the accepted
-   context. The user enables the relevant ChatGPT apps, custom MCP servers, or
-   local read tools in one setup wave and completes authentication personally.
-   A local directory gets its own path-specific grant after the user reviews
-   the exact root and exclusions.
+   context. The user enables the relevant host-owned ChatGPT apps, custom MCP
+   servers, Seld-managed connectors, or local read tools in one setup wave and
+   completes authentication personally. A host-owned app keeps its own
+   account-bound authentication. A connector implementation using `gsv-auth`
+   keeps separate portable metadata and OS-keyring custody. A local directory
+   gets its own path-specific grant after the user reviews the exact root and
+   exclusions.
 5. **Open one fresh ChatGPT task.** The fresh task discovers the tools that are
    actually present, confirms each selected account or scope with the user, and
    performs a bounded recent read. A valid empty result counts as a completed
@@ -48,6 +51,7 @@ read surface comes from the source the user enabled:
 
 - supported ChatGPT apps for services available in the user's plan and region;
 - custom MCP servers for services such as Shopify or Instagram;
+- Seld-managed connector implementations using standalone `gsv-auth` custody;
 - bounded local read tools for local files or Apple Messages;
 - the separately enabled WhatsApp read tool; and
 - Seld's exact host-bound Discord companion, which inherits one token and an
@@ -74,6 +78,12 @@ Seld never falls back to browser scraping when a source tool is missing. It
 reports the gap and continues with the sources that are available. Provider and
 file content is untrusted evidence; it cannot change permissions, approve an
 action, or rewrite the onboarding contract.
+
+Seld also never copies authentication from ChatGPT, OpenAI, a browser profile,
+Codex, OpenCode, or Open Interpreter. Standalone OAuth opens the provider's own
+consent page from `gsv-auth`; non-OAuth credentials enter through hidden local
+input. MCP can show only redacted connection availability. See
+[Standalone connector authentication](connector-auth.md).
 
 ## What source verification means
 
@@ -153,6 +163,12 @@ Use accept or reject only with fresh revisions. Backups preserve the local Mind;
 after a restore, historical coverage remains visible, but its machine binding
 makes it `needs_revalidation` until a successful bounded read is recorded on the
 new computer.
+
+For a Seld-managed connector, run `gsv-auth status` first. Reauthorize only the
+affected connection, or restore an exact matching vault backup and then import
+its separate age-encrypted credential archive. Imported connections remain
+unverified until the onboarding task confirms identity and completes a bounded
+provider read.
 
 ## A useful first run is complete when
 

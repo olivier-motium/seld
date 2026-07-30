@@ -57,16 +57,43 @@ be confused with Seld's portable source receipt. A CLI-only, compare-and-swap
 host record binds one exact self-contained executable, its interpreter, and
 its three-tool inventory to one physical vault. On POSIX hosts Seld opens and
 re-hashes the bound artifact, then gives that already-open file to the pinned
-interpreter, closing the artifact's verify-to-execute path race. Seld launches it with a
-minimal environment containing exactly one caller-supplied token, the exact
-channel allowlist, and a vault-specific private state path. The generated
+interpreter, closing the artifact's verify-to-execute path race. Seld launches
+it with a minimal environment containing exactly one caller-supplied token, the
+exact channel allowlist, and a vault-specific private state path. The generated
 ChatGPT MCP manifest contains none of those values. Status verifies the
 transient account identity and channel-set digest. Poll performs one bounded
 GET-only read and stages a checkpoint; Seld independently validates the
 privacy-minimized projection and delivery binding. Only after a matching
 portable `SOURCES.md` receipt is committed and fresh-read may acknowledgement
-advance the companion cursor. Pending work replays or is safely reread from
-the last committed cursor after restart.
+advance the companion cursor. Pending work replays or is safely reread from the
+last committed cursor after restart.
+
+Standalone connector authentication follows the same portable/host-local
+split. `CONNECTIONS.md` carries versioned non-secret provider, account, scope,
+client-registration, and health metadata under vault compare-and-swap. Secret
+material stays outside the vault in an approved operating-system keyring,
+addressed by a vault-scoped connection ID through a bounded two-slot token
+publisher. Provider refresh and publication share one per-connection lock, so
+concurrent connector calls cannot fan out a token refresh or overwrite a newer
+credential.
+
+`gsv-auth` is the human setup and transfer adapter. OAuth uses a native
+authorization-code flow for public clients with PKCE, exact state, a one-shot
+loopback callback, and redirect-free token requests. API keys and other opaque
+credentials enter only through hidden input or stdin, never an argument. A
+connector runtime may resolve a credential internally; Bridge and MCP expose
+only redacted availability through `gsv_connection_list`. No Seld path reads or
+copies an OpenAI, ChatGPT, browser, Codex, or other AI-host session.
+
+Vault backups include `CONNECTIONS.md` but exclude keyring values and host-local
+token pointers. Moving credentials is a separate explicit age-encrypted export
+bound to the exact vault ID and connection revision. Import requires that exact
+portable snapshot on the destination and empty custody, or the byte-exact state
+derived from its unverified metadata with every already-published credential
+matching. It marks the restored connections unverified before publishing
+credentials, so a retry can safely continue until a real provider read
+succeeds. This is a local library and CLI boundary, not a daemon, hosted broker,
+or second connector control plane.
 
 The packaged `gsv-onboard`, `gsv-pulse`, and `gsv-update` skills compose
 document, Task, WorkThread, Portfolio, source, operation, Bridge, and updater

@@ -12,6 +12,7 @@ GSV/
   NOW.md
   PORTFOLIO.md
   SOURCES.md
+  CONNECTIONS.md
   AGENTS.md
   README.md
   tasks/*.md
@@ -135,6 +136,23 @@ revoking, replacing, or invalidating a grant changes that hash and makes
 retained local-file coverage `needs_revalidation`; no local path is written
 into `SOURCES.md` or a backup.
 
+`CONNECTIONS.md` is the portable connector-auth registry. One encoded canonical
+JSON header carries the complete versioned metadata; the visible Markdown body
+is a human-readable projection. Each connection binds an opaque connection ID
+to provider and source IDs, credential kind, optional account label and hashed
+fingerprint, scopes, public OAuth client metadata when applicable, health,
+verification time, and record timestamps. It has no field for a password, API
+key, access token, refresh token, client secret, age identity, or host secret
+reference. The complete registry has one SHA-256 revision and every mutation
+uses vault compare-and-swap plus an audit event.
+
+Host-local connector state is outside the vault. Owner-private pointer files
+name one of two bounded opaque keyring slots and carry a token version and
+timestamp, but never credential bytes. The keyring service is scoped to the
+vault ID. Restoring `CONNECTIONS.md` therefore restores what a connection is,
+not authority to use it; redacted status reports `missing` until credentials
+are imported or authorized on that host.
+
 ## Guided review references
 
 One nonterminal review-session Task carries deterministic navigation facts:
@@ -225,7 +243,8 @@ and valid events missing only their final newline remain for manual review.
 
 ## Backups
 
-A backup contains vault files plus a manifest of relative names and SHA-256
+A backup contains vault files, including `CONNECTIONS.md` when present, plus a
+manifest of relative names and SHA-256
 digests. Archive-entry and total expanded sizes are validated separately before
 contents are read. Portable paths exclude platform aliases and control
 characters. Verification checks the manifest before restore. Backup creation
@@ -237,6 +256,14 @@ Failed unpublished restore stages remain named recovery evidence; they are not
 recursively removed by doctor repair.
 Checksums detect accidental corruption; they are not cryptographic
 authentication or encryption.
+
+Ordinary backups exclude operating-system keyring values and host-local token
+pointers. Credential portability uses a separate age-encrypted archive whose
+decrypted payload is bound to the exact vault ID and `CONNECTIONS.md` revision.
+Import requires a restored matching snapshot and empty destination custody, or
+the exact derived unverified metadata with every already-published credential
+matching byte for byte. The ciphertext is not part of the vault backup unless
+the user deliberately stores it there.
 
 The full-vault logical digest covers both canonical Markdown and the private
 `.gsv/control/` intent, disposition, archive, and transport-receipt lane. It is

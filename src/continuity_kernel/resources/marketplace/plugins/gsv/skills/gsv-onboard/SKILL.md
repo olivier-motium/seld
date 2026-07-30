@@ -65,7 +65,15 @@ Use one setup wave:
    combined checklist for the selected ChatGPT apps, custom MCP apps, local
    read tools, and required macOS permissions.
 2. Let the person complete OAuth, credentials, 2FA, legal terms, administrator
-   approval, and OS privacy prompts personally.
+   approval, and OS privacy prompts personally. A host-owned app keeps its own
+   non-portable authentication. When the chosen connector implementation uses
+   Seld-managed auth, use the local `gsv-auth` flow instead: OAuth opens the
+   provider consent page, non-OAuth credentials enter through hidden local
+   input, and MCP may inspect only redacted availability. The agent may explain
+   the command and wait for that redacted status; it must not consent, enter or
+   reuse credentials or second factors, or change account, access, or security
+   settings. Never copy or reuse a ChatGPT, OpenAI, browser, Codex, OpenCode, or
+   Open Interpreter session.
 3. After the person confirms the set, call `gsv_source_select` against the exact
    returned source-state revision. This stores only the selection and purges
    coverage for anything deselected; it does not claim a provider is live.

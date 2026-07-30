@@ -160,6 +160,9 @@ Seld makes its storage, source access, and action boundaries inspectable.
   in those sources.
 - **Local-file access.** Each directory requires a separate host-local grant;
   selecting local files alone grants no filesystem access.
+- **Portable connector auth.** Seld-managed connectors keep non-secret metadata
+  in the vault and credentials in the operating-system keyring. They do not
+  depend on the OpenAI or AI-host account currently running Seld.
 - **Approval required.** No message goes out, meeting gets booked,
   or payment gets made without you doing it.
 - **Account model.** There is no hosted Seld database, subscription, or seat
@@ -167,8 +170,9 @@ Seld makes its storage, source access, and action boundaries inspectable.
 - **Telemetry.** Seld does not collect telemetry. The model processes selected
   material under your ChatGPT account and OpenAI's terms, just like other
   material you use in that app.
-- **Open source.** The code is Apache-2.0 and the runtime has no third-party
-  Python dependencies.
+- **Open source.** The code is Apache-2.0. Seld uses the open-source `keyring`
+  adapter for native operating-system credential custody; connector secrets
+  never move into a Seld cloud service.
 
 What Seld knows about you stays inspectable. Open the record, correct it, or
 remove something you do not want retained.
@@ -195,7 +199,9 @@ your computer without Seld running.
 ## What it runs on
 
 Seld runs through the ChatGPT desktop app on macOS, using your existing ChatGPT
-account. Windows and Claude support are coming.
+account for conversation and reasoning. Seld-managed connector credentials are
+separate from that login, so changing AI hosts or ChatGPT accounts does not
+replace them. Windows and Claude support are coming.
 
 Seld has no subscription or usage meter, and Bridge serves as its reading and
 control surface. Conversation and execution remain in the ChatGPT app.
@@ -222,6 +228,13 @@ uv tool install 'git+https://github.com/olivier-motium/seld.git'
 gsv setup
 ```
 
+The standard source install includes the OS-keyring adapter and the standalone
+auth command. Verify the command before configuring a connector:
+
+```bash
+gsv-auth --help
+```
+
 Setup preserves existing records and unrelated ChatGPT configuration, installs
 Seld's local plugin and skills, and opens Bridge. The install agent then runs
 the health and recovery checks in [`AGENT_INSTALL.md`](AGENT_INSTALL.md).
@@ -243,7 +256,10 @@ The macOS source distribution includes:
   browser-authored semantic decisions;
 - context-first onboarding, source selection, AI-performed bounded reads, and
   a content-free coverage ledger visible in Bridge, CLI, and MCP from a fresh
-  process; and
+  process;
+- a host-agnostic connector-auth library and `gsv-auth` CLI with OS-keyring
+  custody, public-client OAuth with PKCE, serialized refresh, redacted MCP
+  status, and explicit age-encrypted credential transfer;
 - the resident Pulse skill, which lets the AI read selected sources, reason
   over fresh changes and durable context, and author the current Mind through
   exact compare-and-swap writes; and
@@ -255,11 +271,14 @@ The macOS source distribution includes:
 The source catalog includes ChatGPT activity, Gmail, Google Calendar, Google
 Drive and Sheets, Outlook, Slack, Teams, GitHub, Asana, Atlassian, Box, Figma,
 Notion, SharePoint, local files, Apple Messages, WhatsApp, Discord, Shopify,
-Instagram, and optional screen context. The user enables the relevant ChatGPT
-app, custom MCP server, or local read tool. Onboarding confirms the intended account and
-performs a bounded read before recording the AI-authored coverage horizon. Seld
-marks a source current only while the successful read remains within its
-recipe's freshness window on the computer and recipe version that produced it.
+Instagram, and optional screen context. The user enables either a host-owned
+ChatGPT app, a custom MCP server, a Seld-managed connector, or a local read
+tool. Host-owned app authentication remains specific to that host account;
+connector implementations using `gsv-auth` use Seld's portable custody instead.
+Onboarding confirms the intended account and performs a bounded read before
+recording the AI-authored coverage horizon. Seld marks a source current only
+while the successful read remains within its recipe's freshness window on the
+computer and recipe version that produced it.
 
 The supported consumer surface is macOS. Windows and Claude support are coming.
 Evidence for source installation, packaging, and reliability studies is
@@ -316,6 +335,7 @@ gsv update check     # Check public main when the six-hour cache is due
 gsv bridge status    # Check the Bridge process
 gsv backup create    # Create a verified backup without overwriting one
 gsv bridge stop      # Stop Bridge
+gsv-auth status      # Show portable metadata and redacted host availability
 ```
 
 Backup creation refuses unsupported files, unsafe destinations, or a name that
@@ -363,6 +383,7 @@ the exact recovery command instead of guessing.
 - [Seld 0.3.0 release notes](docs/releases/0.3.0.md)
 - [Product contract](docs/product-contract.md)
 - [Installation and recovery](docs/installation.md)
+- [Standalone connector authentication](docs/connector-auth.md)
 - [Architecture](docs/architecture.md)
 - [Trust model](docs/trust-model.md)
 - [State-of-the-art architecture assessment](docs/state-of-the-art.md)

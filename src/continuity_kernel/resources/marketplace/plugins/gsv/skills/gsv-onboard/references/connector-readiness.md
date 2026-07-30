@@ -1,9 +1,12 @@
 # Live source verification
 
-Seld's connectors are the read-capable ChatGPT apps, custom MCP apps, and local
-tools the person chooses. Provider access stays in those tools; Seld does not
-duplicate their OAuth clients or move semantic judgment into deterministic
-code.
+Seld's connectors are the read-capable ChatGPT apps, custom MCP apps,
+Seld-managed connector implementations, and local tools the person chooses. A
+host-owned app keeps provider access and OAuth in that host account. A
+Seld-managed connector uses its own public client registration plus `gsv-auth`
+OS-keyring custody. It never copies a ChatGPT, OpenAI, browser, Codex, OpenCode,
+or Open Interpreter session. Neither path moves semantic judgment into
+deterministic code.
 
 For every selected source in the fresh setup task:
 
@@ -35,6 +38,11 @@ Pulse repeats the same checks whenever a selected source is due or materially
 relevant because tool access, account identity, and provider freshness can
 change between wakes. A restored vault or changed recipe keeps historical
 coverage visible as `needs_revalidation` until a new bounded read succeeds.
+
+For a Seld-managed connector, `gsv_connection_list` may confirm only the
+portable connection ID and redacted host availability. It cannot reveal or
+mutate a credential. A restored age-encrypted credential remains `unverified`
+until the identity check and bounded read above succeed.
 
 External sends, posts, edits, reactions, bookings, purchases, and account
 changes remain outside this read contract and require a fresh interactive user

@@ -57,6 +57,33 @@ GitHub release contains the matching platform artifact and `.sha256` file. The
 installer verifies that checksum before replacement and preserves the vault;
 the supported public source path above does not depend on a prebuilt asset.
 
+## Standalone connector authentication
+
+The standard source install includes the Python `keyring` adapter so connector
+custody survives the same exact-SHA install and self-update path as `gsv`.
+Verify the entrypoint and the selected operating-system backend before adding a
+credential:
+
+```bash
+gsv-auth status
+```
+
+The adapter is loaded only when connector custody is inspected or changed. An
+unavailable, disabled, or unapproved keyring backend fails closed without
+affecting the rest of the local record.
+
+The `gsv-auth` flow is independent of the ChatGPT, OpenAI, Codex, OpenCode, or
+Open Interpreter login. It never imports an existing browser or AI-host
+session. A provider-specific connector still needs its own public OAuth client
+registration or credential, granted by the user through that provider's normal
+consent flow.
+
+Encrypted credential transfer additionally requires the open-source `age`
+executable. On macOS it can be installed separately with `brew install age`.
+Keep the age identity outside the vault and its backups. See
+[Standalone connector authentication](connector-auth.md) for setup, transfer,
+and recovery commands.
+
 ## What setup changes
 
 - `uv` tool executable: normally `${HOME}/.local/bin/gsv`

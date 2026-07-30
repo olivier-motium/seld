@@ -74,6 +74,14 @@ def host_id_path() -> Path:
     return data_dir() / "host-id"
 
 
+def connector_auth_dir(vault_id: str) -> Path:
+    """Return host-local connector state bound to one portable vault identity."""
+
+    if _HOST_ID.fullmatch(vault_id) is None:
+        raise ValidationError("invalid vault ID for connector authentication")
+    return data_dir() / "connector-auth" / vault_id
+
+
 def local_host_id(*, create: bool = False) -> str | None:
     """Load, or explicitly create, one privacy-safe machine-local UUID.
 
