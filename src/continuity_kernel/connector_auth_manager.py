@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import webbrowser
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from time import monotonic
+from typing import Any, Final
 from urllib.parse import urlsplit
 
 from continuity_kernel.config import connector_auth_dir
@@ -21,19 +22,32 @@ from continuity_kernel.connector_credentials import (
 )
 from continuity_kernel.connector_identifiers import ConnectionId, SecretStore, parse_connection_id
 from continuity_kernel.connector_oauth import (
-    FormPoster,
     OAuthClientConfig,
     OAuthTokenEndpointError,
+    OAuthTransportError,
     exchange_authorization_code,
     refresh_access_token,
 )
 from continuity_kernel.connector_oauth_loopback import BoundLoopbackCallback, begin_authorization
 from continuity_kernel.connector_secrets import KeyringSecretStore
 from continuity_kernel.connector_token_store import AtomicTokenStore, ResolvedToken, TokenState
-from continuity_kernel.errors import NotFoundError, SetupError, ValidationError
+from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
 from continuity_kernel.vault import Vault
 
-BrowserOpener = Callable[[str], bool]
+_PINNED_OAUTH_ENDPOINTS: Final = {
+    "google": (
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        "https://oauth2.googleapis.com/token",
+    ),
+    "microsoft": (
+        "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    ),
+    "slack": (
+        "https://slack.com/oauth/v2_user/authorize",
+        "https://slack.com/api/oauth.v2.user.access",
+    ),
+}
 
 
 class ConnectorAuthManager:
@@ -114,14 +128,31 @@ class ConnectorAuthManager:
         self,
         connection_id: ConnectionId | str,
         *,
+        expected_connection_revision: str | None = None,
         minimum_validity_seconds: int = 60,
         timeout_seconds: float = 15.0,
-        post_form: FormPoster | None = None,
         observed_at: datetime | None = None,
     ) -> str:
-        metadata = self._oauth_metadata(connection_id)
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValidationError("OAuth timeout must be a positive finite number")
+        metadata = self._oauth_metadata(
+            connection_id,
+            expected_revision=expected_connection_revision,
+        )
         config = self._oauth_config(metadata)
         now = (observed_at or datetime.now(UTC)).astimezone(UTC)
+        deadline = monotonic() + timeout_seconds
+
+        def remaining() -> float:
+            seconds = deadline - monotonic()
+            if seconds <= 0:
+                raise OAuthTransportError("OAuth credential resolution timed out")
+            return seconds
 
         def refresh_if_needed(resolved: ResolvedToken) -> bytes | None:
             previous = OAuthCredential.from_bytes(resolved.value)
@@ -136,8 +167,7 @@ class ConnectorAuthManager:
                 config,
                 refresh_token=previous.refresh_token,
                 scopes=previous.scopes,
-                timeout_seconds=timeout_seconds,
-                post_form=post_form,
+                timeout_seconds=remaining(),
             )
             return credential_from_token_set(
                 token_set,
@@ -149,7 +179,7 @@ class ConnectorAuthManager:
             resolved = self.tokens.refresh_serialized(
                 metadata.connection_id,
                 transform=refresh_if_needed,
-                lock_timeout_seconds=timeout_seconds + 15.0,
+                lock_timeout_seconds=timeout_seconds,
                 updated_at=now,
             )
         except OAuthTokenEndpointError as exc:
@@ -168,8 +198,6 @@ class ConnectorAuthManager:
         connection_id: ConnectionId | str,
         *,
         timeout_seconds: float = 180.0,
-        post_form: FormPoster | None = None,
-        open_browser: BrowserOpener = webbrowser.open,
     ) -> None:
         """Run one interactive native authorization and persist its secret result."""
 
@@ -187,7 +215,7 @@ class ConnectorAuthManager:
             config = self._oauth_config(metadata, redirect_uri=listener.redirect_uri)
             attempt = begin_authorization(config)
             listener.configure(config, attempt)
-            if not open_browser(attempt.authorization_url):
+            if not webbrowser.open(attempt.authorization_url):
                 raise SetupError("the OAuth authorization page could not be opened")
             code = listener.wait_for_code(timeout_seconds=timeout_seconds)
             token_set = exchange_authorization_code(
@@ -195,7 +223,6 @@ class ConnectorAuthManager:
                 authorization_code=code,
                 code_verifier=attempt.code_verifier,
                 timeout_seconds=min(timeout_seconds, 30.0),
-                post_form=post_form,
             )
         finally:
             listener.close()
@@ -234,15 +261,28 @@ class ConnectorAuthManager:
             connection_id=clean_id,
         )
 
-    def _metadata(self, connection_id: ConnectionId | str) -> ConnectionMetadata:
+    def _metadata(
+        self,
+        connection_id: ConnectionId | str,
+        *,
+        expected_revision: str | None = None,
+    ) -> ConnectionMetadata:
         clean_id = parse_connection_id(connection_id)
-        metadata = self.vault.get_connection_snapshot().connection(clean_id)
+        snapshot = self.vault.get_connection_snapshot()
+        if expected_revision is not None and snapshot.revision != expected_revision:
+            raise ConflictError("connection changed; reload before resolving its credential")
+        metadata = snapshot.connection(clean_id)
         if metadata is None:
             raise NotFoundError("connection was not found")
         return metadata
 
-    def _oauth_metadata(self, connection_id: ConnectionId | str) -> ConnectionMetadata:
-        metadata = self._metadata(connection_id)
+    def _oauth_metadata(
+        self,
+        connection_id: ConnectionId | str,
+        *,
+        expected_revision: str | None = None,
+    ) -> ConnectionMetadata:
+        metadata = self._metadata(connection_id, expected_revision=expected_revision)
         if metadata.credential_kind is not CredentialKind.OAUTH2:
             raise ValidationError("connection does not use OAuth")
         return metadata
@@ -257,6 +297,16 @@ class ConnectorAuthManager:
         assert client.identifier is not None
         assert client.authorization_endpoint is not None
         assert client.token_endpoint is not None
+        expected_endpoints = _PINNED_OAUTH_ENDPOINTS.get(metadata.provider)
+        if (
+            expected_endpoints is None
+            or (
+                client.authorization_endpoint,
+                client.token_endpoint,
+            )
+            != expected_endpoints
+        ):
+            raise ValidationError("OAuth endpoints do not match a built-in provider")
         return OAuthClientConfig(
             authorization_endpoint=client.authorization_endpoint,
             token_endpoint=client.token_endpoint,

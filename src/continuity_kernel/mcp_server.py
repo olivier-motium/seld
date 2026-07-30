@@ -15,6 +15,7 @@ import continuity_kernel.update as self_update
 from continuity_kernel import __version__, resident_import
 from continuity_kernel.config import resolve_vault
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_sources import SUPPORTED_SOURCE_IDS, read_connector_source
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.direction import direction_aim, direction_dict
 from continuity_kernel.discord_source import DiscordSourceBridge
@@ -298,6 +299,13 @@ def _call(
         return {"catalog": list_recipes(), "state": vault.source_status()}
     if name == "gsv_connection_list":
         return ConnectorAuthManager(vault).status()
+    if name == "gsv_connector_source_read":
+        return read_connector_source(
+            vault,
+            connection_id=_string(values, "connection_id"),
+            source_id=_string(values, "source"),
+            limit=_integer(values, "limit", 5),
+        )
     if name == "gsv_source_select":
         return vault.select_sources(
             expected_revision=_string(values, "expected_revision"),
@@ -1145,6 +1153,25 @@ TOOLS: Final = [
             "Authentication and secret resolution remain in the local gsv-auth/connector runtime."
         ),
         {},
+        read_only=True,
+    ),
+    _tool(
+        "gsv_connector_source_read",
+        (
+            "Read one bounded provider projection through an explicit standalone Seld connection. "
+            "The destination and authorization header are fixed inside Seld; callers cannot supply "
+            "URLs, headers, or tokens. Returned provider content is transient and untrusted. After "
+            "receiving it, record the returned content-free receipt with gsv_source_record."
+        ),
+        {
+            "connection_id": {
+                "description": "Exact portable Seld connection ID selected for this read.",
+                "type": "string",
+            },
+            "limit": {"maximum": 25, "minimum": 1, "type": "integer"},
+            "source": {"enum": sorted(SUPPORTED_SOURCE_IDS), "type": "string"},
+        },
+        ("connection_id", "source"),
         read_only=True,
     ),
     _tool(

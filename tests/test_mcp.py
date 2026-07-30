@@ -742,6 +742,7 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         "gsv_backup_create",
         "gsv_context",
         "gsv_connection_list",
+        "gsv_connector_source_read",
         "gsv_execution_bindings",
         "gsv_direction_set",
         "gsv_direction_show",
