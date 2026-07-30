@@ -119,10 +119,18 @@ class ConnectorAuthManager:
     def resolve_credential(self, connection_id: ConnectionId | str) -> bytes:
         """Resolve only inside a connector runtime; never expose through MCP or status."""
 
+        return self.resolve_credential_state(connection_id).value
+
+    def resolve_credential_state(
+        self,
+        connection_id: ConnectionId | str,
+    ) -> ResolvedToken:
+        """Resolve runtime-only bytes with the pointer state needed for operation CAS."""
+
         metadata = self._metadata(connection_id)
         if metadata.credential_kind is CredentialKind.OAUTH2:
             raise ValidationError("use resolve_oauth_access_token for an OAuth connection")
-        return self.tokens.read(metadata.connection_id).value
+        return self.tokens.read(metadata.connection_id)
 
     def resolve_oauth_access_token(
         self,

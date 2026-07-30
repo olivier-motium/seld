@@ -55,18 +55,21 @@ change makes earlier coverage require a new bounded read.
 Discord uses a dedicated companion bridge because its provider cursor must not
 be confused with Seld's portable source receipt. A CLI-only, compare-and-swap
 host record binds one exact self-contained executable, its interpreter, and
-its three-tool inventory to one physical vault. On POSIX hosts Seld opens and
-re-hashes the bound artifact, then gives that already-open file to the pinned
-interpreter, closing the artifact's verify-to-execute path race. Seld launches
-it with a minimal environment containing exactly one caller-supplied token, the
-exact channel allowlist, and a vault-specific private state path. The generated
-ChatGPT MCP manifest contains none of those values. Status verifies the
-transient account identity and channel-set digest. Poll performs one bounded
-GET-only read and stages a checkpoint; Seld independently validates the
-privacy-minimized projection and delivery binding. Only after a matching
-portable `SOURCES.md` receipt is committed and fresh-read may acknowledgement
-advance the companion cursor. Pending work replays or is safely reread from the
-last committed cursor after restart.
+its three-tool inventory to one physical vault and one explicit bot-only
+connection ID. On POSIX hosts Seld opens and re-hashes the bound artifact, then
+gives that already-open file to the pinned interpreter, closing the artifact's
+verify-to-execute path race. For each operation Seld resolves the bot token
+from OS-keyring custody and launches the companion with a minimal environment
+containing that credential, the host-only exact channel allowlist, and a
+vault-specific private state path. The generated ChatGPT MCP manifest contains
+none of those values. Status verifies the transient account identity and
+channel-set digest. Poll performs one bounded GET-only read and stages a
+checkpoint; Seld independently validates the privacy-minimized projection and
+delivery binding. Connection and credential revisions are checked again after
+the provider call and across acknowledgement. Only after a matching portable
+`SOURCES.md` receipt is committed and fresh-read may acknowledgement advance
+the companion cursor. Pending work replays or is safely reread from the last
+committed cursor after restart.
 
 Standalone connector authentication follows the same portable/host-local
 split. `CONNECTIONS.md` carries versioned non-secret provider, account, scope,

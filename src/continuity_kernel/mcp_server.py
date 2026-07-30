@@ -1243,8 +1243,8 @@ TOOLS: Final = [
         "gsv_discord_source_status",
         (
             "Verify the exact host-bound GET-only Discord companion, configured account identity, "
-            "channel-set confinement, and content-free checkpoint health. Tokens and channel IDs "
-            "are inherited transiently and never returned or stored by Seld."
+            "portable bot-connection custody, channel-set confinement, and content-free checkpoint "
+            "health. Credentials and channel IDs are never returned through MCP."
         ),
         {},
         read_only=True,

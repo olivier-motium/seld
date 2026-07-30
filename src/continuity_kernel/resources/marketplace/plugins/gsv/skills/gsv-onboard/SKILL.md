@@ -115,17 +115,19 @@ source-state revision, result references, actor, and confirmed account binding.
 Never import existing message history merely to establish a baseline.
 
 For selected Discord, read [Discord setup](references/providers/discord.md)
-before asking the person to enable anything. Prefer bot mode. If they choose a
-normal user token, show Discord's self-bot warning and obtain an explicit
-informed opt-in before continuing; GET-only behavior does not remove that
-terms or account-enforcement risk. The person supplies credentials and the
-exact channel allowlist privately through the process environment, never in
-chat or Seld state. Bind the exact companion executable with the local CLI,
-then use `gsv_discord_source_status`, `gsv_discord_source_poll`,
-`gsv_source_record`, and `gsv_discord_source_acknowledge` in that order. A
-poll stages but never advances its private cursor. Record and fresh-read the
-matching content-free receipt before acknowledgement. On restart, replay a
-pending delivery; never poll past it or invent a new baseline.
+before asking the person to enable anything. Discord is bot-only: never accept,
+copy, or use a normal-user token. The person creates the bot, grants its server
+and channel access, and enters its token through `gsv-auth credential`'s hidden
+local prompt. The onboarding agent may explain those steps and read redacted
+status, but it must not consent, enter or reuse credentials, change account or
+application settings, or alter permissions. Store the exact portable
+connection ID in the CLI-only runtime binding. Keep only the channel allowlist
+in the private host environment, never in chat or Seld state. Then use
+`gsv_discord_source_status`, `gsv_discord_source_poll`, `gsv_source_record`,
+and `gsv_discord_source_acknowledge` in that order. A poll stages but never
+advances its private cursor. Record and fresh-read the matching content-free
+receipt before acknowledgement. On restart, replay a pending delivery; never
+poll past it or invent a new baseline.
 
 Seld supports any user-enabled ChatGPT app or MCP tool that can satisfy the
 same bounded read contract. The catalog supplies first-class recipes for

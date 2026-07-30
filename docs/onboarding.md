@@ -54,8 +54,9 @@ read surface comes from the source the user enabled:
 - Seld-managed connector implementations using standalone `gsv-auth` custody;
 - bounded local read tools for local files or Apple Messages;
 - the separately enabled WhatsApp read tool; and
-- Seld's exact host-bound Discord companion, which inherits one token and an
-  exact channel allowlist from the private process environment.
+- Seld's exact host-bound Discord companion, which resolves one explicitly
+  bound bot connection through `gsv-auth` and inherits only the exact channel
+  allowlist from the private process environment.
 
 Selecting `local_files` does not grant a directory. After the user approves one
 exact root, the interactive task runs
@@ -67,12 +68,15 @@ vault.
 
 Discord setup is deliberately separate from Seld's generated MCP manifest, so
 the token and raw channel IDs are never written into the plugin, vault, or
-binding receipt. The local CLI binds one exact `discord-mcp` executable; Seld's
-own MCP then exposes status, bounded poll, and explicit acknowledgement. Bot
-mode is recommended. Discord states that automating a normal user account
-outside its OAuth2/bot API is forbidden and can result in account termination,
-so user-token mode proceeds only after a visible warning and explicit informed
-opt-in. Seld's GET-only confinement does not change that terms risk.
+generated manifest. The local CLI binds one exact `discord-mcp` executable and
+one portable connection ID; the bot token stays in OS-keyring custody and the
+binding stores no credential. Seld's own MCP then exposes status, bounded poll,
+and explicit acknowledgement. Normal-user tokens are rejected because Discord
+forbids self-bot automation. The person creates and authorizes the bot, enters
+the token through hidden local `gsv-auth` input, and chooses the channel
+allowlist. An onboarding agent may explain and verify redacted status but may
+not perform consent, enter or reuse credentials, or change account,
+application, access, or security settings.
 
 Seld never falls back to browser scraping when a source tool is missing. It
 reports the gap and continues with the sources that are available. Provider and

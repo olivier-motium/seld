@@ -42,6 +42,7 @@ from continuity_kernel.config import (
     restore_config,
     save_config,
 )
+from continuity_kernel.connector_identifiers import parse_connection_id
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
 from continuity_kernel.direction import direction_aim, direction_dict
@@ -370,6 +371,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
         if args.discord_source_command == "bind":
             return discord_bridge.bind(
                 Path(args.runtime).expanduser().absolute(),
+                connection_id=parse_connection_id(args.connection_id),
                 expected_revision=args.expected_revision,
             )
         if args.discord_source_command == "unbind":
@@ -1262,9 +1264,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     discord_bind = discord_source_commands.add_parser(
         "bind",
-        help="CAS-bind one exact local companion executable; no credentials are stored.",
+        help=(
+            "CAS-bind one exact local companion executable to a portable Discord bot "
+            "connection; no credentials enter the binding."
+        ),
     )
     discord_bind.add_argument("--runtime", required=True)
+    discord_bind.add_argument("--connection-id", required=True)
     discord_bind.add_argument("--expected-revision", required=True)
     discord_unbind = discord_source_commands.add_parser(
         "unbind",

@@ -33,7 +33,17 @@ from continuity_kernel.atomic import (
     sha256_regular_file,
 )
 from continuity_kernel.config import data_dir
-from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
+from continuity_kernel.connector_auth import ConnectionHealth, CredentialKind
+from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_identifiers import ConnectionId, parse_connection_id
+from continuity_kernel.connector_token_store import TokenState
+from continuity_kernel.errors import (
+    ConflictError,
+    ContinuityError,
+    NotFoundError,
+    SetupError,
+    ValidationError,
+)
 from continuity_kernel.source_state import source_fingerprint
 from continuity_kernel.vault import Vault
 
@@ -42,21 +52,19 @@ RECIPE_VERSION: Final = "2"
 TOOL_BINDING: Final = "seld-discord-source:readonly:v2"
 UNAVAILABLE_TOOL_BINDING: Final = "seld-discord-source:unavailable"
 MCP_PROTOCOL_VERSION: Final = "2025-03-26"
-USER_TOKEN_TERMS_WARNING: Final = (
-    "Discord forbids normal-user self-bot automation and may terminate the account; "
-    "GET-only access does not remove that risk."
-)
 EXPECTED_TOOLS: Final = (
     "discord_acknowledge_messages",
     "discord_poll_messages",
     "discord_source_status",
 )
-BINDING_VERSION: Final = 1
+LEGACY_BINDING_VERSION: Final = 1
+BINDING_VERSION: Final = 2
 ABSENT_BINDING_REVISION: Final = "absent"
 MAX_BINDING_BYTES: Final = 32 * 1024
 MAX_RUNTIME_BYTES: Final = 32 * 1024 * 1024
 MAX_INTERPRETER_BYTES: Final = 512 * 1024 * 1024
 MAX_MCP_OUTPUT_BYTES: Final = 256 * 1024
+MAX_DISCORD_TOKEN_BYTES: Final = 16 * 1024
 # One poll can perform identity plus five sequential channel GETs. The
 # companion caps each request at five seconds and permits one provider-directed
 # retry of at most two seconds, so the host bound must cover the 72-second
@@ -65,7 +73,7 @@ MCP_TIMEOUT_SECONDS: Final = 80
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVISION = re.compile(r"^(?:absent|[0-9a-f]{64})$")
 _ACK_TOKEN = re.compile(r"^[0-9a-f]{64}$")
-_ACCOUNT = re.compile(r"^discord-(?:user|bot)-v1:sha256:[0-9a-f]{64}$")
+_ACCOUNT = re.compile(r"^discord-bot-v1:sha256:[0-9a-f]{64}$")
 _POSIX_OS = cast(Any, os)
 _POSIX_SIGNAL = cast(Any, signal)
 _ERROR_CODES: Final = frozenset(
@@ -94,18 +102,38 @@ class _FileIdentity:
 class _RuntimeBinding:
     vault_id: str
     vault_root_digest: str
+    connection_id: ConnectionId | None
     runtime: _FileIdentity
     interpreter: _FileIdentity | None
     inventory_digest: str
 
 
+class _ProviderUnavailable(ContinuityError):
+    """Fixed, redacted provider setup failure used by status and operations."""
+
+    def __init__(self, error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
 class DiscordSourceBridge:
     """Invoke one exact local companion without sharing provider authority."""
 
-    def __init__(self, vault: Vault):
+    def __init__(
+        self,
+        vault: Vault,
+        *,
+        auth_manager: ConnectorAuthManager | None = None,
+    ):
         self.vault = vault
         identity = vault.identity()
         self.vault_id = _required_text(identity.get("vault_id"), "vault identity", 128)
+        self.auth_manager = auth_manager or ConnectorAuthManager(vault)
+        if (
+            self.auth_manager.vault_id != self.vault_id
+            or self.auth_manager.vault.root != self.vault.root
+        ):
+            raise ValidationError("Discord auth manager belongs to a different vault")
         self.vault_root_digest = _digest(str(vault.root))
         self.key = sha256_bytes(f"{self.vault_id}\0{self.vault_root_digest}".encode())[:32]
         self.root = data_dir() / "discord-source"
@@ -130,50 +158,68 @@ class DiscordSourceBridge:
             return {
                 "bound": True,
                 "bindingRevision": sha256_bytes(encoded),
+                "connectionId": (
+                    str(binding.connection_id) if binding.connection_id is not None else None
+                ),
+                "migrationRequired": binding.connection_id is None,
                 "runtimeCurrent": current,
                 "runtimeDigest": binding.runtime.digest,
                 "inventoryDigest": binding.inventory_digest,
             }
 
-    def bind(self, runtime: Path | str, *, expected_revision: str) -> dict[str, Any]:
+    def bind(
+        self,
+        runtime: Path | str,
+        *,
+        connection_id: ConnectionId | str,
+        expected_revision: str,
+    ) -> dict[str, Any]:
         _binding_revision(expected_revision)
-        with exclusive_lock(self.lock_path):
-            _prior, prior_bytes = self._load_binding(required=False)
-            current_revision = (
-                ABSENT_BINDING_REVISION if not prior_bytes else sha256_bytes(prior_bytes)
-            )
-            if current_revision != expected_revision:
-                raise ConflictError("Discord runtime binding changed; reload binding status")
-            snapshot, interpreter = _runtime_snapshot(Path(runtime))
-            with tempfile.TemporaryDirectory(prefix="seld-discord-bind-") as temporary:
-                inventory, _ = _run_mcp(
-                    snapshot,
-                    interpreter,
-                    state_path=Path(temporary) / "state.json",
-                    tool=None,
-                    arguments={},
-                    provider_environment=_synthetic_provider_environment(),
+        clean_connection_id = parse_connection_id(connection_id)
+        with exclusive_lock(self.vault.state / "locks/global.lock"):
+            connection_revision = self._validated_connection_revision(clean_connection_id)
+            with exclusive_lock(self.lock_path):
+                _prior, prior_bytes = self._load_binding(required=False)
+                current_revision = (
+                    ABSENT_BINDING_REVISION if not prior_bytes else sha256_bytes(prior_bytes)
                 )
-            inventory_digest = _inventory_digest(inventory)
-            binding = _RuntimeBinding(
-                vault_id=self.vault_id,
-                vault_root_digest=self.vault_root_digest,
-                runtime=snapshot,
-                interpreter=interpreter,
-                inventory_digest=inventory_digest,
-            )
-            encoded = _binding_bytes(binding)
-            self.binding_path.parent.mkdir(parents=True, exist_ok=True)
-            if os.name != "nt":
-                self.binding_path.parent.chmod(0o700)
-            atomic_write(self.binding_path, encoded)
-            return {
-                "bound": True,
-                "bindingRevision": sha256_bytes(encoded),
-                "runtimeCurrent": True,
-                "runtimeDigest": snapshot.digest,
-                "inventoryDigest": inventory_digest,
-            }
+                if current_revision != expected_revision:
+                    raise ConflictError("Discord runtime binding changed; reload binding status")
+                snapshot, interpreter = _runtime_snapshot(Path(runtime))
+                with tempfile.TemporaryDirectory(prefix="seld-discord-bind-") as temporary:
+                    inventory, _ = _run_mcp(
+                        snapshot,
+                        interpreter,
+                        state_path=Path(temporary) / "state.json",
+                        tool=None,
+                        arguments={},
+                        provider_environment=_synthetic_provider_environment(),
+                    )
+                inventory_digest = _inventory_digest(inventory)
+                if self.vault.get_connection_snapshot().revision != connection_revision:
+                    raise ConflictError("Discord connection changed during runtime binding")
+                binding = _RuntimeBinding(
+                    vault_id=self.vault_id,
+                    vault_root_digest=self.vault_root_digest,
+                    connection_id=clean_connection_id,
+                    runtime=snapshot,
+                    interpreter=interpreter,
+                    inventory_digest=inventory_digest,
+                )
+                encoded = _binding_bytes(binding)
+                self.binding_path.parent.mkdir(parents=True, exist_ok=True)
+                if os.name != "nt":
+                    self.binding_path.parent.chmod(0o700)
+                atomic_write(self.binding_path, encoded)
+                return {
+                    "bound": True,
+                    "bindingRevision": sha256_bytes(encoded),
+                    "connectionId": str(clean_connection_id),
+                    "migrationRequired": False,
+                    "runtimeCurrent": True,
+                    "runtimeDigest": snapshot.digest,
+                    "inventoryDigest": inventory_digest,
+                }
 
     def unbind(self, *, expected_revision: str) -> dict[str, Any]:
         _binding_revision(expected_revision)
@@ -200,13 +246,14 @@ class DiscordSourceBridge:
             return {**base, "available": False, "errorCode": "tool_absent"}
         if not base["selected"]:
             return {**base, "available": False, "errorCode": "policy_blocked"}
-        provider, error = _provider_environment(required=False)
-        if error is not None:
-            return {**base, "available": False, "errorCode": error}
+        if binding_status.get("migrationRequired") is True:
+            return {**base, "available": False, "errorCode": "auth_required"}
         try:
-            payload, bound_tool = self._invoke("discord_source_status", {}, provider)
+            payload, bound_tool, _credential_state = self._invoke("discord_source_status", {})
             projected = _status_projection(payload)
             _promote_bound_tool(projected, bound_tool)
+        except _ProviderUnavailable as exc:
+            return {**base, "available": False, "errorCode": exc.error_code}
         except ContinuityError:
             return {**base, "available": False, "errorCode": "tool_error"}
         return {**base, **projected}
@@ -220,14 +267,11 @@ class DiscordSourceBridge:
             or not 0 <= max_content_chars <= 500
         ):
             raise ValidationError("Discord preview bound must be between 0 and 500")
-        provider, error = _provider_environment(required=True)
-        assert error is None
         with exclusive_lock(self.vault.state / "locks/global.lock"):
             snapshot = self._selected_snapshot()
-            payload, bound_tool = self._invoke(
+            payload, bound_tool, _credential_state = self._invoke(
                 "discord_poll_messages",
                 {"limit": limit, "maxContentChars": max_content_chars},
-                provider,
             )
             if self.vault.get_source_snapshot().revision != snapshot.revision:
                 raise ConflictError(
@@ -264,8 +308,6 @@ class DiscordSourceBridge:
         if _ACK_TOKEN.fullmatch(ack_token) is None:
             raise ValidationError("Discord acknowledgement token is invalid")
         _binding_revision(expected_source_revision)
-        provider, error = _provider_environment(required=True)
-        assert error is None
         with exclusive_lock(self.vault.state / "locks/global.lock"):
             snapshot = self._selected_snapshot()
             if snapshot.revision != expected_source_revision:
@@ -275,7 +317,7 @@ class DiscordSourceBridge:
                 raise ConflictError(
                     "record the matching Discord source receipt before acknowledging"
                 )
-            status_payload, bound_tool = self._invoke("discord_source_status", {}, provider)
+            status_payload, bound_tool, credential_state = self._invoke("discord_source_status", {})
             status = _status_projection(status_payload)
             _promote_bound_tool(status, bound_tool)
             if not status["available"]:
@@ -285,11 +327,11 @@ class DiscordSourceBridge:
             self._verify_receipt(observation, status, pending=pending)
             if self.vault.get_source_snapshot().revision != expected_source_revision:
                 raise ConflictError("source state changed during Discord acknowledgement")
-            ack_payload, _ack_bound_tool = self._invoke(
+            ack_payload, _ack_bound_tool, _ack_credential_state = self._invoke(
                 "discord_acknowledge_messages",
                 {"ackToken": ack_token},
-                provider,
                 expected_bound_tool=bound_tool,
+                expected_credential_state=credential_state,
             )
             result = _ack_projection(ack_payload)
             committed = result["checkpoint"]
@@ -352,17 +394,25 @@ class DiscordSourceBridge:
         self,
         tool: str,
         arguments: dict[str, Any],
-        provider_environment: dict[str, str],
         *,
         expected_bound_tool: str | None = None,
-    ) -> tuple[dict[str, Any], str]:
+        expected_credential_state: TokenState | None = None,
+    ) -> tuple[dict[str, Any], str, TokenState]:
         with exclusive_lock(self.lock_path):
             binding, encoded = self._load_binding(required=True)
             assert binding is not None
             self._verify_runtime(binding)
+            provider_environment, connection_revision, credential_state = (
+                self._provider_environment(binding)
+            )
             bound_tool = _bound_tool_binding(sha256_bytes(encoded))
             if expected_bound_tool is not None and bound_tool != expected_bound_tool:
                 raise ConflictError("Discord companion binding changed before acknowledgement")
+            if (
+                expected_credential_state is not None
+                and credential_state != expected_credential_state
+            ):
+                raise ConflictError("Discord credential changed before acknowledgement")
             inventory, payload = _run_mcp(
                 binding.runtime,
                 binding.interpreter,
@@ -373,9 +423,77 @@ class DiscordSourceBridge:
             )
             if _inventory_digest(inventory) != binding.inventory_digest:
                 raise ValidationError("Discord companion tool inventory changed; rebind explicitly")
+            if self.vault.get_connection_snapshot().revision != connection_revision:
+                raise ConflictError(
+                    "Discord connection changed during the provider read; discard and retry"
+                )
+            if self.auth_manager.tokens.state(credential_state.connection_id) != credential_state:
+                raise ConflictError(
+                    "Discord credential changed during the provider read; discard and retry"
+                )
             if payload is None:
                 raise ValidationError("Discord companion returned no tool result")
-            return payload, bound_tool
+            return payload, bound_tool, credential_state
+
+    def _validated_connection_revision(self, connection_id: ConnectionId) -> str:
+        snapshot = self.vault.get_connection_snapshot()
+        metadata = snapshot.connection(connection_id)
+        if metadata is None:
+            raise ValidationError("Discord connection was not found")
+        if metadata.provider != SOURCE_ID:
+            raise ValidationError("Discord binding requires a Discord connection")
+        if SOURCE_ID not in metadata.source_ids:
+            raise ValidationError("Discord connection does not authorize the Discord source")
+        if metadata.credential_kind is not CredentialKind.BEARER:
+            raise ValidationError("Discord connection must use a bearer bot token")
+        if metadata.health in {
+            ConnectionHealth.REAUTHORIZATION_REQUIRED,
+            ConnectionHealth.REVOKED,
+        }:
+            raise ValidationError("Discord connection requires reauthorization")
+        return snapshot.revision
+
+    def _provider_environment(
+        self,
+        binding: _RuntimeBinding,
+    ) -> tuple[dict[str, str], str, TokenState]:
+        connection_id = binding.connection_id
+        if connection_id is None:
+            raise _ProviderUnavailable(
+                "auth_required",
+                "legacy Discord binding must be rebound to a portable connection",
+            )
+        try:
+            connection_revision = self._validated_connection_revision(connection_id)
+        except ValidationError as exc:
+            raise _ProviderUnavailable(
+                "auth_required",
+                "Discord portable connection is unavailable",
+            ) from exc
+        channels = os.environ.get("DISCORD_CHANNEL_IDS", "")
+        if not channels.strip():
+            raise _ProviderUnavailable(
+                "policy_blocked",
+                "set the exact DISCORD_CHANNEL_IDS allowlist",
+            )
+        try:
+            resolved = self.auth_manager.resolve_credential_state(connection_id)
+            token = _discord_bot_token(resolved.value)
+        except (NotFoundError, OSError, SetupError, ValidationError) as exc:
+            raise _ProviderUnavailable(
+                "auth_required",
+                "Discord bot credential is unavailable",
+            ) from exc
+        if self.vault.get_connection_snapshot().revision != connection_revision:
+            raise ConflictError("Discord connection changed while resolving its credential")
+        return (
+            {
+                "DISCORD_BOT_TOKEN": token,
+                "DISCORD_CHANNEL_IDS": channels,
+            },
+            connection_revision,
+            resolved.state,
+        )
 
     def _load_binding(self, *, required: bool) -> tuple[_RuntimeBinding | None, bytes]:
         if not os.path.lexists(self.binding_path):
@@ -411,7 +529,11 @@ def current_discord_tool_fingerprint(vault: Vault) -> str:
         status = bridge.binding_status()
     except ContinuityError:
         status = {"bound": False, "runtimeCurrent": False}
-    if not status["bound"] or not status["runtimeCurrent"]:
+    if (
+        not status["bound"]
+        or not status["runtimeCurrent"]
+        or status.get("migrationRequired") is not False
+    ):
         return source_fingerprint(UNAVAILABLE_TOOL_BINDING, "Discord tool binding")
     revision = _required_text(status.get("bindingRevision"), "Discord binding revision", 64)
     return source_fingerprint(_bound_tool_binding(revision), "Discord tool binding")
@@ -544,7 +666,10 @@ def _open_verified_runtime(identity: _FileIdentity) -> int:
 
 
 def _binding_bytes(binding: _RuntimeBinding) -> bytes:
+    if binding.connection_id is None:
+        raise ValidationError("legacy Discord binding cannot be rewritten implicitly")
     payload = {
+        "connection_id": str(binding.connection_id),
         "format_version": BINDING_VERSION,
         "inventory_digest": binding.inventory_digest,
         "interpreter": _identity_dict(binding.interpreter),
@@ -582,18 +707,29 @@ def _parse_binding(
         value = json.loads(encoded.decode("ascii"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValidationError("Discord runtime binding is invalid") from exc
-    if not isinstance(value, dict) or set(value) != {
+    if not isinstance(value, dict):
+        raise ValidationError("Discord runtime binding is invalid")
+    legacy_keys = {
         "format_version",
         "inventory_digest",
         "interpreter",
         "runtime",
         "vault_id",
         "vault_root_digest",
-    }:
+    }
+    format_version = value.get("format_version")
+    if format_version == LEGACY_BINDING_VERSION:
+        if set(value) != legacy_keys:
+            raise ValidationError("Discord runtime binding is invalid")
+        connection_id = None
+    elif format_version == BINDING_VERSION:
+        if set(value) != legacy_keys | {"connection_id"}:
+            raise ValidationError("Discord runtime binding is invalid")
+        connection_id = parse_connection_id(value["connection_id"])
+    else:
         raise ValidationError("Discord runtime binding is invalid")
     if (
-        value["format_version"] != BINDING_VERSION
-        or value["vault_id"] != vault_id
+        value["vault_id"] != vault_id
         or value["vault_root_digest"] != vault_root_digest
         or _SHA256.fullmatch(str(value["inventory_digest"])) is None
     ):
@@ -601,6 +737,7 @@ def _parse_binding(
     return _RuntimeBinding(
         vault_id=vault_id,
         vault_root_digest=vault_root_digest,
+        connection_id=connection_id,
         runtime=_parse_identity(value["runtime"], "runtime"),
         interpreter=(
             None
@@ -970,11 +1107,9 @@ def _status_projection(value: dict[str, Any]) -> dict[str, Any]:
         raise ValidationError("Discord checkpoint account does not match current identity")
     if checkpoint["channelSetDigest"] not in (None, channel_digest):
         raise ValidationError("Discord checkpoint channels do not match current confinement")
-    auth_type = _one_of(value.get("authType"), {"user", "bot"}, "Discord auth type")
+    auth_type = _exact(value.get("authType"), "bot", "Discord auth type")
     terms_warning = value.get("termsWarning")
-    if (auth_type == "user" and terms_warning != USER_TOKEN_TERMS_WARNING) or (
-        auth_type == "bot" and terms_warning is not None
-    ):
+    if terms_warning is not None:
         raise ValidationError("Discord token-mode terms warning is invalid")
     result.update(
         {
@@ -1119,7 +1254,7 @@ def _poll_projection(
         "result": result,
         "completeness": completeness,
         "coveredThrough": covered_through,
-        "authType": _one_of(value.get("authType"), {"user", "bot"}, "Discord auth type"),
+        "authType": _exact(value.get("authType"), "bot", "Discord auth type"),
         "accountBinding": account,
         "channelSetDigest": channel_digest,
         "toolBinding": tool_binding,
@@ -1220,25 +1355,23 @@ def _source_header(value: dict[str, Any]) -> None:
         raise ValidationError("Discord companion source contract is incompatible")
 
 
-def _provider_environment(*, required: bool) -> tuple[dict[str, str], str | None]:
-    user = os.environ.get("DISCORD_USER_TOKEN", "")
-    bot = os.environ.get("DISCORD_BOT_TOKEN", "")
-    channels = os.environ.get("DISCORD_CHANNEL_IDS", "")
-    if bool(user) == bool(bot):
-        if required:
-            raise ContinuityError("set exactly one Discord token in the calling environment")
-        return {}, "auth_required"
-    if not channels.strip():
-        if required:
-            raise ContinuityError("set the exact DISCORD_CHANNEL_IDS allowlist")
-        return {}, "policy_blocked"
-    token_name = "DISCORD_USER_TOKEN" if user else "DISCORD_BOT_TOKEN"
-    return {token_name: user or bot, "DISCORD_CHANNEL_IDS": channels}, None
+def _discord_bot_token(encoded: bytes) -> str:
+    if not encoded or len(encoded) > MAX_DISCORD_TOKEN_BYTES:
+        raise ValidationError("Discord bot credential is invalid")
+    try:
+        token = encoded.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValidationError("Discord bot credential is invalid") from exc
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127 for character in token
+    ):
+        raise ValidationError("Discord bot credential is invalid")
+    return token
 
 
 def _synthetic_provider_environment() -> dict[str, str]:
     return {
-        "DISCORD_USER_TOKEN": "seld-binding-probe-not-a-provider-token",
+        "DISCORD_BOT_TOKEN": "seld-binding-probe-not-a-provider-token",
         "DISCORD_CHANNEL_IDS": "111111111111111111",
     }
 
