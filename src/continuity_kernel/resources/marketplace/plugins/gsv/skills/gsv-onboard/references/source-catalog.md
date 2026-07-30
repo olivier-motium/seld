@@ -11,6 +11,7 @@ to `$gsv-onboard`.
 
 | Source | Setup surface | Bounded verification |
 | --- | --- | --- |
+| Seld on this computer | Installed Seld MCP or exact-vault local CLI | Verify the vault identity and one bounded `gsv_context` read; this is source zero and remains available when a task-local plugin is absent. |
 | ChatGPT activity | Installed Seld/ChatGPT task tools | Confirm the current task/account context and read recent relevant activity. |
 | [Gmail](providers/gmail.md) | Gmail app in ChatGPT | Confirm the Google account; read a small recent mail window. |
 | [Google Calendar](providers/google-calendar.md) | Google Calendar app | Confirm the calendar identity; read a bounded current window. |
@@ -27,8 +28,8 @@ to `$gsv-onboard`.
 | [Notion](providers/notion.md) | Notion app | Confirm the workspace; search or read a bounded recent page set. |
 | [SharePoint](providers/sharepoint.md) | SharePoint app | Confirm the tenant/site; search or read a bounded recent file or site window. |
 | [Local files](local-files.md) | Seld's host-local grant and `gsv_local_file_read` | Approve one exact root; read only named regular files without hydrating cloud placeholders. |
-| Apple Messages | A read-only macOS Messages tool or MCP app | Confirm the local profile and macOS permission; read a small recent conversation window. |
-| WhatsApp | A read-only WhatsApp tool such as `wacli` or an MCP app | Confirm the account; read a small recent chat window without sending or reacting. |
+| Apple Messages | Seld's read-only local adapter | Confirm the local profile and macOS permission. Check staged status first and adopt a verified imported prefix when present; create a forward-only baseline only when there is no staged checkpoint or prior receipt, then verify one bounded replay-safe delta. |
+| WhatsApp | Seld's read-only `wacli` companion | Confirm the account and companion health. Check staged status first and adopt a verified imported prefix when present; create a forward-only baseline only when there is no staged checkpoint or prior receipt, then verify one bounded replay-safe delta without sending or reacting. |
 | Shopify | A Shopify app or custom read-only MCP app | Confirm the store; read a bounded recent order/customer window. |
 | Instagram | A Meta/Instagram app or custom read-only MCP app | Confirm the account; read a bounded recent activity or message window within granted scopes. |
 | Screen context | Optional local derived-context tool | Ask for a fresh per-flow approval; retain derived signals, never frames. |

@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -14,8 +15,14 @@ from typing import Any
 
 import pytest
 
-from continuity_kernel import atomic as atomic_module
-from continuity_kernel import codex_integration as integration
+from continuity_kernel import (
+    atomic as atomic_module,
+)
+from continuity_kernel import (
+    codex_integration as integration,
+)
+from continuity_kernel import resident_context, whatsapp
+from continuity_kernel.config import data_dir
 from continuity_kernel.errors import ConflictError, SetupError, ValidationError
 
 
@@ -93,6 +100,318 @@ def _marketplace_root(home: Path) -> Path:
 def _required_text(value: str | None) -> str:
     assert value is not None
     return value
+
+
+def _generated_mcp_environment(vault: Path) -> dict[str, str]:
+    contents, _ = integration._marketplace_contents(
+        vault,
+        runtime=("test-python", ["-m", "continuity_kernel"]),
+    )
+    encoded = contents["plugins/gsv/.mcp.json"]
+    assert isinstance(encoded, bytes)
+    payload = json.loads(encoded.decode("utf-8"))
+    environment = payload["mcpServers"]["gsv"]["env"]
+    assert isinstance(environment, dict)
+    return environment
+
+
+def _write_imported_skill(vault: Path, name: str = "resident-exact") -> Path:
+    skill = vault / "context/resident/skills" / name
+    (skill / "references").mkdir(parents=True)
+    (skill / "scripts").mkdir()
+    (skill / "SKILL.md").write_bytes(
+        f"---\nname: {name}\ndescription: Exact resident skill.\n---\n\n# Resident exact\n".encode()
+    )
+    (skill / "references/context.md").write_bytes(b"# Context\n")
+    (skill / "scripts/check.py").write_bytes(b"#!/usr/bin/env python3\nprint('resident')\n")
+    if os.name != "nt":
+        (skill / "SKILL.md").chmod(0o600)
+        (skill / "references/context.md").chmod(0o600)
+        (skill / "scripts/check.py").chmod(0o700)
+    return skill
+
+
+def test_generated_mcp_environment_omits_unsupplied_service_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.delenv(whatsapp.SERVICE_LABEL_ENV, raising=False)
+
+    assert _generated_mcp_environment(vault) == {
+        integration.GSV_DATA_DIR_ENV: str(data_dir()),
+        "GSV_VAULT": str(vault.resolve()),
+    }
+
+
+def test_generated_mcp_environment_preserves_only_valid_explicit_service_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv(whatsapp.SERVICE_LABEL_ENV, "ai.example.wacli-sync")
+    monkeypatch.setenv("UNRELATED_PROVIDER_SECRET", "must-not-copy")
+
+    assert _generated_mcp_environment(vault) == {
+        integration.GSV_DATA_DIR_ENV: str(data_dir()),
+        "GSV_VAULT": str(vault.resolve()),
+        whatsapp.SERVICE_LABEL_ENV: "ai.example.wacli-sync",
+    }
+
+
+def test_generated_mcp_environment_pins_default_or_isolated_host_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.delenv(integration.GSV_DATA_DIR_ENV, raising=False)
+    monkeypatch.delenv(whatsapp.SERVICE_LABEL_ENV, raising=False)
+    default_data = str(data_dir())
+    default_environment = _generated_mcp_environment(vault)
+
+    isolated = tmp_path / "isolated-host-data"
+    monkeypatch.setenv(integration.GSV_DATA_DIR_ENV, str(isolated))
+    isolated_environment = _generated_mcp_environment(vault)
+
+    assert default_environment[integration.GSV_DATA_DIR_ENV] == default_data
+    assert isolated_environment == {
+        integration.GSV_DATA_DIR_ENV: str(isolated.resolve()),
+        "GSV_VAULT": str(vault.resolve()),
+    }
+
+
+def test_generated_mcp_environment_rejects_vault_data_authority_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv(integration.GSV_DATA_DIR_ENV, str(vault / ".host-data"))
+
+    with pytest.raises(ValidationError, match="must be separate absolute paths"):
+        _generated_mcp_environment(vault)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "",
+        "ai.example service",
+        "ai/example/service",
+        "ai.example." + "x" * 256,
+        "ai." + "s" + "k-proj-AbCdEfGhIjKlMnOpQrStUvWxYz123456",
+    ],
+)
+def test_generated_mcp_environment_rejects_malformed_service_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv(whatsapp.SERVICE_LABEL_ENV, label)
+
+    with pytest.raises(ValidationError, match="bounded non-secret launchd service label"):
+        _generated_mcp_environment(vault)
+
+
+def test_install_bundles_imported_skill_in_the_receipt_bound_marketplace(
+    tmp_path: Path,
+    fake_codex: FakeCodex,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    skill = _write_imported_skill(vault)
+    monkeypatch.delenv(whatsapp.SERVICE_LABEL_ENV, raising=False)
+
+    installed = integration.install_codex(vault=vault, codex_home=home)
+    generated = Path(installed.marketplace_root) / "plugins/gsv/skills/resident-exact"
+
+    assert (generated / "SKILL.md").read_bytes() == (skill / "SKILL.md").read_bytes()
+    assert (generated / "references/context.md").read_bytes() == (
+        skill / "references/context.md"
+    ).read_bytes()
+    assert (generated / "scripts/check.py").read_bytes() == (
+        skill / "scripts/check.py"
+    ).read_bytes()
+    if os.name != "nt":
+        assert stat.S_IMODE((generated / "SKILL.md").stat().st_mode) == 0o600
+        assert stat.S_IMODE((generated / "references/context.md").stat().st_mode) == 0o600
+        assert stat.S_IMODE((generated / "scripts/check.py").stat().st_mode) == 0o700
+        invoked = subprocess.run(
+            [str(generated / "scripts/check.py")],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert invoked.returncode == 0
+        assert invoked.stdout == "resident\n"
+        receipt_manifest = _receipt_payload(home)["marketplace_manifest"]
+        assert receipt_manifest[
+            "plugins/gsv/skills/resident-exact/references/context.md"
+        ].startswith("file:")
+        assert receipt_manifest["plugins/gsv/skills/resident-exact/scripts/check.py"].startswith(
+            "file+x:"
+        )
+    mcp = json.loads(
+        (Path(installed.marketplace_root) / "plugins/gsv/.mcp.json").read_text(encoding="utf-8")
+    )
+    assert mcp["mcpServers"]["gsv"]["env"][integration.GSV_DATA_DIR_ENV] == str(data_dir())
+    assert integration.codex_status(codex_home=home)["manifest_verified"] is True
+    assert fake_codex.plugins == {integration.PLUGIN_ID}
+
+    reinstalled = integration.install_codex(vault=vault, codex_home=home)
+    reinstalled_skill = Path(reinstalled.marketplace_root) / "plugins/gsv/skills/resident-exact"
+    if os.name != "nt":
+        assert stat.S_IMODE((reinstalled_skill / "references/context.md").stat().st_mode) == 0o600
+        assert stat.S_IMODE((reinstalled_skill / "scripts/check.py").stat().st_mode) == 0o700
+    assert integration.codex_status(codex_home=home)["manifest_verified"] is True
+    if os.name != "nt":
+        (reinstalled_skill / "scripts/check.py").chmod(0o600)
+        assert integration.codex_status(codex_home=home)["manifest_verified"] is False
+
+
+def test_install_receipt_carries_a_large_bounded_resident_skill_inventory(
+    tmp_path: Path,
+    fake_codex: FakeCodex,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    for index in range(61):
+        _write_imported_skill(vault, f"resident-{index:03d}")
+    monkeypatch.delenv(whatsapp.SERVICE_LABEL_ENV, raising=False)
+    receipt_sizes: list[int] = []
+    write_receipt = integration._write_receipt_state
+
+    def record_receipt_size(
+        target_home: Path,
+        *,
+        expected: bytes | None,
+        replacement: bytes,
+        context: str,
+    ) -> None:
+        receipt_sizes.append(len(replacement))
+        write_receipt(
+            target_home,
+            expected=expected,
+            replacement=replacement,
+            context=context,
+        )
+
+    monkeypatch.setattr(integration, "_write_receipt_state", record_receipt_size)
+
+    installed = integration.install_codex(vault=vault, codex_home=home)
+
+    assert max(receipt_sizes) > 64 * 1024
+    assert max(receipt_sizes) <= integration.RECEIPT_MAX_BYTES
+    assert integration.codex_status(codex_home=home)["manifest_verified"] is True
+    assert fake_codex.plugins == {integration.PLUGIN_ID}
+    assert Path(installed.marketplace_root).is_dir()
+
+
+def test_install_uses_one_transactional_resident_skill_snapshot(
+    tmp_path: Path,
+    fake_codex: FakeCodex,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    skill = _write_imported_skill(vault)
+    original = (skill / "SKILL.md").read_bytes()
+    materialize = integration._materialize_marketplace
+    mutated = False
+
+    def mutate_source_after_preflight(
+        target: Path,
+        contents: dict[str, bytes | resident_context.ResidentSkillFile | None],
+        manifest: dict[str, str],
+    ) -> None:
+        nonlocal mutated
+        mutated = True
+        (skill / "SKILL.md").write_text(
+            "---\nname: resident-exact\ndescription: Changed after preflight.\n---\n",
+            encoding="utf-8",
+        )
+        if os.name != "nt":
+            (skill / "scripts/check.py").chmod(0o600)
+        materialize(target, contents, manifest)
+
+    monkeypatch.setattr(integration, "_materialize_marketplace", mutate_source_after_preflight)
+
+    installed = integration.install_codex(vault=vault, codex_home=home)
+    generated = Path(installed.marketplace_root) / "plugins/gsv/skills/resident-exact/SKILL.md"
+
+    assert mutated is True
+    assert generated.read_bytes() == original
+    assert generated.read_bytes() != (skill / "SKILL.md").read_bytes()
+    if os.name != "nt":
+        generated_script = generated.parent / "scripts/check.py"
+        assert stat.S_IMODE(generated_script.stat().st_mode) == 0o700
+        assert stat.S_IMODE((skill / "scripts/check.py").stat().st_mode) == 0o600
+    assert integration.codex_status(codex_home=home)["manifest_verified"] is True
+    assert fake_codex.plugins == {integration.PLUGIN_ID}
+
+
+def test_generated_instructions_keep_legacy_import_mechanics_inert(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    resident = vault / "context/resident"
+    resident.mkdir(parents=True)
+    legacy_guidance = (
+        "# Imported resident\n\n"
+        "Use the private checkout and `.sbrain/PULSE`, then run `gsv pending-show`.\n"
+    )
+    (resident / "AGENTS.md").write_bytes(legacy_guidance.encode("utf-8"))
+    control = resident / "control"
+    control.mkdir()
+    (control / "RESIDENT").write_text("legacy-host-task-binding\n", encoding="utf-8")
+
+    contents, _ = integration._marketplace_contents(
+        vault,
+        runtime=("test-python", ["-m", "continuity_kernel"]),
+    )
+    generated = contents["plugins/gsv/skills/gsv/SKILL.md"]
+
+    assert resident_context.read_resident_guidance(vault)["content"] == legacy_guidance
+    assert isinstance(generated, bytes)
+    assert b"installed Seld plugin and the active vault" in generated
+    assert b"context/resident/control` is inert legacy data" in generated
+    assert b"legacy `gsv pending-*` commands" in generated
+    assert b"legacy-host-task-binding" not in generated
+    assert (
+        "installed Seld plugin and active vault remain authoritative" in integration.MANAGED_BLOCK
+    )
+
+
+def test_imported_builtin_skill_collision_fails_before_local_install_mutation(
+    tmp_path: Path,
+    fake_codex: FakeCodex,
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    agents = home / "AGENTS.md"
+    agents.write_text("# Existing\n", encoding="utf-8")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _write_imported_skill(vault, "gsv")
+
+    with pytest.raises(ConflictError, match="preserved the built-in skill"):
+        integration.install_codex(vault=vault, codex_home=home)
+
+    assert agents.read_text(encoding="utf-8") == "# Existing\n"
+    assert not integration._marketplace_root(home).exists()
+    assert fake_codex.plugins == set()
+    assert fake_codex.marketplaces == {}
 
 
 def _receipt_payload(home: Path) -> dict[str, Any]:
@@ -206,6 +525,10 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
     providers = onboard / "references/providers"
     assert {path.stem for path in providers.glob("*.md")} == provider_names
     source_catalog = (onboard / "references/source-catalog.md").read_text(encoding="utf-8")
+    recovery = (onboard / "references/recovery.md").read_text(encoding="utf-8")
+    assert "local-source staged-status" in recovery
+    assert "local-source adopt-staged" in recovery
+    assert "local-source adopt-checkpoint" not in recovery
     for provider_name in provider_names:
         provider_text = " ".join(
             (providers / f"{provider_name}.md").read_text(encoding="utf-8").split()
@@ -729,6 +1052,10 @@ def test_reinstall_rechecks_prior_marketplace_immediately_before_replacement(
         target: Path,
         expected_prior_manifest: dict[str, str] | None = None,
         before_moves: Any,
+        prepared: tuple[
+            dict[str, bytes | resident_context.ResidentSkillFile | None], dict[str, str]
+        ]
+        | None = None,
     ) -> integration._MarketplaceChange:
         sentinel.write_bytes(b"preserve concurrent user bytes\n")
         return real_replace(
@@ -737,6 +1064,7 @@ def test_reinstall_rechecks_prior_marketplace_immediately_before_replacement(
             target=target,
             expected_prior_manifest=expected_prior_manifest,
             before_moves=before_moves,
+            prepared=prepared,
         )
 
     monkeypatch.setattr(integration, "_replace_marketplace", mutate_before_replace)
@@ -1674,9 +2002,13 @@ def test_failed_reinstall_restores_previous_marketplace_bytes(
     home.mkdir()
     first_vault = tmp_path / "first-vault"
     second_vault = tmp_path / "second-vault"
+    _write_imported_skill(first_vault)
+    _write_imported_skill(second_vault)
     installed = integration.install_codex(vault=first_vault, codex_home=home)
     manifest = Path(installed.marketplace_root) / "plugins/gsv/.mcp.json"
+    installed_skill = Path(installed.marketplace_root) / "plugins/gsv/skills/resident-exact"
     before = manifest.read_bytes()
+    real_status = integration.codex_status
     monkeypatch.setattr(
         integration,
         "codex_status",
@@ -1687,8 +2019,13 @@ def test_failed_reinstall_restores_previous_marketplace_bytes(
         integration.install_codex(vault=second_vault, codex_home=home)
 
     assert manifest.read_bytes() == before
+    if os.name != "nt":
+        assert stat.S_IMODE((installed_skill / "references/context.md").stat().st_mode) == 0o600
+        assert stat.S_IMODE((installed_skill / "scripts/check.py").stat().st_mode) == 0o700
+    assert real_status(codex_home=home)["manifest_verified"] is True
     payload = json.loads(before)
     assert payload["mcpServers"]["gsv"]["env"]["GSV_VAULT"] == str(first_vault.resolve())
+    assert payload["mcpServers"]["gsv"]["env"][integration.GSV_DATA_DIR_ENV] == str(data_dir())
 
 
 def test_first_install_visible_transition_write_error_is_accepted_by_readback(
@@ -1772,6 +2109,9 @@ def test_reinstall_visible_transition_write_error_is_accepted_by_readback(
     assert len(payload["cleanup_pending"]) == 1
     assert _retained_paths(home)[0].is_dir()
     assert updated_manifest["mcpServers"]["gsv"]["env"]["GSV_VAULT"] == str(second_vault.resolve())
+    assert updated_manifest["mcpServers"]["gsv"]["env"][integration.GSV_DATA_DIR_ENV] == str(
+        data_dir()
+    )
     monkeypatch.setattr(integration, "atomic_write", real_atomic_write)
     assert integration.uninstall_codex(codex_home=home)["cleanup_complete"] is False
 
@@ -1818,6 +2158,8 @@ def _launch_generated_manifest(marketplace: Path) -> dict[str, Any]:
     payload = json.loads((marketplace / "plugins/gsv/.mcp.json").read_text(encoding="utf-8"))
     server = payload["mcpServers"]["gsv"]
     environment = os.environ.copy()
+    for name in (integration.GSV_DATA_DIR_ENV, "GSV_VAULT", whatsapp.SERVICE_LABEL_ENV):
+        environment.pop(name, None)
     environment.update(server["env"])
     process = subprocess.Popen(
         [server["command"], *server["args"]],
@@ -1863,6 +2205,7 @@ def test_exact_source_runtime_manifest_executes(tmp_path: Path) -> None:
 
     assert result["server"]["command"] == sys.executable
     assert result["server"]["args"] == ["-m", "continuity_kernel", "mcp", "serve"]
+    assert result["server"]["env"][integration.GSV_DATA_DIR_ENV] == str(data_dir())
     assert result["response"]["result"]["serverInfo"]["name"] == "gsv"
 
 
@@ -2937,12 +3280,12 @@ def test_partial_install_candidate_is_cataloged_and_recovery_is_idempotent(
     real_write = integration._write_exclusive
     writes = 0
 
-    def fail_after_partial_candidate(path: Path, content: bytes) -> None:
+    def fail_after_partial_candidate(path: Path, content: bytes, *, mode: int = 0o600) -> None:
         nonlocal writes
         writes += 1
         if writes == 2:
             raise PermissionError("injected partial candidate failure")
-        real_write(path, content)
+        real_write(path, content, mode=mode)
 
     monkeypatch.setattr(integration, "_write_exclusive", fail_after_partial_candidate)
     with pytest.raises(SetupError, match="partial candidate failure"):

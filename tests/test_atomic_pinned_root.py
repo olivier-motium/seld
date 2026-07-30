@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,52 @@ from continuity_kernel.vault import Vault
 pytestmark = pytest.mark.skipif(
     os.name == "nt", reason="secure directory-pinned storage is POSIX-only foundation"
 )
+_POSIX_OS = cast(Any, os)
+
+
+def test_pinned_directory_listing_is_sorted_filtered_and_bounded(tmp_path: Path) -> None:
+    root = tmp_path / "pinned"
+    directory = root / "history"
+    directory.mkdir(parents=True)
+    (directory / "b.jsonl").write_bytes(b"b")
+    (directory / "a.jsonl").write_bytes(b"a")
+    (directory / "note.txt").write_bytes(b"note")
+    store = atomic_module.PinnedPathRoot(root)
+    try:
+        assert store.list_directory_entry_names("history", max_entries=3, suffix=".jsonl") == (
+            "a.jsonl",
+            "b.jsonl",
+        )
+        with pytest.raises(ValidationError, match="supported bound"):
+            store.list_directory_entry_names("history", max_entries=2, suffix=".jsonl")
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("error_number", (errno.ELOOP, errno.ENOTDIR))
+def test_pinned_read_maps_nofollow_path_faults_to_stable_validation_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+) -> None:
+    root = tmp_path / "pinned"
+    value = root / "control/value"
+    value.parent.mkdir(parents=True)
+    value.write_bytes(b"canonical")
+    store = atomic_module.PinnedPathRoot(root)
+    actual_open = os.open
+
+    def fail_leaf_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if path == "value" and kwargs.get("dir_fd") is not None:
+            raise OSError(error_number, "injected no-follow path fault")
+        return actual_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fail_leaf_open)
+    try:
+        with pytest.raises(ValidationError, match="could not read value beneath the pinned root"):
+            store.read_regular_file("control/value", label="value", max_bytes=64)
+    finally:
+        store.close()
 
 
 def test_pinned_directory_count_uses_descriptor_and_honors_match_bound(
@@ -550,3 +597,132 @@ def test_pinned_file_lock_never_yields_after_descendant_parent_replacement(
     assert yielded is False
     assert (parked / "global.lock").read_bytes() == b"0"
     assert (lock_directory / "global.lock").read_bytes() == b"0"
+
+
+def test_regular_file_watch_second_dup_failure_closes_first_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "pinned"
+    records = root / "records"
+    records.mkdir(parents=True)
+    path = records / "value"
+    path.write_bytes(b"value")
+    parent = os.open(records, os.O_RDONLY | _POSIX_OS.O_DIRECTORY)
+    descriptor = os.open(path, os.O_RDONLY)
+    baseline = len(os.listdir("/dev/fd"))
+    actual_dup = os.dup
+    calls = 0
+
+    def fail_second_duplicate(value: int) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second dup failure")
+        return actual_dup(value)
+
+    monkeypatch.setattr(os, "dup", fail_second_duplicate)
+    try:
+        with pytest.raises(OSError, match="second dup"):
+            atomic_module.PinnedPathRoot._duplicate_regular_file_watch(
+                ("records", "value"),
+                parent,
+                descriptor,
+                identity=(path.stat().st_dev, path.stat().st_ino),
+            )
+        assert len(os.listdir("/dev/fd")) == baseline
+    finally:
+        monkeypatch.setattr(os, "dup", actual_dup)
+        os.close(descriptor)
+        os.close(parent)
+
+
+def test_named_retain_dup_failure_preserves_previous_authoritative_watch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "pinned"
+    records = root / "records"
+    records.mkdir(parents=True)
+    path = records / "value"
+    path.write_bytes(b"value")
+    store = atomic_module.PinnedPathRoot(root)
+    store.read_regular_file(
+        "records/value",
+        label="value",
+        max_bytes=1024,
+        retain=True,
+    )
+    previous = store._retained_files[("records", "value")]
+    baseline = len(os.listdir("/dev/fd"))
+
+    def fail_watch_duplicate(*args: object, **kwargs: object) -> atomic_module._RegularFileWatch:
+        raise OSError("injected watch duplication failure")
+
+    monkeypatch.setattr(
+        atomic_module.PinnedPathRoot,
+        "_duplicate_regular_file_watch",
+        staticmethod(fail_watch_duplicate),
+    )
+    parent = os.open(records, os.O_RDONLY | _POSIX_OS.O_DIRECTORY)
+    try:
+        with pytest.raises(OSError, match="watch duplication"):
+            store._retain_named_regular_file(
+                ("records", "value"),
+                parent,
+                "value",
+                expected_identity=(path.stat().st_dev, path.stat().st_ino),
+                label="value",
+            )
+        assert store._retained_files[("records", "value")] is previous
+        assert len(os.listdir("/dev/fd")) == baseline + 1
+    finally:
+        os.close(parent)
+        store.close()
+
+
+def test_directory_traversal_close_error_never_retries_or_leaks_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "pinned"
+    (root / "one/two").mkdir(parents=True)
+    store = atomic_module.PinnedPathRoot(root)
+    baseline = len(os.listdir("/dev/fd"))
+    current = os.dup(store._root_descriptor)
+    actual_close = os.close
+    actual_open = os.open
+    injected = False
+    close_calls: dict[int, int] = {}
+    opened_children: list[int] = []
+
+    def tracked_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        descriptor = actual_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+        opened_children.append(descriptor)
+        return descriptor
+
+    def consume_then_fail(descriptor: int) -> None:
+        nonlocal injected
+        close_calls[descriptor] = close_calls.get(descriptor, 0) + 1
+        if not injected and descriptor == current:
+            injected = True
+            actual_close(descriptor)
+            raise OSError("injected consumed close failure")
+        actual_close(descriptor)
+
+    monkeypatch.setattr(os, "open", tracked_open)
+    monkeypatch.setattr(os, "close", consume_then_fail)
+    try:
+        with pytest.raises(ValidationError, match="could not traverse"):
+            store._open_directory_from_descriptor(
+                current,
+                ("one", "two"),
+                create=False,
+                mode=0o700,
+            )
+        assert injected
+        assert close_calls[current] == 1
+        assert opened_children
+        assert close_calls[opened_children[0]] == 1
+        assert len(os.listdir("/dev/fd")) == baseline
+    finally:
+        monkeypatch.setattr(os, "close", actual_close)
+        monkeypatch.setattr(os, "open", actual_open)
+        store.close()

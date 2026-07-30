@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from continuity_kernel.atomic import durable_unlink
 from continuity_kernel.errors import ConflictError
 from continuity_kernel.vault import Vault
 
@@ -73,8 +74,23 @@ and next action without a rebrief.
 
     orphan = root / "tasks/.ship-atlas-migration.md.tmp-demo-crash"
     orphan.write_bytes(b"synthetic interrupted write")
-    repaired = vault.doctor(repair=True)
-    interrupted_write_recovered = repaired.healthy and not orphan.exists()
+    retained = vault.doctor(repair=True)
+    interrupted_write_retained_for_review = (
+        not retained.healthy
+        and any(
+            issue.code == "orphan-temp"
+            and issue.path == "tasks/.ship-atlas-migration.md.tmp-demo-crash"
+            for issue in retained.issues
+        )
+        and orphan.read_bytes() == b"synthetic interrupted write"
+    )
+    # The demo created this exact synthetic path, so it can remove it explicitly after proving
+    # that the conservative doctor retained unknown crash state for inspection.
+    durable_unlink(orphan)
+    repaired = vault.doctor()
+    demo_owned_crash_residue_cleaned = (
+        interrupted_write_retained_for_review and repaired.healthy and not orphan.exists()
+    )
 
     backup = vault.create_backup()
     restored_path = root.parent / f"{root.name}-restored"
@@ -93,7 +109,8 @@ and next action without a rebrief.
         "fresh_process_resumed": fresh_process_resumed,
         "hand_process_killed": hand_process_killed,
         "initialized": seeded["initialized"],
-        "interrupted_write_recovered": interrupted_write_recovered,
+        "demo_owned_crash_residue_cleaned": demo_owned_crash_residue_cleaned,
+        "interrupted_write_retained_for_review": interrupted_write_retained_for_review,
         "logical_restore_equivalent": equivalent,
         "restore": {**restore, "temporary_target_removed": not restored_path.exists()},
         "same_name_entities_disambiguated": engineering.identifier != research.identifier,

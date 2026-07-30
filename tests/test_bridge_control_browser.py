@@ -129,7 +129,7 @@ def test_browser_renders_cached_update_states_as_chatgpt_links_not_browser_posts
                         None
                         if outcome is None and state_name != "interrupted"
                         else {
-                            "token": "018f6a20-7b3c-7d42-8a19-2e5f603b91c4",
+                            "token": "018f6a20-" + "7b3c-7d42-8a19-2e5f603b91c4",
                             "outcome": outcome,
                         }
                     )
@@ -151,7 +151,7 @@ def test_browser_renders_cached_update_states_as_chatgpt_links_not_browser_posts
                     state="available",
                     candidate={"sha": "3" * 40, "verified": True, "ci_checks": 8},
                     transaction={
-                        "token": "018f6a20-7b3c-7d42-8a19-2e5f603b91c4",
+                        "token": "018f6a20-" + "7b3c-7d42-8a19-2e5f603b91c4",
                         "to_sha": "2" * 40,
                         "outcome": "rolled_back",
                     },
@@ -168,6 +168,155 @@ def test_browser_renders_cached_update_states_as_chatgpt_links_not_browser_posts
                     == 1
                 )
                 assert update_requests == []
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_browser_treats_superseded_tasks_as_closed_history(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Superseded task Bridge proof")
+    vault.create_task(
+        identifier="replacement-outcome",
+        title="Replacement outcome",
+        outcome="Keep the replacement visible as open work.",
+    )
+    vault.create_task(
+        identifier="superseded-outcome",
+        title="Superseded outcome",
+        outcome="Keep the superseded record in history without presenting it as open.",
+        status="superseded",
+        superseded_by="replacement-outcome",
+    )
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"height": 760, "width": 1024})
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
+                page.locator('[data-view="storylines"]').click()
+                assert page.get_by_text("1 open", exact=True).is_visible()
+                assert page.get_by_text("1 recorded", exact=True).is_visible()
+                assert page.get_by_role(
+                    "heading", name="Replacement outcome", exact=True
+                ).is_visible()
+                assert page.get_by_role(
+                    "heading", name="Superseded outcome", exact=True
+                ).is_visible()
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_browser_shows_trustworthy_briefing_time_and_exact_task_continuation(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Briefing and continuation proof")
+    current_now = vault.read_document("NOW.md")
+    vault.write_document(
+        "NOW.md",
+        "# Now\n\nA timestamp-free briefing written through the canonical writer.\n",
+        expected_revision=current_now["revision"],
+    )
+    active_hand = "019f0000-0000-7000-8000-000000000777"
+    vault.create_task(
+        identifier="bound-task",
+        title="Bound task",
+        outcome="Resume the exact saved ChatGPT task.",
+        status="doing",
+        next_actor="agent",
+        next_action="Continue the existing hand.",
+        active_thread_id=active_hand,
+    )
+    vault.create_task(
+        identifier="unbound-task",
+        title="Unbound task",
+        outcome="Open a new ChatGPT task when no binding exists.",
+    )
+    vault.create_task(
+        identifier="invalid-binding",
+        title="Invalid binding",
+        outcome="Stop before opening a duplicate ChatGPT task.",
+        status="doing",
+        next_actor="agent",
+        next_action="Repair the saved binding.",
+        active_thread_id="not-a-chatgpt-task",
+    )
+    static_resource = files("continuity_kernel") / "resources/bridge"
+    with as_file(static_resource) as static_root:
+        server = BridgeHTTPServer(
+            ("127.0.0.1", 0),
+            vault,
+            static_root,
+            access_token=ACCESS_TOKEN,
+            instance_id=INSTANCE_ID,
+            integration_provider=lambda: {
+                "available": True,
+                "instructions_installed": True,
+                "plugin_installed": True,
+                "ready": True,
+            },
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"height": 760, "width": 1024})
+                page.goto(f"{base}/#token={ACCESS_TOKEN}", wait_until="networkidle")
+                assert page.get_by_text("Briefed just now", exact=True).is_visible()
+                assert page.get_by_text("Briefing time unavailable", exact=True).count() == 0
+
+                page.locator('[data-view="storylines"]').click()
+                page.locator(
+                    ".task-card",
+                    has=page.get_by_role("heading", name="Bound task", exact=True),
+                ).click()
+                continuation = page.locator("#continue-in-codex")
+                assert continuation.get_attribute("href") == f"codex://threads/{active_hand}"
+                page.locator("#close-inspector").click()
+
+                page.locator(
+                    ".task-card",
+                    has=page.get_by_role("heading", name="Unbound task", exact=True),
+                ).click()
+                assert continuation.get_attribute("href").startswith("codex://new?")
+                page.locator("#close-inspector").click()
+
+                page.locator(
+                    ".task-card",
+                    has=page.get_by_role("heading", name="Invalid binding", exact=True),
+                ).click()
+                assert page.locator("#inspector-foot a").count() == 0
+                assert page.get_by_text(
+                    "Repair the binding before continuing so Seld does not open a duplicate task.",
+                    exact=False,
+                ).is_visible()
                 browser.close()
         finally:
             server.shutdown()

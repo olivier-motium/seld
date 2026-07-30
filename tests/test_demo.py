@@ -15,7 +15,8 @@ def test_demo_proves_all_public_gsv_guarantees(tmp_path: Path) -> None:
     assert result["fresh_process_resumed"] is True
     assert result["hand_process_killed"] is True
     assert result["doctor_healthy"] is True
-    assert result["interrupted_write_recovered"] is True
+    assert result["demo_owned_crash_residue_cleaned"] is True
+    assert result["interrupted_write_retained_for_review"] is True
     assert result["logical_restore_equivalent"] is True
     assert result["same_name_entities_disambiguated"] is True
     assert result["stale_write_rejected"] is True

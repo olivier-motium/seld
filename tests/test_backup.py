@@ -6,7 +6,9 @@ import os
 import shutil
 import stat
 import sys
+import threading
 import zipfile
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ from continuity_kernel.errors import (
     ValidationError,
 )
 from continuity_kernel.records import new_task, render_task
+from continuity_kernel.resident_signals import MAX_SIGNAL_QUEUE_BYTES, ResidentSignalStore
 from continuity_kernel.vault import BACKUP_MANIFEST, Vault
 from continuity_kernel.vault_identity import REQUIRED_VAULT_DIRECTORIES
 
@@ -39,12 +42,28 @@ def _valid_backup_manifest(
     format_version: int = 1,
     vault_id: str = TEST_VAULT_ID,
 ) -> dict[str, Any]:
-    return {
+    manifest: dict[str, Any] = {
         "created_at": "2026-07-24T00:00:00Z",
         "files": files,
         "format_version": format_version,
         "vault_id": vault_id,
     }
+    if format_version == vault_backup_module.BACKUP_FORMAT_VERSION:
+        manifest["executable_files"] = []
+    return manifest
+
+
+def _write_backup_with_manifest(
+    source: Path,
+    destination: Path,
+    manifest: dict[str, Any],
+) -> None:
+    with zipfile.ZipFile(source, "r") as archive:
+        contents = {item.filename: archive.read(item.filename) for item in archive.infolist()}
+    contents[BACKUP_MANIFEST] = json.dumps(manifest, sort_keys=True).encode()
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in contents.items():
+            archive.writestr(name, content)
 
 
 def _rewrite_backup(
@@ -88,6 +107,54 @@ def _write_crafted_backup(
         archive.writestr(BACKUP_MANIFEST, json.dumps(manifest))
 
 
+def _leave_markerless_committed_compaction(
+    signals: ResidentSignalStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    real_unlink = signals._unlink_private_exact
+    marker_removed = False
+
+    def fail_first_cleanup(
+        store: object,
+        path: Path,
+        *,
+        expected: bytes,
+        label: str,
+        max_bytes: int = MAX_SIGNAL_QUEUE_BYTES,
+    ) -> None:
+        nonlocal marker_removed
+        if path == signals.compaction_marker_path:
+            real_unlink(
+                store,  # type: ignore[arg-type]
+                path,
+                expected=expected,
+                label=label,
+                max_bytes=max_bytes,
+            )
+            marker_removed = True
+            return
+        if marker_removed:
+            raise OSError(errno.EIO, "injected post-marker cleanup failure")
+        real_unlink(
+            store,  # type: ignore[arg-type]
+            path,
+            expected=expected,
+            label=label,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(signals, "_unlink_private_exact", fail_first_cleanup)
+    with pytest.raises(MutationCommittedError, match="cleanup is incomplete"):
+        signals.compact(retain_recent=1)
+
+    operations = signals.root / "operations"
+    operation_roots = list(operations.iterdir())
+    assert marker_removed is True
+    assert not signals.compaction_marker_path.exists()
+    assert len(operation_roots) == 1
+    return operation_roots[0]
+
+
 def test_backup_verify_restore_and_logical_equivalence(vault: Vault, tmp_path: Path) -> None:
     vault.create_task(
         identifier="backup-proof",
@@ -103,9 +170,408 @@ def test_backup_verify_restore_and_logical_equivalence(vault: Vault, tmp_path: P
 
     assert backup["verified"] is True
     assert Vault.verify_backup(Path(backup["backup"]))["valid"] is True
+    with zipfile.ZipFile(backup["backup"], "r") as archive:
+        manifest = json.loads(archive.read(BACKUP_MANIFEST))
+    assert manifest["format_version"] == vault_backup_module.BACKUP_FORMAT_VERSION
+    assert manifest["executable_files"] == []
     assert restored["digest"] == vault.logical_digest()
     assert Vault(target).doctor().healthy
     assert all((target / relative).is_dir() for relative in REQUIRED_VAULT_DIRECTORIES)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable modes are unavailable")
+def test_backup_v2_restores_only_declared_executable_files(vault: Vault, tmp_path: Path) -> None:
+    executable = vault.root / "context/resident/skills/example/scripts/run.sh"
+    regular = vault.root / "context/resident/skills/example/SKILL.md"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    regular.write_text("# Example\n", encoding="utf-8")
+    executable.chmod(0o700)
+    regular.chmod(0o600)
+
+    backup = Path(vault.create_backup(tmp_path / "modes.zip")["backup"])
+    with zipfile.ZipFile(backup, "r") as archive:
+        manifest = json.loads(archive.read(BACKUP_MANIFEST))
+
+    assert manifest["format_version"] == vault_backup_module.BACKUP_FORMAT_VERSION
+    assert manifest["executable_files"] == ["context/resident/skills/example/scripts/run.sh"]
+
+    target = tmp_path / "restored-modes"
+    Vault.restore_backup(backup, target)
+
+    assert stat.S_IMODE((target / executable.relative_to(vault.root)).stat().st_mode) == 0o700
+    assert stat.S_IMODE((target / regular.relative_to(vault.root)).stat().st_mode) == 0o600
+
+
+def test_restore_v1_backup_defaults_every_file_to_non_executable(
+    vault: Vault, tmp_path: Path
+) -> None:
+    executable = vault.root / "tools/legacy-run.sh"
+    executable.parent.mkdir()
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    if os.name != "nt":
+        executable.chmod(0o700)
+    current = Path(vault.create_backup(tmp_path / "current.zip")["backup"])
+    with zipfile.ZipFile(current, "r") as archive:
+        manifest = json.loads(archive.read(BACKUP_MANIFEST))
+    manifest["format_version"] = 1
+    manifest.pop("executable_files")
+    legacy = tmp_path / "legacy-v1.zip"
+    _write_backup_with_manifest(current, legacy, manifest)
+
+    assert Vault.verify_backup(legacy)["valid"] is True
+    target = tmp_path / "restored-legacy"
+    Vault.restore_backup(legacy, target)
+
+    assert Vault(target).doctor().healthy is True
+    if os.name != "nt":
+        assert stat.S_IMODE((target / "tools/legacy-run.sh").stat().st_mode) == 0o600
+
+
+def test_backup_serializes_signal_compaction_into_one_restorable_snapshot(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals = ResidentSignalStore(vault.root)
+    first = signals.append(kind="test", envelope={"summary": "settled"})
+    signals.append(kind="test", envelope={"summary": "pending"})
+    before = signals.status()
+    signals.acknowledge(
+        (first.input_id,),
+        expected_revision=before.revision,
+        consumer="test",
+        disposition=None,
+        result_refs=(),
+    )
+
+    acknowledgement_copied = threading.Event()
+    release_backup = threading.Event()
+    compaction_attempted = threading.Event()
+    compaction_acquired = threading.Event()
+    backup_errors: list[BaseException] = []
+    compaction_errors: list[BaseException] = []
+    result: dict[str, Any] = {}
+    real_read = vault_backup_module._read_backup_source
+    real_transaction = signals._transaction
+
+    def pause_after_acknowledgements(
+        path: Path,
+        *,
+        root: Path,
+        store: object,
+    ) -> bytes:
+        content = real_read(path, root=root, store=store)  # type: ignore[arg-type]
+        if path == signals.acknowledgements_path:
+            acknowledgement_copied.set()
+            if not release_backup.wait(timeout=2):
+                raise AssertionError("test did not release the paused backup")
+        return content
+
+    @contextmanager
+    def observe_compaction_lock() -> Any:
+        compaction_attempted.set()
+        with real_transaction() as store:
+            compaction_acquired.set()
+            yield store
+
+    def back_up() -> None:
+        try:
+            result.update(vault.create_backup(tmp_path / "signals.zip"))
+        except BaseException as exc:  # pragma: no cover - asserted by the parent thread
+            backup_errors.append(exc)
+
+    def compact() -> None:
+        try:
+            signals.compact(retain_recent=1)
+        except BaseException as exc:  # pragma: no cover - asserted by the parent thread
+            compaction_errors.append(exc)
+
+    monkeypatch.setattr(vault_backup_module, "_read_backup_source", pause_after_acknowledgements)
+    monkeypatch.setattr(signals, "_transaction", observe_compaction_lock)
+    backup_thread = threading.Thread(target=back_up, daemon=True)
+    compaction_thread = threading.Thread(target=compact, daemon=True)
+    backup_thread.start()
+    try:
+        assert acknowledgement_copied.wait(timeout=2)
+        with (
+            pytest.raises(ConflictError),
+            atomic_module.exclusive_lock(signals.lock_path, timeout=0.0),
+        ):
+            raise AssertionError("backup did not hold the resident-signal lock")
+        compaction_thread.start()
+        assert compaction_attempted.wait(timeout=2)
+        assert not compaction_acquired.is_set()
+    finally:
+        release_backup.set()
+    backup_thread.join(timeout=5)
+    compaction_thread.join(timeout=5)
+
+    assert not backup_thread.is_alive()
+    assert not compaction_thread.is_alive()
+    assert backup_errors == []
+    assert compaction_errors == []
+    assert compaction_acquired.is_set()
+    backup = Path(result["backup"])
+    restored = tmp_path / "restored-signals"
+    Vault.restore_backup(backup, restored)
+    restored_vault = Vault(restored)
+
+    assert restored_vault.doctor().healthy is True
+    assert ResidentSignalStore(restored).status().inputs == 2
+    assert ResidentSignalStore(restored).status().acknowledged == 1
+
+
+def test_backup_recovers_marker_present_signal_compaction_before_snapshot(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals = ResidentSignalStore(vault.root)
+    archived, created = signals.append_result(
+        kind="source-due",
+        ref="source:gmail",
+        event_key="source-due:gmail:marker-present-backup",
+        envelope={"covered_through": "2026-07-29T08:00:00Z"},
+    )
+    signals.append(kind="test", envelope={"summary": "pending"})
+    signals.acknowledge(
+        (archived.input_id,),
+        expected_revision=signals.status().revision,
+        consumer="test",
+    )
+    real_recover = signals._recover_compaction
+
+    def crash_after_marker(store: object) -> None:
+        if signals.compaction_marker_path.exists():
+            raise SystemExit("crash after compaction marker")
+        real_recover(store)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as crash:
+        crash.setattr(signals, "_recover_compaction", crash_after_marker)
+        with pytest.raises(SystemExit, match="after compaction marker"):
+            signals.compact(retain_recent=1)
+
+    assert created is True
+    assert signals.compaction_marker_path.exists()
+    assert any((signals.root / "operations").iterdir())
+
+    backup = Path(vault.create_backup(tmp_path / "recovered-compaction.zip")["backup"])
+
+    assert not signals.compaction_marker_path.exists()
+    assert not any((signals.root / "operations").iterdir())
+    target = tmp_path / "restored-recovered-compaction"
+    Vault.restore_backup(backup, target)
+    restored = ResidentSignalStore(target)
+    replay, replay_created = restored.append_result(
+        kind="source-due",
+        ref="source:gmail",
+        event_key="source-due:gmail:marker-present-backup",
+        envelope={"covered_through": "2026-07-29T08:00:00Z"},
+    )
+
+    assert Vault(target).doctor().healthy is True
+    assert replay_created is False
+    assert replay == archived
+    assert restored.status().pending == 1
+
+
+def test_backup_cleans_markerless_committed_signal_compaction_operation(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals = ResidentSignalStore(vault.root)
+    settled = signals.append(kind="test", envelope={"summary": "settled"})
+    signals.append(kind="test", envelope={"summary": "pending"})
+    signals.acknowledge(
+        (settled.input_id,),
+        expected_revision=signals.status().revision,
+        consumer="test",
+    )
+    _leave_markerless_committed_compaction(signals, monkeypatch)
+    operations = signals.root / "operations"
+    backup = Path(vault.create_backup(tmp_path / "cleaned-operation.zip")["backup"])
+
+    assert not any(operations.iterdir())
+    target = tmp_path / "restored-cleaned-operation"
+    Vault.restore_backup(backup, target)
+    assert Vault(target).doctor().healthy is True
+    assert ResidentSignalStore(target).status().pending == 1
+
+
+def test_backup_fails_closed_for_divergent_markerless_signal_compaction_operation(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals = ResidentSignalStore(vault.root)
+    settled = signals.append(kind="test", envelope={"summary": "settled"})
+    signals.append(kind="test", envelope={"summary": "pending"})
+    signals.acknowledge(
+        (settled.input_id,),
+        expected_revision=signals.status().revision,
+        consumer="test",
+    )
+    operation = _leave_markerless_committed_compaction(signals, monkeypatch)
+    staged_input = operation / "live_inputs.jsonl"
+    staged_input.write_bytes(staged_input.read_bytes() + b"{}\n")
+    destination = tmp_path / "must-not-back-up-divergent-operation.zip"
+
+    with pytest.raises(ValidationError, match="differs from canonical storage"):
+        vault.create_backup(destination)
+
+    assert not destination.exists()
+    assert any(issue.code == "orphan-signal-operation" for issue in vault.doctor().issues)
+
+
+def test_backup_restore_preserves_compacted_event_key_suppression(
+    vault: Vault, tmp_path: Path
+) -> None:
+    signals = ResidentSignalStore(vault.root)
+    original, created = signals.append_result(
+        kind="source-due",
+        ref="source:gmail",
+        event_key="source-due:gmail:backup-proof",
+        envelope={"covered_through": "2026-07-29T08:00:00Z"},
+    )
+    signals.acknowledge(
+        (original.input_id,),
+        expected_revision=signals.status().revision,
+        consumer="test",
+    )
+    signals.compact(retain_recent=0)
+    backup = Path(vault.create_backup(tmp_path / "settled-event-keys.zip")["backup"])
+    restored = tmp_path / "restored-event-keys"
+    Vault.restore_backup(backup, restored)
+
+    replay, replay_created = ResidentSignalStore(restored).append_result(
+        kind="source-due",
+        ref="source:gmail",
+        event_key="source-due:gmail:backup-proof",
+        envelope={"covered_through": "2026-07-29T08:00:00Z"},
+    )
+
+    assert created is True
+    assert replay_created is False
+    assert replay == original
+    assert ResidentSignalStore(restored).status().pending == 0
+
+
+def test_backup_revalidates_exact_signal_archive_bytes_after_validation(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals = ResidentSignalStore(vault.root)
+    settled = signals.append(
+        kind="test",
+        event_key="backup:validated-archive-race",
+        envelope={"summary": "settled"},
+    )
+    signals.acknowledge(
+        (settled.input_id,),
+        expected_revision=signals.status().revision,
+        consumer="test",
+    )
+    signals.compact(retain_recent=0)
+    archive_inputs = next((signals.root / "archive").glob("inputs-*.jsonl"))
+    original = archive_inputs.read_bytes()
+    rows = [json.loads(line) for line in original.splitlines()]
+    rows[0]["envelope"]["summary"] = "changed after validation"
+    changed = b"".join(
+        json.dumps(row, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n" for row in rows
+    )
+    assert changed != original
+
+    real_read = ResidentSignalStore._read_optional_state
+    archive_reads = 0
+
+    def mutate_after_second_validation_read(
+        self: ResidentSignalStore,
+        store: object,
+        path: Path,
+        *,
+        label: str,
+        max_bytes: int,
+        retain: bool = True,
+    ) -> bytes | None:
+        nonlocal archive_reads
+        content = real_read(
+            self,
+            store,  # type: ignore[arg-type]
+            path,
+            label=label,
+            max_bytes=max_bytes,
+            retain=retain,
+        )
+        if self.vault_root == vault.root and path == archive_inputs:
+            archive_reads += 1
+            if archive_reads == 2:
+                archive_inputs.write_bytes(changed)
+        return content
+
+    monkeypatch.setattr(
+        ResidentSignalStore,
+        "_read_optional_state",
+        mutate_after_second_validation_read,
+    )
+    signals.status(verify_archive_history=True)
+
+    @contextmanager
+    def already_validated(_root: Path) -> Any:
+        yield
+
+    monkeypatch.setattr(
+        vault_backup_module,
+        "_coherent_backup_snapshot",
+        already_validated,
+    )
+    destination = tmp_path / "must-not-publish-raced-signals.zip"
+
+    with pytest.raises(ValidationError, match="settled event-key ledger"):
+        vault.create_backup(destination)
+
+    assert archive_reads == 2
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        f".gsv/signals/archive/.inputs-20260729T090000Z-{'a' * 32}.jsonl.seld-stage-short",
+        ".gsv/signals/archive/nested/payload.bin",
+    ),
+)
+def test_backup_rejects_noncanonical_signal_archive_entry_before_publication(
+    vault: Vault,
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    signals = ResidentSignalStore(vault.root)
+    settled = signals.append(
+        kind="test",
+        event_key="backup:archive-near-match",
+        envelope={"summary": "settled"},
+    )
+    signals.acknowledge(
+        (settled.input_id,),
+        expected_revision=signals.status().revision,
+        consumer="test",
+    )
+    signals.compact(retain_recent=0)
+    hostile = vault.root / relative
+    hostile.parent.mkdir(parents=True, exist_ok=True)
+    hostile.write_bytes(b"not writer-owned\n")
+    destination = tmp_path / "must-not-publish-invalid-archive.zip"
+
+    with pytest.raises(ValidationError, match="file path is unsupported"):
+        vault.create_backup(destination)
+
+    assert hostile.read_bytes() == b"not writer-owned\n"
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".gsv-backup.tmp-*.zip"))
 
 
 def test_restore_refuses_legacy_duplicate_live_hand_before_publication(
@@ -495,6 +961,36 @@ def test_backup_rejects_unknown_manifest_version(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "executable_files",
+    [
+        "a.txt",
+        [1],
+        ["missing.txt"],
+        ["b.txt", "a.txt"],
+        ["a.txt", "a.txt"],
+    ],
+)
+def test_backup_rejects_malformed_v2_executable_file_list(
+    tmp_path: Path,
+    executable_files: object,
+) -> None:
+    archive_path = tmp_path / "invalid-executable-files.zip"
+    contents = {"a.txt": b"a", "b.txt": b"b"}
+    manifest = _valid_backup_manifest(
+        {name: sha256_bytes(content) for name, content in contents.items()},
+        format_version=vault_backup_module.BACKUP_FORMAT_VERSION,
+    )
+    manifest["executable_files"] = executable_files
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for name, content in contents.items():
+            archive.writestr(name, content)
+        archive.writestr(BACKUP_MANIFEST, json.dumps(manifest))
+
+    with pytest.raises(ValidationError, match="executable-file list"):
+        Vault.verify_backup(archive_path)
+
+
+@pytest.mark.parametrize(
     "replacement",
     [
         {"format_version": True},
@@ -517,12 +1013,17 @@ def test_backup_rejects_noncanonical_manifest_fields(
         Vault.verify_backup(archive_path)
 
 
-def test_backup_rejects_oversized_decompressed_entry(tmp_path: Path) -> None:
+def test_backup_rejects_oversized_decompressed_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     archive_path = tmp_path / "oversized.zip"
-    manifest = _valid_backup_manifest({})
+    size_bound = 1024
+    content = b"x" * (size_bound + 1)
+    manifest = _valid_backup_manifest({"oversized.bin": sha256_bytes(content)})
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("oversized.bin", b"x" * (17 * 1024 * 1024))
+        archive.writestr("oversized.bin", content)
         archive.writestr(BACKUP_MANIFEST, json.dumps(manifest))
+    monkeypatch.setattr(vault_backup_module, "MAX_BACKUP_ENTRY_BYTES", size_bound)
 
     with pytest.raises(ValidationError, match="size bound"):
         Vault.verify_backup(archive_path)
@@ -805,25 +1306,40 @@ def test_backup_includes_authoritative_name_containing_tmp_marker(
 
 
 def test_backup_excludes_only_exact_writer_owned_atomic_temps(vault: Vault, tmp_path: Path) -> None:
+    targets = (
+        "AGENTS.md",
+        "DIRECTION.md",
+        "MIND.md",
+        "NOW.md",
+        "README.md",
+        "SOURCES.md",
+        "tasks/example.md",
+        "entities/example.md",
+        "threads/example.md",
+        ".gsv/manifest.json",
+        ".gsv/migration-culture-grade-foundation-v1.json",
+        "onboarding/session.md",
+        ".gsv/control/initialized",
+        ".gsv/control/queue.jsonl",
+        ".gsv/control/dispositions-0000000000000000.jsonl",
+        ".gsv/control/archive/queue-0-aaaaaaaa.jsonl",
+        ".gsv/control/runtime/turns/11111111-1111-4111-8111-111111111111.json",
+        ".gsv/signals/inputs.jsonl",
+        ".gsv/signals/acks.jsonl",
+        ".gsv/signals/event-keys.jsonl",
+        ".gsv/signals/compaction.json",
+        f".gsv/signals/archive/inputs-20260729T090000Z-{'e' * 32}.jsonl",
+        f".gsv/signals/archive/acks-20260729T090000Z-{'e' * 32}.jsonl",
+        "journal/events.jsonl",
+    )
     owned_temps = [
-        ".AGENTS.md.tmp-token",
-        ".DIRECTION.md.tmp-token",
-        ".MIND.md.tmp-token",
-        ".NOW.md.tmp-token",
-        ".README.md.tmp-token",
-        ".SOURCES.md.tmp-token",
-        "tasks/.example.md.tmp-token",
-        "entities/.example.md.tmp-token",
-        "threads/.example.md.tmp-token",
-        ".gsv/.manifest.json.tmp-token",
-        ".gsv/.migration-culture-grade-foundation-v1.json.tmp-token",
-        "onboarding/.session.md.tmp-token",
-        ".gsv/control/.initialized.tmp-token",
-        ".gsv/control/.queue.jsonl.tmp-token",
-        ".gsv/control/.dispositions-0000000000000000.jsonl.tmp-token",
-        ".gsv/control/archive/.queue-0-aaaaaaaa.jsonl.tmp-token",
-        ".gsv/control/runtime/turns/.11111111-1111-4111-8111-111111111111.json.tmp-token",
-        "journal/.events.jsonl.tmp-token",
+        f"{Path(target).parent.as_posix()}/.{Path(target).name}.{suffix}".removeprefix("./")
+        for target in targets
+        for suffix in (
+            "tmp-deadbeef",
+            f"tmp-{'a' * 32}",
+            f"seld-stage-{'b' * 32}",
+        )
     ]
     for relative in owned_temps:
         path = vault.root / relative
@@ -840,18 +1356,83 @@ def test_backup_excludes_only_exact_writer_owned_atomic_temps(vault: Vault, tmp_
         assert archive.read("tasks/.notes.tmp-user.md") == b"legitimate authored bytes\n"
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".MIND.md.tmp-token",
+        ".MIND.md.tmp-deadbee",
+        ".MIND.md.tmp-deadbeef0",
+        f".MIND.md.tmp-{'g' * 32}",
+        f".MIND.md.tmp-{'A' * 32}",
+        f".MIND.md.seld-stage-{'a' * 31}",
+        f".MIND.md.seld-stage-{'a' * 33}",
+        f".MIND.md.seld-stage-{'A' * 32}",
+        f".unowned.txt.tmp-{'a' * 32}",
+    ],
+)
+def test_backup_preserves_atomic_temp_near_matches(
+    vault: Vault,
+    tmp_path: Path,
+    name: str,
+) -> None:
+    candidate = vault.root / name
+    candidate.write_bytes(b"authored near-match\n")
+
+    backup = Path(
+        vault.create_backup(tmp_path / f"near-match-{sha256_bytes(name.encode())}.zip")["backup"]
+    )
+
+    with zipfile.ZipFile(backup, "r") as archive:
+        assert archive.read(name) == b"authored near-match\n"
+
+
+def test_backup_preserves_signal_marker_stage_near_match(
+    vault: Vault,
+    tmp_path: Path,
+) -> None:
+    relative = ".gsv/signals/.compaction.json.seld-stage-short"
+    candidate = vault.root / relative
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_bytes(b"authored near-match\n")
+
+    backup = Path(vault.create_backup(tmp_path / "marker-stage-near-match.zip")["backup"])
+
+    with zipfile.ZipFile(backup, "r") as archive:
+        assert archive.read(relative) == b"authored near-match\n"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "inputs-20260729T090000Z-short.jsonl",
+        f"inputs-20260729T090000Z-{'A' * 32}.jsonl",
+        f"input-20260729T090000Z-{'a' * 32}.jsonl",
+        f"acks-2026-07-29-{'a' * 32}.jsonl",
+    ],
+)
+def test_backup_temp_filter_requires_canonical_signal_archive_target(target: str) -> None:
+    relative = f".gsv/signals/archive/.{target}.seld-stage-{'b' * 32}"
+
+    assert vault_backup_module._is_owned_vault_temp(relative) is False
+
+
 def test_backup_with_crash_leftover_foundation_temps_restores_cleanly(
     vault: Vault, tmp_path: Path
 ) -> None:
     owned_temps = (
-        ".DIRECTION.md.tmp-crash",
-        ".SOURCES.md.tmp-crash",
-        ".gsv/control/.queue.jsonl.tmp-crash",
-        ".gsv/control/.dispositions-0000000000000000.jsonl.tmp-crash",
-        ".gsv/control/archive/.queue-0-aaaaaaaa.jsonl.tmp-crash",
-        ".gsv/control/runtime/turns/.11111111-1111-4111-8111-111111111111.json.tmp-crash",
-        ".gsv/.migration-culture-grade-foundation-v1.json.tmp-crash",
-        "onboarding/.session.md.tmp-crash",
+        ".DIRECTION.md.tmp-deadbeef",
+        ".SOURCES.md.tmp-deadbeef",
+        ".gsv/control/.queue.jsonl.tmp-deadbeef",
+        ".gsv/control/.dispositions-0000000000000000.jsonl.tmp-deadbeef",
+        ".gsv/control/archive/.queue-0-aaaaaaaa.jsonl.tmp-deadbeef",
+        ".gsv/control/runtime/turns/.11111111-1111-4111-8111-111111111111.json.tmp-deadbeef",
+        ".gsv/signals/.inputs.jsonl.tmp-deadbeef",
+        ".gsv/signals/.acks.jsonl.tmp-deadbeef",
+        ".gsv/signals/.event-keys.jsonl.tmp-deadbeef",
+        f".gsv/signals/archive/.inputs-20260729T090000Z-{'e' * 32}.jsonl.tmp-deadbeef",
+        f".gsv/signals/archive/.acks-20260729T090000Z-{'e' * 32}.jsonl.tmp-deadbeef",
+        f".gsv/.migration-culture-grade-foundation-v1.json.seld-stage-{'c' * 32}",
+        f"onboarding/.session.md.seld-stage-{'d' * 32}",
     )
     for relative in owned_temps:
         path = vault.root / relative

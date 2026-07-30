@@ -19,6 +19,23 @@ person reauthenticate only in the provider-owned app when it requests it. A
 failed recheck is current evidence of stale or unavailable coverage, not an
 empty source.
 
+For a same-host migration, read `local-source staged-status`, then use
+`local-source adopt-staged` only with its exact migration and source revisions
+and disposition `adopt_verified_prefix`. Seld keeps the aggregate cursor opaque
+and accepts the staged checkpoint only when the live database has the same
+schema and generation and the old aggregate prefix is still present exactly.
+A mismatch leaves the new checkpoint absent; do not fall back to a forward
+baseline because that could skip the migration gap.
+
+If a supported local adapter reports that its database was deliberately
+replaced, do not baseline automatically or edit its checkpoint. Read the exact
+checkpoint digest and sequence from `local-source status`. Only after the user
+chooses to discard the old store horizon may you call `local-source rebaseline`
+with those exact values and disposition `forward_only_reset`. Seld archives the
+old checkpoint and any pending delivery, then marks the source as needing a
+fresh proof. A stale CAS conflict means reload; an unavailable or unchanged
+store means stop.
+
 ## Bridge operation queue
 
 Use `gsv operation list` or `gsv_operation_list` to reload the current queue,

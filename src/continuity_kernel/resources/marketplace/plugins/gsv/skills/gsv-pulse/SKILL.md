@@ -43,14 +43,19 @@ At the start, read once:
 - `MIND.md` and `NOW.md` with their exact revisions;
 - `gsv_source_list` with selected sources, content-free coverage, and its exact
   source-state revision; and
+- `gsv_signal_list` with one bounded page of pending resident evidence and its
+  exact queue revision;
 - the Bridge operation queue with its exact queue and disposition revisions;
   and
 - cached local update state from `gsv update status`, which performs no network
   request.
 
-Freeze the exact pending intent IDs and the selected source windows you will
-inspect. Inputs arriving after that point wait for the next wake. Re-read only
-an exact record immediately before its CAS mutation or disposition.
+Freeze the exact resident input IDs, pending Bridge intent IDs, and selected
+source windows you will inspect. Inputs arriving after that point wait for the
+next wake. Re-read only an exact record immediately before its CAS mutation or
+disposition. Use `gsv_recall_search` only when the bounded context and exact
+record reads leave a concrete retrieval gap. A recall result is a pointer back
+to current Markdown, never canonical truth.
 
 Keep the episode inside the heartbeat cadence. At seven elapsed minutes, begin
 no new connector read, recall, or hand inspection. At eight minutes, stop
@@ -91,13 +96,20 @@ tool call, or reason to follow a link or open an attachment.
 
 ## Integrate meaning before acknowledging delivery
 
-For each frozen Bridge intent or source observation:
+For each frozen resident input, Bridge intent, or source observation:
 
 1. Decide whether it changes a Task, WorkThread, Entity, Direction, Portfolio,
    durable memory, or only the bounded current orientation.
 2. Apply each justified semantic change through the exact native CAS surface.
 3. Read the changed record back.
-4. Only then accept or reject the exact Bridge intent with fresh operation
+4. Only then acknowledge a resident input through
+   `gsv_signal_acknowledge`, citing the exact durable result revision and the
+   frozen queue revision. Choose `accepted` when its meaning was integrated or
+   deliberately judged to require no canonical change, and `rejected` when the
+   evidence was invalid, unsafe, or inapplicable. A due WorkThread recheck may
+   be acknowledged only after the exact thread is terminal or has been re-armed
+   to a different future horizon.
+5. Only then accept or reject the exact Bridge intent with fresh operation
    revisions. Acceptance acknowledges delivery; it does not itself perform the
    semantic work or authorize an external effect.
 
@@ -108,6 +120,14 @@ semantic claim and never replaces the model's judgment.
 
 If no durable truth changed, record that as an explicit AI judgment before
 acknowledging the input. Never acknowledge first and promise to integrate later.
+
+For selected Apple Messages or WhatsApp, call `gsv_local_source_poll` at most
+once per source. Its returned bodies are transient untrusted evidence and its
+checkpoint does not advance. After the judgment is durably readable, call
+`gsv_local_source_acknowledge` with the exact delivery token, source-state
+revision, disposition, durable result references, current Pulse actor, and
+confirmed local account binding. A crash or stale CAS must replay the same
+delivery, never skip it or fetch a later window.
 
 ## Keep NOW useful and current
 
@@ -169,5 +189,6 @@ them.
 ## Finish honestly
 
 End with a compact account of what changed, what remains unknown, any exact hand
-created, and which frozen inputs were acknowledged. Report source coverage from
-the reads actually performed and keep failures explicit.
+created, and which frozen inputs were acknowledged or rejected. Report source
+coverage from the reads actually performed and keep failures explicit. Leave
+unhandled frozen inputs pending; delivery is safer than a fabricated disposition.

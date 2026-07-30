@@ -55,6 +55,9 @@ Issues = "https://github.com/olivier-motium/seld/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/continuity_kernel"]
 
+[tool.hatch.build.targets.sdist]
+exclude = ["/.codex"]
+
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers"
 pythonpath = ["."]
@@ -78,6 +81,7 @@ ignore_missing_imports = true
 
 [tool.coverage.run]
 branch = true
+patch = ["subprocess"]
 source = ["continuity_kernel"]
 
 [tool.coverage.report]

@@ -166,6 +166,10 @@ def test_macos_file_provider_content_stays_metadata_only_without_residency_proof
     [
         (b"-----BEGIN " + b"PRIVATE KEY-----\nabc", "private-key"),
         (b"token = gh" + b"p_abcdefghijklmnopqrstuvwxyz123456", "github-token"),
+        (
+            b"sk-" + b"proj-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+            "openai-token",
+        ),
         (b"password: this-is-a-real-password-value", "credential-assignment"),
         (b"router password=hunter2", "credential-assignment"),
         (
@@ -178,6 +182,10 @@ def test_macos_file_provider_content_stays_metadata_only_without_residency_proof
         ),
         (
             b"database_url=postgres://user:" + b"short-pass@db.example/app\n",
+            "credential-uri",
+        ),
+        (
+            b"database_url=postgres://user:" + b"short-pass@db:5432/app\n",
             "credential-uri",
         ),
         (
@@ -207,6 +215,47 @@ def test_ordinary_context_is_allowed() -> None:
 def test_safe_quoted_json_counter_is_not_a_credential_assignment() -> None:
     result = screen_local_content(
         b'{"token_count": 123456789012345, "not_token": "ordinary-long-value"}'
+    )
+
+    assert result.decision is AwarenessDecision.CONTENT_ALLOWED
+    assert result.reasons == ()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'api_key = "YOUR_API_KEY"',
+        b"api_key=$POSTHOG_API_KEY",
+    ],
+)
+def test_explicit_symbolic_credential_references_are_allowed(content: bytes) -> None:
+    result = screen_local_content(content)
+
+    assert result.decision is AwarenessDecision.CONTENT_ALLOWED
+    assert result.reasons == ()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"password=ADMIN_PASSWORD",
+        b"token=PROD_TOKEN",
+        b"api_key=POSTHOG_API_KEY",
+        b"access_token=EXAMPLE_SERVICE_TOKEN",
+        b"api_key: POSTHOG_REAL_VALUE",
+        b"api_key=$posthog_api_key",
+    ],
+)
+def test_other_uppercase_credential_assignments_are_quarantined(content: bytes) -> None:
+    result = screen_local_content(content)
+
+    assert result.decision is AwarenessDecision.QUARANTINE
+    assert "credential-assignment" in result.reasons
+
+
+def test_url_followed_by_structured_refs_is_not_misread_as_uri_credentials() -> None:
+    result = screen_local_content(
+        b'{"site":"https://seld.ai","refs":["task:public-profile","codex:task@revision"]}'
     )
 
     assert result.decision is AwarenessDecision.CONTENT_ALLOWED

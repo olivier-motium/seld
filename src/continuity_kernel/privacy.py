@@ -93,21 +93,22 @@ _POSIX_SYSTEM_ROOTS: Final = frozenset(
 _SECRET_PATTERNS: Final = (
     ("private-key", re.compile(rb"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")),
     ("github-token", re.compile(rb"\b(?:gh[oprsu]_[A-Za-z0-9_]{20,})\b")),
+    (
+        "openai-token",
+        re.compile(rb"\bsk-(?:(?:proj|svcacct)-)?[A-Za-z0-9_-]{20,}\b"),
+    ),
     ("slack-token", re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
     ("aws-access-key", re.compile(rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
-    (
-        "credential-assignment",
-        re.compile(
-            rb"(?i)(?<![A-Za-z0-9_-])(?:[\"']?)(?:api[_-]?key|client[_-]?secret|access[_-]?token|"
-            rb"refresh[_-]?token|id[_-]?token|password|secret|token)(?:[\"']?)\s*[:=]\s*"
-            rb"(?:[\"']?)[^\s\"',;}]+(?:[\"']?)"
-        ),
-    ),
     (
         "credential-uri",
         re.compile(
             rb"(?i)\b(?:https?|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?|ftp)://"
-            rb"[^\s/:@]+:[^\s/@]+@"
+            rb"[-A-Za-z0-9._~!$&'()*+,;=%]+:"
+            rb"[-A-Za-z0-9._~!$&'()*+,;=:%]+@"
+            rb"(?:localhost|\[[0-9A-Fa-f:.]+\]|"
+            rb"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+            rb"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)"
+            rb"(?::[0-9]{1,5})?(?=[/?#\s\"',;)}\]]|$)"
         ),
     ),
     (
@@ -115,6 +116,12 @@ _SECRET_PATTERNS: Final = (
         re.compile(rb"(?im)^\s*(?:authorization|cookie|proxy-authorization|set-cookie)\s*:\s*\S+"),
     ),
 )
+_CREDENTIAL_ASSIGNMENT: Final = re.compile(
+    rb"(?i)(?<![A-Za-z0-9_-])(?:[\"']?)(?:api[_-]?key|client[_-]?secret|access[_-]?token|"
+    rb"refresh[_-]?token|id[_-]?token|password|secret|token)(?:[\"']?)\s*[:=]\s*"
+    rb"(?:[\"']?)(?P<value>[^\s\"',;}]+)(?:[\"']?)"
+)
+_CREDENTIAL_PLACEHOLDER: Final = re.compile(rb"^(?:YOUR_API_KEY|\$[A-Z][A-Z0-9_]{1,63})$")
 _HIGH_ENTROPY_TOKEN: Final = re.compile(rb"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{32,}(?![A-Za-z0-9])")
 _MACOS_FILE_PROVIDER_ROOTS: Final = (
     Path.home() / "Library/CloudStorage",
@@ -321,6 +328,11 @@ def screen_local_content(content: bytes) -> ContentAssessment:
             min(len(content), MAX_SCREEN_BYTES),
         )
     reasons = [name for name, pattern in _SECRET_PATTERNS if pattern.search(content)]
+    if any(
+        not _is_credential_placeholder(match.group("value"))
+        for match in _CREDENTIAL_ASSIGNMENT.finditer(content)
+    ):
+        reasons.append("credential-assignment")
     if _contains_high_entropy_secret(content):
         reasons.append("high-entropy-token")
     if b"\x00" in content:
@@ -330,6 +342,13 @@ def screen_local_content(content: bytes) -> ContentAssessment:
         tuple(sorted(set(reasons))),
         len(content),
     )
+
+
+def _is_credential_placeholder(value: bytes) -> bool:
+    # Markdown code spans and sentence punctuation are not part of a bare
+    # environment-variable placeholder, while concrete assignments still fail.
+    candidate = value.strip(b"`<>.)]}")
+    return _CREDENTIAL_PLACEHOLDER.fullmatch(candidate) is not None
 
 
 def _is_structurally_excluded(parts: tuple[str, ...], joined: str) -> bool:

@@ -13,13 +13,20 @@ from pathlib import Path
 from typing import Any
 
 import continuity_kernel.update as self_update
-from continuity_kernel import __version__
+from continuity_kernel import __version__, resident_import, whatsapp
 from continuity_kernel.bridge import (
     bridge_status,
     open_bridge,
     open_bridge_in_browser,
     serve_bridge,
     stop_bridge,
+)
+from continuity_kernel.bridge_launcher import (
+    current_gsv_executable,
+    install_native_bridge,
+    native_bridge_status,
+    open_native_bridge,
+    uninstall_native_bridge,
 )
 from continuity_kernel.codex_integration import (
     codex_status,
@@ -38,7 +45,13 @@ from continuity_kernel.config import (
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
 from continuity_kernel.direction import direction_aim, direction_dict
-from continuity_kernel.errors import ContinuityError, SetupError
+from continuity_kernel.errors import ContinuityError, SetupError, ValidationError
+from continuity_kernel.local_source_delivery import (
+    FORWARD_ONLY_RESET,
+    SUPPORTED_LOCAL_SOURCES,
+    VERIFIED_PREFIX_ADOPTION,
+    LocalSourceDelivery,
+)
 from continuity_kernel.mcp_server import GUIDED_REVIEW_PROFILE, serve
 from continuity_kernel.operations import OperationLedger, capture_operation_binding
 from continuity_kernel.portfolio import (
@@ -46,7 +59,20 @@ from continuity_kernel.portfolio import (
     portfolio_inspection_dict,
     portfolio_item,
 )
-from continuity_kernel.records import record_dict
+from continuity_kernel.recall import RecallCompanion
+from continuity_kernel.records import (
+    TaskEntityLink,
+    WorkThreadEntityLink,
+    WorkThreadTaskLink,
+    record_dict,
+)
+from continuity_kernel.resident_context import (
+    execution_bindings,
+    read_resident_guidance,
+    resident_context_status,
+)
+from continuity_kernel.scheduler import MacOSScheduler, scheduler_dict
+from continuity_kernel.sense_sweep import heartbeat_status, sense_sweep
 from continuity_kernel.source_recipes import list_recipes
 from continuity_kernel.source_state import SOURCE_ERROR_CODES
 from continuity_kernel.vault import Vault, doctor_dict
@@ -195,7 +221,19 @@ def _dispatch(args: argparse.Namespace) -> Any:
             return bridge_status()
         if args.bridge_command == "stop":
             return stop_bridge()
+        if args.bridge_command == "native-status":
+            return native_bridge_status()
+        if args.bridge_command == "native-open":
+            return open_native_bridge()
+        if args.bridge_command == "native-uninstall":
+            return uninstall_native_bridge(expected_revision=args.expected_revision)
         vault = Vault(resolve_vault(explicit_vault))
+        if args.bridge_command == "native-install":
+            return install_native_bridge(
+                vault,
+                executable=current_gsv_executable(),
+                expected_revision=args.expected_revision,
+            )
         if args.bridge_command == "open":
             return open_bridge(vault, open_browser=not args.no_browser)
         if args.bridge_command == "serve":
@@ -266,6 +304,18 @@ def _dispatch(args: argparse.Namespace) -> Any:
                     f"the old Bridge stopped, run `{setup_command}`."
                 ),
             }
+    if args.command == "migration":
+        export_path = Path(args.export)
+        target = Path(args.target)
+        if args.migration_command == "inspect":
+            return resident_import.inspect_resident_export(export_path, target)
+        if args.migration_command == "apply":
+            return resident_import.apply_resident_export(
+                export_path,
+                target,
+                expected_plan_revision=args.expected_plan_revision,
+            )
+        raise AssertionError("unreachable migration command")
 
     vault = Vault(resolve_vault(explicit_vault))
     if args.command == "status":
@@ -280,6 +330,15 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "context":
         context = vault.context_pack(max_characters=args.max_characters)
         return context if args.format == "markdown" else {"context": context}
+    if args.command == "resident-context":
+        if args.resident_context_command == "status":
+            return resident_context_status(vault.root)
+        if args.resident_context_command == "show":
+            guidance = read_resident_guidance(vault.root)
+            return guidance["content"] if args.format == "markdown" else guidance
+        raise AssertionError("unreachable resident-context command")
+    if args.command == "execution-bindings":
+        return execution_bindings(vault)
     if args.command == "source":
         if args.source_command == "list":
             return {"catalog": list_recipes(), "state": vault.source_status()}
@@ -303,6 +362,132 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 error_code=args.error_code,
             )
         raise AssertionError("unreachable source command")
+    if args.command == "local-source":
+        delivery = LocalSourceDelivery(
+            vault,
+            store_root=(
+                Path(args.store_root).expanduser().resolve()
+                if getattr(args, "store_root", None)
+                else None
+            ),
+            whatsapp_runtime=Path(
+                getattr(args, "runtime", str(whatsapp.DEFAULT_RUNTIME))
+            ).expanduser(),
+            whatsapp_service_label=getattr(args, "service_label", None),
+        )
+        if args.local_source_command == "status":
+            return delivery.status(args.source)
+        if args.local_source_command == "baseline":
+            return delivery.baseline(args.source)
+        if args.local_source_command == "staged-status":
+            return resident_import.staged_local_source_checkpoint_status(
+                vault,
+                delivery=delivery,
+            )
+        if args.local_source_command == "adopt-staged":
+            return resident_import.adopt_staged_local_source_checkpoint(
+                vault,
+                source=args.source,
+                expected_migration_revision=args.expected_migration_revision,
+                expected_source_revision=args.expected_source_revision,
+                disposition=args.disposition,
+                delivery=delivery,
+            )
+        if args.local_source_command == "poll":
+            return delivery.poll(args.source, limit=args.limit)
+        if args.local_source_command == "rebaseline":
+            return delivery.rebaseline(
+                args.source,
+                expected_checkpoint_digest=args.expected_checkpoint_digest,
+                expected_sequence=args.expected_sequence,
+                disposition=args.disposition,
+            )
+        if args.local_source_command == "acknowledge":
+            return delivery.acknowledge(
+                args.source,
+                token=args.token,
+                expected_source_revision=args.expected_source_revision,
+                disposition=args.disposition,
+                result_refs=tuple(args.result_ref),
+                actor_ref=args.actor_ref,
+                account_binding=args.account_binding,
+            )
+        raise AssertionError("unreachable local source command")
+    if args.command == "signal":
+        if args.signal_command == "status":
+            return vault.resident_signal_status()
+        if args.signal_command == "list":
+            return vault.list_resident_signals(
+                include_acknowledged=args.include_acknowledged,
+                limit=args.limit,
+                cursor=args.cursor,
+            )
+        if args.signal_command == "show":
+            return vault.get_resident_signal(args.input_id)
+        if args.signal_command == "append":
+            return vault.append_canonical_signal(
+                record_ref=args.record_ref,
+                change_type=args.change_type,
+            )
+        if args.signal_command in {"acknowledge", "ack"}:
+            return {
+                "acknowledgements": vault.acknowledge_resident_signals(
+                    tuple(args.input_id),
+                    expected_revision=args.expected_revision,
+                    consumer=args.consumer,
+                    disposition=args.disposition,
+                    result_refs=tuple(args.result_ref),
+                ),
+                "status": vault.resident_signal_status(),
+            }
+        if args.signal_command == "compact":
+            return vault.compact_resident_signals(retain_recent=args.retain_recent)
+        raise AssertionError("unreachable signal command")
+    if args.command == "recall":
+        recall = RecallCompanion(
+            vault.root,
+            executable=args.executable,
+            index=args.index,
+        )
+        if args.recall_command == "status":
+            return asdict(recall.status(timeout_seconds=args.timeout))
+        if args.recall_command == "refresh":
+            return asdict(recall.refresh(timeout_seconds=args.timeout))
+        if args.recall_command == "rebuild":
+            return asdict(recall.rebuild(timeout_seconds=args.timeout))
+        if args.recall_command == "search":
+            return asdict(
+                recall.search(
+                    args.query,
+                    limit=args.limit,
+                    timeout_seconds=args.timeout,
+                )
+            )
+        raise AssertionError("unreachable recall command")
+    if args.command == "pulse":
+        if args.pulse_command == "status":
+            return _pulse_status(vault)
+        if args.pulse_command == "sweep":
+            return sense_sweep(vault).to_dict()
+        raise AssertionError("unreachable pulse command")
+    if args.command == "scheduler":
+        scheduler = _scheduler_for(vault, interval_seconds=args.interval_seconds)
+        if args.scheduler_command == "plan":
+            return scheduler_dict(scheduler.plan())
+        if args.scheduler_command == "status":
+            return scheduler_dict(scheduler.status())
+        if args.scheduler_command == "install":
+            return scheduler_dict(scheduler.install(expected_revision=args.expected_revision))
+        if args.scheduler_command == "run-canary":
+            return scheduler_dict(
+                scheduler.run_canary(
+                    expected_revision=args.expected_revision,
+                    timeout_seconds=args.timeout,
+                )
+            )
+        if args.scheduler_command == "uninstall":
+            return scheduler_dict(scheduler.uninstall(expected_revision=args.expected_revision))
+        raise AssertionError("unreachable scheduler command")
     if args.command == "local-file":
         if args.local_file_command == "grant":
             return vault.grant_local_file_root(args.root)
@@ -393,6 +578,29 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
     return None
 
 
+def _pulse_status(vault: Vault) -> dict[str, object]:
+    return {
+        "heartbeat": heartbeat_status(vault.root),
+        "signals": vault.resident_signal_status(),
+    }
+
+
+def _scheduler_for(vault: Vault, *, interval_seconds: int) -> MacOSScheduler:
+    executable = current_gsv_executable()
+    return MacOSScheduler(
+        (
+            str(executable),
+            "--vault",
+            str(vault.root),
+            "--json",
+            "pulse",
+            "sweep",
+        ),
+        vault_root=vault.root,
+        interval_seconds=interval_seconds,
+    )
+
+
 def _configuration_matches_target(target: Path) -> bool | str:
     try:
         configuration = load_config(required=False)
@@ -474,6 +682,13 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
                 waiting_on=args.waiting_on,
                 rank=args.rank,
                 active_thread_id=args.active_thread_id,
+                superseded_by=args.superseded_by,
+                project=args.project,
+                workspace=args.workspace,
+                attention_at=args.attention_at,
+                due=args.due,
+                entity_links=tuple(_task_entity_link(value) for value in args.entity_link_json),
+                codex_episode_ids=tuple(args.codex_episode_id),
                 refs=tuple(args.ref),
             )
         )
@@ -489,13 +704,30 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
             waiting_on=args.waiting_on,
             rank=args.rank,
             active_thread_id=args.active_thread_id,
+            superseded_by=args.superseded_by,
+            project=args.project,
+            workspace=args.workspace,
+            attention_at=args.attention_at,
+            due=args.due,
             clear_next_actor=args.clear_next_actor,
             clear_next_action=args.clear_next_action,
             clear_waiting_on=args.clear_waiting_on,
             clear_rank=args.clear_rank,
             clear_active_thread_id=args.clear_active_thread_id,
+            clear_superseded_by=args.clear_superseded_by,
+            clear_project=args.clear_project,
+            clear_workspace=args.clear_workspace,
+            clear_attention_at=args.clear_attention_at,
+            clear_due=args.clear_due,
+            add_entity_links=tuple(_task_entity_link(value) for value in args.add_entity_link_json),
+            remove_entity_links=tuple(
+                _task_entity_link(value) for value in args.remove_entity_link_json
+            ),
+            add_codex_episode_ids=tuple(args.add_codex_episode_id),
+            remove_codex_episode_ids=tuple(args.remove_codex_episode_id),
             add_refs=tuple(args.add_ref),
             remove_refs=tuple(args.remove_ref),
+            note=args.note,
         )
     )
 
@@ -505,6 +737,8 @@ def _entity(vault: Vault, args: argparse.Namespace) -> Any:
         return {"entities": [record_dict(item) for item in vault.list_entities()]}
     if args.entity_command == "show":
         return record_dict(vault.get_entity(args.id))
+    if args.entity_command == "resolve":
+        return record_dict(vault.resolve_entity(args.id))
     if args.entity_command == "create":
         return record_dict(
             vault.create_entity(
@@ -514,17 +748,63 @@ def _entity(vault: Vault, args: argparse.Namespace) -> Any:
                 summary=args.summary,
                 aliases=tuple(args.alias),
                 refs=tuple(args.ref),
+                status=args.status,
+                recheck_at=args.recheck_at,
             )
         )
+    if args.entity_command == "link":
+        return record_dict(
+            vault.link_entity(
+                args.id,
+                expected_revision=args.expected_revision,
+                predicate=args.predicate,
+                target_id=args.target_id,
+                refs=tuple(args.ref),
+                valid_from=args.valid_from,
+                note=args.note,
+            )
+        )
+    if args.entity_command == "unlink":
+        return record_dict(
+            vault.unlink_entity(
+                args.id,
+                expected_revision=args.expected_revision,
+                predicate=args.predicate,
+                target_id=args.target_id,
+                refs=tuple(args.ref),
+                valid_to=args.valid_to,
+                note=args.note,
+            )
+        )
+    if args.entity_command == "merge":
+        result = vault.merge_entity(
+            args.id,
+            merged_into=args.merged_into,
+            expected_revision=args.expected_revision,
+            expected_target_revision=args.expected_target_revision,
+            refs=tuple(args.ref),
+            note=args.note,
+        )
+        return {
+            "changed": result.changed,
+            "source": record_dict(result.source),
+            "target": record_dict(result.target),
+        }
     return record_dict(
         vault.update_entity(
             args.id,
             expected_revision=args.expected_revision,
             title=args.title,
             summary=args.summary,
+            status=args.status,
             aliases=tuple(args.alias) if args.alias is not None else None,
+            add_aliases=tuple(args.add_alias),
+            remove_aliases=tuple(args.remove_alias),
             add_refs=tuple(args.add_ref),
             remove_refs=tuple(args.remove_ref),
+            recheck_at=args.recheck_at,
+            clear_recheck_at=args.clear_recheck_at,
+            note=args.note,
         )
     )
 
@@ -547,9 +827,24 @@ def _portfolio(vault: Vault, args: argparse.Namespace) -> Any:
         )
     parsed = []
     for encoded in args.item_json:
-        value = json.loads(encoded)
-        if not isinstance(value, dict):
-            raise ValueError("each --item-json value must be a JSON object")
+        value = _strict_json_object(
+            encoded,
+            label="Portfolio item",
+            required={"task_id", "task_revision", "stance", "reason"},
+            allowed={
+                "task_id",
+                "task_revision",
+                "stance",
+                "reason",
+                "work_thread_id",
+                "work_thread_revision",
+                "direction_aim_ids",
+                "unaligned_reason",
+                "source_position",
+                "source_task_updated_at",
+                "source_thread_updated_at",
+            },
+        )
         parsed.append(
             portfolio_item(
                 task_id_value=value.get("task_id"),
@@ -560,6 +855,9 @@ def _portfolio(vault: Vault, args: argparse.Namespace) -> Any:
                 work_thread_revision=value.get("work_thread_revision"),
                 direction_aim_ids=value.get("direction_aim_ids", ()),
                 unaligned_reason=value.get("unaligned_reason"),
+                source_position=value.get("source_position"),
+                source_task_updated_at=value.get("source_task_updated_at"),
+                source_thread_updated_at=value.get("source_thread_updated_at"),
             )
         )
     return portfolio_dict(
@@ -568,6 +866,12 @@ def _portfolio(vault: Vault, args: argparse.Namespace) -> Any:
             summary=args.summary,
             items=tuple(parsed),
             direction_revision=args.direction_revision,
+            source_direction_updated_at=args.source_direction_updated_at,
+            refs=_optional_json_string_tuple(args.refs_json, "Portfolio refs"),
+            source_observed_at=args.source_observed_at,
+            recorded_at=args.recorded_at,
+            review_after=args.review_after,
+            note=args.note,
         )
     )
 
@@ -577,9 +881,12 @@ def _direction(vault: Vault, args: argparse.Namespace) -> Any:
         return direction_dict(vault.get_direction())
     aims = []
     for encoded in args.aim_json:
-        value = json.loads(encoded)
-        if not isinstance(value, dict):
-            raise ValueError("each --aim-json value must be a JSON object")
+        value = _strict_json_object(
+            encoded,
+            label="Direction aim",
+            required={"id", "title", "desired_state"},
+            allowed={"id", "title", "desired_state"},
+        )
         aims.append(
             direction_aim(
                 identifier=value.get("id"),
@@ -593,8 +900,104 @@ def _direction(vault: Vault, args: argparse.Namespace) -> Any:
             status=args.status,
             current_chapter=args.current_chapter,
             aims=tuple(aims),
+            constraints=_optional_json_string_tuple(args.constraints_json, "Direction constraints"),
+            tensions=_optional_json_string_tuple(args.tensions_json, "Direction tensions"),
+            refs=_optional_json_string_tuple(args.refs_json, "Direction refs"),
+            source_observed_at=args.source_observed_at,
+            recorded_at=args.recorded_at,
+            recheck_at=args.recheck_at,
+            note=args.note,
         )
     )
+
+
+def _strict_json_object(
+    encoded: str,
+    *,
+    label: str,
+    required: set[str],
+    allowed: set[str],
+) -> dict[str, Any]:
+    try:
+        value = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"{label} is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValidationError(f"{label} must be a JSON object")
+    keys = set(value)
+    if missing := required - keys:
+        raise ValidationError(f"{label} is missing field {sorted(missing)[0]}")
+    if extra := keys - allowed:
+        raise ValidationError(f"{label} has unknown field {sorted(extra)[0]}")
+    return value
+
+
+def _json_object(encoded: str, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"{label} is not valid JSON") from exc
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ValidationError(f"{label} must be a JSON object with string keys")
+    return dict(value)
+
+
+def _optional_json_string_tuple(encoded: str | None, label: str) -> tuple[str, ...] | None:
+    if encoded is None:
+        return None
+    try:
+        value = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"{label} is not valid JSON") from exc
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValidationError(f"{label} must be a JSON string array")
+    return tuple(value)
+
+
+def _task_entity_link(encoded: str) -> TaskEntityLink:
+    value = _strict_json_object(
+        encoded,
+        label="Task entity link",
+        required={"role", "entity_id"},
+        allowed={"role", "entity_id"},
+    )
+    role = value.get("role")
+    entity_id = value.get("entity_id")
+    if not isinstance(role, str) or not isinstance(entity_id, str):
+        raise ValidationError("Task entity link role and entity_id must be strings")
+    return TaskEntityLink(role, entity_id)
+
+
+def _thread_entity_link(encoded: str) -> WorkThreadEntityLink:
+    value = _strict_json_object(
+        encoded,
+        label="WorkThread entity link",
+        required={"role", "entity_id"},
+        allowed={"role", "entity_id"},
+    )
+    role = value.get("role")
+    entity_id = value.get("entity_id")
+    if role is not None and not isinstance(role, str):
+        raise ValidationError("WorkThread entity link role must be a string or null")
+    if not isinstance(entity_id, str):
+        raise ValidationError("WorkThread entity link entity_id must be a string")
+    return WorkThreadEntityLink(role, entity_id)
+
+
+def _thread_task_link(encoded: str) -> WorkThreadTaskLink:
+    value = _strict_json_object(
+        encoded,
+        label="WorkThread task link",
+        required={"position", "task_id"},
+        allowed={"position", "task_id"},
+    )
+    position = value.get("position")
+    identifier = value.get("task_id")
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise ValidationError("WorkThread task link position must be an integer")
+    if not isinstance(identifier, str):
+        raise ValidationError("WorkThread task link task_id must be a string")
+    return WorkThreadTaskLink(position, identifier)
 
 
 def _thread(vault: Vault, args: argparse.Namespace) -> Any:
@@ -602,6 +1005,8 @@ def _thread(vault: Vault, args: argparse.Namespace) -> Any:
         return {"threads": [record_dict(item) for item in vault.list_threads(status=args.status)]}
     if args.thread_command == "show":
         return record_dict(vault.get_thread(args.id))
+    if args.thread_command == "resolve":
+        return record_dict(vault.resolve_thread(args.id))
     if args.thread_command == "create":
         return record_dict(
             vault.create_thread(
@@ -614,9 +1019,36 @@ def _thread(vault: Vault, args: argparse.Namespace) -> Any:
                 focus_task_id=args.focus_task_id,
                 task_ids=tuple(args.task_id),
                 entity_ids=tuple(args.entity_id),
+                task_links=tuple(_thread_task_link(value) for value in args.task_link_json),
+                entity_links=tuple(_thread_entity_link(value) for value in args.entity_link_json),
+                closure_condition=args.closure_condition,
+                next_actor=args.next_actor,
+                waiting_on=args.waiting_on,
+                recheck_at=args.recheck_at,
                 refs=tuple(args.ref),
             )
         )
+    if args.thread_command == "merge":
+        result = vault.merge_thread(
+            args.id,
+            merged_into=args.merged_into,
+            expected_revision=args.expected_revision,
+            expected_target_revision=args.expected_target_revision,
+            absorb_source_entities=args.absorb_source_entities,
+            absorb_source_tasks=args.absorb_source_tasks,
+            absorb_source_refs=args.absorb_source_refs,
+            add_entity_links=tuple(
+                _thread_entity_link(value) for value in args.add_entity_link_json
+            ),
+            add_task_links=tuple(_thread_task_link(value) for value in args.add_task_link_json),
+            add_refs=tuple(args.add_ref),
+            note=args.note,
+        )
+        return {
+            "changed": result.changed,
+            "source": record_dict(result.source),
+            "target": record_dict(result.target),
+        }
     task_ids = tuple(args.task_id) if args.task_id is not None else None
     entity_ids = tuple(args.entity_id) if args.entity_id is not None else None
     return record_dict(
@@ -633,8 +1065,35 @@ def _thread(vault: Vault, args: argparse.Namespace) -> Any:
             clear_focus_task=args.clear_focus_task,
             task_ids=task_ids,
             entity_ids=entity_ids,
+            task_links=(
+                tuple(_thread_task_link(value) for value in args.task_link_json)
+                if args.task_link_json is not None
+                else None
+            ),
+            entity_links=(
+                tuple(_thread_entity_link(value) for value in args.entity_link_json)
+                if args.entity_link_json is not None
+                else None
+            ),
+            add_task_links=tuple(_thread_task_link(value) for value in args.add_task_link_json),
+            remove_task_ids=tuple(args.remove_task_id),
+            add_entity_links=tuple(
+                _thread_entity_link(value) for value in args.add_entity_link_json
+            ),
+            remove_entity_links=tuple(
+                _thread_entity_link(value) for value in args.remove_entity_link_json
+            ),
+            closure_condition=args.closure_condition,
+            next_actor=args.next_actor,
+            waiting_on=args.waiting_on,
+            recheck_at=args.recheck_at,
+            clear_closure_condition=args.clear_closure_condition,
+            clear_next_actor=args.clear_next_actor,
+            clear_waiting_on=args.clear_waiting_on,
+            clear_recheck_at=args.clear_recheck_at,
             add_refs=tuple(args.add_ref),
             remove_refs=tuple(args.remove_ref),
+            note=args.note,
         )
     )
 
@@ -704,6 +1163,34 @@ def _parser() -> argparse.ArgumentParser:
     context.add_argument("--max-characters", type=int, default=48_000)
     context.set_defaults(raw=True)
 
+    resident_context = commands.add_parser(
+        "resident-context",
+        help="Inspect user-imported resident guidance and native skill inventory.",
+    )
+    resident_context_commands = resident_context.add_subparsers(
+        dest="resident_context_command",
+        required=True,
+    )
+    resident_context_commands.add_parser(
+        "status",
+        help="Show content-free imported guidance and exact $skill metadata.",
+    )
+    resident_context_show = resident_context_commands.add_parser(
+        "show",
+        help="Read the exact user-approved resident AGENTS guidance.",
+    )
+    resident_context_show.add_argument(
+        "--format",
+        choices=("markdown", "json"),
+        default="markdown",
+    )
+    resident_context_show.set_defaults(raw=True)
+
+    commands.add_parser(
+        "execution-bindings",
+        help="Read every explicit active ChatGPT hand and focused WorkThread binding.",
+    )
+
     source = commands.add_parser(
         "source",
         help="Select sources and record bounded reads made by the resident AI.",
@@ -735,6 +1222,192 @@ def _parser() -> argparse.ArgumentParser:
     source_record.add_argument("--cursor")
     source_record.add_argument("--evidence-ref", action="append", default=[])
     source_record.add_argument("--error-code", choices=SOURCE_ERROR_CODES)
+
+    local_source = commands.add_parser(
+        "local-source",
+        help="Adopt, baseline, poll, repair, and disposition bounded local message evidence.",
+    )
+    local_source_commands = local_source.add_subparsers(dest="local_source_command", required=True)
+    local_source_status = local_source_commands.add_parser(
+        "status", help="Show content-free host checkpoint state."
+    )
+    local_source_status.add_argument("--source", choices=SUPPORTED_LOCAL_SOURCES, required=True)
+    local_source_baseline = local_source_commands.add_parser(
+        "baseline", help="Start forward-only delivery at the current aggregate cursor."
+    )
+    local_source_poll = local_source_commands.add_parser(
+        "poll", help="Read or replay one bounded transient delta without advancing."
+    )
+    local_source_ack = local_source_commands.add_parser(
+        "acknowledge",
+        help="Record an explicit semantic disposition, then advance the host checkpoint.",
+    )
+    local_source_rebaseline = local_source_commands.add_parser(
+        "rebaseline",
+        help="Explicitly accept a replaced store and preserve the old checkpoint as history.",
+    )
+    local_source_staged_status = local_source_commands.add_parser(
+        "staged-status",
+        help="Show content-free checkpoints staged by a resident migration.",
+    )
+    local_source_adopt_staged = local_source_commands.add_parser(
+        "adopt-staged",
+        help="Adopt one exact vault-staged checkpoint without exposing its cursor.",
+    )
+    for command in (
+        local_source_baseline,
+        local_source_poll,
+        local_source_ack,
+        local_source_rebaseline,
+        local_source_adopt_staged,
+    ):
+        command.add_argument("--source", choices=SUPPORTED_LOCAL_SOURCES, required=True)
+    for command in (
+        local_source_baseline,
+        local_source_poll,
+        local_source_ack,
+        local_source_rebaseline,
+        local_source_staged_status,
+        local_source_adopt_staged,
+    ):
+        command.add_argument(
+            "--store-root",
+            help=(
+                "Establish or verify an exact host-local adapter location. The path stays "
+                "outside the portable vault and is reused by fresh ChatGPT tool sessions."
+            ),
+        )
+        command.add_argument("--runtime", default=str(whatsapp.DEFAULT_RUNTIME))
+        command.add_argument("--service-label")
+    local_source_poll.add_argument("--limit", type=int, default=100)
+    local_source_ack.add_argument("--token", required=True)
+    local_source_ack.add_argument("--expected-source-revision", required=True)
+    local_source_ack.add_argument("--disposition", choices=("accepted", "rejected"), required=True)
+    local_source_ack.add_argument("--result-ref", action="append", required=True)
+    local_source_ack.add_argument("--actor-ref", required=True)
+    local_source_ack.add_argument("--account-binding", required=True)
+    local_source_rebaseline.add_argument("--expected-checkpoint-digest", required=True)
+    local_source_rebaseline.add_argument("--expected-sequence", type=int, required=True)
+    local_source_rebaseline.add_argument(
+        "--disposition",
+        choices=(FORWARD_ONLY_RESET,),
+        required=True,
+    )
+    local_source_adopt_staged.add_argument("--expected-migration-revision", required=True)
+    local_source_adopt_staged.add_argument("--expected-source-revision", required=True)
+    local_source_adopt_staged.add_argument(
+        "--disposition",
+        choices=(VERIFIED_PREFIX_ADOPTION,),
+        required=True,
+    )
+
+    signal = commands.add_parser(
+        "signal",
+        help="Inspect and disposition the resident AI evidence mailbox.",
+    )
+    signal_commands = signal.add_subparsers(dest="signal_command", required=True)
+    signal_commands.add_parser("status", help="Show validated content-free queue counts.")
+    signal_list = signal_commands.add_parser("list", help="List one bounded queue page.")
+    signal_list.add_argument("--include-acknowledged", action="store_true")
+    signal_list.add_argument("--limit", type=int, default=500)
+    signal_list.add_argument("--cursor")
+    signal_show = signal_commands.add_parser("show", help="Show one exact evidence envelope.")
+    signal_show.add_argument("input_id")
+    signal_append = signal_commands.add_parser(
+        "append",
+        help="Append one content-free canonical record pointer for resident interpretation.",
+    )
+    signal_append.add_argument("--record-ref", required=True)
+    signal_append.add_argument(
+        "--change-type",
+        choices=("correction", "failure", "observation", "outcome"),
+        required=True,
+    )
+    signal_ack = signal_commands.add_parser(
+        "acknowledge",
+        aliases=["ack"],
+        help="Acknowledge evidence after an explicit durable AI disposition.",
+    )
+    signal_ack.add_argument("--input-id", action="append", required=True)
+    signal_ack.add_argument("--expected-revision", required=True)
+    signal_ack.add_argument("--consumer", required=True)
+    signal_ack.add_argument("--disposition", choices=("accepted", "rejected"), required=True)
+    signal_ack.add_argument("--result-ref", action="append", required=True)
+    signal_compact = signal_commands.add_parser(
+        "compact",
+        help="Archive settled evidence and recover bounded live capacity.",
+    )
+    signal_compact.add_argument("--retain-recent", type=int, default=1_000)
+
+    recall = commands.add_parser(
+        "recall",
+        help="Search canonical Markdown through disposable QMD or an exact local fallback.",
+    )
+    recall.add_argument("--executable", default="qmd")
+    recall.add_argument("--index", default="seld")
+    recall_commands = recall.add_subparsers(dest="recall_command", required=True)
+    recall_status = recall_commands.add_parser("status")
+    recall_status.add_argument("--timeout", type=int, default=10)
+    recall_refresh = recall_commands.add_parser("refresh")
+    recall_refresh.add_argument("--timeout", type=int, default=120)
+    recall_rebuild = recall_commands.add_parser("rebuild")
+    recall_rebuild.add_argument("--timeout", type=int, default=600)
+    recall_search = recall_commands.add_parser("search")
+    recall_search.add_argument("query")
+    recall_search.add_argument("--limit", type=int, default=8)
+    recall_search.add_argument("--timeout", type=int, default=20)
+
+    pulse = commands.add_parser(
+        "pulse",
+        help="Inspect or run one bounded mechanical resident sweep.",
+    )
+    pulse_commands = pulse.add_subparsers(dest="pulse_command", required=True)
+    pulse_commands.add_parser("status", help="Read the latest content-free sweep heartbeat.")
+    pulse_commands.add_parser(
+        "sweep",
+        help="Run one provider-free mechanical sweep and publish its heartbeat.",
+    )
+
+    scheduler = commands.add_parser(
+        "scheduler",
+        help="Manage the owned macOS launchd wake for the mechanical Pulse.",
+    )
+    scheduler_commands = scheduler.add_subparsers(dest="scheduler_command", required=True)
+    scheduler_plan = scheduler_commands.add_parser(
+        "plan",
+        help="Show the exact launchd command and receipt CAS without changing the host.",
+    )
+    scheduler_status = scheduler_commands.add_parser(
+        "status",
+        help="Read owned launchd state without changing it.",
+    )
+    scheduler_install = scheduler_commands.add_parser(
+        "install",
+        help="CAS-install or update the owned launchd job.",
+    )
+    scheduler_canary = scheduler_commands.add_parser(
+        "run-canary",
+        help="CAS-run one asynchronous launchd proof against the installed job.",
+    )
+    scheduler_uninstall = scheduler_commands.add_parser(
+        "uninstall",
+        help="CAS-remove only the exact Seld-owned launchd job.",
+    )
+    for scheduler_command in (
+        scheduler_plan,
+        scheduler_status,
+        scheduler_install,
+        scheduler_canary,
+        scheduler_uninstall,
+    ):
+        scheduler_command.add_argument("--interval-seconds", type=int, default=600)
+    for scheduler_mutation in (
+        scheduler_install,
+        scheduler_canary,
+        scheduler_uninstall,
+    ):
+        scheduler_mutation.add_argument("--expected-revision", required=True)
+    scheduler_canary.add_argument("--timeout", type=float, default=10)
 
     local_file = commands.add_parser(
         "local-file",
@@ -784,13 +1457,28 @@ def _parser() -> argparse.ArgumentParser:
     task_update.add_argument("--waiting-on")
     task_update.add_argument("--rank", type=int)
     task_update.add_argument("--active-thread-id")
+    task_update.add_argument("--superseded-by")
+    task_update.add_argument("--project")
+    task_update.add_argument("--workspace")
+    task_update.add_argument("--attention-at")
+    task_update.add_argument("--due")
     task_update.add_argument("--clear-next-actor", action="store_true")
     task_update.add_argument("--clear-next-action", action="store_true")
     task_update.add_argument("--clear-waiting-on", action="store_true")
     task_update.add_argument("--clear-rank", action="store_true")
     task_update.add_argument("--clear-active-thread-id", action="store_true")
+    task_update.add_argument("--clear-superseded-by", action="store_true")
+    task_update.add_argument("--clear-project", action="store_true")
+    task_update.add_argument("--clear-workspace", action="store_true")
+    task_update.add_argument("--clear-attention-at", action="store_true")
+    task_update.add_argument("--clear-due", action="store_true")
+    task_update.add_argument("--add-entity-link-json", action="append", default=[])
+    task_update.add_argument("--remove-entity-link-json", action="append", default=[])
+    task_update.add_argument("--add-codex-episode-id", action="append", default=[])
+    task_update.add_argument("--remove-codex-episode-id", action="append", default=[])
     task_update.add_argument("--add-ref", action="append", default=[])
     task_update.add_argument("--remove-ref", action="append", default=[])
+    task_update.add_argument("--note")
 
     portfolio = commands.add_parser(
         "portfolio", help="Show or author the complete open Portfolio judgment."
@@ -813,6 +1501,18 @@ def _parser() -> argparse.ArgumentParser:
     portfolio_set.add_argument("--summary", required=True)
     portfolio_set.add_argument("--direction-revision")
     portfolio_set.add_argument("--item-json", action="append", default=[])
+    portfolio_set.add_argument("--source-direction-updated-at")
+    portfolio_set.add_argument(
+        "--refs-json",
+        help="JSON string array replacing Portfolio provenance refs; omitted preserves v3 refs.",
+    )
+    portfolio_set.add_argument("--source-observed-at")
+    portfolio_set.add_argument("--recorded-at")
+    portfolio_set.add_argument("--review-after")
+    portfolio_set.add_argument(
+        "--note",
+        help="One authored Portfolio history note appended to existing v3 history.",
+    )
 
     direction = commands.add_parser(
         "direction", help="Show or author the current whole-life Direction."
@@ -824,12 +1524,33 @@ def _parser() -> argparse.ArgumentParser:
     direction_set.add_argument("--status", choices=("provisional", "confirmed"), required=True)
     direction_set.add_argument("--current-chapter", required=True)
     direction_set.add_argument("--aim-json", action="append", default=[], required=True)
+    direction_set.add_argument(
+        "--constraints-json",
+        help="JSON string array replacing constraints; omitted preserves v2 constraints.",
+    )
+    direction_set.add_argument(
+        "--tensions-json",
+        help="JSON string array replacing tensions; omitted preserves v2 tensions.",
+    )
+    direction_set.add_argument(
+        "--refs-json",
+        help="JSON string array replacing Direction provenance refs; omitted preserves v2 refs.",
+    )
+    direction_set.add_argument("--source-observed-at")
+    direction_set.add_argument("--recorded-at")
+    direction_set.add_argument("--recheck-at")
+    direction_set.add_argument(
+        "--note",
+        help="One authored Direction history note appended to existing v2 history.",
+    )
 
     entity = commands.add_parser("entity", help="Create and inspect canonical entities.")
     entity_commands = entity.add_subparsers(dest="entity_command", required=True)
     entity_commands.add_parser("list")
     entity_show = entity_commands.add_parser("show")
     entity_show.add_argument("id")
+    entity_resolve = entity_commands.add_parser("resolve")
+    entity_resolve.add_argument("id")
     entity_create = entity_commands.add_parser("create")
     entity_create.add_argument("--id", required=True)
     entity_create.add_argument("--title", required=True)
@@ -837,14 +1558,38 @@ def _parser() -> argparse.ArgumentParser:
     entity_create.add_argument("--summary", required=True)
     entity_create.add_argument("--alias", action="append", default=[])
     entity_create.add_argument("--ref", action="append", default=[])
+    entity_create.add_argument("--status", default="current")
+    entity_create.add_argument("--recheck-at")
     entity_update = entity_commands.add_parser("update")
     entity_update.add_argument("id")
     entity_update.add_argument("--expected-revision", required=True)
     entity_update.add_argument("--title")
     entity_update.add_argument("--summary")
+    entity_update.add_argument("--status")
     entity_update.add_argument("--alias", action="append")
+    entity_update.add_argument("--add-alias", action="append", default=[])
+    entity_update.add_argument("--remove-alias", action="append", default=[])
     entity_update.add_argument("--add-ref", action="append", default=[])
     entity_update.add_argument("--remove-ref", action="append", default=[])
+    entity_update.add_argument("--recheck-at")
+    entity_update.add_argument("--clear-recheck-at", action="store_true")
+    entity_update.add_argument("--note")
+    for command_name in ("link", "unlink"):
+        relationship = entity_commands.add_parser(command_name)
+        relationship.add_argument("id")
+        relationship.add_argument("--expected-revision", required=True)
+        relationship.add_argument("--predicate", required=True)
+        relationship.add_argument("--target-id", required=True)
+        relationship.add_argument("--ref", action="append", default=[])
+        relationship.add_argument("--note")
+        relationship.add_argument("--valid-from" if command_name == "link" else "--valid-to")
+    entity_merge = entity_commands.add_parser("merge")
+    entity_merge.add_argument("id")
+    entity_merge.add_argument("--merged-into", required=True)
+    entity_merge.add_argument("--expected-revision", required=True)
+    entity_merge.add_argument("--expected-target-revision", required=True)
+    entity_merge.add_argument("--ref", action="append", default=[])
+    entity_merge.add_argument("--note")
 
     thread = commands.add_parser("thread", help="Create, inspect, and update work threads.")
     thread_commands = thread.add_subparsers(dest="thread_command", required=True)
@@ -852,6 +1597,8 @@ def _parser() -> argparse.ArgumentParser:
     thread_list.add_argument("--status")
     thread_show = thread_commands.add_parser("show")
     thread_show.add_argument("id")
+    thread_resolve = thread_commands.add_parser("resolve")
+    thread_resolve.add_argument("id")
     thread_create = thread_commands.add_parser("create")
     _thread_create_arguments(thread_create)
     thread_update = thread_commands.add_parser("update")
@@ -867,8 +1614,35 @@ def _parser() -> argparse.ArgumentParser:
     thread_update.add_argument("--clear-focus-task", action="store_true")
     thread_update.add_argument("--task-id", action="append")
     thread_update.add_argument("--entity-id", action="append")
+    thread_update.add_argument("--task-link-json", action="append")
+    thread_update.add_argument("--entity-link-json", action="append")
+    thread_update.add_argument("--add-task-link-json", action="append", default=[])
+    thread_update.add_argument("--remove-task-id", action="append", default=[])
+    thread_update.add_argument("--add-entity-link-json", action="append", default=[])
+    thread_update.add_argument("--remove-entity-link-json", action="append", default=[])
+    thread_update.add_argument("--closure-condition")
+    thread_update.add_argument("--next-actor", choices=("agent", "human", "external"))
+    thread_update.add_argument("--waiting-on")
+    thread_update.add_argument("--recheck-at")
+    thread_update.add_argument("--clear-closure-condition", action="store_true")
+    thread_update.add_argument("--clear-next-actor", action="store_true")
+    thread_update.add_argument("--clear-waiting-on", action="store_true")
+    thread_update.add_argument("--clear-recheck-at", action="store_true")
     thread_update.add_argument("--add-ref", action="append", default=[])
     thread_update.add_argument("--remove-ref", action="append", default=[])
+    thread_update.add_argument("--note")
+    thread_merge = thread_commands.add_parser("merge")
+    thread_merge.add_argument("id")
+    thread_merge.add_argument("--merged-into", required=True)
+    thread_merge.add_argument("--expected-revision", required=True)
+    thread_merge.add_argument("--expected-target-revision", required=True)
+    thread_merge.add_argument("--absorb-source-entities", action="store_true")
+    thread_merge.add_argument("--absorb-source-tasks", action="store_true")
+    thread_merge.add_argument("--absorb-source-refs", action="store_true")
+    thread_merge.add_argument("--add-entity-link-json", action="append", default=[])
+    thread_merge.add_argument("--add-task-link-json", action="append", default=[])
+    thread_merge.add_argument("--add-ref", action="append", default=[])
+    thread_merge.add_argument("--note")
 
     if CONTROL_STORE_SUPPORTED:
         operation = commands.add_parser(
@@ -924,6 +1698,25 @@ def _parser() -> argparse.ArgumentParser:
     backup_restore.add_argument("path")
     backup_restore.add_argument("target")
 
+    migration = commands.add_parser(
+        "migration",
+        help="Inspect or apply one owner-local resident export to a new Seld vault.",
+    )
+    migration_commands = migration.add_subparsers(dest="migration_command", required=True)
+    migration_inspect = migration_commands.add_parser(
+        "inspect",
+        help="Validate an export and print its exact CAS-bound import plan without writing.",
+    )
+    migration_inspect.add_argument("export")
+    migration_inspect.add_argument("target")
+    migration_apply = migration_commands.add_parser(
+        "apply",
+        help="Publish one validated export to an absent target without changing configuration.",
+    )
+    migration_apply.add_argument("export")
+    migration_apply.add_argument("target")
+    migration_apply.add_argument("--expected-plan-revision", required=True)
+
     demo = commands.add_parser("demo", help="Run the complete synthetic Seld proof.")
     demo.add_argument("--output")
 
@@ -933,6 +1726,24 @@ def _parser() -> argparse.ArgumentParser:
     bridge_open.add_argument("--no-browser", action="store_true")
     bridge_commands.add_parser("status", help="Show the verified Bridge process state.")
     bridge_commands.add_parser("stop", help="Stop only the verified Seld Bridge process.")
+    bridge_native_install = bridge_commands.add_parser(
+        "native-install",
+        help="Build and install the unsigned local Seld app for this exact vault.",
+    )
+    bridge_native_install.add_argument("--expected-revision")
+    bridge_commands.add_parser(
+        "native-status",
+        help="Verify the installed native Seld app without opening it.",
+    )
+    bridge_commands.add_parser(
+        "native-open",
+        help="Open only the verified current native Seld app.",
+    )
+    bridge_native_uninstall = bridge_commands.add_parser(
+        "native-uninstall",
+        help="Remove only the app proven by its Seld ownership receipt.",
+    )
+    bridge_native_uninstall.add_argument("--expected-revision", required=True)
     bridge_serve = bridge_commands.add_parser("serve", help=argparse.SUPPRESS)
     bridge_serve.add_argument("--port", type=int, default=0)
     bridge_serve.add_argument("--instance-id")
@@ -1110,6 +1921,13 @@ def _task_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--waiting-on")
     parser.add_argument("--rank", type=int)
     parser.add_argument("--active-thread-id")
+    parser.add_argument("--superseded-by")
+    parser.add_argument("--project")
+    parser.add_argument("--workspace")
+    parser.add_argument("--attention-at")
+    parser.add_argument("--due")
+    parser.add_argument("--entity-link-json", action="append", default=[])
+    parser.add_argument("--codex-episode-id", action="append", default=[])
     parser.add_argument("--ref", action="append", default=[])
 
 
@@ -1123,6 +1941,12 @@ def _thread_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--focus-task-id")
     parser.add_argument("--task-id", action="append", default=[])
     parser.add_argument("--entity-id", action="append", default=[])
+    parser.add_argument("--task-link-json", action="append", default=[])
+    parser.add_argument("--entity-link-json", action="append", default=[])
+    parser.add_argument("--closure-condition")
+    parser.add_argument("--next-actor", choices=("agent", "human", "external"))
+    parser.add_argument("--waiting-on")
+    parser.add_argument("--recheck-at")
     parser.add_argument("--ref", action="append", default=[])
 
 

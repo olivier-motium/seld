@@ -6,18 +6,25 @@ import json
 import os
 import stat
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Literal, TypeVar
 
 from continuity_kernel.atomic import (
+    PINNED_PATH_ROOT_SUPPORTED,
     AppendOutcome,
     DurableAppendError,
+    DurablePublishError,
+    PinnedPathRoot,
+    PublishOutcome,
+    active_pinned_path_root,
     append_durable,
     atomic_write,
     durable_unlink,
     exclusive_lock,
+    mark_active_pinned_transaction_committed,
     portable_relative,
     read_regular_file,
     sha256_bytes,
@@ -26,6 +33,7 @@ from continuity_kernel.atomic import (
 from continuity_kernel.config import local_host_id
 from continuity_kernel.direction import (
     ABSENT_DIRECTION_REVISION,
+    DIRECTION_RICH_FORMAT_VERSION,
     Direction,
     DirectionAim,
     new_direction,
@@ -48,6 +56,7 @@ from continuity_kernel.local_files import (
 )
 from continuity_kernel.portfolio import (
     ABSENT_PORTFOLIO_REVISION,
+    PORTFOLIO_RICH_FORMAT_VERSION,
     Portfolio,
     PortfolioInspection,
     PortfolioItem,
@@ -59,38 +68,67 @@ from continuity_kernel.portfolio import (
 )
 from continuity_kernel.records import (
     REVIEW_WORK_THREAD_ID,
+    SHA256_REVISION,
     TERMINAL_TASK_STATUSES,
+    TERMINAL_THREAD_STATUSES,
     Entity,
+    EntityMergeAbsorption,
+    EntityRelationship,
     Record,
     Task,
+    TaskEntityLink,
     WorkThread,
+    WorkThreadEntityLink,
+    WorkThreadTaskLink,
     actor,
+    body_text,
+    calendar_date,
     canonical_id,
+    codex_episodes,
     entity_ids_value,
+    entity_merge_absorptions,
+    entity_relationships,
+    entity_status,
     format_time,
     hand_id,
     has_review_session_signal,
+    history_entries,
     is_resident_pulse_task,
+    lines,
     new_entity,
     new_task,
     new_thread,
     next_timestamp,
     optional_body,
+    optional_line,
+    optional_stored_time,
     parse_entity,
     parse_review_references,
     parse_task,
     parse_thread,
     parse_time,
     references,
+    relationship_status,
     render_entity,
     render_task,
     render_thread,
+    safe_token,
+    stored_time,
+    task_entity_links,
     task_id,
     task_ids_value,
     task_rank,
     task_status,
+    thread_entity_links,
     thread_status,
+    thread_task_links,
     title_text,
+)
+from continuity_kernel.resident_signals import (
+    ResidentSignal,
+    ResidentSignalStore,
+    signal_dict,
+    signal_view_dict,
 )
 from continuity_kernel.source_state import (
     ABSENT_SOURCE_REVISION,
@@ -207,6 +245,24 @@ class DoctorResult:
     repaired: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class EntityMergeResult:
+    """Both exact records produced by one explicit identity merge."""
+
+    source: Entity
+    target: Entity
+    changed: bool
+
+
+@dataclass(frozen=True)
+class WorkThreadMergeResult:
+    """Both exact records produced by one explicit WorkThread merge."""
+
+    source: WorkThread
+    target: WorkThread
+    changed: bool
+
+
 class Vault:
     def __init__(self, root: Path | str):
         self.root = Path(root).expanduser().resolve()
@@ -288,8 +344,12 @@ class Vault:
         }
 
     def create_task(self, **values: Any) -> Task:
-        task = new_task(**values)
         with exclusive_lock(self.state / "locks/global.lock"):
+            payload = dict(values)
+            supplied_links = task_entity_links(tuple(payload.get("entity_links", ())))
+            payload["entity_links"] = self._resolved_task_entity_links(supplied_links)
+            task = new_task(**payload)
+            self._validate_task_supersession(task)
             self._validate_active_hand_owner(task)
             return self._create_record_locked("task", task)
 
@@ -320,13 +380,28 @@ class Vault:
         waiting_on: str | None = None,
         rank: int | None = None,
         active_thread_id: str | None = None,
+        superseded_by: str | None = None,
+        project: str | None = None,
+        workspace: str | None = None,
+        attention_at: str | None = None,
+        due: str | None = None,
         clear_next_actor: bool = False,
         clear_next_action: bool = False,
         clear_waiting_on: bool = False,
         clear_rank: bool = False,
         clear_active_thread_id: bool = False,
+        clear_superseded_by: bool = False,
+        clear_project: bool = False,
+        clear_workspace: bool = False,
+        clear_attention_at: bool = False,
+        clear_due: bool = False,
+        add_entity_links: tuple[TaskEntityLink, ...] = (),
+        remove_entity_links: tuple[TaskEntityLink, ...] = (),
+        add_codex_episode_ids: tuple[str, ...] = (),
+        remove_codex_episode_ids: tuple[str, ...] = (),
         add_refs: tuple[str, ...] = (),
         remove_refs: tuple[str, ...] = (),
+        note: str | None = None,
         observed_at: datetime | None = None,
     ) -> Task:
         clean_id = task_id(identifier)
@@ -337,49 +412,135 @@ class Vault:
         ):
             before = self._read_task(clean_id)
             self._expect(before.revision, expected_revision)
+            _exclusive_choice(active_thread_id, clear_active_thread_id, "active Codex hand")
+            _exclusive_choice(superseded_by, clear_superseded_by, "superseding task")
+            _exclusive_choice(project, clear_project, "project")
+            _exclusive_choice(workspace, clear_workspace, "workspace")
+            _exclusive_choice(attention_at, clear_attention_at, "attention date")
+            _exclusive_choice(due, clear_due, "due date")
+            _exclusive_choice(next_actor, clear_next_actor, "next actor")
+            _exclusive_choice(next_action, clear_next_action, "next action")
+            _exclusive_choice(waiting_on, clear_waiting_on, "waiting on")
+            _exclusive_choice(rank, clear_rank, "rank")
+
             target_status = task_status(status) if status is not None else before.status
-            target_actor = actor(next_actor) if next_actor is not None else before.next_actor
+            target_actor = (
+                actor(next_actor)
+                if next_actor is not None
+                else None
+                if clear_next_actor
+                else before.next_actor
+            )
             target_next = (
                 optional_body(next_action, "next action")
                 if next_action is not None
+                else None
+                if clear_next_action
                 else before.next_action
             )
             target_waiting = (
                 optional_body(waiting_on, "waiting on")
                 if waiting_on is not None
+                else None
+                if clear_waiting_on
                 else before.waiting_on
             )
-            target_rank = task_rank(rank) if rank is not None else before.rank
+            target_rank = (
+                task_rank(rank) if rank is not None else None if clear_rank else before.rank
+            )
             target_active_thread_id = (
                 hand_id(active_thread_id)
                 if active_thread_id is not None
+                else None
+                if clear_active_thread_id
                 else before.active_thread_id
             )
-            if target_status in {"done", "dropped"} and any(
+            target_superseded_by = (
+                task_id(superseded_by)
+                if superseded_by is not None
+                else None
+                if clear_superseded_by
+                else before.superseded_by
+            )
+            target_project = (
+                optional_line(project, "project", 120)
+                if project is not None
+                else None
+                if clear_project
+                else before.project
+            )
+            target_workspace = (
+                optional_line(workspace, "workspace", 2_048)
+                if workspace is not None
+                else None
+                if clear_workspace
+                else before.workspace
+            )
+            target_attention = (
+                calendar_date(attention_at, "attention date")
+                if attention_at is not None
+                else None
+                if clear_attention_at
+                else before.attention_at
+            )
+            target_due = (
+                calendar_date(due, "due date")
+                if due is not None
+                else None
+                if clear_due
+                else before.due
+            )
+            if target_status in TERMINAL_TASK_STATUSES and any(
                 value is not None
                 for value in (next_actor, next_action, waiting_on, active_thread_id)
             ):
                 raise ValidationError(
                     "terminal task updates cannot also set future-work fields or an active hand"
                 )
-            if clear_next_actor:
-                target_actor = None
-            if clear_next_action:
-                target_next = None
-            if clear_waiting_on:
-                target_waiting = None
-            if clear_rank:
-                target_rank = None
-            if clear_active_thread_id:
-                target_active_thread_id = None
-            if target_status in {"done", "dropped"}:
+            if target_status in TERMINAL_TASK_STATUSES:
                 self._require_task_focus_cleared(before.identifier)
                 target_actor = None
                 target_next = None
                 target_waiting = None
                 target_active_thread_id = None
+
+            if target_status == "superseded" and target_superseded_by is None:
+                raise ValidationError("superseded task status requires one superseding task ID")
+            if target_status != "superseded" and target_superseded_by is not None:
+                raise ValidationError("only a superseded task may retain a superseding task ID")
+
+            incoming_links = self._resolved_task_entity_links(task_entity_links(add_entity_links))
+            outgoing_links = self._resolved_task_entity_links(
+                task_entity_links(remove_entity_links), allow_unavailable=True
+            )
+            if set(incoming_links) & set(outgoing_links):
+                raise ValidationError("cannot add and remove the same task entity link")
+            existing_links = self._resolved_task_entity_links(
+                before.entity_links, allow_unavailable=True
+            )
+            remaining_links = tuple(
+                link for link in existing_links if link not in set(outgoing_links)
+            )
+            target_entity_links = task_entity_links((*remaining_links, *incoming_links))
+
+            additions = codex_episodes(add_codex_episode_ids)
+            removals = codex_episodes(remove_codex_episode_ids)
+            if set(additions) & set(removals):
+                raise ValidationError("cannot add and remove the same Codex episode")
+            target_episodes = codex_episodes(
+                tuple(
+                    episode for episode in before.codex_episode_ids if episode not in set(removals)
+                )
+                + additions
+                + ((target_active_thread_id,) if target_active_thread_id is not None else ())
+            )
+            if target_active_thread_id is not None and target_active_thread_id in set(removals):
+                raise ValidationError(
+                    "the active Codex hand cannot be removed from episode history"
+                )
+
             refs = tuple(item for item in before.refs if item not in set(remove_refs))
-            if target_status in {"done", "dropped"}:
+            if target_status in TERMINAL_TASK_STATUSES:
                 refs = tuple(
                     item
                     for item in refs
@@ -388,10 +549,74 @@ class Vault:
                     and item != "review-state:paused"
                 )
             refs = references((*refs, *add_refs))
+
+            transfer_owner = self._active_hand_transfer_owner(
+                target_active_thread_id,
+                owner=before.identifier,
+            )
+            timestamp = _next_record_timestamp(
+                (before, *((transfer_owner,) if transfer_owner is not None else ())),
+                observed_at,
+            )
+            changes = _changed_fields(
+                (
+                    (
+                        "title",
+                        before.title,
+                        title_text(title) if title is not None else before.title,
+                    ),
+                    (
+                        "outcome",
+                        before.outcome,
+                        body_text(outcome, "outcome", required=True)
+                        if outcome is not None
+                        else before.outcome,
+                    ),
+                    ("status", before.status, target_status),
+                    ("next actor", before.next_actor, target_actor),
+                    ("next action", before.next_action, target_next),
+                    ("waiting on", before.waiting_on, target_waiting),
+                    ("rank", before.rank, target_rank),
+                    ("active Codex hand", before.active_thread_id, target_active_thread_id),
+                    ("superseding task", before.superseded_by, target_superseded_by),
+                    ("project", before.project, target_project),
+                    ("entity links", before.entity_links, target_entity_links),
+                    ("workspace", before.workspace, target_workspace),
+                    ("attention date", before.attention_at, target_attention),
+                    ("due date", before.due, target_due),
+                    ("Codex episodes", before.codex_episode_ids, target_episodes),
+                    ("references", before.refs, refs),
+                )
+            )
+            clean_note = optional_line(note, "history note", 500)
+            if not changes and clean_note is None:
+                return before
+
+            rich = bool(before.history) or any(
+                (
+                    target_superseded_by is not None,
+                    target_project is not None,
+                    bool(target_entity_links),
+                    target_workspace is not None,
+                    target_attention is not None,
+                    target_due is not None,
+                    bool(target_episodes),
+                    clean_note is not None,
+                )
+            )
+            history = (
+                _append_record_history(before.history, timestamp, changes, clean_note)
+                if rich
+                else before.history
+            )
             candidate = replace(
                 before,
                 title=title_text(title) if title is not None else before.title,
-                outcome=outcome.strip() if outcome is not None else before.outcome,
+                outcome=(
+                    body_text(outcome, "outcome", required=True)
+                    if outcome is not None
+                    else before.outcome
+                ),
                 status=target_status,
                 next_actor=target_actor,
                 next_action=target_next,
@@ -399,23 +624,85 @@ class Vault:
                 rank=target_rank,
                 active_thread_id=target_active_thread_id,
                 refs=refs,
-                updated_at=next_timestamp(before.updated_at, observed_at),
+                superseded_by=target_superseded_by,
+                project=target_project,
+                entity_links=target_entity_links,
+                workspace=target_workspace,
+                attention_at=target_attention,
+                due=target_due,
+                codex_episode_ids=target_episodes,
+                state_changed_at=(
+                    timestamp
+                    if rich and (target_status != before.status or before.state_changed_at is None)
+                    else before.state_changed_at
+                ),
+                history=history,
+                updated_at=timestamp,
                 revision="",
             )
             after = parse_task(render_task(candidate))
-            self._validate_active_hand_owner(after)
-            self._replace_record(path, "task", before, after, render_task(after))
+            self._validate_task_supersession(after)
+            ignored = (transfer_owner.identifier,) if transfer_owner is not None else ()
+            self._validate_active_hand_owner(after, ignored_task_ids=ignored)
+
+            if transfer_owner is not None:
+                released = self._released_hand_owner(
+                    transfer_owner,
+                    new_owner=after.identifier,
+                    timestamp=timestamp,
+                )
+                self._replace_record(
+                    self._path("task", transfer_owner.identifier),
+                    "task",
+                    transfer_owner,
+                    released,
+                    render_task(released),
+                )
+                try:
+                    self._replace_record(path, "task", before, after, render_task(after))
+                except Exception as exc:
+                    raise MutationCommittedError(
+                        "the previous task released this Codex hand, but its new task binding "
+                        "did not commit; reload both tasks and retry the explicit claim"
+                    ) from exc
+            else:
+                self._replace_record(path, "task", before, after, render_task(after))
             return after
 
     def create_entity(self, **values: Any) -> Entity:
-        entity = new_entity(**values)
-        return self._create_record("entity", entity)
+        with exclusive_lock(self.state / "locks/global.lock"):
+            payload = dict(values)
+            relationships = entity_relationships(tuple(payload.get("relationships", ())))
+            payload["relationships"] = self._resolved_entity_relationships(relationships)
+            entity = new_entity(**payload)
+            if entity.status == "merged":
+                raise ValidationError("use entity merge to create a redirect")
+            return self._create_record_locked("entity", entity)
 
     def get_entity(self, identifier: str) -> Entity:
         clean_id = canonical_id(identifier, "entity ID")
         record = parse_entity(self._read_text(self._path("entity", clean_id)))
         self._assert_record_identity(self._path("entity", clean_id), record)
         return record
+
+    def resolve_entity(self, identifier: str, *, max_redirects: int = 16) -> Entity:
+        """Follow only explicit structured redirects to the current canonical identity."""
+
+        if not 1 <= max_redirects <= 100:
+            raise ValidationError("max_redirects must be between 1 and 100")
+        current = canonical_id(identifier, "entity ID")
+        seen: set[str] = set()
+        for _ in range(max_redirects + 1):
+            if current in seen:
+                raise ValidationError("entity redirect cycle detected")
+            seen.add(current)
+            record = self.get_entity(current)
+            if record.status != "merged":
+                return record
+            if record.merged_into is None:
+                raise ValidationError(f"merged entity lacks a redirect target: {record.identifier}")
+            current = record.merged_into
+        raise ValidationError("entity redirect chain is too long")
 
     def list_entities(self) -> list[Entity]:
         records = []
@@ -434,9 +721,15 @@ class Vault:
         expected_revision: str,
         title: str | None = None,
         summary: str | None = None,
+        status: str | None = None,
         aliases: tuple[str, ...] | None = None,
+        add_aliases: tuple[str, ...] = (),
+        remove_aliases: tuple[str, ...] = (),
         add_refs: tuple[str, ...] = (),
         remove_refs: tuple[str, ...] = (),
+        recheck_at: str | None = None,
+        clear_recheck_at: bool = False,
+        note: str | None = None,
         observed_at: datetime | None = None,
     ) -> Entity:
         clean_id = canonical_id(identifier, "entity ID")
@@ -446,26 +739,432 @@ class Vault:
             exclusive_lock(self._record_lock("entity", clean_id)),
         ):
             before = self.get_entity(clean_id)
+            if before.status == "merged":
+                raise ValidationError("entity is merged; resolve and update its canonical target")
             self._expect(before.revision, expected_revision)
+            _exclusive_choice(recheck_at, clear_recheck_at, "entity recheck time")
+            incoming_aliases = lines(add_aliases, "entity alias", 100)
+            outgoing_aliases = lines(remove_aliases, "entity alias", 100)
+            if set(incoming_aliases) & set(outgoing_aliases):
+                raise ValidationError("cannot add and remove the same entity alias")
+            base_aliases = (
+                lines(aliases, "entity alias", 100) if aliases is not None else before.aliases
+            )
+            target_aliases = lines(
+                tuple(alias for alias in base_aliases if alias not in set(outgoing_aliases))
+                + incoming_aliases,
+                "entity alias",
+                100,
+            )
             refs = tuple(item for item in before.refs if item not in set(remove_refs))
+            target_refs = references((*refs, *add_refs))
+            target_status = entity_status(status) if status is not None else before.status
+            if target_status == "merged":
+                raise ValidationError("use entity merge to create a redirect")
+            target_recheck = (
+                optional_stored_time(recheck_at, "recheck_at")
+                if recheck_at is not None
+                else None
+                if clear_recheck_at
+                else before.recheck_at
+            )
+            if target_status == "superseded" and any(
+                relationship.status == "current" for relationship in before.relationships
+            ):
+                raise ValidationError("unlink current relationships before superseding this entity")
+            timestamp = _next_record_timestamp((before,), observed_at)
+            target_title = title_text(title) if title is not None else before.title
+            target_summary = (
+                body_text(summary, "entity summary", required=True)
+                if summary is not None
+                else before.summary
+            )
+            changes = _changed_fields(
+                (
+                    ("title", before.title, target_title),
+                    ("summary", before.summary, target_summary),
+                    ("status", before.status, target_status),
+                    ("aliases", before.aliases, target_aliases),
+                    ("references", before.refs, target_refs),
+                    ("recheck time", before.recheck_at, target_recheck),
+                )
+            )
+            clean_note = optional_line(note, "history note", 500)
+            if not changes and clean_note is None:
+                return before
+            rich = bool(before.history) or any(
+                (
+                    target_status != "current",
+                    bool(before.relationships),
+                    target_recheck is not None,
+                    clean_note is not None,
+                )
+            )
             candidate = replace(
                 before,
-                title=title_text(title) if title is not None else before.title,
-                summary=summary.strip() if summary is not None else before.summary,
-                aliases=tuple(aliases) if aliases is not None else before.aliases,
-                refs=references((*refs, *add_refs)),
-                updated_at=next_timestamp(before.updated_at, observed_at),
+                title=target_title,
+                summary=target_summary,
+                status=target_status,
+                aliases=target_aliases,
+                refs=target_refs,
+                observed_at=(timestamp if rich else before.observed_at),
+                recheck_at=target_recheck,
+                history=(
+                    _append_record_history(before.history, timestamp, changes, clean_note)
+                    if rich
+                    else before.history
+                ),
+                updated_at=timestamp,
                 revision="",
             )
             after = parse_entity(render_entity(candidate))
             self._replace_record(path, "entity", before, after, render_entity(after))
             return after
 
+    def link_entity(
+        self,
+        identifier: str,
+        *,
+        expected_revision: str,
+        predicate: str,
+        target_id: str,
+        refs: tuple[str, ...] = (),
+        valid_from: str | None = None,
+        note: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> Entity:
+        """Author one exact current relationship; names and prose never allocate it."""
+
+        source_id = canonical_id(identifier, "entity ID")
+        path = self._path("entity", source_id)
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("entity", source_id)),
+        ):
+            before = self.get_entity(source_id)
+            self._assert_entity_writable(before)
+            target = self.resolve_entity(target_id)
+            if target.status in {"merged", "superseded"}:
+                raise ValidationError("relationship target must be a current canonical entity")
+            if target.identifier == source_id:
+                raise ValidationError("an entity cannot link to itself")
+            clean_predicate = safe_token(predicate, "relationship predicate")
+            clean_refs = references(refs)
+            clean_valid_from = optional_stored_time(valid_from, "valid_from")
+            relationships = list(before.relationships)
+            current_index = next(
+                (
+                    index
+                    for index, relationship in enumerate(relationships)
+                    if relationship.status == "current"
+                    and relationship.predicate == clean_predicate
+                    and self.resolve_entity(relationship.target).identifier == target.identifier
+                ),
+                None,
+            )
+            if current_index is not None:
+                existing = relationships[current_index]
+                exact_validity = clean_valid_from is None or clean_valid_from == existing.valid_from
+                if exact_validity and set(clean_refs).issubset(existing.refs):
+                    return before
+            self._expect(before.revision, expected_revision)
+            timestamp = _next_record_timestamp((before,), observed_at)
+            if clean_valid_from is not None and parse_time(clean_valid_from) > parse_time(
+                timestamp
+            ):
+                raise ValidationError("current relationship valid_from cannot be in the future")
+            if current_index is None:
+                relationships.append(
+                    EntityRelationship(
+                        predicate=clean_predicate,
+                        target=target.identifier,
+                        status="current",
+                        recorded_at=timestamp,
+                        valid_from=clean_valid_from,
+                        valid_to=None,
+                        refs=clean_refs,
+                    )
+                )
+            else:
+                existing = relationships[current_index]
+                if (
+                    existing.valid_from is not None
+                    and clean_valid_from is not None
+                    and existing.valid_from != clean_valid_from
+                ):
+                    raise ValidationError(
+                        "current relationship has a different valid_from; unlink and relink it"
+                    )
+                relationships[current_index] = replace(
+                    existing,
+                    target=target.identifier,
+                    refs=references((*existing.refs, *clean_refs)),
+                    valid_from=existing.valid_from or clean_valid_from,
+                )
+            clean_note = optional_line(note, "history note", 500)
+            candidate = replace(
+                before,
+                relationships=entity_relationships(relationships),
+                observed_at=timestamp,
+                updated_at=timestamp,
+                history=_append_record_history(
+                    before.history,
+                    timestamp,
+                    (f"linked {clean_predicate} to {target.identifier}",),
+                    clean_note,
+                ),
+                revision="",
+            )
+            after = parse_entity(render_entity(candidate))
+            self._replace_record(path, "entity", before, after, render_entity(after))
+            return after
+
+    def unlink_entity(
+        self,
+        identifier: str,
+        *,
+        expected_revision: str,
+        predicate: str,
+        target_id: str,
+        refs: tuple[str, ...] = (),
+        valid_to: str | None = None,
+        note: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> Entity:
+        """Historicize one exact current relationship without erasing its evidence."""
+
+        source_id = canonical_id(identifier, "entity ID")
+        path = self._path("entity", source_id)
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("entity", source_id)),
+        ):
+            before = self.get_entity(source_id)
+            self._assert_entity_writable(before)
+            target = self.resolve_entity(target_id)
+            clean_predicate = safe_token(predicate, "relationship predicate")
+            clean_refs = references(refs)
+            requested_valid_to = optional_stored_time(valid_to, "valid_to")
+            relationships = list(before.relationships)
+            current_index = next(
+                (
+                    index
+                    for index, relationship in enumerate(relationships)
+                    if relationship.status == "current"
+                    and relationship.predicate == clean_predicate
+                    and self.resolve_entity(relationship.target).identifier == target.identifier
+                ),
+                None,
+            )
+            if current_index is None:
+                exact_replay = any(
+                    relationship.status == "historical"
+                    and relationship.predicate == clean_predicate
+                    and self.resolve_entity(relationship.target).identifier == target.identifier
+                    and set(clean_refs).issubset(relationship.refs)
+                    and (requested_valid_to is None or requested_valid_to == relationship.valid_to)
+                    for relationship in relationships
+                )
+                if exact_replay:
+                    return before
+            self._expect(before.revision, expected_revision)
+            if current_index is None:
+                raise ValidationError("current entity relationship does not exist")
+            timestamp = _next_record_timestamp((before,), observed_at)
+            clean_valid_to = requested_valid_to or timestamp
+            existing = relationships[current_index]
+            if existing.valid_from is not None and parse_time(clean_valid_to) < parse_time(
+                existing.valid_from
+            ):
+                raise ValidationError("valid_to predates valid_from")
+            relationships[current_index] = replace(
+                existing,
+                target=target.identifier,
+                status=relationship_status("historical"),
+                valid_to=clean_valid_to,
+                refs=references((*existing.refs, *clean_refs)),
+            )
+            clean_note = optional_line(note, "history note", 500)
+            candidate = replace(
+                before,
+                relationships=entity_relationships(relationships),
+                observed_at=timestamp,
+                updated_at=timestamp,
+                history=_append_record_history(
+                    before.history,
+                    timestamp,
+                    (f"historicized {clean_predicate} to {target.identifier}",),
+                    clean_note,
+                ),
+                revision="",
+            )
+            after = parse_entity(render_entity(candidate))
+            self._replace_record(path, "entity", before, after, render_entity(after))
+            return after
+
+    def merge_entity(
+        self,
+        identifier: str,
+        *,
+        merged_into: str,
+        expected_revision: str,
+        expected_target_revision: str,
+        refs: tuple[str, ...] = (),
+        note: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> EntityMergeResult:
+        """Merge one explicit duplicate using structured target-first recovery evidence."""
+
+        source_id = canonical_id(identifier, "entity ID")
+        requested_target = canonical_id(merged_into, "merged entity ID")
+        if source_id == requested_target:
+            raise ValidationError("an entity cannot merge into itself")
+        source_lock = self._record_lock("entity", source_id)
+        target_lock = self._record_lock("entity", requested_target)
+        first_lock, second_lock = sorted((source_lock, target_lock), key=str)
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(first_lock),
+            exclusive_lock(second_lock),
+        ):
+            before = self.get_entity(source_id)
+            target = self.resolve_entity(requested_target)
+            if target.identifier == source_id:
+                raise ValidationError("entity merge would create a redirect cycle")
+            if before.entity_type != target.entity_type:
+                raise ValidationError("entities can merge only within the same type")
+            if before.status == "merged":
+                resolved = self.resolve_entity(before.identifier)
+                if resolved.identifier != target.identifier:
+                    raise ValidationError(
+                        "entity is merged; resolve and choose its current canonical target"
+                    )
+                return EntityMergeResult(before, target, False)
+            self._assert_entity_writable(target, target=True)
+            self._expect(before.revision, expected_revision)
+            self._assert_entity_merge_role_safe(source_id, target.identifier)
+
+            recorded_absorption = next(
+                (item for item in target.merge_absorptions if item.source_id == source_id),
+                None,
+            )
+            if recorded_absorption is not None:
+                if recorded_absorption.source_updated_at != before.updated_at:
+                    raise ValidationError(
+                        "merge target absorption does not match the exact source version"
+                    )
+                required_absorptions = self._merge_absorptions(
+                    target, before.merge_absorptions, recorded_absorption
+                )
+                if required_absorptions != target.merge_absorptions:
+                    raise ValidationError(
+                        "merge target has incomplete structured recovery state; repair is required"
+                    )
+                timestamp = recorded_absorption.merged_at
+                updated_target = target
+            else:
+                self._expect(target.revision, expected_target_revision)
+                timestamp = _next_record_timestamp((before, target), observed_at)
+                absorption = EntityMergeAbsorption(
+                    source_id=source_id,
+                    source_updated_at=before.updated_at,
+                    merged_at=timestamp,
+                )
+                absorptions = self._merge_absorptions(target, before.merge_absorptions, absorption)
+                migrated = self._relationships_after_entity_merge(
+                    source=before,
+                    target=target,
+                    merged_at=timestamp,
+                )
+                target_candidate = replace(
+                    target,
+                    relationships=migrated,
+                    merge_absorptions=absorptions,
+                    observed_at=timestamp,
+                    updated_at=timestamp,
+                    history=_append_record_history(
+                        target.history,
+                        timestamp,
+                        (f"absorbed exact relationships from merged {source_id}",),
+                        None,
+                    ),
+                    revision="",
+                )
+                updated_target = parse_entity(render_entity(target_candidate))
+                self._replace_record(
+                    self._path("entity", target.identifier),
+                    "entity",
+                    target,
+                    updated_target,
+                    render_entity(updated_target),
+                )
+
+            source_relationships = tuple(
+                replace(
+                    relationship,
+                    status=relationship_status("historical"),
+                    valid_to=relationship.valid_to or timestamp,
+                )
+                if relationship.status == "current"
+                else relationship
+                for relationship in before.relationships
+            )
+            clean_note = optional_line(note, "history note", 500)
+            source_candidate = replace(
+                before,
+                status=entity_status("merged"),
+                relationships=entity_relationships(source_relationships),
+                refs=references((*before.refs, *refs)),
+                observed_at=timestamp,
+                recheck_at=None,
+                merged_into=updated_target.identifier,
+                merged_at=timestamp,
+                merged_from_updated_at=before.updated_at,
+                updated_at=timestamp,
+                history=_append_record_history(
+                    before.history,
+                    timestamp,
+                    (f"merged into {updated_target.identifier}",),
+                    clean_note,
+                ),
+                revision="",
+            )
+            source_after = parse_entity(render_entity(source_candidate))
+            try:
+                self._replace_record(
+                    self._path("entity", source_id),
+                    "entity",
+                    before,
+                    source_after,
+                    render_entity(source_after),
+                )
+            except Exception as exc:
+                if recorded_absorption is None:
+                    raise MutationCommittedError(
+                        "the merge target retained structured absorption, but the source redirect "
+                        "did not commit; retry the same merge to recover it"
+                    ) from exc
+                raise
+            return EntityMergeResult(source_after, updated_target, True)
+
     def create_thread(self, **values: Any) -> WorkThread:
-        thread = new_thread(**values)
         with exclusive_lock(self.state / "locks/global.lock"):
+            payload = dict(values)
+            if payload.get("task_links"):
+                payload["task_links"] = thread_task_links(tuple(payload["task_links"]))
+            if payload.get("entity_links"):
+                payload["entity_links"] = self._resolved_thread_entity_links(
+                    thread_entity_links(tuple(payload["entity_links"]))
+                )
+            elif payload.get("entity_ids"):
+                payload["entity_ids"] = tuple(
+                    self.resolve_entity(value).identifier for value in payload["entity_ids"]
+                )
+            thread = new_thread(**payload)
             self._validate_relations(thread.task_ids, thread.entity_ids)
             self._validate_thread_focus(thread)
+            self._validate_thread_horizon(thread)
+            self._validate_thread_redirect(thread)
             return self._create_record_locked("thread", thread)
 
     def get_thread(self, identifier: str) -> WorkThread:
@@ -473,6 +1172,27 @@ class Vault:
         record = parse_thread(self._read_text(self._path("thread", clean_id)))
         self._assert_record_identity(self._path("thread", clean_id), record)
         return record
+
+    def resolve_thread(self, identifier: str, *, max_redirects: int = 16) -> WorkThread:
+        """Follow only explicit WorkThread supersession redirects."""
+
+        if not 1 <= max_redirects <= 100:
+            raise ValidationError("max_redirects must be between 1 and 100")
+        current = canonical_id(identifier, "thread ID", prefix="thread")
+        seen: set[str] = set()
+        for _ in range(max_redirects + 1):
+            if current in seen:
+                raise ValidationError("WorkThread redirect cycle detected")
+            seen.add(current)
+            record = self.get_thread(current)
+            if record.status != "superseded":
+                return record
+            if record.superseded_by is None:
+                raise ValidationError(
+                    f"superseded WorkThread lacks a redirect target: {record.identifier}"
+                )
+            current = record.superseded_by
+        raise ValidationError("WorkThread redirect chain is too long")
 
     def list_threads(self, *, status: str | None = None) -> list[WorkThread]:
         if status is not None:
@@ -500,8 +1220,23 @@ class Vault:
         clear_focus_task: bool = False,
         task_ids: tuple[str, ...] | None = None,
         entity_ids: tuple[str, ...] | None = None,
+        task_links: tuple[WorkThreadTaskLink, ...] | None = None,
+        entity_links: tuple[WorkThreadEntityLink, ...] | None = None,
+        add_task_links: tuple[WorkThreadTaskLink, ...] = (),
+        remove_task_ids: tuple[str, ...] = (),
+        add_entity_links: tuple[WorkThreadEntityLink, ...] = (),
+        remove_entity_links: tuple[WorkThreadEntityLink, ...] = (),
+        closure_condition: str | None = None,
+        next_actor: str | None = None,
+        waiting_on: str | None = None,
+        recheck_at: str | None = None,
+        clear_closure_condition: bool = False,
+        clear_next_actor: bool = False,
+        clear_waiting_on: bool = False,
+        clear_recheck_at: bool = False,
         add_refs: tuple[str, ...] = (),
         remove_refs: tuple[str, ...] = (),
+        note: str | None = None,
         observed_at: datetime | None = None,
     ) -> WorkThread:
         clean_id = canonical_id(identifier, "thread ID", prefix="thread")
@@ -511,14 +1246,39 @@ class Vault:
             exclusive_lock(self._record_lock("thread", clean_id)),
         ):
             before = self.get_thread(clean_id)
+            if before.status == "superseded":
+                raise ValidationError(
+                    "WorkThread is superseded; resolve and update its canonical target"
+                )
             self._expect(before.revision, expected_revision)
-            target_tasks = task_ids_value(task_ids) if task_ids is not None else before.task_ids
-            target_entities = (
-                entity_ids_value(entity_ids) if entity_ids is not None else before.entity_ids
+            if task_ids is not None and task_links is not None:
+                raise ValidationError("choose positioned task links or legacy task IDs, not both")
+            if entity_ids is not None and entity_links is not None:
+                raise ValidationError("choose typed entity links or legacy entity IDs, not both")
+            _exclusive_choice(focus_task_id, clear_focus_task, "focus task")
+            _exclusive_choice(next_move, clear_next_move, "next move")
+            _exclusive_choice(closure_condition, clear_closure_condition, "closure condition")
+            _exclusive_choice(next_actor, clear_next_actor, "next actor")
+            _exclusive_choice(waiting_on, clear_waiting_on, "waiting on")
+            _exclusive_choice(recheck_at, clear_recheck_at, "recheck time")
+
+            target_task_links = self._updated_thread_task_links(
+                before,
+                task_ids=task_ids,
+                task_links=task_links,
+                add_task_links=add_task_links,
+                remove_task_ids=remove_task_ids,
             )
+            target_entity_links = self._updated_thread_entity_links(
+                before,
+                entity_ids=entity_ids,
+                entity_links=entity_links,
+                add_entity_links=add_entity_links,
+                remove_entity_links=remove_entity_links,
+            )
+            target_tasks = tuple(link.task_id for link in target_task_links)
+            target_entities = tuple(link.entity_id for link in target_entity_links)
             self._validate_relations(target_tasks, target_entities)
-            if focus_task_id is not None and clear_focus_task:
-                raise ValidationError("choose a focus task or clear it")
             target_focus = (
                 task_id(focus_task_id)
                 if focus_task_id is not None
@@ -527,37 +1287,345 @@ class Vault:
                 else before.focus_task_id
             )
             refs = tuple(item for item in before.refs if item not in set(remove_refs))
+            target_refs = references((*refs, *add_refs))
             target_next = (
-                optional_body(next_move, "next move") if next_move is not None else before.next_move
+                optional_body(next_move, "next move")
+                if next_move is not None
+                else None
+                if clear_next_move
+                else before.next_move
+            )
+            target_closure = (
+                optional_body(closure_condition, "closure condition")
+                if closure_condition is not None
+                else None
+                if clear_closure_condition
+                else before.closure_condition
+            )
+            target_actor = (
+                actor(next_actor)
+                if next_actor is not None
+                else None
+                if clear_next_actor
+                else before.next_actor
+            )
+            target_waiting = (
+                optional_body(waiting_on, "waiting on")
+                if waiting_on is not None
+                else None
+                if clear_waiting_on
+                else before.waiting_on
+            )
+            target_recheck = (
+                optional_stored_time(recheck_at, "recheck_at")
+                if recheck_at is not None
+                else None
+                if clear_recheck_at
+                else before.recheck_at
             )
             target_status = thread_status(status) if status is not None else before.status
-            if target_status == "closed" and next_move is not None:
-                raise ValidationError("closed thread updates cannot also set a next move")
-            if clear_next_move or target_status == "closed":
+            if target_status == "superseded":
+                raise ValidationError("use WorkThread merge to supersede a WorkThread")
+            if target_status in TERMINAL_THREAD_STATUSES and any(
+                value is not None
+                for value in (focus_task_id, next_actor, next_move, waiting_on, recheck_at)
+            ):
+                raise ValidationError(
+                    "terminal WorkThread updates cannot also set future-work fields"
+                )
+            if target_status in TERMINAL_THREAD_STATUSES:
                 target_next = None
-            if target_status == "closed":
                 target_focus = None
+                target_actor = None
+                target_waiting = None
+                target_recheck = None
+
+            timestamp = _next_record_timestamp((before,), observed_at)
+            target_title = title_text(title) if title is not None else before.title
+            target_purpose = (
+                body_text(purpose, "thread purpose", required=True)
+                if purpose is not None
+                else before.purpose
+            )
+            target_summary = (
+                body_text(summary, "thread summary", required=True)
+                if summary is not None
+                else before.summary
+            )
+            changes = _changed_fields(
+                (
+                    ("title", before.title, target_title),
+                    ("purpose", before.purpose, target_purpose),
+                    ("closure condition", before.closure_condition, target_closure),
+                    ("summary", before.summary, target_summary),
+                    ("status", before.status, target_status),
+                    ("focus task", before.focus_task_id, target_focus),
+                    ("next actor", before.next_actor, target_actor),
+                    ("next move", before.next_move, target_next),
+                    ("waiting on", before.waiting_on, target_waiting),
+                    ("task sequence", before.task_links, target_task_links),
+                    ("entity links", before.entity_links, target_entity_links),
+                    ("references", before.refs, target_refs),
+                    ("recheck time", before.recheck_at, target_recheck),
+                )
+            )
+            clean_note = optional_line(note, "history note", 500)
+            if not changes and clean_note is None:
+                return before
+            rich_requested = any(
+                (
+                    task_links is not None,
+                    entity_links is not None,
+                    bool(add_task_links),
+                    bool(remove_task_ids),
+                    bool(add_entity_links),
+                    bool(remove_entity_links),
+                    closure_condition is not None,
+                    clear_closure_condition,
+                    next_actor is not None,
+                    clear_next_actor,
+                    waiting_on is not None,
+                    clear_waiting_on,
+                    recheck_at is not None,
+                    clear_recheck_at,
+                    clean_note is not None,
+                    target_status in {"resolved", "dropped"},
+                )
+            )
+            rich = bool(before.history) or rich_requested
+            state_changed_at = before.state_changed_at
+            if rich and state_changed_at is None:
+                state_changed_at = before.updated_at
+            if rich and target_status != before.status:
+                state_changed_at = timestamp
+            resolved_at = before.resolved_at
+            if rich and target_status in TERMINAL_THREAD_STATUSES:
+                resolved_at = resolved_at or timestamp
+            elif rich:
+                resolved_at = None
             candidate = replace(
                 before,
-                title=title_text(title) if title is not None else before.title,
-                purpose=purpose.strip() if purpose is not None else before.purpose,
-                summary=summary.strip() if summary is not None else before.summary,
+                title=target_title,
+                purpose=target_purpose,
+                closure_condition=target_closure,
+                summary=target_summary,
                 status=target_status,
                 next_move=target_next,
                 focus_task_id=target_focus,
-                task_ids=target_tasks,
-                entity_ids=target_entities,
-                refs=references((*refs, *add_refs)),
-                updated_at=next_timestamp(before.updated_at, observed_at),
+                next_actor=target_actor,
+                waiting_on=target_waiting,
+                task_links=target_task_links,
+                entity_links=target_entity_links,
+                refs=target_refs,
+                observed_at=(timestamp if rich else before.observed_at),
+                state_changed_at=state_changed_at,
+                recheck_at=target_recheck,
+                resolved_at=resolved_at,
+                history=(
+                    _append_record_history(before.history, timestamp, changes, clean_note)
+                    if rich
+                    else before.history
+                ),
+                updated_at=timestamp,
                 revision="",
             )
+            self._validate_thread_horizon(candidate)
             self._validate_thread_focus(
                 candidate,
-                allow_unfocused_review=clear_focus_task or target_status == "closed",
+                allow_unfocused_review=(
+                    clear_focus_task or target_status in TERMINAL_THREAD_STATUSES
+                ),
             )
             after = parse_thread(render_thread(candidate))
             self._replace_record(path, "thread", before, after, render_thread(after))
             return after
+
+    def merge_thread(
+        self,
+        identifier: str,
+        *,
+        merged_into: str,
+        expected_revision: str,
+        expected_target_revision: str,
+        absorb_source_entities: bool = False,
+        absorb_source_tasks: bool = False,
+        absorb_source_refs: bool = False,
+        add_entity_links: tuple[WorkThreadEntityLink, ...] = (),
+        add_task_links: tuple[WorkThreadTaskLink, ...] = (),
+        add_refs: tuple[str, ...] = (),
+        note: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> WorkThreadMergeResult:
+        """Supersede one exact duplicate; every absorbed collection is caller-selected."""
+
+        source_id = canonical_id(identifier, "thread ID", prefix="thread")
+        target_id = canonical_id(merged_into, "thread ID", prefix="thread")
+        if source_id == target_id:
+            raise ValidationError("a WorkThread cannot merge into itself")
+        source_lock = self._record_lock("thread", source_id)
+        target_lock = self._record_lock("thread", target_id)
+        first_lock, second_lock = sorted((source_lock, target_lock), key=str)
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(first_lock),
+            exclusive_lock(second_lock),
+        ):
+            before = self.get_thread(source_id)
+            target = self.get_thread(target_id)
+            if before.status == "superseded":
+                if before.superseded_by != target_id:
+                    raise ValidationError(
+                        "WorkThread is superseded; resolve and choose its canonical target"
+                    )
+                return WorkThreadMergeResult(before, target, False)
+            if target.status == "superseded":
+                raise ValidationError(
+                    "merge target is superseded; resolve and choose its canonical WorkThread"
+                )
+            self._expect(before.revision, expected_revision)
+
+            authored_entities = self._resolved_thread_entity_links(
+                thread_entity_links(add_entity_links)
+            )
+            inherited_entities = before.entity_links if absorb_source_entities else ()
+            incoming_entities = self._resolved_thread_entity_links(
+                thread_entity_links((*inherited_entities, *authored_entities))
+            )
+            target_entities = self._resolved_thread_entity_links(target.entity_links)
+            merged_entities = self._merge_thread_entity_links(target_entities, incoming_entities)
+
+            incoming_tasks = (
+                (*before.task_links, *add_task_links) if absorb_source_tasks else add_task_links
+            )
+            merged_tasks = self._merge_thread_task_links(
+                target.task_links,
+                thread_task_links(incoming_tasks),
+            )
+            inherited_refs = before.refs if absorb_source_refs else ()
+            merged_refs = references((*target.refs, *inherited_refs, *add_refs))
+            self._validate_relations(
+                tuple(link.task_id for link in merged_tasks),
+                tuple(link.entity_id for link in merged_entities),
+            )
+            if target.focus_task_id is not None and target.focus_task_id not in {
+                link.task_id for link in merged_tasks
+            }:
+                raise ValidationError("merge would remove the target WorkThread focus task")
+
+            clean_note = optional_line(note, "history note", 500)
+            request_revision = sha256_bytes(
+                json.dumps(
+                    {
+                        "absorb_source_entities": absorb_source_entities,
+                        "absorb_source_refs": absorb_source_refs,
+                        "absorb_source_tasks": absorb_source_tasks,
+                        "add_entity_links": [
+                            {"entity_id": link.entity_id, "role": link.role}
+                            for link in authored_entities
+                        ],
+                        "add_refs": list(references(add_refs)),
+                        "add_task_links": [
+                            {"position": link.position, "task_id": link.task_id}
+                            for link in thread_task_links(add_task_links)
+                        ],
+                        "note": clean_note,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            marker = (
+                f"accepted superseded duplicate {source_id}@{before.revision} "
+                f"with request {request_revision}"
+            )
+            target_has_marker = any(marker in entry for entry in target.history)
+            target_content_changed = any(
+                (
+                    merged_entities != target.entity_links,
+                    merged_tasks != target.task_links,
+                    merged_refs != target.refs,
+                )
+            )
+            recovering = target_has_marker and not target_content_changed
+            if not recovering:
+                self._expect(target.revision, expected_target_revision)
+            timestamp = (
+                target.updated_at
+                if recovering
+                else _next_record_timestamp((before, target), observed_at)
+            )
+            updated_target = target
+            if not recovering:
+                target_changes = (marker,)
+                updated_target = replace(
+                    target,
+                    task_links=merged_tasks,
+                    entity_links=merged_entities,
+                    refs=merged_refs,
+                    observed_at=timestamp,
+                    state_changed_at=target.state_changed_at or target.updated_at,
+                    resolved_at=(
+                        target.resolved_at
+                        or (
+                            target.updated_at if target.status in TERMINAL_THREAD_STATUSES else None
+                        )
+                    ),
+                    history=_append_record_history(
+                        target.history, timestamp, target_changes, clean_note
+                    ),
+                    updated_at=timestamp,
+                    revision="",
+                )
+                self._validate_thread_horizon(updated_target)
+                updated_target = parse_thread(render_thread(updated_target))
+                self._replace_record(
+                    self._path("thread", target_id),
+                    "thread",
+                    target,
+                    updated_target,
+                    render_thread(updated_target),
+                )
+
+            source_timestamp = _next_record_timestamp((before, updated_target), observed_at)
+            source_after = replace(
+                before,
+                status=thread_status("superseded"),
+                superseded_by=target_id,
+                focus_task_id=None,
+                next_actor=None,
+                next_move=None,
+                waiting_on=None,
+                recheck_at=None,
+                observed_at=source_timestamp,
+                state_changed_at=source_timestamp,
+                resolved_at=source_timestamp,
+                history=_append_record_history(
+                    before.history,
+                    source_timestamp,
+                    (f"superseded by canonical WorkThread {target_id}",),
+                    clean_note,
+                ),
+                updated_at=source_timestamp,
+                revision="",
+            )
+            source_after = parse_thread(render_thread(source_after))
+            try:
+                self._replace_record(
+                    self._path("thread", source_id),
+                    "thread",
+                    before,
+                    source_after,
+                    render_thread(source_after),
+                )
+            except Exception as exc:
+                if not recovering:
+                    raise MutationCommittedError(
+                        "the WorkThread target accepted the exact duplicate, but the source "
+                        "redirect did not commit; retry the same merge to recover it"
+                    ) from exc
+                raise
+            return WorkThreadMergeResult(source_after, updated_target, True)
 
     def migrate_legacy_review_session(
         self,
@@ -593,7 +1661,7 @@ class Vault:
             if os.path.lexists(thread_path):
                 before = self.get_thread(REVIEW_WORK_THREAD_ID)
                 self._expect(before.revision, expected_review_thread_revision)
-                if before.status == "closed":
+                if before.status in TERMINAL_THREAD_STATUSES:
                     raise ValidationError(
                         "reopen the canonical review WorkThread deliberately before migration"
                     )
@@ -603,11 +1671,39 @@ class Vault:
                     raise ValidationError(
                         "existing review WorkThread prose is preserved during migration"
                     )
+                timestamp = next_timestamp(before.updated_at, observed_at)
                 candidate = replace(
                     before,
                     focus_task_id=session.identifier,
-                    task_ids=task_ids_value((*before.task_ids, session.identifier)),
-                    updated_at=next_timestamp(before.updated_at, observed_at),
+                    task_links=(
+                        before.task_links
+                        if session.identifier in before.task_ids
+                        else thread_task_links(
+                            (
+                                *before.task_links,
+                                WorkThreadTaskLink(
+                                    max(
+                                        (link.position for link in before.task_links),
+                                        default=0,
+                                    )
+                                    + 1,
+                                    session.identifier,
+                                ),
+                            )
+                        )
+                    ),
+                    observed_at=(timestamp if before.history else before.observed_at),
+                    history=(
+                        _append_record_history(
+                            before.history,
+                            timestamp,
+                            (f"focused migrated review session {session.identifier}",),
+                            None,
+                        )
+                        if before.history
+                        else before.history
+                    ),
+                    updated_at=timestamp,
                     revision="",
                 )
                 self._validate_thread_focus(candidate)
@@ -653,9 +1749,16 @@ class Vault:
         status: str,
         current_chapter: str,
         aims: tuple[DirectionAim, ...],
+        constraints: tuple[str, ...] | None = None,
+        tensions: tuple[str, ...] | None = None,
+        refs: tuple[str, ...] | None = None,
+        source_observed_at: str | None = None,
+        recorded_at: str | None = None,
+        recheck_at: str | None = None,
+        note: str | None = None,
         observed_at: datetime | None = None,
     ) -> Direction:
-        """CAS-author one complete Direction without deriving aims from task text."""
+        """CAS-author Direction while carrying omitted rich fields without deriving judgment."""
 
         path = self.root / "DIRECTION.md"
         with (
@@ -677,11 +1780,52 @@ class Vault:
                         "Direction changed; reload it before authoring the complete aims"
                     )
                 timestamp = format_time(observed_at or datetime.now(UTC))
+            rich_before = (
+                before is not None and before.format_version == DIRECTION_RICH_FORMAT_VERSION
+            )
             after = new_direction(
                 status=status,
                 current_chapter=current_chapter,
                 aims=aims,
                 observed_at=parse_time(timestamp),
+                constraints=(
+                    constraints
+                    if constraints is not None
+                    else (before.constraints if rich_before and before is not None else ())
+                ),
+                tensions=(
+                    tensions
+                    if tensions is not None
+                    else (before.tensions if rich_before and before is not None else ())
+                ),
+                refs=(
+                    refs
+                    if refs is not None
+                    else (before.refs if rich_before and before is not None else ())
+                ),
+                source_observed_at=(
+                    source_observed_at
+                    if source_observed_at is not None
+                    else (before.observed_at if rich_before and before is not None else None)
+                ),
+                recorded_at=(
+                    recorded_at
+                    if recorded_at is not None
+                    else (before.recorded_at if rich_before and before is not None else None)
+                ),
+                recheck_at=(
+                    recheck_at
+                    if recheck_at is not None
+                    else (before.recheck_at if rich_before and before is not None else None)
+                ),
+                history=(
+                    (
+                        *(before.history if rich_before and before is not None else ()),
+                        note,
+                    )
+                    if note is not None
+                    else (before.history if rich_before and before is not None else ())
+                ),
             )
             self._persist_with_event(
                 path=path,
@@ -704,9 +1848,15 @@ class Vault:
         summary: str,
         items: tuple[PortfolioItem, ...],
         direction_revision: str | None = None,
+        source_direction_updated_at: str | None = None,
+        refs: tuple[str, ...] | None = None,
+        source_observed_at: str | None = None,
+        recorded_at: str | None = None,
+        review_after: str | None = None,
+        note: str | None = None,
         observed_at: datetime | None = None,
     ) -> Portfolio:
-        """Author the complete open Portfolio with one exact CAS write."""
+        """Author Portfolio while carrying rich judgment and refreshing exact anchors."""
 
         path = self.root / "PORTFOLIO.md"
         clean_items = portfolio_items(items)
@@ -730,12 +1880,77 @@ class Vault:
                     )
                 timestamp = format_time(observed_at or datetime.now(UTC))
             direction = self._direction_for_portfolio(direction_revision)
-            self._validate_portfolio_items(clean_items, direction=direction)
+            rich_before = (
+                before is not None and before.format_version == PORTFOLIO_RICH_FORMAT_VERSION
+            )
+            rich_requested = any(
+                value is not None
+                for value in (
+                    source_direction_updated_at,
+                    refs,
+                    source_observed_at,
+                    recorded_at,
+                    review_after,
+                    note,
+                )
+            ) or any(
+                item.source_position is not None
+                or item.source_task_updated_at is not None
+                or item.source_thread_updated_at is not None
+                for item in clean_items
+            )
+            rich = rich_before or rich_requested
+            if rich:
+                if direction is None:
+                    raise ValidationError("Portfolio version 3 requires an authored Direction")
+                if (
+                    source_direction_updated_at is not None
+                    and source_direction_updated_at != direction.updated_at
+                ):
+                    raise ConflictError(
+                        "Portfolio Direction timestamp anchor changed; reload before writing"
+                    )
+            validated_items = self._validate_portfolio_items(
+                clean_items,
+                direction=direction,
+                refresh_source_anchors=rich,
+            )
+            if validated_items is not None:
+                clean_items = validated_items
             after = new_portfolio(
                 summary=summary,
                 items=clean_items,
                 direction_revision=direction.revision if direction is not None else None,
                 observed_at=parse_time(timestamp),
+                source_direction_updated_at=(direction.updated_at if rich and direction else None),
+                refs=(
+                    refs
+                    if refs is not None
+                    else (before.refs if rich_before and before is not None else ())
+                ),
+                source_observed_at=(
+                    source_observed_at
+                    if source_observed_at is not None
+                    else (before.observed_at if rich_before and before is not None else None)
+                ),
+                recorded_at=(
+                    recorded_at
+                    if recorded_at is not None
+                    else (before.recorded_at if rich_before and before is not None else None)
+                ),
+                review_after=(
+                    review_after
+                    if review_after is not None
+                    else (before.review_after if rich_before and before is not None else None)
+                ),
+                history=(
+                    (
+                        *(before.history if rich_before and before is not None else ()),
+                        note,
+                    )
+                    if note is not None
+                    else (before.history if rich_before and before is not None else ())
+                ),
             )
             self._persist_with_event(
                 path=path,
@@ -800,6 +2015,198 @@ class Vault:
 
     def context_pack(self, *, max_characters: int = 48_000) -> str:
         return _build_context_pack(self, max_characters=max_characters)
+
+    def resident_signal_status(self) -> dict[str, Any]:
+        """Return validated, content-free mailbox counts."""
+
+        return signal_dict(ResidentSignalStore(self.root).status())
+
+    def list_resident_signals(
+        self,
+        *,
+        include_acknowledged: bool = False,
+        limit: int = 500,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        return signal_view_dict(
+            ResidentSignalStore(self.root).list(
+                include_acknowledged=include_acknowledged,
+                limit=limit,
+                cursor=cursor,
+            )
+        )
+
+    def get_resident_signal(self, input_id: str) -> dict[str, Any]:
+        return signal_dict(ResidentSignalStore(self.root).get(input_id))
+
+    def append_resident_signal(
+        self,
+        *,
+        kind: str,
+        envelope: dict[str, object],
+        ref: str | None = None,
+        event_key: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        return signal_dict(
+            ResidentSignalStore(self.root).append(
+                kind=kind,
+                envelope=envelope,
+                ref=ref,
+                event_key=event_key,
+                observed_at=observed_at,
+            )
+        )
+
+    def append_canonical_signal(
+        self,
+        *,
+        record_ref: str,
+        change_type: str,
+        observed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Queue one content-free canonical record pointer for resident review."""
+
+        with exclusive_lock(self.state / "locks/global.lock"):
+            clean_record_ref = self._resolve_canonical_result_ref(record_ref)
+            return signal_dict(
+                ResidentSignalStore(self.root).append_canonical_change(
+                    record_ref=clean_record_ref,
+                    change_type=change_type,
+                    observed_at=observed_at,
+                )
+            )
+
+    def resolve_canonical_result_ref(self, value: str) -> str:
+        """Resolve one exact typed canonical record revision for a durable receipt."""
+
+        with exclusive_lock(self.state / "locks/global.lock"):
+            return self._resolve_canonical_result_ref(value)
+
+    def _resolve_canonical_result_ref(self, value: str) -> str:
+        try:
+            record_kind, pinned = value.split(":", 1)
+            identifier, expected_revision = pinned.rsplit("@", 1)
+        except (AttributeError, ValueError) as exc:
+            raise ValidationError(
+                "canonical result reference must name one typed record revision"
+            ) from exc
+        if SHA256_REVISION.fullmatch(expected_revision) is None:
+            raise ValidationError("canonical result reference must end in a SHA-256 revision")
+        record: Task | WorkThread | Entity | Direction | Portfolio
+        if record_kind == "task":
+            record = self.get_task(identifier)
+            canonical = f"task:{record.identifier}@{record.revision}"
+        elif record_kind == "thread":
+            record = self.get_thread(identifier)
+            canonical = f"{record.identifier}@{record.revision}"
+        elif record_kind == "entity":
+            record = self.get_entity(identifier)
+            canonical = f"entity:{record.identifier}@{record.revision}"
+        elif record_kind == "direction" and identifier == "current":
+            record = self.get_direction()
+            canonical = f"direction:current@{record.revision}"
+        elif record_kind == "portfolio" and identifier == "current":
+            record = self.get_portfolio()
+            canonical = f"portfolio:current@{record.revision}"
+        else:
+            raise ValidationError("canonical result record kind is unsupported")
+        if record.revision != expected_revision:
+            raise ConflictError("canonical result record changed; reload before acknowledging")
+        if canonical != value:
+            raise ValidationError("canonical result reference is not in its canonical form")
+        return canonical
+
+    def acknowledge_resident_signals(
+        self,
+        input_ids: tuple[str, ...],
+        *,
+        expected_revision: str,
+        consumer: str,
+        disposition: str,
+        result_refs: tuple[str, ...],
+        acknowledged_at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Acknowledge evidence only after one durable semantic disposition."""
+
+        when = acknowledged_at or datetime.now(UTC)
+        validated_result_refs: tuple[str, ...] | None = None
+
+        def guard(signal: ResidentSignal) -> None:
+            nonlocal validated_result_refs
+            if validated_result_refs is None:
+                validated_result_refs = tuple(
+                    self._resolve_canonical_result_ref(value) for value in result_refs
+                )
+            self._validate_resident_signal_disposition(
+                signal,
+                result_refs=validated_result_refs,
+                acknowledged_at=when,
+            )
+
+        with exclusive_lock(self.state / "locks/global.lock"):
+            acknowledgements = ResidentSignalStore(self.root).acknowledge(
+                input_ids,
+                expected_revision=expected_revision,
+                consumer=consumer,
+                disposition=disposition,
+                result_refs=result_refs,
+                precommit_guard=guard,
+                acknowledged_at=when,
+            )
+        return [signal_dict(item) for item in acknowledgements]
+
+    def compact_resident_signals(
+        self,
+        *,
+        retain_recent: int = 1_000,
+        observed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        return signal_dict(
+            ResidentSignalStore(self.root).compact(
+                retain_recent=retain_recent,
+                observed_at=observed_at,
+            )
+        )
+
+    def _validate_resident_signal_disposition(
+        self,
+        signal: ResidentSignal,
+        *,
+        result_refs: tuple[str, ...],
+        acknowledged_at: datetime,
+    ) -> None:
+        if signal.kind != "work-thread-recheck":
+            return
+        thread_identifier = signal.envelope.get("work_thread_id")
+        authored_recheck = signal.envelope.get("recheck_at")
+        authored_updated = signal.envelope.get("thread_updated_at")
+        if not all(
+            isinstance(value, str)
+            for value in (thread_identifier, authored_recheck, authored_updated)
+        ):
+            raise ValidationError("work-thread recheck signal is malformed")
+        assert isinstance(thread_identifier, str)
+        assert isinstance(authored_recheck, str)
+        assert isinstance(authored_updated, str)
+        thread = self.get_thread(thread_identifier)
+        exact_result_ref = f"{thread.identifier}@{thread.revision}"
+        if exact_result_ref not in result_refs:
+            raise ConflictError(
+                "work-thread recheck acknowledgement requires the current thread revision"
+            )
+        if thread.status in TERMINAL_THREAD_STATUSES:
+            return
+        current_recheck = thread.recheck_at
+        if (
+            current_recheck is None
+            or current_recheck == authored_recheck
+            or thread.updated_at == authored_updated
+            or parse_time(current_recheck) <= acknowledged_at.astimezone(UTC)
+        ):
+            raise ConflictError(
+                "work-thread recheck remains due; close it or author a new future horizon first"
+            )
 
     def get_source_snapshot(self) -> SourceSnapshot:
         """Read the portable source ledger, or one explicit absent revision."""
@@ -950,7 +2357,11 @@ class Vault:
         tool_binding: str | None = None,
         cursor: str | None = None,
         evidence_refs: tuple[str, ...] = (),
+        canonical_result_refs: tuple[str, ...] = (),
         error_code: str | None = None,
+        observed_at: datetime | None = None,
+        _before_commit: Callable[[SourceSnapshot], datetime] | None = None,
+        _after_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """CAS-record one AI-performed bounded read without provider content."""
 
@@ -964,6 +2375,7 @@ class Vault:
             exclusive_lock(self.state / "locks/global.lock"),
             exclusive_lock(self._record_lock("source", "selection")),
         ):
+            _ = tuple(self._resolve_canonical_result_ref(value) for value in canonical_result_refs)
             before = self.get_source_snapshot()
             self._expect(before.revision, expected_revision)
             persisted_tool_binding = tool_binding
@@ -976,6 +2388,9 @@ class Vault:
                 "tool binding",
             )
             host_id = local_host_id(create=result in {"success", "explicit_empty"})
+            effective_observed_at = (
+                _before_commit(before) if _before_commit is not None else observed_at
+            )
             after = record_source_observation(
                 before,
                 source_id=source_id,
@@ -991,6 +2406,7 @@ class Vault:
                     source_fingerprint(item, "source evidence reference") for item in evidence_refs
                 ),
                 error_code=error_code,
+                observed_at=effective_observed_at,
             )
             encoded = render_source_snapshot(after).encode("utf-8")
             previous = self._read_bytes(path, max_bytes=MAX_SOURCE_STATE_BYTES)
@@ -1004,6 +2420,8 @@ class Vault:
                 before_revision=before.revision,
                 after_revision=after.revision,
             )
+            if _after_commit is not None:
+                _after_commit(projected)
             return projected
 
     def doctor(self, *, repair: bool = False) -> DoctorResult:
@@ -1053,25 +2471,44 @@ class Vault:
                 metadata = os.lstat(path)
             except OSError:
                 metadata = None
-            repairable_temp = metadata is not None and stat.S_ISREG(metadata.st_mode)
+            try:
+                candidate_relative = path.relative_to(self.root)
+            except ValueError:
+                candidate_relative = None
+            ordinary_temp = (
+                metadata is not None
+                and stat.S_ISREG(metadata.st_mode)
+                and candidate_relative is not None
+            )
             message = (
-                "interrupted operation temporary file"
-                if repairable_temp
+                "interrupted operation temporary file retained for exact manual inspection; "
+                "doctor does not remove scan-discovered paths"
+                if ordinary_temp
                 else "retained recovery path; inspect it before removing that exact path"
             )
-            issues.append(DoctorIssue("orphan-temp", relative, message, repairable_temp))
-            if repair and repairable_temp:
-                try:
-                    current = os.lstat(path)
-                except OSError:
-                    continue
-                if (
-                    stat.S_ISREG(current.st_mode)
-                    and metadata is not None
-                    and (current.st_dev, current.st_ino) == (metadata.st_dev, metadata.st_ino)
-                ):
-                    path.unlink()
-                    repaired.append(relative)
+            issues.append(DoctorIssue("orphan-temp", relative, message, False))
+
+        transaction_paths: set[Path] = set()
+        if self.root.exists():
+            for pattern in (
+                ".*.seld-stage-*",
+                ".*.seld-quarantine-*",
+                ".*.seld-rollback-*",
+            ):
+                transaction_paths.update(self.root.rglob(pattern))
+        for path in sorted(transaction_paths):
+            try:
+                relative = portable_relative(path, self.root)
+            except ValueError:
+                relative = path.name
+            issues.append(
+                DoctorIssue(
+                    "orphan-storage-transaction",
+                    relative,
+                    "retained exact-mutation state; inspect the canonical leaf and this exact "
+                    "path before choosing either state",
+                )
+            )
 
         for name in ("MIND.md", "NOW.md"):
             try:
@@ -1101,6 +2538,45 @@ class Vault:
                 )
             except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
                 issues.append(DoctorIssue("invalid-sources", "SOURCES.md", str(exc)))
+
+        signal_counts = {"signals": 0, "signals_pending": 0}
+        try:
+            signal_status = ResidentSignalStore(self.root).status(verify_archive_history=True)
+            signal_counts = {
+                "signals": signal_status.inputs,
+                "signals_pending": signal_status.pending,
+            }
+        except (
+            ConflictError,
+            NotFoundError,
+            OSError,
+            UnicodeDecodeError,
+            ValidationError,
+        ) as exc:
+            issues.append(
+                DoctorIssue(
+                    "invalid-resident-signals",
+                    ".gsv/signals",
+                    str(exc),
+                )
+            )
+
+        operations_root = self.root / ".gsv/signals/operations"
+        if operations_root.exists() and not operations_root.is_symlink():
+            for path in sorted(operations_root.iterdir()):
+                try:
+                    metadata = os.lstat(path)
+                except OSError:
+                    continue
+                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                    issues.append(
+                        DoctorIssue(
+                            "orphan-signal-operation",
+                            portable_relative(path, self.root),
+                            "retained resident-signal compaction state; inspect the live queue, "
+                            "archive, and this operation directory before manual removal",
+                        )
+                    )
 
         records: dict[str, Record] = {}
         for kind, directory, parser in (
@@ -1179,29 +2655,71 @@ class Vault:
         journal = self.root / journal_relative
         try:
             with exclusive_lock(self.state / "locks/journal.lock"):
-                journal_issue, valid_bytes = self._journal_issue(journal)
-                if repair and journal_issue is not None and journal_issue.repairable:
-                    removed_bytes = journal.stat().st_size - valid_bytes
-                    with journal.open("r+b") as handle:
-                        handle.truncate(valid_bytes)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    repaired.append(journal_relative)
-                    journal_issue = DoctorIssue(
-                        "repaired-journal-tail",
+                store = active_pinned_path_root(self.root)
+                if store is not None:
+                    repaired_journal = False
+                    with store.open_regular_file_descriptor(
                         journal_relative,
-                        f"removed {removed_bytes} invalid trailing bytes after all complete "
-                        "journal records validated",
-                    )
+                        label="audit journal",
+                        writable=repair,
+                    ) as descriptor:
+                        before = os.fstat(descriptor)
+                        snapshot = (
+                            int(before.st_dev),
+                            int(before.st_ino),
+                            int(before.st_size),
+                            int(before.st_mtime_ns),
+                        )
+                        journal_issue, valid_bytes = self._journal_issue(
+                            journal,
+                            descriptor=descriptor,
+                        )
+                        current = os.fstat(descriptor)
+                        if (
+                            int(current.st_dev),
+                            int(current.st_ino),
+                            int(current.st_size),
+                            int(current.st_mtime_ns),
+                        ) != snapshot:
+                            raise ConflictError("audit journal changed while doctor validated it")
+                        if repair and journal_issue is not None and journal_issue.repairable:
+                            removed_bytes = int(current.st_size) - valid_bytes
+                            os.ftruncate(descriptor, valid_bytes)
+                            os.fsync(descriptor)
+                            repaired_journal = True
+                            journal_issue = DoctorIssue(
+                                "repaired-journal-tail",
+                                journal_relative,
+                                f"removed {removed_bytes} invalid trailing bytes after all "
+                                "complete journal records validated",
+                            )
+                    if repaired_journal:
+                        repaired.append(journal_relative)
+                else:
+                    journal_issue, valid_bytes = self._journal_issue(journal)
+                    if repair and journal_issue is not None and journal_issue.repairable:
+                        removed_bytes = journal.stat().st_size - valid_bytes
+                        with journal.open("r+b") as handle:
+                            handle.truncate(valid_bytes)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        repaired.append(journal_relative)
+                        journal_issue = DoctorIssue(
+                            "repaired-journal-tail",
+                            journal_relative,
+                            f"removed {removed_bytes} invalid trailing bytes after all complete "
+                            "journal records validated",
+                        )
                 if journal_issue is not None:
                     issues.append(journal_issue)
-        except (OSError, ConflictError) as exc:
+        except (OSError, ConflictError, ValidationError) as exc:
             issues.append(DoctorIssue("invalid-journal", journal_relative, str(exc)))
 
         counts = {
             "tasks": len(task_ids),
             "entities": len(entity_ids),
             "threads": sum(isinstance(item, WorkThread) for item in records.values()),
+            **signal_counts,
         }
         return DoctorResult(
             healthy=not [issue for issue in issues if not (repair and issue.path in repaired)],
@@ -1239,7 +2757,19 @@ class Vault:
         """Publish a validated record while the caller owns the global vault lock."""
 
         path = self._path(kind, record.identifier)
-        if path.exists():
+        store = active_pinned_path_root(self.root)
+        if store is not None:
+            existing = store.read_regular_file(
+                path.relative_to(self.root),
+                label="canonical vault file",
+                max_bytes=MAX_DOCUMENT_BYTES,
+                missing_ok=True,
+                retain=True,
+            )
+            exists = existing is not None
+        else:
+            exists = path.exists()
+        if exists:
             raise ConflictError(f"{kind} already exists: {record.identifier}")
         rendered = _render_record(record)
         self._persist_with_event(
@@ -1259,7 +2789,7 @@ class Vault:
         self._persist_with_event(
             path=path,
             content=rendered.encode("utf-8"),
-            previous=path.read_bytes(),
+            previous=self._read_bytes(path),
             operation=f"{kind}.update",
             identifier=before.identifier,
             before_revision=before.revision,
@@ -1277,6 +2807,138 @@ class Vault:
         before_revision: str | None,
         after_revision: str,
     ) -> None:
+        if not PINNED_PATH_ROOT_SUPPORTED:
+            self._persist_with_event_unpinned(
+                path=path,
+                content=content,
+                previous=previous,
+                operation=operation,
+                identifier=identifier,
+                before_revision=before_revision,
+                after_revision=after_revision,
+            )
+            return
+
+        self._assert_inside(path)
+        relative = path.relative_to(self.root)
+        binding = relative.parent if relative.parent != Path(".") else Path(".")
+        store = active_pinned_path_root(self.root)
+        owns_store = store is None
+        if store is None:
+            store = PinnedPathRoot(self.root)
+        if before_revision is not None and (
+            previous is None or sha256_bytes(previous) != before_revision
+        ):
+            if owns_store:
+                store.close()
+            raise ConflictError("record bytes changed after revision validation")
+        audit_committed = False
+        try:
+            current = store.read_regular_file(
+                relative,
+                label="canonical vault file",
+                max_bytes=MAX_DOCUMENT_BYTES,
+                missing_ok=True,
+                retain=True,
+            )
+            if current != previous:
+                raise ConflictError("canonical vault file changed before pinned publication")
+            try:
+                with (
+                    store.bind_directory(binding),
+                    store.watch_directory(".gsv"),
+                    store.watch_directory(".gsv/locks"),
+                    store.watch_directory("journal"),
+                    store.watch_regular_file(
+                        "journal/events.jsonl",
+                        label="audit journal",
+                    ),
+                ):
+                    try:
+                        store.replace_regular_file_if_exact(
+                            relative,
+                            expected=previous,
+                            replacement=content,
+                            label="canonical vault file",
+                            max_bytes=MAX_DOCUMENT_BYTES,
+                        )
+                    except DurablePublishError as exc:
+                        if exc.outcome is PublishOutcome.UNPUBLISHED:
+                            raise PersistenceError(
+                                f"{operation} was not committed because its canonical file "
+                                "could not be published"
+                            ) from exc
+                        raise DegradedIntegrityError(
+                            f"{operation} canonical publication has an unknown or unaudited "
+                            "state. Run gsv doctor before retrying"
+                        ) from exc
+                    try:
+                        self._event(
+                            operation,
+                            identifier,
+                            before_revision,
+                            after_revision,
+                            store=store,
+                        )
+                    except (DegradedIntegrityError, MutationCommittedError):
+                        raise
+                    except Exception as event_error:
+                        try:
+                            store.rollback_regular_file_if_exact(
+                                relative,
+                                expected=content,
+                                replacement=previous,
+                                label="canonical vault file",
+                                max_bytes=MAX_DOCUMENT_BYTES,
+                            )
+                        except Exception as rollback_error:
+                            raise DegradedIntegrityError(
+                                f"could not restore {relative.as_posix()} after its audit event "
+                                "failed; the pinned canonical or journal state may have changed. "
+                                "Run gsv doctor before retrying"
+                            ) from rollback_error
+                        try:
+                            store.validate_bound_directory()
+                        except ValidationError as binding_error:
+                            raise DegradedIntegrityError(
+                                f"{relative.as_posix()} was restored in its pinned tree after "
+                                "audit failure, but its canonical parent was substituted; the "
+                                "foreign tree was left untouched. Run gsv doctor before retrying"
+                            ) from binding_error
+                        raise PersistenceError(
+                            f"{operation} was not committed because its audit event could not be "
+                            "persisted; the prior pinned file state was restored"
+                        ) from event_error
+                    audit_committed = True
+                    mark_active_pinned_transaction_committed(self.root)
+                    store.validate_bound_directory()
+            except (OSError, ValidationError) as exc:
+                if audit_committed:
+                    raise MutationCommittedError(
+                        f"{operation} and its audit event were committed, but a pinned "
+                        "canonical or journal path was substituted. Reload the record before "
+                        "any retry"
+                    ) from exc
+                raise PersistenceError(
+                    f"{operation} was not committed because a pinned storage path changed identity"
+                ) from exc
+        finally:
+            if owns_store:
+                store.close()
+
+    def _persist_with_event_unpinned(
+        self,
+        *,
+        path: Path,
+        content: bytes,
+        previous: bytes | None,
+        operation: str,
+        identifier: str,
+        before_revision: str | None,
+        after_revision: str,
+    ) -> None:
+        """Retain the existing portability path where pinned dir-fds are unavailable."""
+
         atomic_write(path, content)
         try:
             self._event(operation, identifier, before_revision, after_revision)
@@ -1345,10 +3007,33 @@ class Vault:
 
     def _read_bytes(self, path: Path, *, max_bytes: int = 256 * 1024) -> bytes:
         self._assert_inside(path)
-        if not os.path.lexists(path):
+        if not PINNED_PATH_ROOT_SUPPORTED:
+            if not os.path.lexists(path):
+                relative = path.relative_to(self.root).as_posix()
+                raise NotFoundError(f"file does not exist: {relative}")
+            return read_regular_file(path, label="vault file", max_bytes=max_bytes)
+        if not self.root.exists():
             relative = path.relative_to(self.root).as_posix()
             raise NotFoundError(f"file does not exist: {relative}")
-        return read_regular_file(path, label="vault file", max_bytes=max_bytes)
+        store = active_pinned_path_root(self.root)
+        owns_store = store is None
+        if store is None:
+            store = PinnedPathRoot(self.root)
+        try:
+            content = store.read_regular_file(
+                path.relative_to(self.root),
+                label="vault file",
+                max_bytes=max_bytes,
+                missing_ok=True,
+                retain=not owns_store,
+            )
+        finally:
+            if owns_store:
+                store.close()
+        if content is None:
+            relative = path.relative_to(self.root).as_posix()
+            raise NotFoundError(f"file does not exist: {relative}")
+        return content
 
     def _document_path(self, name: str) -> Path:
         upper = name.strip().upper()
@@ -1360,7 +3045,15 @@ class Vault:
         path = self.state / "manifest.json"
         return parse_vault_manifest(self._read_bytes(path, max_bytes=64 * 1024))
 
-    def _event(self, operation: str, identifier: str, before: str | None, after: str) -> None:
+    def _event(
+        self,
+        operation: str,
+        identifier: str,
+        before: str | None,
+        after: str,
+        *,
+        store: PinnedPathRoot | None = None,
+    ) -> None:
         event = {
             "after_revision": after,
             "before_revision": before,
@@ -1371,9 +3064,21 @@ class Vault:
         }
         committed = False
         try:
-            with exclusive_lock(self.state / "locks/journal.lock"):
+            lock = (
+                store.exclusive_file_lock(".gsv/locks/journal.lock")
+                if store is not None
+                else exclusive_lock(self.state / "locks/journal.lock")
+            )
+            with lock:
                 try:
-                    append_durable(self.root / "journal/events.jsonl", _json_line(event))
+                    if store is not None:
+                        store.append_durable(
+                            "journal/events.jsonl",
+                            _json_line(event),
+                            label="audit journal",
+                        )
+                    else:
+                        append_durable(self.root / "journal/events.jsonl", _json_line(event))
                 except DurableAppendError as exc:
                     if exc.outcome is AppendOutcome.COMMITTED:
                         raise MutationCommittedError(
@@ -1397,9 +3102,15 @@ class Vault:
                 ) from exc
             raise
 
-    def _journal_issue(self, path: Path) -> tuple[DoctorIssue | None, int]:
+    def _journal_issue(
+        self,
+        path: Path,
+        *,
+        descriptor: int | None = None,
+    ) -> tuple[DoctorIssue | None, int]:
         valid_bytes = 0
-        with path.open("rb") as handle:
+        stream = os.fdopen(os.dup(descriptor), "rb") if descriptor is not None else path.open("rb")
+        with stream as handle:
             number = 0
             while True:
                 line = handle.readline(MAX_JOURNAL_LINE_BYTES + 1)
@@ -1477,17 +3188,425 @@ class Vault:
                 "record changed since it was read; reload it and retry deliberately"
             )
 
+    def _resolved_task_entity_links(
+        self,
+        values: tuple[TaskEntityLink, ...],
+        *,
+        allow_unavailable: bool = False,
+    ) -> tuple[TaskEntityLink, ...]:
+        resolved: list[TaskEntityLink] = []
+        for link in task_entity_links(values):
+            try:
+                entity = self.resolve_entity(link.entity_id)
+            except (NotFoundError, ValidationError):
+                if allow_unavailable:
+                    resolved.append(link)
+                    continue
+                raise
+            if entity.status == "superseded":
+                raise ValidationError(f"task entity link target is superseded: {entity.identifier}")
+            resolved.append(TaskEntityLink(link.role, entity.identifier))
+        return task_entity_links(resolved)
+
+    def _resolved_entity_relationships(
+        self,
+        values: tuple[EntityRelationship, ...],
+        *,
+        allow_unavailable: bool = False,
+    ) -> tuple[EntityRelationship, ...]:
+        resolved: list[EntityRelationship] = []
+        for relationship in entity_relationships(values):
+            try:
+                target = self.resolve_entity(relationship.target)
+            except (NotFoundError, ValidationError):
+                if allow_unavailable:
+                    resolved.append(relationship)
+                    continue
+                raise
+            if relationship.status == "current" and target.status == "superseded":
+                raise ValidationError(
+                    f"current relationship target is superseded: {target.identifier}"
+                )
+            resolved.append(replace(relationship, target=target.identifier))
+        return entity_relationships(resolved)
+
+    def _resolved_thread_entity_links(
+        self,
+        values: tuple[WorkThreadEntityLink, ...],
+        *,
+        allow_unavailable: bool = False,
+    ) -> tuple[WorkThreadEntityLink, ...]:
+        resolved: list[WorkThreadEntityLink] = []
+        by_identifier: dict[str, WorkThreadEntityLink] = {}
+        for link in thread_entity_links(values):
+            try:
+                target = self.resolve_entity(link.entity_id)
+            except (NotFoundError, ValidationError):
+                if allow_unavailable:
+                    target_id = link.entity_id
+                else:
+                    raise
+            else:
+                if target.status == "superseded":
+                    raise ValidationError(
+                        f"WorkThread entity link target is superseded: {target.identifier}"
+                    )
+                target_id = target.identifier
+            candidate = WorkThreadEntityLink(link.role, target_id)
+            existing = by_identifier.get(target_id)
+            if existing is not None and existing.role != candidate.role:
+                raise ValidationError(
+                    "entity redirects collapse distinct WorkThread roles; choose one role first"
+                )
+            if existing is None:
+                by_identifier[target_id] = candidate
+                resolved.append(candidate)
+        return thread_entity_links(resolved)
+
+    def _validate_task_supersession(self, candidate: Task) -> None:
+        if candidate.superseded_by is None:
+            return
+        if candidate.superseded_by == candidate.identifier:
+            raise ValidationError("a task cannot supersede itself")
+        current = self.get_task(candidate.superseded_by)
+        seen = {candidate.identifier}
+        while True:
+            if current.identifier in seen:
+                raise ValidationError("superseding task link would create a cycle")
+            seen.add(current.identifier)
+            if current.superseded_by is None:
+                return
+            current = self.get_task(current.superseded_by)
+
+    def _active_hand_transfer_owner(
+        self,
+        active_thread_id: str | None,
+        *,
+        owner: str,
+    ) -> Task | None:
+        if active_thread_id is None:
+            return None
+        matches = tuple(
+            task
+            for task in self.list_tasks()
+            if task.identifier != owner
+            and task.status not in TERMINAL_TASK_STATUSES
+            and task.active_thread_id == active_thread_id
+        )
+        if len(matches) > 1:
+            raise ValidationError(
+                "active Codex hand has multiple prior owners; repair those exact tasks first"
+            )
+        if not matches:
+            return None
+        previous = matches[0]
+        if previous.status == "doing":
+            raise ValidationError(
+                "active Codex hand already belongs to doing task "
+                f"{previous.identifier}; "
+                "move that exact task out of doing or clear its hand before transfer"
+            )
+        return previous
+
+    def _released_hand_owner(
+        self,
+        before: Task,
+        *,
+        new_owner: str,
+        timestamp: str,
+    ) -> Task:
+        assert before.active_thread_id is not None
+        episodes = codex_episodes((*before.codex_episode_ids, before.active_thread_id))
+        candidate = replace(
+            before,
+            active_thread_id=None,
+            codex_episode_ids=episodes,
+            state_changed_at=before.state_changed_at or before.updated_at,
+            history=_append_record_history(
+                before.history,
+                timestamp,
+                (f"active Codex hand transferred to task {new_owner}; episode retained",),
+                None,
+            ),
+            updated_at=timestamp,
+            revision="",
+        )
+        return parse_task(render_task(candidate))
+
+    def _assert_entity_writable(self, record: Entity, *, target: bool = False) -> None:
+        if record.status in {"merged", "superseded"}:
+            label = "target entity" if target else "entity"
+            raise ValidationError(
+                f"{label} is {record.status}; resolve or choose its current identity"
+            )
+
+    def _assert_entity_merge_role_safe(self, source_id: str, target_id: str) -> None:
+        for thread in self.list_threads():
+            source_links: list[WorkThreadEntityLink] = []
+            target_links: list[WorkThreadEntityLink] = []
+            for link in thread.entity_links:
+                resolved = self.resolve_entity(link.entity_id).identifier
+                if resolved == source_id:
+                    source_links.append(link)
+                elif resolved == target_id:
+                    target_links.append(link)
+            if not source_links or not target_links:
+                continue
+            if len({link.role for link in (*source_links, *target_links)}) == 1:
+                continue
+            raise ValidationError(
+                "entity merge would collapse distinct WorkThread roles in "
+                f"{thread.identifier}; choose one surviving role before merging"
+            )
+
+    def _merge_absorptions(
+        self,
+        target: Entity,
+        inherited: tuple[EntityMergeAbsorption, ...],
+        direct: EntityMergeAbsorption,
+    ) -> tuple[EntityMergeAbsorption, ...]:
+        result = list(target.merge_absorptions)
+        by_source = {item.source_id: item for item in result}
+        for item in (*inherited, direct):
+            if item.source_id == target.identifier:
+                raise ValidationError("entity merge absorption would create an identity cycle")
+            existing = by_source.get(item.source_id)
+            if existing is not None and existing != item:
+                raise ValidationError(
+                    "merge target has conflicting structured recovery state; repair is required"
+                )
+            if existing is None:
+                result.append(item)
+                by_source[item.source_id] = item
+        return entity_merge_absorptions(result)
+
+    def _entity_redirect_path_contains(self, identifier: str, wanted_id: str) -> bool:
+        current = canonical_id(identifier, "entity ID")
+        seen: set[str] = set()
+        for _ in range(17):
+            if current == wanted_id:
+                return True
+            if current in seen:
+                raise ValidationError("entity redirect cycle detected")
+            seen.add(current)
+            record = self.get_entity(current)
+            if record.status != "merged" or record.merged_into is None:
+                return False
+            current = record.merged_into
+        raise ValidationError("entity redirect chain is too long")
+
+    def _relationships_after_entity_merge(
+        self,
+        *,
+        source: Entity,
+        target: Entity,
+        merged_at: str,
+    ) -> tuple[EntityRelationship, ...]:
+        migrated = [
+            replace(
+                relationship,
+                status=relationship_status("historical"),
+                valid_to=relationship.valid_to or merged_at,
+            )
+            if relationship.status == "current"
+            and self._entity_redirect_path_contains(relationship.target, source.identifier)
+            else relationship
+            for relationship in target.relationships
+        ]
+        for relationship in source.relationships:
+            if relationship.status != "current":
+                continue
+            relationship_target = self.resolve_entity(relationship.target)
+            if relationship_target.status == "superseded":
+                raise ValidationError(
+                    "merge source has a current relationship to a superseded entity"
+                )
+            if relationship_target.identifier == target.identifier:
+                continue
+            existing_index = next(
+                (
+                    index
+                    for index, existing in enumerate(migrated)
+                    if existing.status == "current"
+                    and existing.predicate == relationship.predicate
+                    and self.resolve_entity(existing.target).identifier
+                    == relationship_target.identifier
+                ),
+                None,
+            )
+            if existing_index is None:
+                migrated.append(
+                    replace(
+                        relationship,
+                        target=relationship_target.identifier,
+                        recorded_at=merged_at,
+                        valid_to=None,
+                    )
+                )
+                continue
+            existing = migrated[existing_index]
+            if existing.valid_from != relationship.valid_from:
+                raise ValidationError(
+                    "merge has conflicting relationship validity; reconcile it first"
+                )
+            migrated[existing_index] = replace(
+                existing,
+                refs=references((*existing.refs, *relationship.refs)),
+            )
+        return entity_relationships(migrated)
+
+    def _updated_thread_task_links(
+        self,
+        before: WorkThread,
+        *,
+        task_ids: tuple[str, ...] | None,
+        task_links: tuple[WorkThreadTaskLink, ...] | None,
+        add_task_links: tuple[WorkThreadTaskLink, ...],
+        remove_task_ids: tuple[str, ...],
+    ) -> tuple[WorkThreadTaskLink, ...]:
+        removals = task_ids_value(remove_task_ids)
+        additions = thread_task_links(add_task_links)
+        if {link.task_id for link in additions} & set(removals):
+            raise ValidationError("cannot add and remove the same task membership")
+        if task_links is not None:
+            base = thread_task_links(task_links)
+        elif task_ids is not None:
+            wanted = task_ids_value(task_ids)
+            existing = {link.task_id: link for link in before.task_links}
+            next_position = max((link.position for link in before.task_links), default=0)
+            values: list[WorkThreadTaskLink] = []
+            for identifier in wanted:
+                link = existing.get(identifier)
+                if link is None:
+                    next_position += 1
+                    link = WorkThreadTaskLink(next_position, identifier)
+                values.append(link)
+            base = thread_task_links(values)
+        else:
+            base = before.task_links
+        additions_by_id = {link.task_id: link for link in additions}
+        remaining = tuple(
+            link
+            for link in base
+            if link.task_id not in set(removals) and link.task_id not in additions_by_id
+        )
+        return thread_task_links((*remaining, *additions_by_id.values()))
+
+    def _updated_thread_entity_links(
+        self,
+        before: WorkThread,
+        *,
+        entity_ids: tuple[str, ...] | None,
+        entity_links: tuple[WorkThreadEntityLink, ...] | None,
+        add_entity_links: tuple[WorkThreadEntityLink, ...],
+        remove_entity_links: tuple[WorkThreadEntityLink, ...],
+    ) -> tuple[WorkThreadEntityLink, ...]:
+        removals = self._resolved_thread_entity_links(
+            thread_entity_links(remove_entity_links), allow_unavailable=True
+        )
+        additions = self._resolved_thread_entity_links(thread_entity_links(add_entity_links))
+        if set(additions) & set(removals):
+            raise ValidationError("cannot add and remove the same entity link")
+        if entity_links is not None:
+            base = self._resolved_thread_entity_links(thread_entity_links(entity_links))
+        elif entity_ids is not None:
+            wanted = tuple(
+                self.resolve_entity(value).identifier for value in entity_ids_value(entity_ids)
+            )
+            existing = {
+                link.entity_id: link
+                for link in self._resolved_thread_entity_links(
+                    before.entity_links, allow_unavailable=True
+                )
+            }
+            base = thread_entity_links(
+                tuple(
+                    existing.get(identifier, WorkThreadEntityLink(None, identifier))
+                    for identifier in wanted
+                )
+            )
+        else:
+            base = self._resolved_thread_entity_links(before.entity_links, allow_unavailable=True)
+        removal_set = set(removals)
+        additions_by_id = {link.entity_id: link for link in additions}
+        remaining = tuple(
+            link
+            for link in base
+            if link not in removal_set and link.entity_id not in additions_by_id
+        )
+        return thread_entity_links((*remaining, *additions_by_id.values()))
+
+    def _merge_thread_entity_links(
+        self,
+        target: tuple[WorkThreadEntityLink, ...],
+        incoming: tuple[WorkThreadEntityLink, ...],
+    ) -> tuple[WorkThreadEntityLink, ...]:
+        result = list(target)
+        by_id = {link.entity_id: link for link in result}
+        for link in incoming:
+            existing = by_id.get(link.entity_id)
+            if existing is not None and existing.role != link.role:
+                raise ValidationError(
+                    "WorkThread merge has conflicting entity roles; choose one explicitly first"
+                )
+            if existing is None:
+                result.append(link)
+                by_id[link.entity_id] = link
+        return thread_entity_links(result)
+
+    def _merge_thread_task_links(
+        self,
+        target: tuple[WorkThreadTaskLink, ...],
+        incoming: tuple[WorkThreadTaskLink, ...],
+    ) -> tuple[WorkThreadTaskLink, ...]:
+        incoming_by_id = {link.task_id: link for link in incoming}
+        remaining = tuple(link for link in target if link.task_id not in incoming_by_id)
+        return thread_task_links((*remaining, *incoming_by_id.values()))
+
+    def _validate_thread_horizon(self, thread: WorkThread) -> None:
+        rich = bool(thread.history) or thread.observed_at is not None
+        if not rich:
+            return
+        if thread.status in {"waiting", "dormant"} and thread.recheck_at is None:
+            raise ValidationError(
+                f"{thread.status} WorkThread requires an authored future recheck time"
+            )
+        if (
+            thread.status not in TERMINAL_THREAD_STATUSES
+            and thread.recheck_at is not None
+            and parse_time(thread.recheck_at) <= parse_time(thread.updated_at)
+        ):
+            raise ValidationError("WorkThread recheck time must be later than its updated time")
+
+    def _validate_thread_redirect(self, thread: WorkThread) -> None:
+        if thread.superseded_by is None:
+            return
+        current = self.get_thread(thread.superseded_by)
+        seen = {thread.identifier}
+        while True:
+            if current.identifier in seen:
+                raise ValidationError("WorkThread redirect would create a cycle")
+            seen.add(current.identifier)
+            if current.superseded_by is None:
+                return
+            current = self.get_thread(current.superseded_by)
+
     def _validate_relations(self, task_ids: tuple[str, ...], entity_ids: tuple[str, ...]) -> None:
         for identifier in task_ids:
             self.get_task(identifier)
         for identifier in entity_ids:
-            self.get_entity(identifier)
+            entity = self.resolve_entity(identifier)
+            if entity.status == "superseded":
+                raise ValidationError(f"related entity is superseded: {entity.identifier}")
 
     def _validate_thread_focus(
         self, thread: WorkThread, *, allow_unfocused_review: bool = False
     ) -> None:
         if thread.focus_task_id is None:
-            if thread.identifier == REVIEW_WORK_THREAD_ID and thread.status != "closed":
+            if (
+                thread.identifier == REVIEW_WORK_THREAD_ID
+                and thread.status not in TERMINAL_THREAD_STATUSES
+            ):
                 members = [self.get_task(identifier) for identifier in thread.task_ids]
                 scoped = [
                     task
@@ -1524,7 +3643,10 @@ class Vault:
         blockers = [
             thread.identifier
             for thread in self.list_threads()
-            if thread.status != "closed" and thread.focus_task_id == task_identifier
+            if (
+                thread.status not in TERMINAL_THREAD_STATUSES
+                and thread.focus_task_id == task_identifier
+            )
         ]
         if blockers:
             raise ValidationError(
@@ -1532,7 +3654,12 @@ class Vault:
                 + ", ".join(blockers)
             )
 
-    def _validate_active_hand_owner(self, candidate: Task) -> None:
+    def _validate_active_hand_owner(
+        self,
+        candidate: Task,
+        *,
+        ignored_task_ids: tuple[str, ...] = (),
+    ) -> None:
         """Keep one live durable outcome per exact Codex hand.
 
         The caller owns the vault-wide lock.  This is a coordination invariant,
@@ -1546,6 +3673,7 @@ class Vault:
             task.identifier
             for task in self.list_tasks()
             if task.identifier != candidate.identifier
+            and task.identifier not in set(ignored_task_ids)
             and task.status not in TERMINAL_TASK_STATUSES
             and task.active_thread_id == candidate.active_thread_id
         )
@@ -1578,7 +3706,8 @@ class Vault:
         items: tuple[PortfolioItem, ...],
         *,
         direction: Direction | None,
-    ) -> None:
+        refresh_source_anchors: bool = False,
+    ) -> tuple[PortfolioItem, ...]:
         tasks = self.list_tasks()
         threads = self.list_threads()
         review_session_id: str | None = None
@@ -1586,7 +3715,7 @@ class Vault:
             (thread for thread in threads if thread.identifier == REVIEW_WORK_THREAD_ID),
             None,
         )
-        if review_thread is not None and review_thread.status != "closed":
+        if review_thread is not None and review_thread.status not in TERMINAL_THREAD_STATUSES:
             sessions = [
                 task
                 for task in tasks
@@ -1630,15 +3759,27 @@ class Vault:
             )
         owners_by_task: dict[str, list[WorkThread]] = {}
         for thread in threads:
-            if thread.identifier == REVIEW_WORK_THREAD_ID or thread.status == "closed":
+            if (
+                thread.identifier == REVIEW_WORK_THREAD_ID
+                or thread.status in TERMINAL_THREAD_STATUSES
+            ):
                 continue
             for identifier in thread.task_ids:
                 owners_by_task.setdefault(identifier, []).append(thread)
-        for item in items:
+        canonical_items: list[PortfolioItem] = []
+        for position, item in enumerate(items, 1):
             task = open_tasks[item.task_id]
             if item.task_revision != task.revision:
                 raise ConflictError(
                     f"Portfolio task anchor changed for {item.task_id}; reload before writing"
+                )
+            if (
+                item.source_task_updated_at is not None
+                and item.source_task_updated_at != task.updated_at
+            ):
+                raise ConflictError(
+                    f"Portfolio task timestamp anchor changed for {item.task_id}; "
+                    "reload before writing"
                 )
             owners = owners_by_task.get(item.task_id, [])
             if len(owners) > 1:
@@ -1651,6 +3792,8 @@ class Vault:
                     raise ValidationError(
                         f"Portfolio task {item.task_id} is not owned by a current WorkThread"
                     )
+                if item.source_thread_updated_at is not None:
+                    raise ValidationError(f"Portfolio task {item.task_id} has no source WorkThread")
             elif item.work_thread_id != owner.identifier:
                 raise ValidationError(
                     f"Portfolio item must anchor its exact owning WorkThread: {item.task_id}"
@@ -1660,29 +3803,53 @@ class Vault:
                     f"Portfolio work-thread anchor changed for {item.task_id}; "
                     "reload before writing"
                 )
+            elif (
+                item.source_thread_updated_at is not None
+                and item.source_thread_updated_at != owner.updated_at
+            ):
+                raise ConflictError(
+                    f"Portfolio WorkThread timestamp anchor changed for {item.task_id}; "
+                    "reload before writing"
+                )
             if direction is None:
                 if item.direction_aim_ids or item.unaligned_reason is not None:
                     raise ValidationError("Portfolio aim alignment requires an authored Direction")
-                continue
-            known_aims = {aim.identifier for aim in direction.aims}
-            if item.direction_aim_ids:
-                unknown = next(
-                    (
-                        identifier
-                        for identifier in item.direction_aim_ids
-                        if identifier not in known_aims
-                    ),
-                    None,
-                )
-                if unknown is not None:
-                    raise ValidationError(
-                        f"Portfolio item names unknown Direction aim: {item.task_id} -> {unknown}"
+            else:
+                known_aims = {aim.identifier for aim in direction.aims}
+                if item.direction_aim_ids:
+                    unknown = next(
+                        (
+                            identifier
+                            for identifier in item.direction_aim_ids
+                            if identifier not in known_aims
+                        ),
+                        None,
                     )
-            elif item.unaligned_reason is None:
-                raise ValidationError(
-                    "Portfolio item requires exact Direction aim IDs or an explicit "
-                    f"unaligned reason: {item.task_id}"
+                    if unknown is not None:
+                        raise ValidationError(
+                            "Portfolio item names unknown Direction aim: "
+                            f"{item.task_id} -> {unknown}"
+                        )
+                elif item.unaligned_reason is None:
+                    raise ValidationError(
+                        "Portfolio item requires exact Direction aim IDs or an explicit "
+                        f"unaligned reason: {item.task_id}"
+                    )
+            canonical_items.append(
+                replace(
+                    item,
+                    source_position=(
+                        item.source_position
+                        if refresh_source_anchors and item.source_position is not None
+                        else (position if refresh_source_anchors else None)
+                    ),
+                    source_task_updated_at=(task.updated_at if refresh_source_anchors else None),
+                    source_thread_updated_at=(
+                        owner.updated_at if refresh_source_anchors and owner is not None else None
+                    ),
                 )
+            )
+        return tuple(canonical_items)
 
     def _assert_inside(self, path: Path) -> None:
         try:
@@ -1705,6 +3872,58 @@ def doctor_dict(result: DoctorResult) -> dict[str, Any]:
         "vault": result.vault,
         "vault_id": result.vault_id,
     }
+
+
+def _exclusive_choice(value: object | None, clear: bool, label: str) -> None:
+    if value is not None and clear:
+        raise ValidationError(f"choose a {label} value or clear it")
+
+
+def _next_record_timestamp(
+    records: tuple[Task | Entity | WorkThread, ...],
+    observed_at: datetime | None,
+) -> str:
+    candidate = observed_at or datetime.now(UTC)
+    floor = max((parse_time(record.updated_at) for record in records), default=candidate)
+    if candidate <= floor:
+        candidate = floor + timedelta(microseconds=1)
+    return format_time(candidate)
+
+
+def _changed_fields(
+    values: tuple[tuple[str, object, object], ...],
+) -> tuple[str, ...]:
+    changes: list[str] = []
+    for label, before, after in values:
+        if before == after:
+            continue
+        if label == "status":
+            changes.append(f"status changed from {before} to {after}")
+        elif after is None:
+            changes.append(f"{label} cleared")
+        elif before is None:
+            changes.append(f"{label} set")
+        else:
+            changes.append(f"{label} changed")
+    return tuple(changes)
+
+
+def _append_record_history(
+    history: tuple[str, ...],
+    timestamp: str,
+    changes: tuple[str, ...],
+    note: str | None,
+) -> tuple[str, ...]:
+    clean_note = optional_line(note, "history note", 500)
+    parts = list(changes)
+    if clean_note is not None:
+        parts.append(clean_note.rstrip(".?!"))
+    if not parts:
+        parts.append("record annotated")
+    detail = "; ".join(parts)
+    if detail[-1] not in ".?!":
+        detail += "."
+    return history_entries((*history, f"{stored_time(timestamp, 'history timestamp')} — {detail}"))
 
 
 def _render_record(record: Record) -> str:

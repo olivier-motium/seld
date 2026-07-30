@@ -14,13 +14,18 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from ctypes import wintypes
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from continuity_kernel.errors import ConflictError, ValidationError
+from continuity_kernel.errors import (
+    ConflictError,
+    MutationCommittedError,
+    ValidationError,
+)
 
 
 class _PosixLock(Protocol):
@@ -67,6 +72,15 @@ class _DirectoryBinding:
     depth: int = 1
 
 
+@dataclass
+class _RegularFileWatch:
+    parts: tuple[str, ...]
+    parent_descriptor: int
+    descriptor: int
+    identity: tuple[int, int]
+    depth: int = 1
+
+
 class AppendOutcome(StrEnum):
     RESTORED = "restored"
     COMMITTED = "committed"
@@ -81,6 +95,10 @@ class DurableAppendError(OSError):
     def __init__(self, message: str, *, outcome: AppendOutcome):
         super().__init__(message)
         self.outcome = outcome
+
+
+class _PinnedLockTeardownError(ValidationError):
+    """A lock validated on entry but failed validation or cleanup after its body."""
 
 
 class PublishOutcome(StrEnum):
@@ -113,6 +131,7 @@ class RegularFileSnapshot:
     inode: int
     size: int
     modified_ns: int
+    mode: int
 
 
 def _snapshot(metadata: os.stat_result) -> RegularFileSnapshot:
@@ -121,6 +140,7 @@ def _snapshot(metadata: os.stat_result) -> RegularFileSnapshot:
         inode=int(metadata.st_ino),
         size=int(metadata.st_size),
         modified_ns=int(metadata.st_mtime_ns),
+        mode=int(metadata.st_mode),
     )
 
 
@@ -199,6 +219,10 @@ class PinnedPathRoot:
         self._root_descriptor = root_descriptor
         self._root_identity = (int(metadata.st_dev), int(metadata.st_ino))
         self._directory_binding: _DirectoryBinding | None = None
+        self._directory_watches: dict[tuple[str, ...], _DirectoryBinding] = {}
+        self._file_watches: dict[tuple[str, ...], _RegularFileWatch] = {}
+        self._retained_directories: dict[tuple[str, ...], _DirectoryBinding] = {}
+        self._retained_files: dict[tuple[str, ...], _RegularFileWatch] = {}
         try:
             self._validate_root_identity()
         except Exception:
@@ -206,8 +230,18 @@ class PinnedPathRoot:
             raise
 
     def close(self) -> None:
-        if self._directory_binding is not None:
+        if self._directory_binding is not None or self._directory_watches or self._file_watches:
             raise ValidationError("cannot close pinned local storage with an active binding")
+        for watch in self._retained_files.values():
+            with suppress(OSError):
+                os.close(watch.descriptor)
+            with suppress(OSError):
+                os.close(watch.parent_descriptor)
+        self._retained_files.clear()
+        for binding in self._retained_directories.values():
+            with suppress(OSError):
+                os.close(binding.descriptor)
+        self._retained_directories.clear()
         descriptor = self._root_descriptor
         self._root_descriptor = -1
         if descriptor >= 0:
@@ -310,6 +344,53 @@ class PinnedPathRoot:
         finally:
             os.close(descriptor)
 
+    def list_directory_entry_names(
+        self,
+        relative: Path | str,
+        *,
+        max_entries: int,
+        suffix: str | None = None,
+    ) -> tuple[str, ...]:
+        """List bounded names through a pinned descendant directory descriptor."""
+
+        if not isinstance(max_entries, int) or isinstance(max_entries, bool) or max_entries <= 0:
+            raise ValidationError("directory entry list bound must be a positive integer")
+        if suffix is not None and (not suffix or "/" in suffix or "\\" in suffix):
+            raise ValidationError("directory entry suffix must be one non-empty filename suffix")
+        parts = _relative_parts(relative)
+        self._validate_root_identity()
+        try:
+            descriptor = self._open_directory(parts)
+        except OSError as exc:
+            raise ValidationError(
+                f"could not open directory beneath the pinned root: {self.root}: {exc}"
+            ) from exc
+        try:
+            self._validate_directory_path(parts, descriptor)
+            names: list[str] = []
+            seen = 0
+            try:
+                with os.scandir(descriptor) as entries:
+                    for entry in entries:
+                        seen += 1
+                        if seen > max_entries:
+                            raise ValidationError(
+                                "directory contains more entries than the supported bound"
+                            )
+                        if suffix is not None and not entry.name.endswith(suffix):
+                            continue
+                        names.append(entry.name)
+            except ValidationError:
+                raise
+            except OSError as exc:
+                raise ValidationError(
+                    f"could not list directory entries beneath the pinned root: {self.root}: {exc}"
+                ) from exc
+            self._validate_directory_path(parts, descriptor)
+            return tuple(sorted(names))
+        finally:
+            os.close(descriptor)
+
     def ensure_directory(self, relative: Path | str, *, mode: int = 0o700) -> None:
         parts = _relative_parts(relative)
         self._validate_root_identity()
@@ -334,6 +415,7 @@ class PinnedPathRoot:
         label: str,
         max_bytes: int,
         missing_ok: bool = False,
+        retain: bool = False,
     ) -> bytes | None:
         parts = _relative_parts(relative)
         parent_parts = parts[:-1]
@@ -347,15 +429,29 @@ class PinnedPathRoot:
             raise ValidationError(f"{label} is missing beneath the pinned root") from None
         descriptor = -1
         try:
+            retained = self._retained_files.get(parts)
+            if retained is not None:
+                self._validate_regular_file_watch(retained, label=label)
             try:
                 listed = os.stat(name, dir_fd=parent, follow_symlinks=False)
             except FileNotFoundError:
                 self._confirm_leaf_absent(parent_parts, parent, name, label=label)
                 if missing_ok:
+                    if retain:
+                        self._retain_missing_parent(parent_parts, parent)
                     return None
                 raise ValidationError(f"{label} is missing beneath the pinned root") from None
             if stat.S_ISLNK(listed.st_mode) or not stat.S_ISREG(listed.st_mode):
                 raise ValidationError(f"{label} must be a regular file, not a link")
+            if (
+                retained is not None
+                and (
+                    int(listed.st_dev),
+                    int(listed.st_ino),
+                )
+                != retained.identity
+            ):
+                raise ValidationError(f"{label} changed identity after its authoritative read")
             if listed.st_size > max_bytes:
                 raise ValidationError(f"{label} exceeds its size bound")
             flags = os.O_RDONLY | _POSIX_OS.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
@@ -386,6 +482,8 @@ class PinnedPathRoot:
             ):
                 raise ValidationError(f"{label} changed while it was read")
             self._validate_directory_path(parent_parts, parent)
+            if retain:
+                self._retain_regular_file(parts, parent, descriptor, opened_snapshot)
             return content
         except ValidationError:
             raise
@@ -395,6 +493,262 @@ class PinnedPathRoot:
             if descriptor >= 0:
                 os.close(descriptor)
             os.close(parent)
+
+    def retain_directory(self, relative: Path | str) -> tuple[int, int]:
+        """Keep one authoritative descendant directory identity until this root closes."""
+
+        candidate = Path(relative)
+        parts = (
+            ()
+            if not candidate.is_absolute() and candidate == Path(".")
+            else _relative_parts(relative)
+        )
+        retained = self._retained_directories.get(parts)
+        if retained is not None:
+            self._validate_directory_path(parts, retained.descriptor)
+            return retained.identity
+        descriptor = self._open_directory(parts)
+        try:
+            self._validate_directory_path(parts, descriptor)
+            metadata = os.fstat(descriptor)
+            identity = (int(metadata.st_dev), int(metadata.st_ino))
+            self._retained_directories[parts] = _DirectoryBinding(
+                parts=parts,
+                descriptor=os.dup(descriptor),
+                identity=identity,
+            )
+            return identity
+        finally:
+            os.close(descriptor)
+
+    @contextmanager
+    def open_regular_file_descriptor(
+        self,
+        relative: Path | str,
+        *,
+        label: str,
+        writable: bool = False,
+    ) -> Iterator[int]:
+        """Yield one no-follow descriptor and validate the same named inode on exit."""
+
+        parts = _relative_parts(relative)
+        parent, name = self._open_parent(parts)
+        descriptor = -1
+        try:
+            self._validate_directory_path(parts[:-1], parent)
+            listed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISLNK(listed.st_mode) or not stat.S_ISREG(listed.st_mode):
+                raise ValidationError(f"{label} must be a regular file, not a link")
+            flags = (os.O_RDWR if writable else os.O_RDONLY) | _POSIX_OS.O_NOFOLLOW
+            descriptor = os.open(name, flags, dir_fd=parent)
+            opened = os.fstat(descriptor)
+            identity = (int(opened.st_dev), int(opened.st_ino))
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (int(listed.st_dev), int(listed.st_ino)) != identity
+            ):
+                raise ValidationError(f"{label} changed while it was opened")
+            yield descriptor
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (int(current.st_dev), int(current.st_ino)) != identity
+            ):
+                raise ValidationError(f"{label} changed while its descriptor was active")
+            self._validate_directory_path(parts[:-1], parent)
+        except ValidationError:
+            raise
+        except OSError as exc:
+            raise ValidationError(
+                f"could not access {label} beneath the pinned root: {exc}"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(parent)
+
+    def remove_retained_empty_directory(self, relative: Path | str, *, label: str) -> None:
+        """Remove only an empty directory retained by earlier transaction reads."""
+
+        parts = _relative_parts(relative)
+        retained = self._retained_directories.pop(parts, None)
+        if retained is None:
+            raise ValidationError(f"{label} was not retained by this pinned transaction")
+        parent = -1
+        try:
+            self._validate_directory_path(parts, retained.descriptor)
+            parent, name = self._open_parent(parts)
+            self._validate_directory_path(parts[:-1], parent)
+            listed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if (
+                stat.S_ISLNK(listed.st_mode)
+                or not stat.S_ISDIR(listed.st_mode)
+                or (int(listed.st_dev), int(listed.st_ino)) != retained.identity
+            ):
+                raise ConflictError(f"{label} changed and was preserved")
+            os.rmdir(name, dir_fd=parent)
+            os.fsync(parent)
+            self._validate_directory_path(parts[:-1], parent)
+        finally:
+            if parent >= 0:
+                os.close(parent)
+            os.close(retained.descriptor)
+
+    def _retain_regular_file(
+        self,
+        parts: tuple[str, ...],
+        parent: int,
+        descriptor: int,
+        opened: RegularFileSnapshot,
+    ) -> None:
+        watch: _RegularFileWatch | None = None
+        directory_binding: _DirectoryBinding | None = None
+        if parts not in self._retained_files:
+            watch = self._duplicate_regular_file_watch(
+                parts,
+                parent,
+                descriptor,
+                identity=(opened.device, opened.inode),
+            )
+        parent_parts = parts[:-1]
+        try:
+            if parent_parts not in self._retained_directories:
+                metadata = os.fstat(parent)
+                directory_binding = _DirectoryBinding(
+                    parts=parent_parts,
+                    descriptor=os.dup(parent),
+                    identity=(int(metadata.st_dev), int(metadata.st_ino)),
+                )
+        except Exception:
+            self._close_retained_file(watch)
+            raise
+        if watch is not None:
+            self._retained_files[parts] = watch
+        if directory_binding is not None:
+            self._retained_directories[parent_parts] = directory_binding
+
+    def _retain_missing_parent(self, parts: tuple[str, ...], parent: int) -> None:
+        if parts in self._retained_directories:
+            self._validate_directory_path(parts, self._retained_directories[parts].descriptor)
+            return
+        metadata = os.fstat(parent)
+        self._retained_directories[parts] = _DirectoryBinding(
+            parts=parts,
+            descriptor=os.dup(parent),
+            identity=(int(metadata.st_dev), int(metadata.st_ino)),
+        )
+
+    def _take_retained_file(
+        self,
+        parts: tuple[str, ...],
+        *,
+        label: str,
+        validate_canonical: bool = True,
+    ) -> _RegularFileWatch | None:
+        retained = self._retained_files.pop(parts, None)
+        if retained is not None:
+            try:
+                opened = os.fstat(retained.descriptor)
+                listed = os.stat(
+                    retained.parts[-1],
+                    dir_fd=retained.parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or not stat.S_ISREG(listed.st_mode)
+                    or (int(opened.st_dev), int(opened.st_ino)) != retained.identity
+                    or (int(listed.st_dev), int(listed.st_ino)) != retained.identity
+                ):
+                    raise ValidationError(f"{label} changed identity while it was retained")
+                if validate_canonical:
+                    self._validate_directory_path(
+                        retained.parts[:-1],
+                        retained.parent_descriptor,
+                    )
+            except Exception:
+                with suppress(OSError):
+                    os.close(retained.descriptor)
+                with suppress(OSError):
+                    os.close(retained.parent_descriptor)
+                raise
+        return retained
+
+    def _retain_named_regular_file(
+        self,
+        parts: tuple[str, ...],
+        parent: int,
+        name: str,
+        *,
+        expected_identity: tuple[int, int],
+        label: str,
+    ) -> None:
+        flags = os.O_RDONLY | _POSIX_OS.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(name, flags, dir_fd=parent)
+        try:
+            opened = os.fstat(descriptor)
+            identity = (int(opened.st_dev), int(opened.st_ino))
+            if not stat.S_ISREG(opened.st_mode) or identity != expected_identity:
+                raise DurablePublishError(
+                    f"{label} changed before its committed identity could be retained",
+                    outcome=PublishOutcome.UNKNOWN,
+                )
+            self._validate_directory_path(parts[:-1], parent)
+            self._retain_missing_parent(parts[:-1], parent)
+            replacement = self._duplicate_regular_file_watch(
+                parts,
+                parent,
+                descriptor,
+                identity=identity,
+            )
+            previous = self._retained_files.get(parts)
+            self._retained_files[parts] = replacement
+            self._close_retained_file(previous)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _duplicate_regular_file_watch(
+        parts: tuple[str, ...],
+        parent: int,
+        descriptor: int,
+        *,
+        identity: tuple[int, int],
+    ) -> _RegularFileWatch:
+        parent_duplicate = -1
+        descriptor_duplicate = -1
+        try:
+            parent_duplicate = os.dup(parent)
+            descriptor_duplicate = os.dup(descriptor)
+            watch = _RegularFileWatch(
+                parts=parts,
+                parent_descriptor=parent_duplicate,
+                descriptor=descriptor_duplicate,
+                identity=identity,
+            )
+            parent_duplicate = -1
+            descriptor_duplicate = -1
+            return watch
+        finally:
+            if descriptor_duplicate >= 0:
+                owned = descriptor_duplicate
+                descriptor_duplicate = -1
+                with suppress(OSError):
+                    os.close(owned)
+            if parent_duplicate >= 0:
+                owned = parent_duplicate
+                parent_duplicate = -1
+                with suppress(OSError):
+                    os.close(owned)
+
+    @staticmethod
+    def _close_retained_file(watch: _RegularFileWatch | None) -> None:
+        if watch is None:
+            return
+        with suppress(OSError):
+            os.close(watch.descriptor)
+        with suppress(OSError):
+            os.close(watch.parent_descriptor)
 
     def atomic_write(
         self,
@@ -454,6 +808,109 @@ class PinnedPathRoot:
                 os.unlink(temp_name, dir_fd=parent)
             os.close(parent)
 
+    def append_durable(self, relative: Path | str, content: bytes, *, label: str) -> None:
+        """Append through pinned ancestry or report restored, committed, or unknown state."""
+
+        parts = _relative_parts(relative)
+        parent_parts = parts[:-1]
+        descriptor = -1
+        parent = -1
+        original_size: int | None = None
+        identity: tuple[int, int] | None = None
+        committed = False
+        try:
+            self._validate_root_identity()
+            watch = self._file_watches.get(parts)
+            if watch is not None:
+                self._validate_regular_file_watch(watch, label=label)
+                parent = os.dup(watch.parent_descriptor)
+                descriptor = os.dup(watch.descriptor)
+                name = parts[-1]
+            else:
+                parent, name = self._open_parent(parts)
+                self._validate_directory_path(parent_parts, parent)
+                listed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if stat.S_ISLNK(listed.st_mode) or not stat.S_ISREG(listed.st_mode):
+                    raise ValidationError(f"{label} must be a regular file, not a link")
+                flags = os.O_RDWR | os.O_APPEND | _POSIX_OS.O_NOFOLLOW
+                descriptor = os.open(name, flags, dir_fd=parent)
+            opened = os.fstat(descriptor)
+            identity = (int(opened.st_dev), int(opened.st_ino))
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or (int(current.st_dev), int(current.st_ino)) != identity
+            ):
+                raise ValidationError(f"{label} changed while it was opened")
+            original_size = int(opened.st_size)
+            _write_all(descriptor, content)
+            os.fsync(descriptor)
+            finished = os.fstat(descriptor)
+            if int(finished.st_size) != original_size + len(content):
+                raise OSError(f"{label} changed while it was appended")
+            appended = _POSIX_OS.pread(descriptor, len(content), original_size)
+            if appended != content:
+                raise OSError(f"{label} append bytes changed before verification")
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (int(current.st_dev), int(current.st_ino)) != identity
+            ):
+                raise OSError(f"{label} changed before append completion")
+            self._validate_directory_path(parent_parts, parent)
+            committed = True
+        except DurableAppendError:
+            raise
+        except Exception as exc:
+            if descriptor >= 0 and original_size is not None and identity is not None:
+                try:
+                    _restore_exact_append(
+                        descriptor,
+                        original_size=original_size,
+                        content=content,
+                        identity=identity,
+                    )
+                except Exception as rollback_exc:
+                    raise DurableAppendError(
+                        f"{label} append failed and exact rollback is unknown",
+                        outcome=AppendOutcome.UNKNOWN,
+                    ) from rollback_exc
+            raise DurableAppendError(
+                f"{label} append failed and the previous bytes were restored",
+                outcome=AppendOutcome.RESTORED,
+            ) from exc
+        finally:
+            if not committed:
+                if descriptor >= 0:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                    descriptor = -1
+                if parent >= 0:
+                    with suppress(OSError):
+                        os.close(parent)
+                    parent = -1
+
+        try:
+            closing_descriptor = descriptor
+            descriptor = -1
+            os.close(closing_descriptor)
+            closing_parent = parent
+            parent = -1
+            os.close(closing_parent)
+        except Exception as exc:
+            raise DurableAppendError(
+                f"{label} append was synchronized but descriptor cleanup failed",
+                outcome=AppendOutcome.COMMITTED,
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                with suppress(OSError):
+                    os.close(descriptor)
+            if parent >= 0:
+                with suppress(OSError):
+                    os.close(parent)
+
     def compare_and_swap_regular_file(
         self,
         relative: Path | str,
@@ -496,14 +953,747 @@ class PinnedPathRoot:
                 outcome=PublishOutcome.UNKNOWN,
             ) from exc
 
+    def replace_regular_file_if_exact(
+        self,
+        relative: Path | str,
+        *,
+        expected: bytes | None,
+        replacement: bytes,
+        label: str,
+        max_bytes: int,
+        mode: int = 0o600,
+    ) -> None:
+        """Replace one bound leaf without clobbering a concurrent foreign leaf.
+
+        The current name is atomically moved to an unguessable quarantine under
+        the already-open parent descriptor before its bytes are checked.  The
+        replacement is then published with a kernel no-replace move.  All
+        destructive operations therefore stay beneath the pinned parent even
+        if its canonical path is concurrently replaced.
+        """
+
+        self._replace_regular_file_if_exact(
+            relative,
+            expected=expected,
+            replacement=replacement,
+            label=label,
+            max_bytes=max_bytes,
+            mode=mode,
+            validate_canonical=True,
+        )
+
+    def exchange_regular_file_if_exact(
+        self,
+        relative: Path | str,
+        *,
+        expected: bytes | None,
+        replacement: bytes,
+        label: str,
+        max_bytes: int,
+        mode: int = 0o600,
+    ) -> None:
+        """Atomically exchange an existing exact leaf without a public absence window.
+
+        Signal queues use this variant because a hard process death must leave a
+        complete old-or-new JSONL file at the public name. Expected-absent
+        publication retains the ordinary kernel no-replace path.
+        """
+
+        if expected is None:
+            self.replace_regular_file_if_exact(
+                relative,
+                expected=None,
+                replacement=replacement,
+                label=label,
+                max_bytes=max_bytes,
+                mode=mode,
+            )
+            return
+        if len(expected) > max_bytes or len(replacement) > max_bytes:
+            raise ValidationError(f"{label} exceeds its size bound")
+        parts, parent = self._bound_leaf(relative)
+        name = parts[-1]
+        retained: _RegularFileWatch | None = None
+        stage_name = ""
+        stage_identity: tuple[int, int] | None = None
+        exchanged = False
+        committed = False
+        try:
+            retained = self._take_retained_file(parts, label=label)
+            current, current_identity = _read_regular_file_at(
+                parent,
+                name,
+                label=label,
+                max_bytes=max_bytes,
+            )
+            if current != expected or (
+                retained is not None and current_identity != retained.identity
+            ):
+                raise ConflictError(f"{label} changed before atomic exchange and was preserved")
+            stage_name, stage_identity = _stage_regular_file_at(
+                parent,
+                name=name,
+                content=replacement,
+                mode=mode,
+            )
+            self._validate_directory_path(parts[:-1], parent)
+            _exchange_regular_files_at(parent, stage_name, name)
+            exchanged = True
+            os.fsync(parent)
+            assert stage_identity is not None
+            _verify_regular_file_at(
+                parent,
+                name,
+                expected=replacement,
+                identity=stage_identity,
+                label=label,
+                max_bytes=max_bytes,
+            )
+            displaced, displaced_identity = _read_regular_file_at(
+                parent,
+                stage_name,
+                label=f"{label} displaced state",
+                max_bytes=max_bytes,
+            )
+            if displaced != expected or displaced_identity != current_identity:
+                raise ConflictError(
+                    f"{label} changed during atomic exchange; the competing state was preserved"
+                )
+            self._validate_directory_path(parts[:-1], parent)
+            self._retain_named_regular_file(
+                parts,
+                parent,
+                name,
+                expected_identity=stage_identity,
+                label=label,
+            )
+            try:
+                _unlink_private_if_identity_at(
+                    parent,
+                    stage_name,
+                    displaced_identity,
+                    label=f"{label} displaced state",
+                )
+            except Exception as exc:
+                committed = True
+                raise DurablePublishError(
+                    f"{label} is committed but displaced-state cleanup is unconfirmed",
+                    outcome=PublishOutcome.COMMITTED,
+                ) from exc
+            stage_name = ""
+            exchanged = False
+            committed = True
+        except Exception as exc:
+            if committed or (
+                isinstance(exc, DurablePublishError) and exc.outcome is PublishOutcome.COMMITTED
+            ):
+                raise
+            if exchanged:
+                assert stage_identity is not None and stage_name
+                try:
+                    _rollback_regular_file_exchange_at(
+                        parent,
+                        name=name,
+                        stage_name=stage_name,
+                        published_identity=stage_identity,
+                        label=label,
+                    )
+                    exchanged = False
+                except Exception as rollback_exc:
+                    raise DurablePublishError(
+                        f"{label} atomic exchange failed and rollback is unknown",
+                        outcome=PublishOutcome.UNKNOWN,
+                    ) from rollback_exc
+            if isinstance(exc, ConflictError):
+                raise
+            if isinstance(exc, DurablePublishError):
+                raise
+            if isinstance(exc, ValidationError):
+                raise DurablePublishError(
+                    f"{label} atomic exchange lost its pinned canonical parent",
+                    outcome=PublishOutcome.UNPUBLISHED,
+                ) from exc
+            raise DurablePublishError(
+                f"{label} atomic exchange failed; the exact prior state was restored",
+                outcome=PublishOutcome.UNPUBLISHED,
+            ) from exc
+        finally:
+            primary_error = sys.exc_info()[1]
+            cleanup_error: Exception | None = None
+            if stage_name and not exchanged and stage_identity is not None:
+                try:
+                    _unlink_private_if_identity_at(
+                        parent,
+                        stage_name,
+                        stage_identity,
+                        label=f"{label} exchange stage",
+                        missing_ok=True,
+                    )
+                except Exception as exc:
+                    cleanup_error = exc
+            self._close_retained_file(retained)
+            owned_parent = parent
+            parent = -1
+            try:
+                os.close(owned_parent)
+            except OSError as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            if primary_error is None and cleanup_error is not None:
+                raise DurablePublishError(
+                    f"{label} is committed but descriptor cleanup is unconfirmed",
+                    outcome=(PublishOutcome.COMMITTED if committed else PublishOutcome.UNKNOWN),
+                ) from cleanup_error
+
+    def rollback_regular_file_if_exact(
+        self,
+        relative: Path | str,
+        *,
+        expected: bytes,
+        replacement: bytes | None,
+        label: str,
+        max_bytes: int,
+        mode: int = 0o600,
+    ) -> None:
+        """Restore exact prior bytes through an already-held transaction binding.
+
+        This deliberately does not reopen or require the canonical parent path:
+        it is only for rollback after a later transaction step failed. Exact
+        bytes and the active binding keep a substituted foreign tree unreachable.
+        """
+
+        if replacement is None:
+            self._unlink_regular_file_if_exact(
+                relative,
+                expected=expected,
+                label=label,
+                max_bytes=max_bytes,
+                validate_canonical=False,
+            )
+            return
+        self._replace_regular_file_if_exact(
+            relative,
+            expected=expected,
+            replacement=replacement,
+            label=label,
+            max_bytes=max_bytes,
+            mode=mode,
+            validate_canonical=False,
+        )
+
+    def _replace_regular_file_if_exact(
+        self,
+        relative: Path | str,
+        *,
+        expected: bytes | None,
+        replacement: bytes,
+        label: str,
+        max_bytes: int,
+        mode: int,
+        validate_canonical: bool,
+    ) -> None:
+        """Implement exact replacement with optional detached-binding rollback mode."""
+
+        if len(replacement) > max_bytes or (expected is not None and len(expected) > max_bytes):
+            raise ValidationError(f"{label} exceeds its size bound")
+        parts, parent = self._bound_leaf(relative, validate_canonical=validate_canonical)
+        retained: _RegularFileWatch | None = None
+        name = parts[-1]
+        stage_name = ""
+        stage_identity: tuple[int, int] | None = None
+        quarantine_name: str | None = None
+        quarantine_identity: tuple[int, int] | None = None
+        published = False
+        try:
+            retained = self._take_retained_file(
+                parts,
+                label=label,
+                validate_canonical=validate_canonical,
+            )
+            stage_name, stage_identity = _stage_regular_file_at(
+                parent,
+                name=name,
+                content=replacement,
+                mode=mode,
+            )
+            if expected is not None:
+                quarantine_name = f".{name}.seld-quarantine-{secrets.token_hex(16)}"
+                try:
+                    _move_no_replace_at(parent, name, parent, quarantine_name)
+                except FileNotFoundError as exc:
+                    raise ConflictError(f"{label} changed before quarantine") from exc
+                try:
+                    quarantined, quarantine_identity = _read_regular_file_at(
+                        parent,
+                        quarantine_name,
+                        label=label,
+                        max_bytes=max_bytes,
+                    )
+                except (OSError, ValidationError) as exc:
+                    _restore_quarantine_at(parent, quarantine_name, name, label=label)
+                    quarantine_name = None
+                    raise ConflictError(
+                        f"{label} changed before quarantine and was preserved"
+                    ) from exc
+                if quarantined != expected or (
+                    retained is not None and quarantine_identity != retained.identity
+                ):
+                    _restore_quarantine_at(parent, quarantine_name, name, label=label)
+                    quarantine_name = None
+                    raise ConflictError(
+                        f"{label} changed identity before quarantine and was preserved"
+                    )
+            try:
+                _move_no_replace_at(parent, stage_name, parent, name)
+                stage_name = ""
+                published = True
+            except OSError as exc:
+                assert stage_identity is not None
+                try:
+                    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                    source_missing = False
+                    try:
+                        os.stat(stage_name, dir_fd=parent, follow_symlinks=False)
+                    except FileNotFoundError:
+                        source_missing = True
+                    if (
+                        stat.S_ISREG(current.st_mode)
+                        and (int(current.st_dev), int(current.st_ino)) == stage_identity
+                        and source_missing
+                    ):
+                        stage_name = ""
+                        published = True
+                except OSError:
+                    pass
+                if quarantine_name is not None:
+                    if published:
+                        raise
+                    _restore_quarantine_at(parent, quarantine_name, name, label=label)
+                    quarantine_name = None
+                if isinstance(exc, FileExistsError):
+                    raise ConflictError(f"{label} changed before no-clobber publication") from exc
+                raise
+            assert stage_identity is not None
+            _verify_regular_file_at(
+                parent,
+                name,
+                expected=replacement,
+                identity=stage_identity,
+                label=label,
+                max_bytes=max_bytes,
+            )
+            if validate_canonical:
+                try:
+                    self._validate_directory_path(parts[:-1], parent)
+                    self._retain_named_regular_file(
+                        parts,
+                        parent,
+                        name,
+                        expected_identity=stage_identity,
+                        label=label,
+                    )
+                except ValidationError as exc:
+                    try:
+                        _rollback_regular_file_replacement_at(
+                            parent,
+                            name=name,
+                            published_identity=stage_identity,
+                            quarantine_name=quarantine_name,
+                            quarantine_identity=quarantine_identity,
+                            expected=expected,
+                            label=label,
+                            max_bytes=max_bytes,
+                        )
+                    except Exception as rollback_exc:
+                        raise DurablePublishError(
+                            f"{label} parent changed and exact publication rollback is unknown",
+                            outcome=PublishOutcome.UNKNOWN,
+                        ) from rollback_exc
+                    published = False
+                    quarantine_name = None
+                    raise DurablePublishError(
+                        f"{label} parent changed; the exact prior state was restored",
+                        outcome=PublishOutcome.UNPUBLISHED,
+                    ) from exc
+            if quarantine_name is not None:
+                assert quarantine_identity is not None
+                try:
+                    _unlink_private_if_identity_at(
+                        parent,
+                        quarantine_name,
+                        quarantine_identity,
+                        label=f"{label} quarantine",
+                    )
+                except Exception as exc:
+                    raise DurablePublishError(
+                        f"{label} is committed but exact quarantine cleanup is unconfirmed",
+                        outcome=PublishOutcome.COMMITTED,
+                    ) from exc
+                quarantine_name = None
+        except Exception as exc:
+            if isinstance(exc, DurablePublishError) and exc.outcome is PublishOutcome.COMMITTED:
+                raise
+            if isinstance(exc, ConflictError) and not published:
+                # A foreign public leaf can prevent quarantine restoration.
+                # Both identities remain preserved; retrying the same restore
+                # would only obscure the caller-visible CAS conflict.
+                raise
+            try:
+                if published:
+                    assert stage_identity is not None
+                    _rollback_regular_file_replacement_at(
+                        parent,
+                        name=name,
+                        published_identity=stage_identity,
+                        quarantine_name=quarantine_name,
+                        quarantine_identity=quarantine_identity,
+                        expected=expected,
+                        label=label,
+                        max_bytes=max_bytes,
+                    )
+                    published = False
+                    quarantine_name = None
+                elif quarantine_name is not None:
+                    _restore_quarantine_at(parent, quarantine_name, name, label=label)
+                    quarantine_name = None
+            except Exception as rollback_exc:
+                raise DurablePublishError(
+                    f"{label} failed and exact prior-state restoration is unknown",
+                    outcome=PublishOutcome.UNKNOWN,
+                ) from rollback_exc
+            if isinstance(exc, (ConflictError, DurablePublishError, ValidationError)):
+                raise
+            raise DurablePublishError(
+                f"{label} failed before commit; the exact prior state was restored",
+                outcome=PublishOutcome.UNPUBLISHED,
+            ) from exc
+        finally:
+            primary_error = sys.exc_info()[1]
+            cleanup_error: Exception | None = None
+            if stage_name:
+                assert stage_identity is not None
+                try:
+                    _unlink_private_if_identity_at(
+                        parent,
+                        stage_name,
+                        stage_identity,
+                        label=f"{label} stage",
+                        missing_ok=True,
+                    )
+                except Exception as exc:
+                    cleanup_error = exc
+            self._close_retained_file(retained)
+            owned_parent = parent
+            parent = -1
+            try:
+                os.close(owned_parent)
+            except OSError as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            if primary_error is None and cleanup_error is not None:
+                raise DurablePublishError(
+                    f"{label} descriptor cleanup failed after exact publication",
+                    outcome=(PublishOutcome.COMMITTED if published else PublishOutcome.UNKNOWN),
+                ) from cleanup_error
+
+    def unlink_regular_file_if_exact(
+        self,
+        relative: Path | str,
+        *,
+        expected: bytes,
+        label: str,
+        max_bytes: int,
+    ) -> None:
+        """Remove only the exact bound leaf by first moving it out of its public name."""
+
+        self._unlink_regular_file_if_exact(
+            relative,
+            expected=expected,
+            label=label,
+            max_bytes=max_bytes,
+            validate_canonical=True,
+        )
+
+    def unlink_private_regular_file_if_exact(
+        self,
+        relative: Path | str,
+        *,
+        expected: bytes,
+        label: str,
+        max_bytes: int,
+    ) -> None:
+        """Directly remove one exact private transaction artifact.
+
+        Private stages and markers are safe in either old-or-absent state after
+        a hard stop.  Avoiding a public-name quarantine keeps their cleanup
+        idempotent across process death.
+        """
+
+        if len(expected) > max_bytes:
+            raise ValidationError(f"{label} exceeds its size bound")
+        parts, parent = self._bound_leaf(relative)
+        retained: _RegularFileWatch | None = None
+        committed = False
+        try:
+            retained = self._take_retained_file(parts, label=label)
+            try:
+                content, identity = _read_regular_file_at(
+                    parent,
+                    parts[-1],
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+            except (OSError, ValidationError) as exc:
+                raise ConflictError(f"{label} changed before removal and was preserved") from exc
+            if content != expected or (retained is not None and identity != retained.identity):
+                raise ConflictError(f"{label} changed before removal and was preserved")
+            self._validate_directory_path(parts[:-1], parent)
+            try:
+                _unlink_private_if_identity_at(
+                    parent,
+                    parts[-1],
+                    identity,
+                    label=label,
+                )
+                committed = True
+            except ConflictError:
+                raise
+            except OSError as exc:
+                try:
+                    os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    committed = True
+                    raise DurablePublishError(
+                        f"{label} removal is visible but directory durability is unconfirmed",
+                        outcome=PublishOutcome.COMMITTED,
+                    ) from exc
+                raise DurablePublishError(
+                    f"{label} removal has an unknown durable outcome",
+                    outcome=PublishOutcome.UNKNOWN,
+                ) from exc
+        finally:
+            primary_error = sys.exc_info()[1]
+            self._close_retained_file(retained)
+            try:
+                os.close(parent)
+            except OSError as exc:
+                if primary_error is None:
+                    raise DurablePublishError(
+                        f"{label} removal committed but descriptor cleanup is unconfirmed",
+                        outcome=(PublishOutcome.COMMITTED if committed else PublishOutcome.UNKNOWN),
+                    ) from exc
+
+    def _unlink_regular_file_if_exact(
+        self,
+        relative: Path | str,
+        *,
+        expected: bytes,
+        label: str,
+        max_bytes: int,
+        validate_canonical: bool,
+    ) -> None:
+        """Implement exact removal with optional detached-binding rollback mode."""
+
+        if len(expected) > max_bytes:
+            raise ValidationError(f"{label} exceeds its size bound")
+        parts, parent = self._bound_leaf(relative, validate_canonical=validate_canonical)
+        retained: _RegularFileWatch | None = None
+        name = parts[-1]
+        quarantine_name = f".{name}.seld-quarantine-{secrets.token_hex(16)}"
+        committed = False
+        try:
+            retained = self._take_retained_file(
+                parts,
+                label=label,
+                validate_canonical=validate_canonical,
+            )
+            try:
+                _move_no_replace_at(parent, name, parent, quarantine_name)
+            except FileNotFoundError as exc:
+                raise ConflictError(f"{label} changed before removal and was preserved") from exc
+            try:
+                quarantined, identity = _read_regular_file_at(
+                    parent,
+                    quarantine_name,
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+            except (OSError, ValidationError) as exc:
+                _restore_quarantine_at(parent, quarantine_name, name, label=label)
+                quarantine_name = ""
+                raise ConflictError(f"{label} changed before removal and was preserved") from exc
+            if quarantined != expected or (retained is not None and identity != retained.identity):
+                _restore_quarantine_at(parent, quarantine_name, name, label=label)
+                quarantine_name = ""
+                raise ConflictError(f"{label} changed before removal and was preserved")
+            if validate_canonical:
+                try:
+                    self._validate_directory_path(parts[:-1], parent)
+                except ValidationError as exc:
+                    try:
+                        _restore_quarantine_at(parent, quarantine_name, name, label=label)
+                        _verify_regular_file_at(
+                            parent,
+                            name,
+                            expected=expected,
+                            identity=identity,
+                            label=label,
+                            max_bytes=max_bytes,
+                        )
+                    except Exception as rollback_exc:
+                        raise DurablePublishError(
+                            f"{label} parent changed and exact removal rollback is unknown",
+                            outcome=PublishOutcome.UNKNOWN,
+                        ) from rollback_exc
+                    quarantine_name = ""
+                    raise ValidationError(
+                        f"{label} parent changed at its canonical path; the exact file was restored"
+                    ) from exc
+            _unlink_private_if_identity_at(
+                parent,
+                quarantine_name,
+                identity,
+                label=f"{label} quarantine",
+            )
+            quarantine_name = ""
+            committed = True
+        finally:
+            primary_error = sys.exc_info()[1]
+            self._close_retained_file(retained)
+            cleanup_error: OSError | None = None
+            owned_parent = parent
+            parent = -1
+            try:
+                os.close(owned_parent)
+            except OSError as exc:
+                cleanup_error = exc
+            if primary_error is None and cleanup_error is not None:
+                raise DurablePublishError(
+                    f"{label} removal committed but descriptor cleanup is unconfirmed",
+                    outcome=(PublishOutcome.COMMITTED if committed else PublishOutcome.UNKNOWN),
+                ) from cleanup_error
+
+    def _bound_leaf(
+        self,
+        relative: Path | str,
+        *,
+        validate_canonical: bool = True,
+    ) -> tuple[tuple[str, ...], int]:
+        parts = _relative_parts(relative)
+        binding = self._directory_binding
+        if binding is None or parts[: len(binding.parts)] != binding.parts:
+            raise ValidationError("exact leaf mutation requires a pinned ancestor binding")
+        if validate_canonical:
+            self._validate_directory_path(binding.parts, binding.descriptor)
+        parent = self._open_directory(parts[:-1])
+        if validate_canonical:
+            try:
+                self._validate_directory_path(parts[:-1], parent)
+            except Exception:
+                os.close(parent)
+                raise
+        return parts, parent
+
+    def publish_directory_no_replace_if_exact(
+        self,
+        source: Path | str,
+        target: Path | str,
+        *,
+        expected_identity: tuple[int, int],
+        label: str,
+    ) -> None:
+        """Move one exact staged directory to an absent sibling under a pinned parent."""
+
+        source_parts = _relative_parts(source)
+        target_parts = _relative_parts(target)
+        binding = self._directory_binding
+        if (
+            binding is None
+            or source_parts[:-1] != binding.parts
+            or target_parts[:-1] != binding.parts
+            or source_parts[-1] == target_parts[-1]
+        ):
+            raise ValidationError(
+                "directory publication requires two leaves under one pinned-parent binding"
+            )
+        self._validate_directory_path(binding.parts, binding.descriptor)
+        parent = os.dup(binding.descriptor)
+        source_name = source_parts[-1]
+        target_name = target_parts[-1]
+        moved = False
+        try:
+            metadata = os.stat(source_name, dir_fd=parent, follow_symlinks=False)
+            identity = (int(metadata.st_dev), int(metadata.st_ino))
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or identity != expected_identity
+            ):
+                raise ConflictError(f"{label} changed before publication and was preserved")
+            try:
+                _move_no_replace_at(parent, source_name, parent, target_name)
+            except FileExistsError as exc:
+                raise ConflictError(f"{label} target appeared and was preserved") from exc
+            moved = True
+            published = os.stat(target_name, dir_fd=parent, follow_symlinks=False)
+            if (
+                stat.S_ISLNK(published.st_mode)
+                or not stat.S_ISDIR(published.st_mode)
+                or (int(published.st_dev), int(published.st_ino)) != expected_identity
+            ):
+                raise DurablePublishError(
+                    f"{label} publication changed before verification",
+                    outcome=PublishOutcome.UNKNOWN,
+                )
+            try:
+                self._validate_directory_path(binding.parts, parent)
+            except ValidationError as exc:
+                _rollback_directory_publication_at(
+                    parent,
+                    source_name=source_name,
+                    target_name=target_name,
+                    expected_identity=expected_identity,
+                    label=label,
+                )
+                moved = False
+                raise DurablePublishError(
+                    f"{label} parent changed; the exact stage was restored",
+                    outcome=PublishOutcome.UNPUBLISHED,
+                ) from exc
+        except Exception:
+            if moved:
+                try:
+                    _rollback_directory_publication_at(
+                        parent,
+                        source_name=source_name,
+                        target_name=target_name,
+                        expected_identity=expected_identity,
+                        label=label,
+                    )
+                except Exception as rollback_exc:
+                    raise DurablePublishError(
+                        f"{label} publication failed and exact stage rollback is unknown",
+                        outcome=PublishOutcome.UNKNOWN,
+                    ) from rollback_exc
+            raise
+        finally:
+            os.close(parent)
+
     @contextmanager
     def bind_directory(
         self,
         relative: Path | str,
+        *,
+        create: bool = False,
     ) -> Iterator[tuple[int, int]]:
         """Keep one descendant directory identity for a multi-file transaction."""
 
-        parts = _relative_parts(relative)
+        candidate = Path(relative)
+        parts = (
+            ()
+            if not candidate.is_absolute() and candidate == Path(".")
+            else _relative_parts(relative)
+        )
         active = self._directory_binding
         if active is not None:
             if active.parts != parts:
@@ -516,7 +1706,7 @@ class PinnedPathRoot:
                 active.depth -= 1
             return
 
-        descriptor = self._open_directory_from_root(parts)
+        descriptor = self._open_directory(parts, create=create)
         metadata = os.fstat(descriptor)
         identity = (int(metadata.st_dev), int(metadata.st_ino))
         binding = _DirectoryBinding(parts=parts, descriptor=descriptor, identity=identity)
@@ -532,6 +1722,140 @@ class PinnedPathRoot:
         finally:
             self._directory_binding = None
             os.close(descriptor)
+
+    @contextmanager
+    def watch_directory(
+        self,
+        relative: Path | str,
+        *,
+        create: bool = False,
+    ) -> Iterator[tuple[int, int]]:
+        """Keep an additional directory identity for one multi-tree transaction."""
+
+        candidate = Path(relative)
+        parts = (
+            ()
+            if not candidate.is_absolute() and candidate == Path(".")
+            else _relative_parts(relative)
+        )
+        active = self._directory_watches.get(parts)
+        if active is not None:
+            self._validate_directory_path(parts, active.descriptor)
+            active.depth += 1
+            try:
+                yield active.identity
+            finally:
+                active.depth -= 1
+            return
+        if self._directory_binding is not None and self._directory_binding.parts == parts:
+            raise ValidationError("directory is already the active mutation binding")
+
+        descriptor = self._open_directory(parts, create=create)
+        metadata = os.fstat(descriptor)
+        identity = (int(metadata.st_dev), int(metadata.st_ino))
+        binding = _DirectoryBinding(parts=parts, descriptor=descriptor, identity=identity)
+        self._directory_watches[parts] = binding
+        try:
+            self._validate_directory_path(parts, descriptor)
+            try:
+                yield identity
+            except BaseException:
+                raise
+            else:
+                self._validate_directory_path(parts, descriptor)
+        finally:
+            del self._directory_watches[parts]
+            os.close(descriptor)
+
+    @contextmanager
+    def watch_regular_file(
+        self,
+        relative: Path | str,
+        *,
+        label: str,
+    ) -> Iterator[tuple[int, int]]:
+        """Pin one existing regular-file identity for a later transaction step."""
+
+        parts = _relative_parts(relative)
+        active = self._file_watches.get(parts)
+        if active is not None:
+            self._validate_regular_file_watch(active, label=label)
+            active.depth += 1
+            try:
+                yield active.identity
+            finally:
+                active.depth -= 1
+            return
+
+        parent, name = self._open_parent(parts)
+        descriptor = -1
+        try:
+            self._validate_directory_path(parts[:-1], parent)
+            listed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISLNK(listed.st_mode) or not stat.S_ISREG(listed.st_mode):
+                raise ValidationError(f"{label} must be a regular file, not a link")
+            flags = os.O_RDWR | os.O_APPEND | _POSIX_OS.O_NOFOLLOW
+            descriptor = os.open(name, flags, dir_fd=parent)
+            opened = os.fstat(descriptor)
+            identity = (int(opened.st_dev), int(opened.st_ino))
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (int(listed.st_dev), int(listed.st_ino)) != identity
+            ):
+                raise ValidationError(f"{label} changed while it was pinned")
+            watch = _RegularFileWatch(
+                parts=parts,
+                parent_descriptor=parent,
+                descriptor=descriptor,
+                identity=identity,
+            )
+            self._file_watches[parts] = watch
+            try:
+                self._validate_regular_file_watch(watch, label=label)
+                try:
+                    yield identity
+                except BaseException:
+                    raise
+                else:
+                    self._validate_regular_file_watch(watch, label=label)
+            finally:
+                del self._file_watches[parts]
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(parent)
+
+    def _validate_regular_file_watch(
+        self,
+        watch: _RegularFileWatch,
+        *,
+        label: str,
+    ) -> None:
+        try:
+            opened = os.fstat(watch.descriptor)
+            listed = os.stat(
+                watch.parts[-1],
+                dir_fd=watch.parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValidationError(f"{label} changed identity while it was pinned") from exc
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(listed.st_mode)
+            or (int(opened.st_dev), int(opened.st_ino)) != watch.identity
+            or (int(listed.st_dev), int(listed.st_ino)) != watch.identity
+        ):
+            raise ValidationError(f"{label} changed identity while it was pinned")
+        self._validate_directory_path(watch.parts[:-1], watch.parent_descriptor)
+
+    def validate_bound_directory(self) -> None:
+        """Prove that the active transaction binding still has its canonical path."""
+
+        binding = self._directory_binding
+        if binding is None:
+            raise ValidationError("pinned directory validation requires an active binding")
+        self._validate_directory_path(binding.parts, binding.descriptor)
 
     def _verify_published_path(
         self,
@@ -631,8 +1955,15 @@ class PinnedPathRoot:
 
         parts = _relative_parts(relative)
         parent_parts = parts[:-1]
+        display_path = self.root.joinpath(*parts)
+        display_parent = self.root.joinpath(*parent_parts)
         self._validate_root_identity()
-        parent, name = self._open_parent(parts)
+        try:
+            parent, name = self._open_parent(parts)
+        except (OSError, ValidationError) as exc:
+            raise ValidationError(
+                f"lock parent must be one stable real directory: {display_parent}: {exc}"
+            ) from exc
         descriptor = -1
         try:
             try:
@@ -658,7 +1989,9 @@ class PinnedPathRoot:
             except ValidationError:
                 raise
             except OSError as exc:
-                raise ValidationError(f"could not lock pinned local storage: {exc}") from exc
+                raise ValidationError(
+                    f"lock target must be one stable regular file: {display_path}: {exc}"
+                ) from exc
             handle = _DescriptorLockTarget(
                 descriptor,
                 f"{self.root}/{Path(relative).as_posix()} (pinned file lock)",
@@ -676,20 +2009,51 @@ class PinnedPathRoot:
                     descriptor,
                     expected_identity=lock_identity,
                 )
-                yield
-                self._validate_file_lock_identity(
-                    parent,
-                    name,
-                    descriptor,
-                    expected_identity=lock_identity,
-                )
-                self._validate_directory_path(parent_parts, parent)
+                try:
+                    yield
+                except BaseException:
+                    raise
+                else:
+                    try:
+                        self._validate_file_lock_identity(
+                            parent,
+                            name,
+                            descriptor,
+                            expected_identity=lock_identity,
+                        )
+                        self._validate_directory_path(parent_parts, parent)
+                    except (OSError, ValidationError) as exc:
+                        raise _PinnedLockTeardownError(str(exc)) from exc
             finally:
-                _release(handle)
+                primary_error = sys.exc_info()[1]
+                try:
+                    _release(handle)
+                except OSError as exc:
+                    if primary_error is None:
+                        raise _PinnedLockTeardownError(
+                            "pinned lock release failed after the protected operation"
+                        ) from exc
         finally:
+            primary_error = sys.exc_info()[1]
+            cleanup_error: OSError | None = None
             if descriptor >= 0:
-                os.close(descriptor)
-            os.close(parent)
+                owned = descriptor
+                descriptor = -1
+                try:
+                    os.close(owned)
+                except OSError as exc:
+                    cleanup_error = exc
+            owned_parent = parent
+            parent = -1
+            try:
+                os.close(owned_parent)
+            except OSError as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            if primary_error is None and cleanup_error is not None:
+                raise _PinnedLockTeardownError(
+                    "pinned lock descriptor cleanup failed after the protected operation"
+                ) from cleanup_error
 
     @staticmethod
     def _validate_file_lock_identity(
@@ -809,8 +2173,17 @@ class PinnedPathRoot:
         create: bool = False,
         mode: int = 0o700,
     ) -> int:
-        binding = self._directory_binding
-        if binding is not None and parts[: len(binding.parts)] == binding.parts:
+        candidates = (
+            *self._retained_directories.values(),
+            *self._directory_watches.values(),
+        )
+        if self._directory_binding is not None:
+            candidates = (*candidates, self._directory_binding)
+        bindings = tuple(
+            binding for binding in candidates if parts[: len(binding.parts)] == binding.parts
+        )
+        binding = max(bindings, key=lambda item: len(item.parts), default=None)
+        if binding is not None:
             current = os.dup(binding.descriptor)
             remaining_parts = parts[len(binding.parts) :]
         else:
@@ -846,6 +2219,7 @@ class PinnedPathRoot:
         mode: int,
     ) -> int:
         flags = os.O_RDONLY | _POSIX_OS.O_DIRECTORY | _POSIX_OS.O_NOFOLLOW
+        child = -1
         try:
             for part in parts:
                 if create:
@@ -862,19 +2236,30 @@ class PinnedPathRoot:
                 child = os.open(part, flags, dir_fd=current)
                 metadata = os.fstat(child)
                 if not stat.S_ISDIR(metadata.st_mode):
-                    os.close(child)
                     raise ValidationError("pinned storage component is not a directory")
-                os.close(current)
+                previous = current
+                current = -1
+                os.close(previous)
                 current = child
-            return current
+                child = -1
+            result = current
+            current = -1
+            return result
         except OSError as exc:
-            os.close(current)
             if isinstance(exc, FileNotFoundError):
                 raise
             raise ValidationError(f"could not traverse pinned local storage: {exc}") from exc
-        except Exception:
-            os.close(current)
-            raise
+        finally:
+            if child >= 0:
+                owned = child
+                child = -1
+                with suppress(OSError):
+                    os.close(owned)
+            if current >= 0:
+                owned = current
+                current = -1
+                with suppress(OSError):
+                    os.close(owned)
 
 
 def _relative_parts(relative: Path | str) -> tuple[str, ...]:
@@ -988,9 +2373,106 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+@dataclass
+class _PinnedStoreTransaction:
+    root: Path
+    store: PinnedPathRoot
+    mutation_committed: bool = False
+
+
+_ACTIVE_PINNED_STORE: ContextVar[_PinnedStoreTransaction | None] = ContextVar(
+    "continuity_kernel_active_pinned_store",
+    default=None,
+)
+
+
+def active_pinned_path_root(root: Path) -> PinnedPathRoot | None:
+    """Return the root-pinned transaction established by an outer vault lock."""
+
+    active = _ACTIVE_PINNED_STORE.get()
+    if active is None:
+        return None
+    expected = Path(os.path.abspath(root.expanduser()))
+    return active.store if active.root == expected else None
+
+
+def mark_active_pinned_transaction_committed(root: Path) -> None:
+    """Record that the active vault mutation and its audit event are durable."""
+
+    active = _ACTIVE_PINNED_STORE.get()
+    expected = Path(os.path.abspath(root.expanduser()))
+    if active is not None and active.root == expected:
+        active.mutation_committed = True
+
+
+def _vault_lock_target(path: Path) -> tuple[Path, Path] | None:
+    lexical = Path(os.path.abspath(path.expanduser()))
+    if lexical.parent.name != "locks" or lexical.parent.parent.name != ".gsv":
+        return None
+    root = lexical.parent.parent.parent
+    return root, lexical.relative_to(root)
+
+
 @contextmanager
 def exclusive_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
     """Acquire a bounded advisory lock on one stable, named regular file."""
+
+    pinned_target = _vault_lock_target(path) if PINNED_PATH_ROOT_SUPPORTED else None
+    if pinned_target is not None:
+        root, relative = pinned_target
+        active = _ACTIVE_PINNED_STORE.get()
+        if active is not None and active.root == root:
+            with active.store.exclusive_file_lock(relative, timeout=timeout):
+                yield
+            return
+        store = PinnedPathRoot(root)
+        transaction = _PinnedStoreTransaction(root=root, store=store)
+        token = _ACTIVE_PINNED_STORE.set(transaction)
+        operation_error: BaseException | None = None
+        cleanup_error: Exception | None = None
+        try:
+            try:
+                try:
+                    if not store.directory_exists(".gsv/locks"):
+                        store.ensure_directory(".gsv/locks")
+                except (OSError, ValidationError) as exc:
+                    raise ValidationError(
+                        f"lock parent must be one stable real directory: "
+                        f"{root / relative.parent}: {exc}"
+                    ) from exc
+                with store.exclusive_file_lock(relative, timeout=timeout):
+                    yield
+            except BaseException as exc:
+                operation_error = exc
+        finally:
+            try:
+                _ACTIVE_PINNED_STORE.reset(token)
+            except Exception as exc:
+                cleanup_error = exc
+            try:
+                store.close()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if operation_error is not None:
+            if (
+                transaction.mutation_committed
+                and isinstance(operation_error, Exception)
+                and isinstance(operation_error, _PinnedLockTeardownError)
+            ):
+                raise MutationCommittedError(
+                    "vault mutation and audit event were committed, but lock teardown could "
+                    "not confirm the pinned lock path; reload before retrying"
+                ) from operation_error
+            raise operation_error.with_traceback(operation_error.__traceback__)
+        if cleanup_error is not None:
+            if transaction.mutation_committed:
+                raise MutationCommittedError(
+                    "vault mutation and audit event were committed, but pinned transaction "
+                    "cleanup failed; reload before retrying"
+                ) from cleanup_error
+            raise cleanup_error
+        return
 
     path.parent.mkdir(parents=True, exist_ok=True)
     parent_snapshot = _validate_lock_parent(path.parent)
@@ -1239,6 +2721,356 @@ def durable_publish_new(source: Path, target: Path) -> tuple[int, int]:
     return identity
 
 
+def _stage_regular_file_at(
+    parent: int,
+    *,
+    name: str,
+    content: bytes,
+    mode: int,
+) -> tuple[str, tuple[int, int]]:
+    stage_name = f".{name}.seld-stage-{secrets.token_hex(16)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _POSIX_OS.O_NOFOLLOW
+    descriptor = os.open(stage_name, flags, mode, dir_fd=parent)
+    metadata = os.fstat(descriptor)
+    identity = (int(metadata.st_dev), int(metadata.st_ino))
+    try:
+        if os.name != "nt":
+            _POSIX_OS.fchmod(descriptor, mode)
+        _write_all(descriptor, content)
+        os.fsync(descriptor)
+        finished = os.fstat(descriptor)
+        current = os.stat(stage_name, dir_fd=parent, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(finished.st_mode)
+            or (int(finished.st_dev), int(finished.st_ino)) != identity
+            or (int(current.st_dev), int(current.st_ino)) != identity
+        ):
+            raise OSError(f"staged file changed before publication: {stage_name}")
+    except Exception:
+        _unlink_private_if_identity_at(
+            parent,
+            stage_name,
+            identity,
+            label="staged file",
+            missing_ok=True,
+        )
+        raise
+    finally:
+        os.close(descriptor)
+    return stage_name, identity
+
+
+def _read_regular_file_at(
+    parent: int,
+    name: str,
+    *,
+    label: str,
+    max_bytes: int,
+) -> tuple[bytes, tuple[int, int]]:
+    listed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if stat.S_ISLNK(listed.st_mode) or not stat.S_ISREG(listed.st_mode):
+        raise ValidationError(f"{label} must be a regular file, not a link")
+    if listed.st_size > max_bytes:
+        raise ValidationError(f"{label} exceeds its size bound")
+    flags = os.O_RDONLY | _POSIX_OS.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(name, flags, dir_fd=parent)
+    try:
+        opened = os.fstat(descriptor)
+        opened_snapshot = _snapshot(opened)
+        if not stat.S_ISREG(opened.st_mode) or not _same_file(_snapshot(listed), opened_snapshot):
+            raise ValidationError(f"{label} changed while it was opened")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            block = os.read(descriptor, min(64 * 1024, remaining))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        content = b"".join(chunks)
+        if len(content) > max_bytes:
+            raise ValidationError(f"{label} exceeds its size bound")
+        finished = _snapshot(os.fstat(descriptor))
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if finished != opened_snapshot or not _same_file(_snapshot(current), opened_snapshot):
+            raise ValidationError(f"{label} changed while it was read")
+        return content, (opened_snapshot.device, opened_snapshot.inode)
+    finally:
+        os.close(descriptor)
+
+
+def _verify_regular_file_at(
+    parent: int,
+    name: str,
+    *,
+    expected: bytes,
+    identity: tuple[int, int],
+    label: str,
+    max_bytes: int,
+) -> None:
+    content, current_identity = _read_regular_file_at(
+        parent,
+        name,
+        label=label,
+        max_bytes=max_bytes,
+    )
+    if content != expected or current_identity != identity:
+        raise DurablePublishError(
+            f"{label} publication changed before it could be verified",
+            outcome=PublishOutcome.UNKNOWN,
+        )
+
+
+def _unlink_private_if_identity_at(
+    parent: int,
+    name: str,
+    identity: tuple[int, int],
+    *,
+    label: str,
+    missing_ok: bool = False,
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        if missing_ok:
+            return
+        raise
+    if (int(current.st_dev), int(current.st_ino)) != identity:
+        raise ConflictError(f"{label} changed and was preserved")
+    os.unlink(name, dir_fd=parent)
+    os.fsync(parent)
+
+
+def _restore_quarantine_at(parent: int, quarantine: str, name: str, *, label: str) -> None:
+    try:
+        _move_no_replace_at(parent, quarantine, parent, name)
+    except FileExistsError as exc:
+        raise ConflictError(
+            f"{label} changed during the operation; both states were preserved"
+        ) from exc
+
+
+def _rollback_regular_file_replacement_at(
+    parent: int,
+    *,
+    name: str,
+    published_identity: tuple[int, int],
+    quarantine_name: str | None,
+    quarantine_identity: tuple[int, int] | None,
+    expected: bytes | None,
+    label: str,
+    max_bytes: int,
+) -> None:
+    """Restore the exact pre-publication leaf through one held parent descriptor."""
+
+    if quarantine_name is None:
+        _unlink_private_if_identity_at(
+            parent,
+            name,
+            published_identity,
+            label=f"{label} unpublished replacement",
+        )
+        return
+
+    assert quarantine_identity is not None and expected is not None
+    rollback_name = f".{name}.seld-rollback-{secrets.token_hex(16)}"
+    _move_no_replace_at(parent, name, parent, rollback_name)
+    _, rollback_identity = _read_regular_file_at(
+        parent,
+        rollback_name,
+        label=f"{label} unpublished replacement",
+        max_bytes=max_bytes,
+    )
+    if rollback_identity != published_identity:
+        raise DurablePublishError(
+            f"{label} unpublished replacement changed during rollback",
+            outcome=PublishOutcome.UNKNOWN,
+        )
+    _restore_quarantine_at(parent, quarantine_name, name, label=label)
+    _verify_regular_file_at(
+        parent,
+        name,
+        expected=expected,
+        identity=quarantine_identity,
+        label=label,
+        max_bytes=max_bytes,
+    )
+    _unlink_private_if_identity_at(
+        parent,
+        rollback_name,
+        published_identity,
+        label=f"{label} unpublished replacement",
+    )
+
+
+def _rollback_directory_publication_at(
+    parent: int,
+    *,
+    source_name: str,
+    target_name: str,
+    expected_identity: tuple[int, int],
+    label: str,
+) -> None:
+    try:
+        _move_no_replace_at(parent, target_name, parent, source_name)
+    except OSError as exc:
+        raise DurablePublishError(
+            f"{label} exact stage and competing state were preserved, but rollback is unknown",
+            outcome=PublishOutcome.UNKNOWN,
+        ) from exc
+    restored = os.stat(source_name, dir_fd=parent, follow_symlinks=False)
+    if (
+        stat.S_ISLNK(restored.st_mode)
+        or not stat.S_ISDIR(restored.st_mode)
+        or (int(restored.st_dev), int(restored.st_ino)) != expected_identity
+    ):
+        raise DurablePublishError(
+            f"{label} exact stage identity changed during rollback",
+            outcome=PublishOutcome.UNKNOWN,
+        )
+
+
+def _exchange_regular_files_at(parent: int, left_name: str, right_name: str) -> None:
+    """Atomically exchange two names beneath one held directory descriptor."""
+
+    if sys.platform == "darwin":
+        library: Any = ctypes.CDLL(None, use_errno=True)
+        rename_swap = library.renameatx_np
+        rename_swap.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_swap.restype = ctypes.c_int
+        result = rename_swap(
+            ctypes.c_int(parent),
+            ctypes.c_char_p(os.fsencode(left_name)),
+            ctypes.c_int(parent),
+            ctypes.c_char_p(os.fsencode(right_name)),
+            ctypes.c_uint(0x00000002),
+        )
+        if result != 0:
+            _raise_move_error(ctypes.get_errno(), Path(right_name))
+        return
+    if sys.platform.startswith("linux"):
+        library = ctypes.CDLL(None, use_errno=True)
+        rename_exchange = getattr(library, "renameat2", None)
+        if rename_exchange is None:
+            raise OSError(errno.ENOTSUP, "renameat2 is unavailable for atomic exchange")
+        rename_exchange.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_exchange.restype = ctypes.c_int
+        result = rename_exchange(
+            ctypes.c_int(parent),
+            ctypes.c_char_p(os.fsencode(left_name)),
+            ctypes.c_int(parent),
+            ctypes.c_char_p(os.fsencode(right_name)),
+            ctypes.c_uint(0x00000002),
+        )
+        if result != 0:
+            _raise_move_error(ctypes.get_errno(), Path(right_name))
+        return
+    raise OSError(errno.ENOTSUP, "dir-fd atomic exchange is unavailable")
+
+
+def _rollback_regular_file_exchange_at(
+    parent: int,
+    *,
+    name: str,
+    stage_name: str,
+    published_identity: tuple[int, int],
+    label: str,
+) -> None:
+    published = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    displaced = os.stat(stage_name, dir_fd=parent, follow_symlinks=False)
+    if (
+        stat.S_ISLNK(published.st_mode)
+        or not stat.S_ISREG(published.st_mode)
+        or (int(published.st_dev), int(published.st_ino)) != published_identity
+        or stat.S_ISLNK(displaced.st_mode)
+        or not stat.S_ISREG(displaced.st_mode)
+    ):
+        raise DurablePublishError(
+            f"{label} exchange identities changed before rollback",
+            outcome=PublishOutcome.UNKNOWN,
+        )
+    displaced_identity = (int(displaced.st_dev), int(displaced.st_ino))
+    _exchange_regular_files_at(parent, stage_name, name)
+    os.fsync(parent)
+    restored = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    staged = os.stat(stage_name, dir_fd=parent, follow_symlinks=False)
+    if (int(restored.st_dev), int(restored.st_ino)) != displaced_identity or (
+        int(staged.st_dev),
+        int(staged.st_ino),
+    ) != published_identity:
+        raise DurablePublishError(
+            f"{label} exact exchange rollback changed identity",
+            outcome=PublishOutcome.UNKNOWN,
+        )
+
+
+def _move_no_replace_at(
+    source_parent: int,
+    source_name: str,
+    target_parent: int,
+    target_name: str,
+) -> None:
+    if sys.platform == "darwin":
+        library: Any = ctypes.CDLL(None, use_errno=True)
+        rename_exclusive = library.renameatx_np
+        rename_exclusive.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_exclusive.restype = ctypes.c_int
+        result = rename_exclusive(
+            ctypes.c_int(source_parent),
+            ctypes.c_char_p(os.fsencode(source_name)),
+            ctypes.c_int(target_parent),
+            ctypes.c_char_p(os.fsencode(target_name)),
+            ctypes.c_uint(0x00000004),
+        )
+        if result != 0:
+            _raise_move_error(ctypes.get_errno(), Path(target_name))
+    elif sys.platform.startswith("linux"):
+        library = ctypes.CDLL(None, use_errno=True)
+        rename_no_replace = getattr(library, "renameat2", None)
+        if rename_no_replace is None:
+            raise OSError(errno.ENOTSUP, "renameat2 is unavailable for no-replace move")
+        rename_no_replace.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_no_replace.restype = ctypes.c_int
+        result = rename_no_replace(
+            ctypes.c_int(source_parent),
+            ctypes.c_char_p(os.fsencode(source_name)),
+            ctypes.c_int(target_parent),
+            ctypes.c_char_p(os.fsencode(target_name)),
+            ctypes.c_uint(1),
+        )
+        if result != 0:
+            _raise_move_error(ctypes.get_errno(), Path(target_name))
+    else:
+        raise OSError(errno.ENOTSUP, "dir-fd no-replace move is unavailable")
+    os.fsync(source_parent)
+    if target_parent != source_parent:
+        os.fsync(target_parent)
+
+
 def move_no_replace(source: Path, target: Path) -> None:
     """Atomically move one staged path without replacing an existing target."""
 
@@ -1383,6 +3215,32 @@ def _path_absent(path: Path) -> bool:
     except OSError:
         return False
     return False
+
+
+def _restore_exact_append(
+    descriptor: int,
+    *,
+    original_size: int,
+    content: bytes,
+    identity: tuple[int, int],
+) -> None:
+    """Truncate only when every byte after the original end belongs to this append."""
+
+    current = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (int(current.st_dev), int(current.st_ino)) != identity
+        or current.st_size < original_size
+        or current.st_size > original_size + len(content)
+    ):
+        raise OSError("append target changed before exact rollback")
+    appended_size = int(current.st_size) - original_size
+    if _POSIX_OS.pread(descriptor, appended_size, original_size) != content[:appended_size]:
+        raise OSError("append tail changed before exact rollback")
+    os.ftruncate(descriptor, original_size)
+    os.fsync(descriptor)
+    if os.fstat(descriptor).st_size != original_size:
+        raise OSError("append target size changed during exact rollback")
 
 
 def append_durable(path: Path, content: bytes) -> None:

@@ -259,6 +259,14 @@ def test_release_claims_match_the_no_generated_visual_artifact_policy() -> None:
     assert artifacts == []
 
 
+def test_local_review_notes_are_excluded_from_source_distributions() -> None:
+    ignored = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    configuration = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert ".codex/" in ignored
+    assert "/.codex" in configuration["tool"]["hatch"]["build"]["targets"]["sdist"]["exclude"]
+
+
 def test_repository_artifact_policy_allows_only_the_licensed_fonts(tmp_path: Path) -> None:
     allowed = tmp_path / "src/continuity_kernel/resources/bridge/fonts/nunito-var.woff2"
     allowed.parent.mkdir(parents=True)

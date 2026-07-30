@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import stat
+import subprocess
 import sys
 import zipfile
 from collections.abc import Iterator
@@ -14,7 +15,7 @@ from typing import Any, cast
 import pytest
 
 from continuity_kernel import bridge as bridge_module
-from continuity_kernel import cli
+from continuity_kernel import cli, resident_import
 from continuity_kernel import vault_backup as vault_backup_module
 from continuity_kernel.atomic import durable_replace as actual_durable_replace
 from continuity_kernel.codex_integration import CodexInstallResult
@@ -22,6 +23,334 @@ from continuity_kernel.config import config_path, load_config, save_config
 from continuity_kernel.errors import SetupError, ValidationError
 from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
 from continuity_kernel.vault import Vault
+
+
+def test_cli_resident_activation_survives_a_fresh_process(tmp_path: Path) -> None:
+    vault_path = tmp_path / "resident-activation-vault"
+    vault = Vault(vault_path)
+    vault.initialize(name="Resident activation")
+    resident = vault_path / "context/resident"
+    skill = resident / "skills/exact-native/references"
+    skill.mkdir(parents=True)
+    guidance = "# Resident guidance\n\nRead this exact imported file.\n"
+    (resident / "AGENTS.md").write_bytes(guidance.encode("utf-8"))
+    (skill.parent / "SKILL.md").write_bytes(
+        b"---\nname: exact-native\ndescription: Exact native skill.\n---\n\n# Exact\n"
+    )
+    (skill / "proof.md").write_bytes(b"# Proof\n\nNative reference.\n")
+    control = resident / "control"
+    control.mkdir()
+    (control / "PULSE").write_text("legacy-private-task\n", encoding="utf-8")
+    task = vault.create_task(
+        identifier="fresh-process-task",
+        title="Fresh process task",
+        outcome="Remain structurally discoverable.",
+        status="doing",
+        next_actor="agent",
+        next_action="Read through a new process.",
+        active_thread_id="fresh-process-hand",
+    )
+    vault.create_thread(
+        identifier="thread:fresh-process",
+        title="Fresh process thread",
+        purpose="Carry the exact activation proof.",
+        summary="The proof is active.",
+        focus_task_id=task.identifier,
+        task_ids=(task.identifier,),
+    )
+
+    def run(*arguments: str) -> dict[str, Any]:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "continuity_kernel",
+                "--json",
+                "--vault",
+                str(vault_path),
+                *arguments,
+            ],
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            env=os.environ.copy(),
+            timeout=30,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return cast(dict[str, Any], json.loads(completed.stdout)["result"])
+
+    status = run("resident-context", "status")
+    shown = run("resident-context", "show", "--format", "json")
+    bindings = run("execution-bindings")
+
+    assert shown["content"] == guidance
+    assert status["skills_total"] == 1
+    assert status["skills"][0]["name"] == "exact-native"
+    assert status["excluded_paths"] == ["context/resident/control"]
+    assert "legacy-private-task" not in repr(status)
+    assert bindings["active_hands"] == [
+        {
+            "active_thread_id": "fresh-process-hand",
+            "revision": task.revision,
+            "status": "doing",
+            "task_id": task.identifier,
+        }
+    ]
+    assert bindings["focused_threads"][0]["focus_task_id"] == task.identifier
+
+
+def test_cli_pulse_sweep_is_visible_from_a_fresh_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault_path = tmp_path / "pulse-vault"
+    host_data = tmp_path / "host-data"
+    Vault(vault_path).initialize(name="Fresh process Pulse")
+    monkeypatch.setenv("GSV_DATA_DIR", str(host_data))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    assert cli.main(["--json", "--vault", str(vault_path), "pulse", "sweep"]) == 0
+    swept = json.loads(capsys.readouterr().out)["result"]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "continuity_kernel",
+            "--json",
+            "--vault",
+            str(vault_path),
+            "pulse",
+            "status",
+        ],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+        env=os.environ.copy(),
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    restarted = json.loads(completed.stdout)["result"]
+    assert swept["status"] == "complete"
+    assert restarted["heartbeat"]["observed_at"] == swept["observed_at"]
+    assert restarted["heartbeat"]["sequence"] == 1
+    assert restarted["signals"]["pending"] == 0
+
+
+def test_cli_scheduler_plan_pins_executable_vault_and_mechanical_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault_path = tmp_path / "scheduler-vault"
+    executable = tmp_path / "installed-gsv"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    Vault(vault_path).initialize(name="Scheduler provenance")
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host-data"))
+    monkeypatch.setattr(cli, "current_gsv_executable", lambda: executable)
+    scheduler_type = cast(Any, cli).MacOSScheduler
+
+    def macos_scheduler(*args: Any, **kwargs: Any) -> Any:
+        kwargs.update(uid=501, platform="darwin")
+        return scheduler_type(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "MacOSScheduler", macos_scheduler)
+
+    assert cli.main(["--json", "--vault", str(vault_path), "scheduler", "plan"]) == 0
+    plan = json.loads(capsys.readouterr().out)["result"]
+
+    assert plan["command"] == [
+        str(executable),
+        "--vault",
+        str(vault_path.resolve()),
+        "--json",
+        "pulse",
+        "sweep",
+    ]
+    assert plan["interval_seconds"] == 600
+    assert not (tmp_path / "host-data").exists()
+
+
+@pytest.mark.parametrize("command", ["install", "run-canary", "uninstall"])
+def test_cli_scheduler_mutations_require_exact_receipt_cas(command: str) -> None:
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(["scheduler", command])
+
+
+def test_cli_local_source_migration_uses_only_vault_staged_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault_path = tmp_path / "staged-local-source"
+    Vault(vault_path).initialize(name="Staged local source")
+    calls: list[tuple[str, str | None]] = []
+
+    def staged_status(vault: Vault, *, delivery: object) -> dict[str, object]:
+        del delivery
+        calls.append(("status", str(vault.root)))
+        return {"checkpoints": [], "migration_revision": "a" * 64}
+
+    def adopt_staged(
+        vault: Vault,
+        *,
+        source: str,
+        expected_migration_revision: str,
+        expected_source_revision: str,
+        disposition: str,
+        delivery: object,
+    ) -> dict[str, object]:
+        del delivery
+        assert expected_migration_revision == "a" * 64
+        assert expected_source_revision == "b" * 64
+        assert disposition == "adopt_verified_prefix"
+        calls.append(("adopt", source))
+        return {"adopted": True, "source": source}
+
+    monkeypatch.setattr(resident_import, "staged_local_source_checkpoint_status", staged_status)
+    monkeypatch.setattr(resident_import, "adopt_staged_local_source_checkpoint", adopt_staged)
+
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault_path),
+                "local-source",
+                "staged-status",
+            ]
+        )
+        == 0
+    )
+    status = json.loads(capsys.readouterr().out)["result"]
+    assert status["migration_revision"] == "a" * 64
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault_path),
+                "local-source",
+                "adopt-staged",
+                "--source",
+                "apple_messages",
+                "--expected-migration-revision",
+                "a" * 64,
+                "--expected-source-revision",
+                "b" * 64,
+                "--disposition",
+                "adopt_verified_prefix",
+            ]
+        )
+        == 0
+    )
+    adopted = json.loads(capsys.readouterr().out)["result"]
+
+    assert adopted == {"adopted": True, "source": "apple_messages"}
+    assert calls == [("status", str(vault_path.resolve())), ("adopt", "apple_messages")]
+    default_args = cli._parser().parse_args(["local-source", "staged-status"])
+    explicit_args = cli._parser().parse_args(
+        [
+            "local-source",
+            "staged-status",
+            "--service-label",
+            "ai.example.explicit-sync",
+        ]
+    )
+    assert default_args.service_label is None
+    assert explicit_args.service_label == "ai.example.explicit-sync"
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(
+            [
+                "local-source",
+                "adopt-staged",
+                "--source",
+                "apple_messages",
+                "--expected-migration-revision",
+                "a" * 64,
+                "--expected-source-revision",
+                "b" * 64,
+                "--disposition",
+                "adopt_verified_prefix",
+                "--prior-cursor",
+                "raw-provider-cursor",
+            ]
+        )
+
+
+def test_fresh_cli_reports_an_absent_staged_migration_without_blocking_baseline(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "fresh-local-source"
+    vault = Vault(vault_path)
+    vault.initialize(name="Fresh local source")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "continuity_kernel",
+            "--json",
+            "--vault",
+            str(vault_path),
+            "local-source",
+            "staged-status",
+        ],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+        env=os.environ.copy(),
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    status = json.loads(completed.stdout)["result"]
+    assert status == {
+        "checkpoints": [],
+        "migration_revision": resident_import.ABSENT_LOCAL_SOURCE_MIGRATION_REVISION,
+        "source_revision": vault.get_source_snapshot().revision,
+        "vault_id": vault.identity()["vault_id"],
+    }
+    assert not (vault_path / ".gsv/migrations/local-source-checkpoints.json").exists()
+
+
+def test_cli_signal_append_rejects_provider_text_and_accepts_only_record_pointer(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault_path = tmp_path / "signal-vault"
+    Vault(vault_path).initialize(name="Signal privacy")
+
+    exit_code = cli.main(
+        [
+            "--json",
+            "--vault",
+            str(vault_path),
+            "signal",
+            "append",
+            "--record-ref",
+            "Email body with sk-live-secret",
+            "--change-type",
+            "observation",
+        ]
+    )
+
+    assert exit_code == 2
+    failure = json.loads(capsys.readouterr().err)
+    assert "canonical result reference must name one typed record revision" in failure["error"]
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(
+            [
+                "signal",
+                "append",
+                "--kind",
+                "provider-message",
+                "--envelope-json",
+                '{"body":"raw provider body"}',
+            ]
+        )
 
 
 def test_cli_json_task_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1419,16 +1748,28 @@ def test_backup_staging_io_failures_are_structured_and_cleaned(
         monkeypatch.setattr(Path, "open", fail_temp_open)
     else:
         real_fsync = os.fsync
+        real_mkstemp = vault_backup_module._mkstemp
+        staged_identity: tuple[int, int] | None = None
         failed = False
 
-        def fail_first_fsync(descriptor: int) -> None:
+        def capture_staged_identity(*args: Any, **kwargs: Any) -> tuple[int, str]:
+            nonlocal staged_identity
+            descriptor, path = real_mkstemp(*args, **kwargs)
+            metadata = os.fstat(descriptor)
+            staged_identity = (int(metadata.st_dev), int(metadata.st_ino))
+            return descriptor, path
+
+        def fail_staged_fsync(descriptor: int) -> None:
             nonlocal failed
-            if not failed:
+            metadata = os.fstat(descriptor)
+            identity = (int(metadata.st_dev), int(metadata.st_ino))
+            if not failed and identity == staged_identity:
                 failed = True
                 raise PermissionError(injected)
             real_fsync(descriptor)
 
-        monkeypatch.setattr(os, "fsync", fail_first_fsync)
+        monkeypatch.setattr(vault_backup_module, "_mkstemp", capture_staged_identity)
+        monkeypatch.setattr(os, "fsync", fail_staged_fsync)
 
     exit_code = cli.main(
         [

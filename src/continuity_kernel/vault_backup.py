@@ -13,7 +13,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -45,6 +45,12 @@ from continuity_kernel.errors import (
     ValidationError,
 )
 from continuity_kernel.records import WINDOWS_RESERVED_NAMES, format_time, stored_time
+from continuity_kernel.resident_signals import (
+    SETTLED_EVENT_KEYS_RELATIVE,
+    SIGNAL_ARCHIVE_NAME,
+    ResidentSignalStore,
+    build_settled_event_index,
+)
 from continuity_kernel.vault_identity import (
     REQUIRED_VAULT_DIRECTORIES,
     canonical_vault_id,
@@ -52,9 +58,10 @@ from continuity_kernel.vault_identity import (
 )
 
 MAX_BACKUP_ENTRIES: Final = 10_000
-MAX_BACKUP_ENTRY_BYTES: Final = 16 * 1024 * 1024
+MAX_BACKUP_ENTRY_BYTES: Final = 64 * 1024 * 1024
 MAX_BACKUP_TOTAL_BYTES: Final = 512 * 1024 * 1024
 BACKUP_MANIFEST: Final = "GSV_BACKUP.json"
+BACKUP_FORMAT_VERSION: Final = 2
 _MIGRATION_TOMBSTONE_MARKER: Final = re.compile(
     r"^\.(?P<name>onboarding|control|migrations)\.gsv-remove-"
     r"(?P<token>[0-9a-f]{24})\.marker$"
@@ -66,6 +73,26 @@ _MIGRATION_TOMBSTONE_RELATIVE: Final = {
 }
 _MIGRATION_TOMBSTONE_ID: Final = "culture-grade-foundation-v1"
 _MIGRATION_TOMBSTONE_MARKER_MAX_BYTES: Final = 1024
+_ATOMIC_TEMP_NAME: Final = re.compile(r"^\.(?P<target>.+)\.tmp-(?:[0-9a-f]{32}|[a-z0-9_]{8})$")
+_PINNED_STAGE_NAME: Final = re.compile(r"^\.(?P<target>.+)\.seld-stage-[0-9a-f]{32}$")
+# Portable vault writers either hold global.lock or one of the subsystem locks
+# below. Backup takes setup first, then the normal writer order: global before
+# journal, followed by the remaining independent locks in
+# stable lexical order. No subsystem writer acquires an earlier lock while
+# holding a later one. Control queue, operation, and transport-receipt writes
+# already use global.lock; record locks sit below it and need no second lock.
+# The guided-review worker lock may precede global.lock, so it is deliberately
+# absent here; all of that worker's portable writes still pass through global.
+# The resident-signal snapshot context takes its lock last and first repairs any
+# interrupted compaction, so the backup contains canonical bytes that restore
+# without mutating its manifest. Scheduler, recall, grants, and source-delivery
+# locks protect host-only state.
+_BACKUP_LOCK_ORDER: Final = (
+    "setup.lock",
+    "global.lock",
+    "journal.lock",
+    "local-source-migration.lock",
+)
 
 
 def _mkstemp(*, prefix: str, suffix: str, dir: Path) -> tuple[int, str]:
@@ -82,6 +109,48 @@ def _json_bytes(payload: dict[str, Any]) -> bytes:
     )
 
 
+@contextmanager
+def _coherent_backup_snapshot(root: Path) -> Iterator[None]:
+    """Exclude every independently locked writer of portable vault bytes."""
+
+    lock_root = root / ".gsv/locks"
+    with ExitStack() as locks:
+        for name in _BACKUP_LOCK_ORDER:
+            locks.enter_context(exclusive_lock(lock_root / name))
+        with ResidentSignalStore(root).coherent_snapshot():
+            _require_no_retained_signal_operations(root)
+            yield
+
+
+def _require_no_retained_signal_operations(root: Path) -> None:
+    """Fail closed when a committed compaction still needs operator review."""
+
+    operations = root / ".gsv/signals/operations"
+    try:
+        metadata = os.lstat(operations)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValidationError(
+            f"could not inspect resident signal compaction operations: {operations}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValidationError("resident signal compaction operation storage is invalid")
+    try:
+        with os.scandir(operations) as entries:
+            if next(entries, None) is not None:
+                raise ValidationError(
+                    "resident signal compaction operation cleanup is incomplete; "
+                    "run gsv doctor before backup"
+                )
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError(
+            f"could not inspect resident signal compaction operations: {operations}: {exc}"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class _BackupInspection:
     infos: tuple[zipfile.ZipInfo, ...]
@@ -94,6 +163,14 @@ class _BackupInspection:
         if not isinstance(expected, dict):
             return False
         return expected == self.actual
+
+
+def _manifest_executable_files(manifest: dict[str, Any]) -> tuple[str, ...]:
+    if manifest["format_version"] == 1:
+        return ()
+    values = manifest["executable_files"]
+    assert isinstance(values, list)
+    return tuple(values)
 
 
 def _leaf_path(path: Path, *, label: str) -> Path:
@@ -326,12 +403,10 @@ def _owned_backups_component(root: Path, component: str) -> bool:
 
 def _is_owned_vault_temp(relative: str) -> bool:
     path = PurePosixPath(relative)
-    name = path.name
-    if not name.startswith(".") or ".tmp-" not in name:
+    matched = _ATOMIC_TEMP_NAME.fullmatch(path.name) or _PINNED_STAGE_NAME.fullmatch(path.name)
+    if matched is None:
         return False
-    target_name, token = name[1:].rsplit(".tmp-", 1)
-    if not target_name or not token or "." in token:
-        return False
+    target_name = matched.group("target")
     parent = path.parent.as_posix()
     if parent == ".":
         return target_name in {
@@ -353,6 +428,15 @@ def _is_owned_vault_temp(relative: str) -> bool:
         )
     if parent == ".gsv/control/archive":
         return target_name.startswith("queue-") and target_name.endswith(".jsonl")
+    if parent == ".gsv/signals":
+        return target_name in {
+            "inputs.jsonl",
+            "acks.jsonl",
+            "event-keys.jsonl",
+            "compaction.json",
+        }
+    if parent == ".gsv/signals/archive":
+        return SIGNAL_ARCHIVE_NAME.fullmatch(target_name) is not None
     if parent == ".gsv/control/runtime/turns":
         return target_name.endswith(".json")
     return (
@@ -537,6 +621,44 @@ def _read_backup_source(
     return content
 
 
+def _backup_file_is_executable(path: Path) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise ValidationError(f"could not inspect vault backup file mode: {path}: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValidationError(f"vault backup file mode is not bound to a regular file: {path}")
+    return bool(metadata.st_mode & stat.S_IXUSR)
+
+
+def _backup_executable_files(files: list[tuple[str, Path]]) -> tuple[str, ...]:
+    return tuple(relative for relative, path in files if _backup_file_is_executable(path))
+
+
+def _validate_resident_signal_backup_bytes(files: dict[str, bytes]) -> None:
+    """Validate the exact resident-signal bytes written to one backup."""
+
+    canonical_index = build_settled_event_index(files)
+    supplied_index = files.get(SETTLED_EVENT_KEYS_RELATIVE)
+    archives_present = any(path.startswith(".gsv/signals/archive/") for path in files)
+    if archives_present and supplied_index is None:
+        raise ValidationError("resident signal backup is missing its settled event-key ledger")
+    if supplied_index is not None and supplied_index != canonical_index:
+        raise ValidationError(
+            "resident signal backup settled event-key ledger is not canonical for its archives"
+        )
+
+
+def _is_resident_signal_semantic_file(relative: str) -> bool:
+    if relative in {
+        ".gsv/signals/inputs.jsonl",
+        ".gsv/signals/acks.jsonl",
+        SETTLED_EVENT_KEYS_RELATIVE,
+    }:
+        return True
+    return relative.startswith(".gsv/signals/archive/")
+
+
 def _hash_backup_files(
     files: list[tuple[str, Path]],
     *,
@@ -632,6 +754,7 @@ def _extract_backup(handle: IO[bytes], path: Path, stage: Path) -> _BackupInspec
         handle.seek(0)
         with zipfile.ZipFile(handle, "r") as archive:
             infos, manifest = _backup_metadata(archive)
+            executable_files = frozenset(_manifest_executable_files(manifest))
             actual: dict[str, str] = {}
             total = 0
             for info in infos:
@@ -650,7 +773,11 @@ def _extract_backup(handle: IO[bytes], path: Path, stage: Path) -> _BackupInspec
                 except ValueError as exc:
                     raise ValidationError(f"unsafe backup entry: {name}") from exc
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write(destination, content)
+                atomic_write(
+                    destination,
+                    content,
+                    mode=0o700 if name in executable_files else 0o600,
+                )
         return _BackupInspection(infos=infos, manifest=manifest, actual=actual)
     except ValidationError:
         raise
@@ -687,17 +814,18 @@ def _read_archive_entry(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> byte
 
 
 def _validate_backup_manifest(manifest: object) -> None:
-    if not isinstance(manifest, dict) or set(manifest) != {
-        "created_at",
-        "files",
-        "format_version",
-        "vault_id",
-    }:
+    if not isinstance(manifest, dict):
         raise ValidationError("backup manifest has an unsupported shape")
     if type(manifest.get("format_version")) is not int:
         raise ValidationError("unsupported backup manifest version")
-    if manifest["format_version"] != 1:
+    format_version = manifest["format_version"]
+    keys = {"created_at", "files", "format_version", "vault_id"}
+    if format_version == BACKUP_FORMAT_VERSION:
+        keys.add("executable_files")
+    if format_version not in {1, BACKUP_FORMAT_VERSION}:
         raise ValidationError("unsupported backup manifest version")
+    if set(manifest) != keys:
+        raise ValidationError("backup manifest has an unsupported shape")
     canonical_vault_id(manifest.get("vault_id"))
     created_at = manifest.get("created_at")
     if not isinstance(created_at, str):
@@ -720,6 +848,14 @@ def _validate_backup_manifest(manifest: object) -> None:
             or any(character not in "0123456789abcdef" for character in digest)
         ):
             raise ValidationError(f"backup manifest has an invalid SHA-256 digest: {name}")
+    if format_version == BACKUP_FORMAT_VERSION:
+        executable_files = manifest.get("executable_files")
+        if (
+            not isinstance(executable_files, list)
+            or any(not isinstance(name, str) or name not in expected for name in executable_files)
+            or executable_files != sorted(set(executable_files))
+        ):
+            raise ValidationError("backup manifest has an invalid executable-file list")
 
 
 def _restore_target(path: Path) -> Path:
@@ -898,7 +1034,7 @@ def create_backup(vault: Any, destination: Path | None = None) -> dict[str, Any]
         ) from exc
     if not generated_destination:
         _validate_backup_destination(destination)
-    with exclusive_lock(vault.state / "locks/global.lock"):
+    with _coherent_backup_snapshot(vault.root):
         try:
             descriptor, temp_name = _mkstemp(
                 prefix=".gsv-backup.tmp-", suffix=".zip", dir=destination.parent
@@ -926,7 +1062,9 @@ def create_backup(vault: Any, destination: Path | None = None) -> dict[str, Any]
                     )
                     vault_manifest = parse_vault_manifest(manifest_before)
                     files = vault._backup_files()
+                    executable_files = _backup_executable_files(files)
                     hashes: dict[str, str] = {}
+                    resident_signal_files: dict[str, bytes] = {}
                     total = 0
                     with zipfile.ZipFile(
                         temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
@@ -941,7 +1079,10 @@ def create_backup(vault: Any, destination: Path | None = None) -> dict[str, Any]
                             if total > MAX_BACKUP_TOTAL_BYTES:
                                 raise ValidationError("vault backup exceeds its total size bound")
                             hashes[relative] = sha256_bytes(content)
+                            if _is_resident_signal_semantic_file(relative):
+                                resident_signal_files[relative] = content
                             archive.writestr(relative, content)
+                        _validate_resident_signal_backup_bytes(resident_signal_files)
                         manifest_after = _read_backup_source(
                             manifest_path,
                             root=vault.root,
@@ -951,10 +1092,15 @@ def create_backup(vault: Any, destination: Path | None = None) -> dict[str, Any]
                             raise ValidationError(
                                 "vault identity changed while its backup was created"
                             )
+                        if _backup_executable_files(files) != executable_files:
+                            raise ValidationError(
+                                "vault backup file modes changed while the backup was created"
+                            )
                         manifest = {
                             "created_at": format_time(datetime.now(UTC)),
+                            "executable_files": list(executable_files),
                             "files": hashes,
-                            "format_version": 1,
+                            "format_version": BACKUP_FORMAT_VERSION,
                             "vault_id": vault_manifest["vault_id"],
                         }
                         archive.writestr(BACKUP_MANIFEST, _json_bytes(manifest))
@@ -1148,14 +1294,21 @@ def restore_backup(path: Path, target: Path) -> dict[str, Any]:
             raise ValidationError("restored vault identity does not match its backup manifest")
         digest = restored_stage.logical_digest()
         with _backup_source_store(stage) as source_store:
+            staged_files = restored_stage._backup_files()
             staged_hashes = _hash_backup_files(
-                restored_stage._backup_files(),
+                staged_files,
                 root=stage,
                 store=source_store,
             )
         if staged_hashes != inspection.manifest["files"]:
             raise ValidationError(
                 "staged vault files do not match the backup manifest before publication"
+            )
+        if _backup_executable_files(staged_files) != _manifest_executable_files(
+            inspection.manifest
+        ):
+            raise ValidationError(
+                "staged vault executable files do not match the backup manifest before publication"
             )
         target_existed = _validate_restore_target(target)
         prior_identity: tuple[int, int] | None = None
