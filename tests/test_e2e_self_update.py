@@ -27,7 +27,7 @@ def _native_paths(root: Path) -> dict[str, Path]:
     return paths
 
 
-def test_native_lane_is_darwin_only_before_tool_or_source_discovery(
+def test_unsupported_platform_is_rejected_before_tool_or_source_discovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -38,7 +38,10 @@ def test_native_lane_is_darwin_only_before_tool_or_source_discovery(
         lambda _name: pytest.fail("Darwin rejection must precede tool discovery"),
     )
 
-    with pytest.raises(RuntimeError, match="only on macOS"):
+    expected = (
+        "source self-update is not supported on Windows" if os.name == "nt" else "only on macOS"
+    )
+    with pytest.raises(RuntimeError, match=expected):
         self_update.run_e2e(tmp_path / "proof", tmp_path / "source", native=True)
 
 

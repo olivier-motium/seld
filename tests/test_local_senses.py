@@ -45,7 +45,8 @@ def _append_apple(database: Path, *, timestamp: int, body: str) -> None:
 
 def _replace_apple(database: Path, *, body: str) -> None:
     replacement = database.with_name("replacement.db")
-    with sqlite3.connect(replacement) as connection:
+    connection = sqlite3.connect(replacement)
+    try:
         connection.execute(
             "CREATE TABLE message (date INTEGER, is_from_me INTEGER, text TEXT, "
             "attributedBody BLOB, item_type INTEGER DEFAULT 0, "
@@ -53,6 +54,9 @@ def _replace_apple(database: Path, *, body: str) -> None:
             "cache_has_attachments INTEGER DEFAULT 0)"
         )
         connection.execute("INSERT INTO message VALUES (0, 0, ?, NULL, 0, 0, 0)", (body,))
+        connection.commit()
+    finally:
+        connection.close()
     os.replace(replacement, database)
 
 

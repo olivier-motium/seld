@@ -320,7 +320,7 @@ def test_resident_activation_mcp_surfaces_are_exact_bounded_and_fresh_process(
     skill = resident / "skills/exact-native/scripts"
     skill.mkdir(parents=True)
     guidance = "# Resident guidance\n\nExact MCP guidance.\n"
-    (resident / "AGENTS.md").write_text(guidance, encoding="utf-8")
+    (resident / "AGENTS.md").write_bytes(guidance.encode("utf-8"))
     (skill.parent / "SKILL.md").write_text(
         "---\nname: exact-native\ndescription: Exact native skill.\n---\n\n# Exact\n",
         encoding="utf-8",
