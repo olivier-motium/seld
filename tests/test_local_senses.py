@@ -545,6 +545,7 @@ def test_apple_messages_rejects_nonregular_database(tmp_path: Path, kind: str) -
     assert status.error == "Apple Messages store is unavailable"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows locks an open provider database")
 def test_apple_messages_detects_database_entry_swap_during_query(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -572,6 +573,7 @@ def test_apple_messages_detects_database_entry_swap_during_query(
     assert status.error is not None and "changed during" in status.error
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows locks an open provider database")
 def test_apple_messages_connect_time_aba_cannot_redirect_the_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -708,6 +710,7 @@ def test_whatsapp_heartbeat_is_bounded_and_never_follows_links(
     assert status.error == "standalone sync heartbeat is unreadable"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows locks an open provider database")
 def test_whatsapp_detects_database_entry_swap_during_query(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

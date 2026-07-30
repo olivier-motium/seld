@@ -1284,6 +1284,19 @@ def test_bounded_line_reader_drains_oversized_frame() -> None:
     assert lines == [None, b'{"jsonrpc":"2.0","id":2,"method":"ping"}\n']
 
 
+def test_mcp_wire_output_is_ascii_safe_and_round_trips_unicode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    mcp_server._write({"summary": "One decision — ready"})
+
+    encoded = stdout.getvalue()
+    assert encoded.isascii()
+    assert json.loads(encoded) == {"summary": "One decision — ready"}
+
+
 def test_serve_handles_bad_frames_and_continues(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

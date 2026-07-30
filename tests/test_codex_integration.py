@@ -119,14 +119,11 @@ def _write_imported_skill(vault: Path, name: str = "resident-exact") -> Path:
     skill = vault / "context/resident/skills" / name
     (skill / "references").mkdir(parents=True)
     (skill / "scripts").mkdir()
-    (skill / "SKILL.md").write_text(
-        f"---\nname: {name}\ndescription: Exact resident skill.\n---\n\n# Resident exact\n",
-        encoding="utf-8",
+    (skill / "SKILL.md").write_bytes(
+        f"---\nname: {name}\ndescription: Exact resident skill.\n---\n\n# Resident exact\n".encode()
     )
-    (skill / "references/context.md").write_text("# Context\n", encoding="utf-8")
-    (skill / "scripts/check.py").write_text(
-        "#!/usr/bin/env python3\nprint('resident')\n", encoding="utf-8"
-    )
+    (skill / "references/context.md").write_bytes(b"# Context\n")
+    (skill / "scripts/check.py").write_bytes(b"#!/usr/bin/env python3\nprint('resident')\n")
     if os.name != "nt":
         (skill / "SKILL.md").chmod(0o600)
         (skill / "references/context.md").chmod(0o600)
@@ -374,7 +371,7 @@ def test_generated_instructions_keep_legacy_import_mechanics_inert(tmp_path: Pat
         "# Imported resident\n\n"
         "Use the private checkout and `.sbrain/PULSE`, then run `gsv pending-show`.\n"
     )
-    (resident / "AGENTS.md").write_text(legacy_guidance, encoding="utf-8")
+    (resident / "AGENTS.md").write_bytes(legacy_guidance.encode("utf-8"))
     control = resident / "control"
     control.mkdir()
     (control / "RESIDENT").write_text("legacy-host-task-binding\n", encoding="utf-8")

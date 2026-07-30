@@ -657,6 +657,49 @@ def _import_v2_local_checkpoint(
     return migrated, store, database
 
 
+def test_absent_staged_local_checkpoint_status_needs_no_pinned_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = Vault(tmp_path / "portable-vault")
+    vault.initialize(name="Portable staged status")
+    monkeypatch.setattr(resident_import, "PINNED_PATH_ROOT_SUPPORTED", False)
+    monkeypatch.setenv("GSV_WHATSAPP_SERVICE_LABEL", "invalid label")
+
+    status = resident_import.staged_local_source_checkpoint_status(vault)
+
+    assert status == {
+        "checkpoints": [],
+        "migration_revision": resident_import.ABSENT_LOCAL_SOURCE_MIGRATION_REVISION,
+        "source_revision": vault.get_source_snapshot().revision,
+        "vault_id": vault.identity()["vault_id"],
+    }
+    assert not (vault.root / ".gsv/migrations/local-source-checkpoints.json").exists()
+
+
+@_POSIX_IMPORT
+@pytest.mark.parametrize("migration_directory_present", [False, True])
+def test_absent_staged_local_checkpoint_status_needs_no_delivery_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    migration_directory_present: bool,
+) -> None:
+    vault = Vault(tmp_path / "portable-vault")
+    vault.initialize(name="Portable staged status")
+    if migration_directory_present:
+        (vault.root / ".gsv/migrations").mkdir(parents=True)
+    monkeypatch.setenv("GSV_WHATSAPP_SERVICE_LABEL", "invalid label")
+
+    status = resident_import.staged_local_source_checkpoint_status(vault)
+
+    assert status == {
+        "checkpoints": [],
+        "migration_revision": resident_import.ABSENT_LOCAL_SOURCE_MIGRATION_REVISION,
+        "source_revision": vault.get_source_snapshot().revision,
+        "vault_id": vault.identity()["vault_id"],
+    }
+
+
 @_POSIX_IMPORT
 def test_v2_import_consumes_staged_prefix_and_recovers_after_host_adoption_crash(
     tmp_path: Path,

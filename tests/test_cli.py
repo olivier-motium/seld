@@ -33,12 +33,11 @@ def test_cli_resident_activation_survives_a_fresh_process(tmp_path: Path) -> Non
     skill = resident / "skills/exact-native/references"
     skill.mkdir(parents=True)
     guidance = "# Resident guidance\n\nRead this exact imported file.\n"
-    (resident / "AGENTS.md").write_text(guidance, encoding="utf-8")
-    (skill.parent / "SKILL.md").write_text(
-        "---\nname: exact-native\ndescription: Exact native skill.\n---\n\n# Exact\n",
-        encoding="utf-8",
+    (resident / "AGENTS.md").write_bytes(guidance.encode("utf-8"))
+    (skill.parent / "SKILL.md").write_bytes(
+        b"---\nname: exact-native\ndescription: Exact native skill.\n---\n\n# Exact\n"
     )
-    (skill / "proof.md").write_text("# Proof\n\nNative reference.\n", encoding="utf-8")
+    (skill / "proof.md").write_bytes(b"# Proof\n\nNative reference.\n")
     control = resident / "control"
     control.mkdir()
     (control / "PULSE").write_text("legacy-private-task\n", encoding="utf-8")

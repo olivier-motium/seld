@@ -651,6 +651,8 @@ def _snapshot_skill_tree_fallback(
             content,
             os.name != "nt" and bool(snapshot[-1] & stat.S_IXUSR),
         )
+    if os.name == "nt":
+        _verify_fallback_contents(root, files)
     _validate_fallback_ancestry(vault_root, RESIDENT_SKILLS.parts)
     if _fallback_manifest(root) != before:
         raise ValidationError("imported resident skills changed while they were read")
@@ -677,15 +679,22 @@ def _fallback_manifest(root: Path) -> dict[str, tuple[str, tuple[int, int, int, 
             relative_posix = PurePosixPath(*relative.parts)
             _validate_skill_relative_path(relative_posix)
             metadata = entry.stat(follow_symlinks=False)
-            if stat.S_ISLNK(metadata.st_mode):
+            if _is_link_or_reparse(metadata):
                 raise ValidationError(
-                    f"imported resident skill path cannot be a symbolic link: {relative_posix}"
+                    "imported resident skill path cannot be a symbolic link or reparse point: "
+                    f"{relative_posix}"
                 )
             if stat.S_ISDIR(metadata.st_mode):
-                result[relative_posix.as_posix()] = ("directory", _stable_snapshot(metadata))
+                result[relative_posix.as_posix()] = (
+                    "directory",
+                    _fallback_snapshot(metadata, directory=True),
+                )
                 visit(path)
             elif stat.S_ISREG(metadata.st_mode):
-                result[relative_posix.as_posix()] = ("file", _stable_snapshot(metadata))
+                result[relative_posix.as_posix()] = (
+                    "file",
+                    _fallback_snapshot(metadata, directory=False),
+                )
             else:
                 raise ValidationError(
                     f"imported resident skill path must be a regular file: {relative_posix}"
@@ -693,6 +702,47 @@ def _fallback_manifest(root: Path) -> dict[str, tuple[str, tuple[int, int, int, 
 
     visit(root)
     return result
+
+
+def _fallback_snapshot(
+    metadata: os.stat_result,
+    *,
+    directory: bool,
+) -> tuple[int, int, int, int, int]:
+    if os.name != "nt":
+        return _stable_snapshot(metadata)
+    # Windows can report different file-index encodings for the same path.
+    # Exact paths plus a second file snapshot still catch content changes; a
+    # directory's entry set is the stable contract, not its mutable metadata.
+    return (
+        int(metadata.st_dev),
+        0,
+        0 if directory else int(metadata.st_size),
+        0 if directory else int(metadata.st_mtime_ns),
+        stat.S_IFMT(int(metadata.st_mode)),
+    )
+
+
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+    file_attributes = int(getattr(metadata, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return stat.S_ISLNK(metadata.st_mode) or bool(file_attributes & reparse_flag)
+
+
+def _verify_fallback_contents(
+    root: Path,
+    files: dict[str, tuple[bytes, bool]],
+) -> None:
+    for relative, (expected, _executable) in sorted(files.items()):
+        current = read_regular_file(
+            root.joinpath(*PurePosixPath(relative).parts),
+            label=f"imported resident skill file {relative}",
+            max_bytes=MAX_SKILL_FILE_BYTES,
+        )
+        if current != expected:
+            raise ValidationError(
+                f"imported resident skill file changed while it was read: {relative}"
+            )
 
 
 def _validate_fallback_ancestry(vault_root: Path, parts: tuple[str, ...]) -> None:
@@ -703,7 +753,7 @@ def _validate_fallback_ancestry(vault_root: Path, parts: tuple[str, ...]) -> Non
             metadata = os.lstat(current)
         except OSError as exc:
             raise ValidationError(f"could not inspect imported resident context: {exc}") from exc
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
             raise ValidationError(
                 "imported resident context ancestry must contain only real directories"
             )
@@ -758,6 +808,12 @@ def _read_resident_file(
             return None
         raise ValidationError(f"{label} is missing")
     _validate_fallback_ancestry(vault_root, relative.parts[:-1])
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise ValidationError(f"could not inspect {label}: {exc}") from exc
+    if _is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise ValidationError(f"{label} must be a regular file, not a link or reparse point")
     return read_regular_file(path, label=label, max_bytes=max_bytes)
 
 

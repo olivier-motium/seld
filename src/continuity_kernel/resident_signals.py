@@ -176,15 +176,15 @@ class ResidentSignalStore:
     def _transaction(self) -> Iterator[PinnedPathRoot | None]:
         """Serialize one mailbox operation beneath a single pinned signals binding."""
 
-        if not PINNED_PATH_ROOT_SUPPORTED:
-            self.root.mkdir(parents=True, exist_ok=True)
-            with exclusive_lock(self.lock_path):
-                yield None
-            return
-
-        store = PinnedPathRoot(self.vault_root)
+        store: PinnedPathRoot | None = None
         try:
             try:
+                if not PINNED_PATH_ROOT_SUPPORTED:
+                    self.root.mkdir(parents=True, exist_ok=True)
+                    with exclusive_lock(self.lock_path):
+                        yield None
+                    return
+                store = PinnedPathRoot(self.vault_root)
                 with (
                     store.watch_directory(".gsv", create=True),
                     store.watch_directory(".gsv/locks", create=True),
@@ -205,7 +205,8 @@ class ResidentSignalStore:
                     "resident signal storage has an unknown publication state; run gsv doctor"
                 ) from exc
         finally:
-            store.close()
+            if store is not None:
+                store.close()
 
     @contextmanager
     def coherent_snapshot(self) -> Iterator[None]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -444,6 +445,7 @@ def test_recovery_removes_exact_hard_death_archive_stage(
     staged = (operation_root / "archive_inputs.jsonl").read_bytes()
     prefix = staged if fraction == 1.0 else staged[: max(1, len(staged) // 2)]
     orphan = target.parent / f".{target.name}.seld-stage-{'a' * 32}"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
     orphan.write_bytes(prefix)
 
     status = ResidentSignalStore(tmp_path).status()
@@ -519,25 +521,27 @@ def test_archive_stage_unlink_hard_stop_retries_without_quarantine(
     target = tmp_path / str(marker["archive_inputs"])
     staged = (operation / "archive_inputs.jsonl").read_bytes()
     orphan = target.parent / f".{target.name}.seld-stage-{'c' * 32}"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
     orphan.write_bytes(staged[: max(1, len(staged) // 2)])
-    actual_unlink = atomic.PinnedPathRoot.unlink_private_regular_file_if_exact
+    actual_unlink = ResidentSignalStore._unlink_private_exact
     stopped = False
 
     def stop_after_archive_stage_unlink(
-        pinned: atomic.PinnedPathRoot,
-        relative: Path | str,
+        signal_store: ResidentSignalStore,
+        pinned: atomic.PinnedPathRoot | None,
+        path: Path,
         *args: object,
         **kwargs: object,
     ) -> None:
         nonlocal stopped
-        actual_unlink(pinned, relative, *args, **kwargs)  # type: ignore[arg-type]
-        if not stopped and Path(relative).name == orphan.name:
+        actual_unlink(signal_store, pinned, path, *args, **kwargs)  # type: ignore[arg-type]
+        if not stopped and path.name == orphan.name:
             stopped = True
             raise SystemExit("hard stop after archive-stage unlink")
 
     monkeypatch.setattr(
-        atomic.PinnedPathRoot,
-        "unlink_private_regular_file_if_exact",
+        ResidentSignalStore,
+        "_unlink_private_exact",
         stop_after_archive_stage_unlink,
     )
     with pytest.raises(SystemExit, match="archive-stage unlink"):
@@ -548,8 +552,8 @@ def test_archive_stage_unlink_hard_stop_retries_without_quarantine(
     assert store.compaction_marker_path.exists()
     assert not tuple(target.parent.glob("*.seld-quarantine-*"))
     monkeypatch.setattr(
-        atomic.PinnedPathRoot,
-        "unlink_private_regular_file_if_exact",
+        ResidentSignalStore,
+        "_unlink_private_exact",
         actual_unlink,
     )
     assert ResidentSignalStore(tmp_path).status().pending == 1
@@ -1139,7 +1143,8 @@ def test_markerless_prepared_operation_is_discarded_after_each_stage_boundary(
     assert store.inputs_path.read_bytes() == before_inputs
     assert store.acknowledgements_path.read_bytes() == before_acks
     assert not any((store.root / "operations").iterdir())
-    assert not any((store.root / "archive").iterdir())
+    archive = store.root / "archive"
+    assert not archive.exists() or not any(archive.iterdir())
 
 
 @pytest.mark.parametrize("fraction", (1.0, 0.5))
@@ -1210,24 +1215,25 @@ def test_private_operation_stage_unlink_hard_stop_is_restart_safe(
     operation.mkdir(parents=True)
     stage = operation / "live_inputs.jsonl"
     stage.write_bytes(b"private stage\n")
-    actual_unlink = atomic.PinnedPathRoot.unlink_private_regular_file_if_exact
+    actual_unlink = ResidentSignalStore._unlink_private_exact
     stopped = False
 
     def stop_after_private_unlink(
-        pinned: atomic.PinnedPathRoot,
-        relative: Path | str,
+        signal_store: ResidentSignalStore,
+        pinned: atomic.PinnedPathRoot | None,
+        path: Path,
         *args: object,
         **kwargs: object,
     ) -> None:
         nonlocal stopped
-        actual_unlink(pinned, relative, *args, **kwargs)  # type: ignore[arg-type]
+        actual_unlink(signal_store, pinned, path, *args, **kwargs)  # type: ignore[arg-type]
         if not stopped:
             stopped = True
             raise SystemExit("hard stop after private unlink")
 
     monkeypatch.setattr(
-        atomic.PinnedPathRoot,
-        "unlink_private_regular_file_if_exact",
+        ResidentSignalStore,
+        "_unlink_private_exact",
         stop_after_private_unlink,
     )
     with pytest.raises(SystemExit, match="hard stop after private unlink"):
@@ -1237,8 +1243,8 @@ def test_private_operation_stage_unlink_hard_stop_is_restart_safe(
     assert not stage.exists()
     assert not tuple(operation.glob("*.seld-quarantine-*"))
     monkeypatch.setattr(
-        atomic.PinnedPathRoot,
-        "unlink_private_regular_file_if_exact",
+        ResidentSignalStore,
+        "_unlink_private_exact",
         actual_unlink,
     )
     assert ResidentSignalStore(tmp_path).status().pending == 0
@@ -1501,6 +1507,7 @@ def test_doctor_validates_the_complete_resident_mailbox(tmp_path: Path) -> None:
     assert any(issue.code == "invalid-resident-signals" for issue in failed.issues)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX exchange crash injection is unavailable")
 def test_signal_append_hard_crash_after_exchange_keeps_complete_queue_for_restart(
     tmp_path: Path,
 ) -> None:
@@ -1659,7 +1666,14 @@ def test_signal_publish_outcomes_map_to_public_continuity_errors(
     def fail_exchange(*args: object, **kwargs: object) -> None:
         raise atomic.DurablePublishError("injected signal outcome", outcome=outcome)
 
-    monkeypatch.setattr(atomic.PinnedPathRoot, "exchange_regular_file_if_exact", fail_exchange)
+    if atomic.PINNED_PATH_ROOT_SUPPORTED:
+        monkeypatch.setattr(
+            atomic.PinnedPathRoot,
+            "exchange_regular_file_if_exact",
+            fail_exchange,
+        )
+    else:
+        monkeypatch.setattr(resident_signals_module, "atomic_write", fail_exchange)
     with pytest.raises(error_type):
         store.append_many_results(
             (
@@ -1667,3 +1681,23 @@ def test_signal_publish_outcomes_map_to_public_continuity_errors(
                 SignalAppendRequest(kind="source-due", envelope={"source": "third"}),
             )
         )
+
+
+def test_unpinned_signal_publication_error_keeps_its_durable_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ResidentSignalStore(tmp_path)
+    store.append(kind="source-due", envelope={"source": "first"})
+    monkeypatch.setattr(resident_signals_module, "PINNED_PATH_ROOT_SUPPORTED", False)
+
+    def fail_publish(*args: object, **kwargs: object) -> None:
+        raise atomic.DurablePublishError(
+            "injected fallback outcome",
+            outcome=atomic.PublishOutcome.UNKNOWN,
+        )
+
+    monkeypatch.setattr(resident_signals_module, "atomic_write", fail_publish)
+
+    with pytest.raises(DegradedIntegrityError, match="unknown publication state"):
+        store.append(kind="source-due", envelope={"source": "second"})

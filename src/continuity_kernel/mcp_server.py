@@ -1999,7 +1999,7 @@ def _error(request_id: object, code: int, message: str) -> dict[str, Any]:
 
 
 def _write(payload: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
 

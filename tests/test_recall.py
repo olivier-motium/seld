@@ -484,7 +484,11 @@ def test_qmd_search_is_bounded_to_known_documents(
     ]
 
 
-def test_absent_qmd_uses_exact_keyword_then_recency_fallback(vault: Vault, tmp_path: Path) -> None:
+def test_absent_qmd_uses_exact_keyword_then_recency_fallback(
+    vault: Vault,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     older = vault.root / "context/resident/older.md"
     newer = vault.root / "journal/newer.md"
     older.parent.mkdir(parents=True)
@@ -497,6 +501,11 @@ def test_absent_qmd_uses_exact_keyword_then_recency_fallback(vault: Vault, tmp_p
         vault.root,
         executable=tmp_path / "missing-qmd",
         index_root=tmp_path / "qmd-index",
+    )
+    monkeypatch.setattr(
+        recall_module,
+        "_stored_fingerprint",
+        lambda *_args: pytest.fail("absent QMD must not touch pinned index state"),
     )
 
     status = companion.status()

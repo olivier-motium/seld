@@ -241,9 +241,7 @@ def inspect_whatsapp(
         else:
             read_mode = "ro" if writer_possible else "immutable"
             try:
-                schema, generation, messages, chats, max_rowid, newest = _aggregates(
-                    database, immutable=read_mode == "immutable"
-                )
+                schema, generation, messages, chats, max_rowid, newest = _aggregates(database)
             except ContinuityError as exc:
                 query_error = str(exc)
 
@@ -539,8 +537,8 @@ def verify_whatsapp_ack_token(
     return acknowledgement, False
 
 
-def _aggregates(database: Path, *, immutable: bool) -> tuple[str, str, int, int, int, str | None]:
-    with _connect(database, immutable=immutable) as (connection, before):
+def _aggregates(database: Path) -> tuple[str, str, int, int, int, str | None]:
+    with _connect(database) as (connection, before):
         try:
             connection.execute("BEGIN")
             message_columns = _columns(connection, "messages")
@@ -576,7 +574,7 @@ def _delta_rows(
     expected_generation: str,
     through_rowid: int | None = None,
 ) -> list[sqlite3.Row]:
-    with _connect(database, immutable=False) as (connection, before):
+    with _connect(database) as (connection, before):
         try:
             connection.execute("BEGIN")
             columns = _columns(connection, "messages")
@@ -632,10 +630,7 @@ def _delta_rows(
 
 
 @contextmanager
-def _connect(
-    database: Path, *, immutable: bool
-) -> Iterator[tuple[sqlite3.Connection, FileIdentity]]:
-    connection: sqlite3.Connection | None = None
+def _connect(database: Path) -> Iterator[tuple[sqlite3.Connection, FileIdentity]]:
     try:
         with pinned_sqlite_snapshot(database, label="standalone WhatsApp store") as (
             snapshot,
@@ -645,17 +640,17 @@ def _connect(
             suffix = "?mode=ro&immutable=1" if snapshot_immutable else "?mode=ro"
             uri = f"{snapshot.as_uri()}{suffix}"
             connection = sqlite3.connect(uri, uri=True, timeout=2.0)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA query_only = ON")
-            connection.execute("PRAGMA busy_timeout = 2000")
-            yield connection, identity
+            try:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("PRAGMA busy_timeout = 2000")
+                yield connection, identity
+            finally:
+                connection.close()
     except ValidationError as exc:
         raise ContinuityError(str(exc)) from exc
     except sqlite3.Error as exc:
         raise ContinuityError("standalone WhatsApp store is unreadable") from exc
-    finally:
-        if connection is not None:
-            connection.close()
 
 
 def _columns(connection: sqlite3.Connection, table: str) -> dict[str, str]:
@@ -1030,7 +1025,7 @@ def _prefix_aggregates(
 ) -> tuple[int, int, str | None]:
     """Read only count, row position, and time for a historical prefix."""
 
-    with _connect(database, immutable=False) as (connection, before):
+    with _connect(database) as (connection, before):
         try:
             connection.execute("BEGIN")
             message_columns = _columns(connection, "messages")

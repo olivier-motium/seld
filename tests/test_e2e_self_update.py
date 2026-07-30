@@ -11,6 +11,11 @@ import pytest
 
 from scripts import e2e_self_update as self_update
 
+WINDOWS_REQUIRES_DARWIN_NATIVE_SELF_UPDATE = pytest.mark.skipif(
+    os.name == "nt",
+    reason="the native self-update end-to-end lane is macOS-only",
+)
+
 
 def _native_paths(root: Path) -> dict[str, Path]:
     paths = {
@@ -37,6 +42,7 @@ def test_native_lane_is_darwin_only_before_tool_or_source_discovery(
         self_update.run_e2e(tmp_path / "proof", tmp_path / "source", native=True)
 
 
+@WINDOWS_REQUIRES_DARWIN_NATIVE_SELF_UPDATE
 def test_run_e2e_forwards_optional_native_lane_to_each_isolated_scenario(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

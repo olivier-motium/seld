@@ -3,9 +3,11 @@ from __future__ import annotations
 import ctypes
 import importlib
 import os
+import stat
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -15,6 +17,7 @@ from continuity_kernel.errors import ValidationError
 
 _POSIX_OS = cast(Any, os)
 _RESOURCE = cast(Any, importlib.import_module("resource")) if os.name != "nt" else None
+_WINAPI = cast(Any, importlib.import_module("_winapi")) if os.name == "nt" else None
 _RLIM_INFINITY = -1 if _RESOURCE is None else int(_RESOURCE.RLIM_INFINITY)
 
 
@@ -22,17 +25,122 @@ def _write_skill(vault: Path, *, name: str = "exact-skill", frontmatter: str | N
     skill = vault / "context/resident/skills" / name
     (skill / "references").mkdir(parents=True)
     (skill / "scripts").mkdir()
-    (skill / "SKILL.md").write_text(
-        frontmatter or f"---\nname: {name}\ndescription: Exact imported skill.\n---\n\n# Exact\n",
-        encoding="utf-8",
+    (skill / "SKILL.md").write_bytes(
+        (
+            frontmatter
+            or f"---\nname: {name}\ndescription: Exact imported skill.\n---\n\n# Exact\n"
+        ).encode("utf-8")
     )
-    (skill / "references/evidence.md").write_text("# Evidence\n\nRead exactly.\n", encoding="utf-8")
-    (skill / "scripts/check.py").write_text("print('exact')\n", encoding="utf-8")
+    (skill / "references/evidence.md").write_bytes(b"# Evidence\n\nRead exactly.\n")
+    (skill / "scripts/check.py").write_bytes(b"print('exact')\n")
     return skill
 
 
 def _use_resident_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(resident_context, "PINNED_PATH_ROOT_SUPPORTED", False)
+
+
+def test_windows_resident_fallback_uses_content_metadata_not_file_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(resident_context, "os", SimpleNamespace(name="nt"))
+    directory_before = SimpleNamespace(
+        st_dev=7,
+        st_ino=11,
+        st_size=0,
+        st_mtime_ns=13,
+        st_mode=stat.S_IFDIR | 0o755,
+    )
+    directory_after = SimpleNamespace(
+        st_dev=7,
+        st_ino=99,
+        st_size=4096,
+        st_mtime_ns=17,
+        st_mode=stat.S_IFDIR | 0o700,
+    )
+    file_before = SimpleNamespace(
+        st_dev=7,
+        st_ino=21,
+        st_size=23,
+        st_mtime_ns=29,
+        st_mode=stat.S_IFREG | 0o644,
+    )
+    file_after = SimpleNamespace(**{**vars(file_before), "st_ino": 31})
+    file_changed = SimpleNamespace(**{**vars(file_after), "st_mtime_ns": 37})
+
+    assert resident_context._fallback_snapshot(
+        cast(Any, directory_before), directory=True
+    ) == resident_context._fallback_snapshot(cast(Any, directory_after), directory=True)
+    assert resident_context._fallback_snapshot(
+        cast(Any, file_before), directory=False
+    ) == resident_context._fallback_snapshot(cast(Any, file_after), directory=False)
+    assert resident_context._fallback_snapshot(
+        cast(Any, file_before), directory=False
+    ) != resident_context._fallback_snapshot(cast(Any, file_changed), directory=False)
+
+
+def test_windows_resident_fallback_rechecks_same_metadata_content_replacement(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    path = root / "SKILL.md"
+    path.write_bytes(b"one")
+    metadata = path.stat()
+    files = {"SKILL.md": (b"one", False)}
+    path.write_bytes(b"two")
+    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+
+    with pytest.raises(ValidationError, match="changed while it was read"):
+        resident_context._verify_fallback_contents(root, files)
+
+
+def test_resident_fallback_recognizes_reparse_attribute() -> None:
+    metadata = SimpleNamespace(
+        st_file_attributes=0x400,
+        st_mode=stat.S_IFDIR | 0o755,
+    )
+
+    assert resident_context._is_link_or_reparse(cast(Any, metadata)) is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions are a Windows path primitive")
+def test_windows_resident_fallback_rejects_junction_entry_and_ancestry(tmp_path: Path) -> None:
+    assert _WINAPI is not None
+
+    entry_vault = tmp_path / "entry-vault"
+    entry_skill = _write_skill(entry_vault)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "payload.md").write_bytes(b"# Outside\n")
+    entry_junction = entry_skill / "references/external"
+    _WINAPI.CreateJunction(str(outside), str(entry_junction))
+    assert resident_context._is_link_or_reparse(os.lstat(entry_junction)) is True
+
+    try:
+        with pytest.raises(ValidationError, match="reparse point"):
+            resident_context.resident_skills(entry_vault)
+    finally:
+        entry_junction.unlink()
+    assert outside.exists()
+
+    source_vault = tmp_path / "source-vault"
+    _write_skill(source_vault)
+    ancestor_vault = tmp_path / "ancestor-vault"
+    (ancestor_vault / "context").mkdir(parents=True)
+    ancestor_junction = ancestor_vault / "context/resident"
+    _WINAPI.CreateJunction(
+        str(source_vault / "context/resident"),
+        str(ancestor_junction),
+    )
+    assert resident_context._is_link_or_reparse(os.lstat(ancestor_junction)) is True
+
+    try:
+        with pytest.raises(ValidationError, match="ancestry must contain only real directories"):
+            resident_context.resident_skills(ancestor_vault)
+    finally:
+        ancestor_junction.unlink()
+    assert (source_vault / "context/resident").exists()
 
 
 def test_resident_fallback_reads_one_exact_tree_and_preserves_absence(
@@ -55,10 +163,10 @@ def test_resident_fallback_reads_one_exact_tree_and_preserves_absence(
     resident = vault / "context/resident"
     resident.mkdir(parents=True)
     guidance = "# Resident guidance\n\nKeep this exact.\n"
-    (resident / "AGENTS.md").write_text(guidance, encoding="utf-8")
+    (resident / "AGENTS.md").write_bytes(guidance.encode("utf-8"))
     skill = _write_skill(vault)
     (skill / "references/nested").mkdir()
-    (skill / "references/nested/detail.md").write_text("# Detail\n", encoding="utf-8")
+    (skill / "references/nested/detail.md").write_bytes(b"# Detail\n")
 
     shown = resident_context.read_resident_guidance(vault)
     skills = resident_context.resident_skills(vault)
@@ -227,7 +335,8 @@ def test_sqlite_snapshot_copy_fallback_preserves_exact_main_and_wal(
     ):
         assert snapshot.read_bytes() == b"exact-main"
         assert snapshot.with_name(snapshot.name + "-wal").read_bytes() == b"exact-wal"
-        assert snapshot.stat().st_mode & 0o777 == 0o600
+        if os.name != "nt":
+            assert snapshot.stat().st_mode & 0o777 == 0o600
         assert identity[:2] == (database.stat().st_dev, database.stat().st_ino)
         assert wal_absent is False
 
@@ -273,13 +382,14 @@ def test_sqlite_snapshot_rejects_path_size_journal_and_identity_failures(
     ):
         pass
 
-    disappeared = tmp_path / "disappeared.sqlite"
-    disappeared.write_bytes(b"database")
-    with (
-        pytest.raises(ValidationError, match="disappeared during the snapshot"),
-        sqlite_snapshot.pinned_sqlite_snapshot(disappeared, label="disappeared database"),
-    ):
-        disappeared.unlink()
+    if os.name != "nt":
+        disappeared = tmp_path / "disappeared.sqlite"
+        disappeared.write_bytes(b"database")
+        with (
+            pytest.raises(ValidationError, match="disappeared during the snapshot"),
+            sqlite_snapshot.pinned_sqlite_snapshot(disappeared, label="disappeared database"),
+        ):
+            disappeared.unlink()
 
     wal_appeared = tmp_path / "wal-appeared.sqlite"
     wal_appeared.write_bytes(b"database")

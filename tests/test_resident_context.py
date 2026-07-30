@@ -17,12 +17,11 @@ def _write_skill(root: Path, name: str = "exact-skill") -> Path:
     skill = root / "context/resident/skills" / name
     (skill / "references").mkdir(parents=True)
     (skill / "scripts").mkdir()
-    (skill / "SKILL.md").write_text(
-        f"---\nname: {name}\ndescription: Exact imported skill.\n---\n\n# Exact\n",
-        encoding="utf-8",
+    (skill / "SKILL.md").write_bytes(
+        f"---\nname: {name}\ndescription: Exact imported skill.\n---\n\n# Exact\n".encode()
     )
-    (skill / "references/evidence.md").write_text("# Evidence\n\nRead exactly.\n", encoding="utf-8")
-    (skill / "scripts/check.py").write_text("print('exact')\n", encoding="utf-8")
+    (skill / "references/evidence.md").write_bytes(b"# Evidence\n\nRead exactly.\n")
+    (skill / "scripts/check.py").write_bytes(b"print('exact')\n")
     return skill
 
 
@@ -33,7 +32,7 @@ def test_resident_context_reads_exact_guidance_and_content_free_skill_status(
     resident = vault / "context/resident"
     resident.mkdir(parents=True)
     guidance = "# Resident guidance\n\nKeep this exact.\n"
-    (resident / "AGENTS.md").write_text(guidance, encoding="utf-8")
+    (resident / "AGENTS.md").write_bytes(guidance.encode("utf-8"))
     _write_skill(vault)
 
     shown = resident_context.read_resident_guidance(vault)
@@ -60,7 +59,7 @@ def test_legacy_resident_control_is_inert_and_never_bundled(tmp_path: Path) -> N
     resident = vault / "context/resident"
     resident.mkdir(parents=True)
     guidance = "# Resident guidance\n\nUse only this guidance.\n"
-    (resident / "AGENTS.md").write_text(guidance, encoding="utf-8")
+    (resident / "AGENTS.md").write_bytes(guidance.encode("utf-8"))
     _write_skill(vault)
     control = resident / "control"
     control.mkdir()

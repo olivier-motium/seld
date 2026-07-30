@@ -91,7 +91,7 @@ def _transaction_receipt(tmp_path: Path, vault: Vault) -> dict[str, Any]:
         "failed_environment": str(tool_dir / f".gsv.failed.{token}"),
         "tool_dir": str(tool_dir),
         "bin_dir": str(tmp_path / "bin"),
-        "launcher": str(tmp_path / "bin" / "gsv"),
+        "launcher": str(tmp_path / "bin" / ("gsv.exe" if os.name == "nt" else "gsv")),
         "python_version": "3.11",
         "vault": str(vault.root),
         "vault_id": vault_status["vault_id"],
@@ -1820,6 +1820,7 @@ def test_rollback_reinstalls_owned_native_app_for_restored_runtime(
     assert (active / "previous").read_text(encoding="utf-8") == "previous"
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_update_reads_only_receipt_bound_whatsapp_service_label(
     vault: Vault,
     tmp_path: Path,
@@ -1835,6 +1836,7 @@ def test_update_reads_only_receipt_bound_whatsapp_service_label(
     assert self_update._installed_whatsapp_service_label(vault) == ("ai.example.cutover-wacli")
 
 
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_update_omits_unsupplied_whatsapp_service_label(
     vault: Vault,
     tmp_path: Path,
@@ -1850,6 +1852,7 @@ def test_update_omits_unsupplied_whatsapp_service_label(
 
 
 @pytest.mark.parametrize("failure", ("changed", "wrong-vault", "secret-looking"))
+@SOURCE_UPDATE_RUNTIME_ONLY
 def test_update_rejects_untrusted_installed_whatsapp_service_label(
     vault: Vault,
     tmp_path: Path,

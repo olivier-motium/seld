@@ -250,18 +250,18 @@ class RecallCompanion:
                 False,
                 "QMD status timed out; exact Markdown recall remains available",
             )
-        current = (
-            _stored_fingerprint(self.index_root, self.state_path.name) == discovery.fingerprint
-        )
         if _resolved_executable(self.executable) is None:
             return RecallStatus(
                 False,
-                current,
+                False,
                 discovery,
                 str(self.index_root),
                 False,
                 "QMD executable is unavailable; exact Markdown recall remains available",
             )
+        current = (
+            _stored_fingerprint(self.index_root, self.state_path.name) == discovery.fingerprint
+        )
         if not current or not _index_directory_exists(self.index_root, self.snapshot_root.name):
             return RecallStatus(
                 True,
@@ -314,14 +314,14 @@ class RecallCompanion:
                 "QMD refresh timed out; exact Markdown recall remains available",
                 False,
             )
-        prior = _stored_fingerprint(self.index_root, self.state_path.name)
         if _resolved_executable(self.executable) is None:
             return RecallRefresh(
-                prior != discovery.fingerprint,
+                True,
                 discovery,
                 "QMD executable is unavailable; exact Markdown recall remains available",
                 False,
             )
+        prior = _stored_fingerprint(self.index_root, self.state_path.name)
         if prior == discovery.fingerprint and _index_directory_exists(
             self.index_root, self.snapshot_root.name
         ):

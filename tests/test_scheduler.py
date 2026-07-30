@@ -32,6 +32,11 @@ from continuity_kernel.scheduler import (
 from continuity_kernel.sense_sweep import PULSE_CANARY_ENV, heartbeat_status
 from continuity_kernel.vault import Vault
 
+WINDOWS_REQUIRES_DARWIN_SCHEDULER = pytest.mark.skipif(
+    os.name == "nt",
+    reason="the macOS launchd scheduler and its pinned storage are unavailable on Windows",
+)
+
 
 class FakeLaunchd:
     def __init__(self) -> None:
@@ -211,6 +216,7 @@ def test_scheduler_plan_is_exact_and_side_effect_free(tmp_path: Path) -> None:
     assert payload["StandardErrorPath"] == "/dev/null"
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_install_is_cas_protected_and_idempotent_with_injected_launchd(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path)
     runner = FakeLaunchd()
@@ -228,6 +234,7 @@ def test_install_is_cas_protected_and_idempotent_with_injected_launchd(tmp_path:
     assert not any(call[1] == "bootout" for call in runner.calls)
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_same_label_foreign_command_is_not_mistaken_for_the_owned_job(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path)
     runner = FakeLaunchd()
@@ -253,6 +260,7 @@ def test_same_label_foreign_command_is_not_mistaken_for_the_owned_job(tmp_path: 
     assert runner.jobs[SCHEDULER_LABEL]["ProgramArguments"] == ["/usr/bin/false"]
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 @pytest.mark.parametrize("cadence", [1, None])
 def test_copied_fingerprint_and_command_with_wrong_or_missing_cadence_is_foreign(
     tmp_path: Path,
@@ -276,6 +284,7 @@ def test_copied_fingerprint_and_command_with_wrong_or_missing_cadence_is_foreign
         scheduler.uninstall(expected_revision=revision, runner=runner)
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_copied_fingerprint_command_and_cadence_without_run_at_load_is_foreign(
     tmp_path: Path,
 ) -> None:
@@ -294,6 +303,7 @@ def test_copied_fingerprint_command_and_cadence_without_run_at_load_is_foreign(
         scheduler.install(expected_revision=revision, runner=runner)
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_copied_fingerprint_with_another_runtime_data_root_is_foreign(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path)
     runner = FakeLaunchd()
@@ -312,6 +322,7 @@ def test_copied_fingerprint_with_another_runtime_data_root_is_foreign(tmp_path: 
         scheduler.uninstall(expected_revision=revision, runner=runner)
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_failed_upgrade_reports_when_previous_job_cannot_be_restored(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path)
     runner = FakeLaunchd()
@@ -337,6 +348,7 @@ def test_failed_upgrade_reports_when_previous_job_cannot_be_restored(tmp_path: P
     assert SCHEDULER_LABEL not in runner.loaded
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 @pytest.mark.parametrize(
     "boundary",
     ["operation", "plist", "receipt", "bootout", "bootstrap"],
@@ -409,6 +421,7 @@ def test_interrupted_upgrade_converges_from_a_fresh_scheduler_process(
     assert not fresh.operation_path.exists()
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_receipt_write_error_rolls_back_to_the_exact_previous_job(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -453,6 +466,7 @@ def test_receipt_write_error_rolls_back_to_the_exact_previous_job(
     assert not scheduler.operation_path.exists()
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 @pytest.mark.parametrize("occupied", ["plist", "receipt"])
 def test_recovery_preserves_foreign_file_created_after_prepublication_crash(
     tmp_path: Path,
@@ -504,6 +518,7 @@ def test_recovery_preserves_foreign_file_created_after_prepublication_crash(
     assert not any(call[1] == "bootout" for call in runner.calls)
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 @pytest.mark.parametrize("prior_owned", [False, True])
 def test_install_cas_preserves_plist_replaced_after_operation_publication(
     tmp_path: Path,
@@ -547,6 +562,7 @@ def test_install_cas_preserves_plist_replaced_after_operation_publication(
         assert quarantines[0].read_bytes() != foreign
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 @pytest.mark.parametrize("action", ["install", "uninstall"])
 def test_scheduler_dirfd_mutation_never_follows_replaced_launch_agents_parent(
     tmp_path: Path,
@@ -595,6 +611,7 @@ def test_scheduler_dirfd_mutation_never_follows_replaced_launch_agents_parent(
     assert swapped
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_uninstall_preserves_plist_replaced_after_owned_job_is_unloaded(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path)
     runner = FakeLaunchd()
@@ -610,6 +627,7 @@ def test_uninstall_preserves_plist_replaced_after_owned_job_is_unloaded(tmp_path
     assert SCHEDULER_LABEL not in runner.loaded
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 @pytest.mark.parametrize("loaded", [False, True])
 def test_install_preserves_foreign_plist_or_job(tmp_path: Path, loaded: bool) -> None:
     scheduler = _scheduler(tmp_path)
@@ -632,6 +650,7 @@ def test_install_preserves_foreign_plist_or_job(tmp_path: Path, loaded: bool) ->
     assert not any(call[1] in {"bootstrap", "bootout"} for call in runner.calls)
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_run_canary_proves_the_exact_vault_bound_sweep_through_launchd(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path)
     runner = FakeLaunchd()
@@ -654,6 +673,7 @@ def test_run_canary_proves_the_exact_vault_bound_sweep_through_launchd(tmp_path:
     assert not any((scheduler.runtime_root / "canary").iterdir())
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 @pytest.mark.parametrize("cleanup_outcome", ("fail", "retain"))
 def test_canary_fails_closed_and_retains_recovery_plist_when_job_remains_loaded(
     tmp_path: Path,
@@ -681,6 +701,7 @@ def test_canary_fails_closed_and_retains_recovery_plist_when_job_remains_loaded(
     assert all(child.wait(timeout=5) == 0 for child in runner.children)
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_canary_fails_closed_when_cleanup_absence_probe_is_inconclusive(
     tmp_path: Path,
 ) -> None:
@@ -703,6 +724,7 @@ def test_canary_fails_closed_when_cleanup_absence_probe_is_inconclusive(
     assert all(child.wait(timeout=5) == 0 for child in runner.children)
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_canary_fails_closed_when_the_exact_sweep_does_not_heartbeat(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path)
     runner = FakeLaunchd()
@@ -721,6 +743,7 @@ def test_canary_fails_closed_when_the_exact_sweep_does_not_heartbeat(tmp_path: P
     assert canary.heartbeat_sequence is None
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_canary_does_not_accept_an_uncorrelated_main_job_heartbeat(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path)
     runner = FakeLaunchd()
@@ -739,6 +762,7 @@ def test_canary_does_not_accept_an_uncorrelated_main_job_heartbeat(tmp_path: Pat
     assert all(child.wait(timeout=5) == 0 for child in runner.children)
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_status_reports_missing_owned_plist_as_stale_and_foreign_when_loaded(
     tmp_path: Path,
 ) -> None:
@@ -756,6 +780,7 @@ def test_status_reports_missing_owned_plist_as_stale_and_foreign_when_loaded(
     assert status.stale
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_uninstall_requires_exact_owned_plist_and_is_idempotent(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path)
     runner = FakeLaunchd()
@@ -781,6 +806,7 @@ def test_uninstall_requires_exact_owned_plist_and_is_idempotent(tmp_path: Path) 
     assert not again.changed
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_uninstall_preserves_owned_state_when_launchd_observation_is_inconclusive(
     tmp_path: Path,
 ) -> None:
@@ -800,6 +826,7 @@ def test_uninstall_preserves_owned_state_when_launchd_observation_is_inconclusiv
     assert not any(call[1] == "bootout" for call in runner.calls)
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_uninstall_preserves_owned_state_when_bootout_does_not_remove_job(
     tmp_path: Path,
 ) -> None:
@@ -884,6 +911,7 @@ def test_scheduler_rejects_a_boolean_host_uid(
         )
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_canary_requires_the_exact_current_receipt_revision(tmp_path: Path) -> None:
     scheduler = _scheduler(tmp_path)
     runner = FakeLaunchd()
@@ -907,6 +935,7 @@ def test_launchctl_observation_capture_is_memory_bounded() -> None:
     assert result.stdout == ""
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 @pytest.mark.parametrize(
     ("outcome", "error_type"),
     (
@@ -944,6 +973,7 @@ def test_scheduler_exact_publish_outcomes_map_to_public_errors(
         )
 
 
+@WINDOWS_REQUIRES_DARWIN_SCHEDULER
 def test_scheduler_uninstall_rejects_identical_inode_substitution_after_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

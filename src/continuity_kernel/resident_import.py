@@ -471,26 +471,33 @@ def staged_local_source_checkpoint_status(
 ) -> dict[str, Any]:
     """Read the portable migration handoff without returning its raw cursor."""
 
-    local_delivery = delivery or LocalSourceDelivery(vault)
-    _require_delivery_vault(vault, local_delivery)
+    if delivery is not None:
+        _require_delivery_vault(vault, delivery)
+    if not PINNED_PATH_ROOT_SUPPORTED:
+        if os.path.lexists(vault.root / _LOCAL_SOURCE_MIGRATION_PATH):
+            raise ValidationError(
+                "secure staged local-source checkpoint migration is unavailable on this host"
+            )
+        snapshot = vault.get_source_snapshot()
+        return {
+            "checkpoints": [],
+            "migration_revision": ABSENT_LOCAL_SOURCE_MIGRATION_REVISION,
+            "source_revision": snapshot.revision,
+            "vault_id": vault.identity()["vault_id"],
+        }
     store = PinnedPathRoot(vault.root)
     try:
         with store.exclusive_file_lock(_LOCAL_SOURCE_MIGRATION_LOCK):
             snapshot = vault.get_source_snapshot()
             vault_id = _pinned_vault_id(store)
-            if not store.directory_exists(_LOCAL_SOURCE_MIGRATION_DIRECTORY):
-                return {
-                    "checkpoints": [],
-                    "migration_revision": ABSENT_LOCAL_SOURCE_MIGRATION_REVISION,
-                    "source_revision": snapshot.revision,
-                    "vault_id": vault_id,
-                }
-            encoded = store.read_regular_file(
-                _LOCAL_SOURCE_MIGRATION_PATH,
-                label="local source migration checkpoints",
-                max_bytes=_LOCAL_SOURCE_MIGRATION_MAX_BYTES,
-                missing_ok=True,
-            )
+            encoded = None
+            if store.directory_exists(_LOCAL_SOURCE_MIGRATION_DIRECTORY):
+                encoded = store.read_regular_file(
+                    _LOCAL_SOURCE_MIGRATION_PATH,
+                    label="local source migration checkpoints",
+                    max_bytes=_LOCAL_SOURCE_MIGRATION_MAX_BYTES,
+                    missing_ok=True,
+                )
             if encoded is None:
                 return {
                     "checkpoints": [],
@@ -502,6 +509,7 @@ def staged_local_source_checkpoint_status(
                 encoded,
                 expected_vault_id=vault_id,
             )
+            local_delivery = delivery or LocalSourceDelivery(vault)
             checkpoints = []
             for item in migration.checkpoints:
                 host_status = local_delivery.status(item.checkpoint.source)

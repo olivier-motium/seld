@@ -95,7 +95,12 @@ def _open_regular(
         raise ValidationError(f"{label} must be a regular file, not a link")
     if listed.st_size > max_bytes:
         raise ValidationError(f"{label} exceeds its snapshot size bound")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -150,7 +155,11 @@ def _copy_or_clone(source: int, destination: Path, *, max_bytes: int) -> None:
         return
     target = -1
     try:
-        target = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        target = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
         os.lseek(source, 0, os.SEEK_SET)
         remaining = metadata.st_size
         while remaining:

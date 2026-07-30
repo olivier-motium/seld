@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,25 @@ from continuity_kernel.errors import (
     PersistenceError,
 )
 from continuity_kernel.vault import Vault
+
+_POSIX_PINNED_STORAGE = pytest.mark.skipif(
+    not atomic.PINNED_PATH_ROOT_SUPPORTED,
+    reason="pinned canonical rollback injection is POSIX-only",
+)
+
+
+def _patch_event_append(
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: Callable[..., None],
+) -> None:
+    if atomic.PINNED_PATH_ROOT_SUPPORTED:
+        monkeypatch.setattr(atomic.PinnedPathRoot, "append_durable", replacement)
+        return
+
+    def fallback(path: Path, content: bytes) -> None:
+        replacement(None, path, content, label="audit journal")
+
+    monkeypatch.setattr(vault_module, "append_durable", fallback)
 
 
 def test_failed_atomic_replace_preserves_canonical_file(
@@ -165,13 +185,17 @@ def test_create_rolls_back_when_required_event_append_fails(
     journal_before = journal.read_bytes()
 
     def fail_append(
-        store: atomic.PinnedPathRoot, relative: Path | str, content: bytes, *, label: str
+        store: atomic.PinnedPathRoot | None,
+        relative: Path | str,
+        content: bytes,
+        *,
+        label: str,
     ) -> None:
         raise atomic.DurableAppendError(
             "injected append failure", outcome=atomic.AppendOutcome.RESTORED
         )
 
-    monkeypatch.setattr(atomic.PinnedPathRoot, "append_durable", fail_append)
+    _patch_event_append(monkeypatch, fail_append)
 
     with pytest.raises(PersistenceError, match="was not committed"):
         vault.create_task(
@@ -206,15 +230,19 @@ def test_update_rolls_back_exact_bytes_when_required_event_append_fails(
     journal_before = journal.read_bytes()
 
     def fail_append(
-        store: atomic.PinnedPathRoot, relative: Path | str, content: bytes, *, label: str
+        store: atomic.PinnedPathRoot | None,
+        relative: Path | str,
+        content: bytes,
+        *,
+        label: str,
     ) -> None:
         raise atomic.DurableAppendError(
             "injected append failure", outcome=atomic.AppendOutcome.RESTORED
         )
 
-    monkeypatch.setattr(atomic.PinnedPathRoot, "append_durable", fail_append)
+    _patch_event_append(monkeypatch, fail_append)
 
-    with pytest.raises(PersistenceError, match="prior pinned file state was restored"):
+    with pytest.raises(PersistenceError, match="was restored"):
         vault.update_task(
             task.identifier,
             expected_revision=task.revision,
@@ -244,15 +272,19 @@ def test_document_rolls_back_exact_bytes_when_required_event_append_fails(
     journal_before = journal.read_bytes()
 
     def fail_append(
-        store: atomic.PinnedPathRoot, relative: Path | str, content: bytes, *, label: str
+        store: atomic.PinnedPathRoot | None,
+        relative: Path | str,
+        content: bytes,
+        *,
+        label: str,
     ) -> None:
         raise atomic.DurableAppendError(
             "injected append failure", outcome=atomic.AppendOutcome.RESTORED
         )
 
-    monkeypatch.setattr(atomic.PinnedPathRoot, "append_durable", fail_append)
+    _patch_event_append(monkeypatch, fail_append)
 
-    with pytest.raises(PersistenceError, match="prior pinned file state was restored"):
+    with pytest.raises(PersistenceError, match="was restored"):
         vault.write_document(
             "NOW.md",
             "# Now\n\nThis update must roll back.",
@@ -272,6 +304,7 @@ def test_document_rolls_back_exact_bytes_when_required_event_append_fails(
     assert retried["revision"] != before["revision"]
 
 
+@_POSIX_PINNED_STORAGE
 def test_canonical_rollback_failure_is_explicitly_degraded(
     vault: Vault, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -288,7 +321,11 @@ def test_canonical_rollback_failure_is_explicitly_degraded(
         raise OSError("injected canonical rollback failure")
 
     def fail_append(
-        store: atomic.PinnedPathRoot, relative: Path | str, content: bytes, *, label: str
+        store: atomic.PinnedPathRoot | None,
+        relative: Path | str,
+        content: bytes,
+        *,
+        label: str,
     ) -> None:
         raise atomic.DurableAppendError(
             "injected append failure", outcome=atomic.AppendOutcome.RESTORED
@@ -321,13 +358,17 @@ def test_unrestored_journal_failure_retains_canonical_and_reports_degraded(
     journal_before = journal.read_bytes()
 
     def fail_append(
-        store: atomic.PinnedPathRoot, relative: Path | str, content: bytes, *, label: str
+        store: atomic.PinnedPathRoot | None,
+        relative: Path | str,
+        content: bytes,
+        *,
+        label: str,
     ) -> None:
         raise atomic.DurableAppendError(
             "injected append rollback failure", outcome=atomic.AppendOutcome.UNKNOWN
         )
 
-    monkeypatch.setattr(atomic.PinnedPathRoot, "append_durable", fail_append)
+    _patch_event_append(monkeypatch, fail_append)
 
     with pytest.raises(DegradedIntegrityError, match="canonical state was retained"):
         vault.update_task(
@@ -428,16 +469,24 @@ def test_committed_event_error_keeps_canonical_and_forces_cas_reload(
     journal = vault.root / "journal/events.jsonl"
     journal_before = journal.read_bytes()
     real_append = atomic.PinnedPathRoot.append_durable
+    real_fallback_append = atomic.append_durable
 
     def append_then_fail(
-        store: atomic.PinnedPathRoot, relative: Path | str, content: bytes, *, label: str
+        store: atomic.PinnedPathRoot | None,
+        relative: Path | str,
+        content: bytes,
+        *,
+        label: str,
     ) -> None:
-        real_append(store, relative, content, label=label)
+        if store is None:
+            real_fallback_append(Path(relative), content)
+        else:
+            real_append(store, relative, content, label=label)
         raise atomic.DurableAppendError(
             "injected post-commit cleanup failure", outcome=atomic.AppendOutcome.COMMITTED
         )
 
-    monkeypatch.setattr(atomic.PinnedPathRoot, "append_durable", append_then_fail)
+    _patch_event_append(monkeypatch, append_then_fail)
 
     with pytest.raises(MutationCommittedError, match="were committed"):
         vault.update_task(
