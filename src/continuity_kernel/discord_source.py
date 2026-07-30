@@ -22,7 +22,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from continuity_kernel.atomic import (
     atomic_write,
@@ -66,6 +66,8 @@ _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVISION = re.compile(r"^(?:absent|[0-9a-f]{64})$")
 _ACK_TOKEN = re.compile(r"^[0-9a-f]{64}$")
 _ACCOUNT = re.compile(r"^discord-(?:user|bot)-v1:sha256:[0-9a-f]{64}$")
+_POSIX_OS = cast(Any, os)
+_POSIX_SIGNAL = cast(Any, signal)
 _ERROR_CODES: Final = frozenset(
     {
         "auth_required",
@@ -862,7 +864,7 @@ def _stop_mcp_process(process: subprocess.Popen[bytes]) -> None:
             process.terminate()
     else:
         with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
+            _POSIX_OS.killpg(process.pid, signal.SIGTERM)
     try:
         process.wait(timeout=0.25)
         return
@@ -873,7 +875,7 @@ def _stop_mcp_process(process: subprocess.Popen[bytes]) -> None:
             process.kill()
     else:
         with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
+            _POSIX_OS.killpg(process.pid, _POSIX_SIGNAL.SIGKILL)
     with contextlib.suppress(OSError, subprocess.TimeoutExpired):
         process.wait(timeout=1.0)
 
