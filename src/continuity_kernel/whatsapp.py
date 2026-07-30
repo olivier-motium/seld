@@ -707,10 +707,13 @@ def _process_running(*, runner: Runner | None) -> bool | None:
 
 def _service_running(label: str, *, runtime: Path, runner: Runner | None) -> bool:
     label = resolve_service_label(label)
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        return False
     run = runner or subprocess.run
     try:
         result = run(
-            ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            ["/bin/launchctl", "print", f"gui/{getuid()}/{label}"],
             check=False,
             capture_output=True,
             text=True,

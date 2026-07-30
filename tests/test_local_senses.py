@@ -149,6 +149,37 @@ def _tamper(token: str) -> str:
     return replacement + token[1:]
 
 
+@pytest.mark.parametrize("uid_primitive", (None, "not-callable"))
+def test_whatsapp_service_probe_fails_closed_without_callable_posix_uid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    uid_primitive: object | None,
+) -> None:
+    store = tmp_path / "wacli-store"
+    _whatsapp_store(store)
+    runtime_root = tmp_path / "bin"
+    runtime_root.mkdir()
+    runtime = _runtime(runtime_root)
+    calls: list[tuple[str, ...]] = []
+    if uid_primitive is None:
+        monkeypatch.delattr(os, "getuid", raising=False)
+    else:
+        monkeypatch.setattr(os, "getuid", uid_primitive, raising=False)
+
+    status = whatsapp.inspect_whatsapp(
+        runtime=runtime,
+        store_root=store,
+        runner=_runner(runtime, calls),
+        observed_at=NOW,
+    )
+
+    assert status.available is False
+    assert status.sync_service_running is False
+    assert status.error is not None
+    assert status.error.startswith("standalone sync service is not running")
+    assert not any(call[:2] == ("/bin/launchctl", "print") for call in calls)
+
+
 def test_apple_messages_forward_baseline_replays_until_verified_ack(tmp_path: Path) -> None:
     store = tmp_path / "Messages"
     database = _apple_store(store)
@@ -300,6 +331,7 @@ def test_apple_messages_status_is_sanitized_and_exposes_no_write_route(tmp_path:
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="the standalone WhatsApp service uses launchd")
 def test_whatsapp_forward_baseline_replays_until_verified_ack(tmp_path: Path) -> None:
     store = tmp_path / "wacli-store"
     database = _whatsapp_store(store)
@@ -415,6 +447,7 @@ def test_whatsapp_forward_baseline_replays_until_verified_ack(tmp_path: Path) ->
         ("generation", "delivery store changed"),
     ],
 )
+@pytest.mark.skipif(os.name == "nt", reason="the standalone WhatsApp service uses launchd")
 def test_whatsapp_ack_fails_closed_when_store_changes(
     tmp_path: Path, mutation: str, error: str
 ) -> None:
@@ -483,7 +516,18 @@ def test_whatsapp_status_is_sanitized_and_has_no_provider_mutation_route(tmp_pat
     )
 
 
-@pytest.mark.parametrize("kind", ("symlink", "directory"))
+@pytest.mark.parametrize(
+    "kind",
+    (
+        pytest.param(
+            "symlink",
+            marks=pytest.mark.skipif(
+                os.name == "nt", reason="Windows symlink setup needs elevated privileges"
+            ),
+        ),
+        "directory",
+    ),
+)
 def test_apple_messages_rejects_nonregular_database(tmp_path: Path, kind: str) -> None:
     store = tmp_path / "Messages"
     store.mkdir()
@@ -600,7 +644,18 @@ def test_apple_messages_snapshot_includes_a_stable_committed_wal(tmp_path: Path)
     assert [message.body for message in delta.messages] == ["COMMITTED-IN-WAL"]
 
 
-@pytest.mark.parametrize("kind", ("symlink", "directory"))
+@pytest.mark.parametrize(
+    "kind",
+    (
+        pytest.param(
+            "symlink",
+            marks=pytest.mark.skipif(
+                os.name == "nt", reason="Windows symlink setup needs elevated privileges"
+            ),
+        ),
+        "directory",
+    ),
+)
 def test_whatsapp_rejects_nonregular_database(tmp_path: Path, kind: str) -> None:
     store = tmp_path / "wacli-store"
     store.mkdir()
@@ -626,6 +681,7 @@ def test_whatsapp_rejects_nonregular_database(tmp_path: Path, kind: str) -> None
 
 
 @pytest.mark.parametrize("heartbeat_kind", ("symlink", "oversized"))
+@pytest.mark.skipif(os.name == "nt", reason="the standalone WhatsApp service uses launchd")
 def test_whatsapp_heartbeat_is_bounded_and_never_follows_links(
     tmp_path: Path, heartbeat_kind: str
 ) -> None:
@@ -685,6 +741,7 @@ def test_whatsapp_detects_database_entry_swap_during_query(
     assert status.error is not None and "changed during" in status.error
 
 
+@pytest.mark.skipif(os.name == "nt", reason="the standalone WhatsApp service uses launchd")
 def test_whatsapp_connect_time_aba_cannot_redirect_the_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

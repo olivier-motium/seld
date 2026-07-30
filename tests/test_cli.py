@@ -151,6 +151,13 @@ def test_cli_scheduler_plan_pins_executable_vault_and_mechanical_command(
     Vault(vault_path).initialize(name="Scheduler provenance")
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host-data"))
     monkeypatch.setattr(cli, "current_gsv_executable", lambda: executable)
+    scheduler_type = cast(Any, cli).MacOSScheduler
+
+    def macos_scheduler(*args: Any, **kwargs: Any) -> Any:
+        kwargs.update(uid=501, platform="darwin")
+        return scheduler_type(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "MacOSScheduler", macos_scheduler)
 
     assert cli.main(["--json", "--vault", str(vault_path), "scheduler", "plan"]) == 0
     plan = json.loads(capsys.readouterr().out)["result"]

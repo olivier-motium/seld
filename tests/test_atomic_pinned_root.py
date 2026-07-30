@@ -16,6 +16,7 @@ from continuity_kernel.vault import Vault
 pytestmark = pytest.mark.skipif(
     os.name == "nt", reason="secure directory-pinned storage is POSIX-only foundation"
 )
+_POSIX_OS = cast(Any, os)
 
 
 def test_pinned_directory_listing_is_sorted_filtered_and_bounded(tmp_path: Path) -> None:
@@ -606,7 +607,7 @@ def test_regular_file_watch_second_dup_failure_closes_first_duplicate(
     records.mkdir(parents=True)
     path = records / "value"
     path.write_bytes(b"value")
-    parent = os.open(records, os.O_RDONLY | os.O_DIRECTORY)
+    parent = os.open(records, os.O_RDONLY | _POSIX_OS.O_DIRECTORY)
     descriptor = os.open(path, os.O_RDONLY)
     baseline = len(os.listdir("/dev/fd"))
     actual_dup = os.dup
@@ -661,7 +662,7 @@ def test_named_retain_dup_failure_preserves_previous_authoritative_watch(
         "_duplicate_regular_file_watch",
         staticmethod(fail_watch_duplicate),
     )
-    parent = os.open(records, os.O_RDONLY | os.O_DIRECTORY)
+    parent = os.open(records, os.O_RDONLY | _POSIX_OS.O_DIRECTORY)
     try:
         with pytest.raises(OSError, match="watch duplication"):
             store._retain_named_regular_file(

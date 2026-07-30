@@ -31,6 +31,8 @@ from continuity_kernel.bridge_launcher import (
 from continuity_kernel.errors import ConflictError, SetupError
 from continuity_kernel.vault import Vault
 
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="the native Seld app is macOS-only")
+
 
 @dataclass
 class Completed:

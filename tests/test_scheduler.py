@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import plistlib
 import subprocess
 import sys
@@ -832,6 +833,54 @@ def test_non_macos_scheduler_is_explicitly_unsupported(tmp_path: Path) -> None:
             launch_agents_dir=tmp_path / "agents",
             runtime_root=tmp_path / "runtime",
             platform="win32",
+        )
+
+
+def test_scheduler_requires_a_uid_when_the_host_has_no_posix_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(os, "getuid", raising=False)
+
+    with pytest.raises(SetupError, match="requires a macOS user ID"):
+        MacOSScheduler(
+            (
+                sys.executable,
+                "--vault",
+                str(tmp_path / "vault"),
+                "--json",
+                "pulse",
+                "sweep",
+            ),
+            vault_root=tmp_path / "vault",
+            data_root=tmp_path / "data",
+            launch_agents_dir=tmp_path / "agents",
+            runtime_root=tmp_path / "runtime",
+            platform="darwin",
+        )
+
+
+def test_scheduler_rejects_a_boolean_host_uid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "getuid", lambda: True, raising=False)
+
+    with pytest.raises(ValidationError, match="scheduler user ID is invalid"):
+        MacOSScheduler(
+            (
+                sys.executable,
+                "--vault",
+                str(tmp_path / "vault"),
+                "--json",
+                "pulse",
+                "sweep",
+            ),
+            vault_root=tmp_path / "vault",
+            data_root=tmp_path / "data",
+            launch_agents_dir=tmp_path / "agents",
+            runtime_root=tmp_path / "runtime",
+            platform="darwin",
         )
 
 

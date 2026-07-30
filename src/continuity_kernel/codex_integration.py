@@ -3776,7 +3776,10 @@ def _write_exclusive(path: Path, content: bytes, *, mode: int = 0o600) -> None:
                 raise OSError("short write while creating legacy marketplace scaffold")
             offset += written
         if os.name != "nt":
-            os.fchmod(descriptor, mode)
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is None:
+                raise OSError("owner-only file modes are unavailable")
+            fchmod(descriptor, mode)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)

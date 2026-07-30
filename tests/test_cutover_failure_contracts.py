@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import importlib
 import os
-import resource
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -12,6 +12,10 @@ import pytest
 
 from continuity_kernel import bridge, bridge_worker, resident_context, sqlite_snapshot
 from continuity_kernel.errors import ValidationError
+
+_POSIX_OS = cast(Any, os)
+_RESOURCE = cast(Any, importlib.import_module("resource")) if os.name != "nt" else None
+_RLIM_INFINITY = -1 if _RESOURCE is None else int(_RESOURCE.RLIM_INFINITY)
 
 
 def _write_skill(vault: Path, *, name: str = "exact-skill", frontmatter: str | None = None) -> Path:
@@ -76,28 +80,29 @@ def test_resident_fallback_rejects_links_special_files_bounds_and_tree_mutation(
 ) -> None:
     _use_resident_fallback(monkeypatch)
 
-    linked_vault = tmp_path / "linked"
-    linked_skill = _write_skill(linked_vault)
-    target = linked_skill / "references/target.md"
-    target.write_text("ordinary\n", encoding="utf-8")
-    (linked_skill / "references/link.md").symlink_to(target)
-    with pytest.raises(ValidationError, match="symbolic link"):
-        resident_context.resident_skills(linked_vault)
+    if os.name != "nt":
+        linked_vault = tmp_path / "linked"
+        linked_skill = _write_skill(linked_vault)
+        target = linked_skill / "references/target.md"
+        target.write_text("ordinary\n", encoding="utf-8")
+        (linked_skill / "references/link.md").symlink_to(target)
+        with pytest.raises(ValidationError, match="symbolic link"):
+            resident_context.resident_skills(linked_vault)
 
-    linked_ancestor_vault = tmp_path / "linked-ancestor"
-    real_skills = linked_ancestor_vault / "real-skills"
-    real_skills.mkdir(parents=True)
-    resident = linked_ancestor_vault / "context/resident"
-    resident.mkdir(parents=True)
-    (resident / "skills").symlink_to(real_skills, target_is_directory=True)
-    with pytest.raises(ValidationError, match="ancestry must contain only real directories"):
-        resident_context.resident_skills(linked_ancestor_vault)
+        linked_ancestor_vault = tmp_path / "linked-ancestor"
+        real_skills = linked_ancestor_vault / "real-skills"
+        real_skills.mkdir(parents=True)
+        resident = linked_ancestor_vault / "context/resident"
+        resident.mkdir(parents=True)
+        (resident / "skills").symlink_to(real_skills, target_is_directory=True)
+        with pytest.raises(ValidationError, match="ancestry must contain only real directories"):
+            resident_context.resident_skills(linked_ancestor_vault)
 
-    special_vault = tmp_path / "special"
-    special_skill = _write_skill(special_vault)
-    os.mkfifo(special_skill / "references/pipe")
-    with pytest.raises(ValidationError, match="must be a regular file"):
-        resident_context.resident_skills(special_vault)
+        special_vault = tmp_path / "special"
+        special_skill = _write_skill(special_vault)
+        _POSIX_OS.mkfifo(special_skill / "references/pipe")
+        with pytest.raises(ValidationError, match="must be a regular file"):
+            resident_context.resident_skills(special_vault)
 
     count_vault = tmp_path / "count"
     _write_skill(count_vault)
@@ -238,15 +243,16 @@ def test_sqlite_snapshot_rejects_path_size_journal_and_identity_failures(
     ):
         pass
 
-    target = tmp_path / "target.sqlite"
-    target.write_bytes(b"target")
-    linked = tmp_path / "linked.sqlite"
-    linked.symlink_to(target)
-    with (
-        pytest.raises(ValidationError, match="regular file, not a link"),
-        sqlite_snapshot.pinned_sqlite_snapshot(linked, label="linked database"),
-    ):
-        pass
+    if os.name != "nt":
+        target = tmp_path / "target.sqlite"
+        target.write_bytes(b"target")
+        linked = tmp_path / "linked.sqlite"
+        linked.symlink_to(target)
+        with (
+            pytest.raises(ValidationError, match="regular file, not a link"),
+            sqlite_snapshot.pinned_sqlite_snapshot(linked, label="linked database"),
+        ):
+            pass
 
     oversized = tmp_path / "oversized.sqlite"
     oversized.write_bytes(b"x")
@@ -395,18 +401,20 @@ def test_detached_bridge_worker_dispatches_exact_runtime_identity(
 
 @pytest.mark.parametrize(
     ("soft_limit", "expected_end"),
-    [(128, 128), (resource.RLIM_INFINITY, 1_048_576)],
+    [(128, 128), (_RLIM_INFINITY, 1_048_576)],
 )
+@pytest.mark.skipif(os.name == "nt", reason="detached process groups are POSIX-only")
 def test_detached_bridge_worker_closes_descriptors_before_new_session(
     monkeypatch: pytest.MonkeyPatch,
     soft_limit: int,
     expected_end: int,
 ) -> None:
+    assert _RESOURCE is not None
     closed: list[tuple[int, int]] = []
     detached: list[bool] = []
     stages: list[str] = []
     monkeypatch.setenv("GSV_BRIDGE_DETACH_IN_CHILD", "1")
-    monkeypatch.setattr(resource, "getrlimit", lambda _: (soft_limit, soft_limit))
+    monkeypatch.setattr(_RESOURCE, "getrlimit", lambda _: (soft_limit, soft_limit))
     monkeypatch.setattr(os, "closerange", lambda start, end: closed.append((start, end)))
     monkeypatch.setattr(os, "setsid", lambda: detached.append(True))
     monkeypatch.setattr(bridge_worker, "_startup_marker", stages.append)

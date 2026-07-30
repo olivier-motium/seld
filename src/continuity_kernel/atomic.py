@@ -849,7 +849,7 @@ class PinnedPathRoot:
             finished = os.fstat(descriptor)
             if int(finished.st_size) != original_size + len(content):
                 raise OSError(f"{label} changed while it was appended")
-            appended = os.pread(descriptor, len(content), original_size)
+            appended = _POSIX_OS.pread(descriptor, len(content), original_size)
             if appended != content:
                 raise OSError(f"{label} append bytes changed before verification")
             current = os.stat(name, dir_fd=parent, follow_symlinks=False)
@@ -3235,7 +3235,7 @@ def _restore_exact_append(
     ):
         raise OSError("append target changed before exact rollback")
     appended_size = int(current.st_size) - original_size
-    if os.pread(descriptor, appended_size, original_size) != content[:appended_size]:
+    if _POSIX_OS.pread(descriptor, appended_size, original_size) != content[:appended_size]:
         raise OSError("append tail changed before exact rollback")
     os.ftruncate(descriptor, original_size)
     os.fsync(descriptor)

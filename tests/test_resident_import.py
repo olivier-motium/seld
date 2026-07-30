@@ -41,6 +41,10 @@ from continuity_kernel.resident_signals import (
 )
 from continuity_kernel.vault import Vault
 
+_POSIX_IMPORT = pytest.mark.skipif(
+    os.name == "nt", reason="resident import publication requires POSIX pinned storage"
+)
+
 OBSERVED = datetime(2026, 7, 29, 10, 0, tzinfo=UTC)
 TIMESTAMP = "2026-07-29T10:00:00.000000Z"
 SIGNAL_A = "019f0000-0000-7000-8000-000000000101"
@@ -370,6 +374,7 @@ def _available_update() -> dict[str, object]:
     return {"state": "current", "transaction": None}
 
 
+@_POSIX_IMPORT
 def test_exact_manifest_import_preserves_rich_semantics_files_sources_and_signals(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -445,6 +450,7 @@ def test_exact_manifest_import_preserves_rich_semantics_files_sources_and_signal
     ).read_bytes()
 
 
+@_POSIX_IMPORT
 def test_import_derives_compacted_event_index_and_suppresses_replay_in_fresh_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -493,6 +499,7 @@ def test_import_derives_compacted_event_index_and_suppresses_replay_in_fresh_pro
     assert json.loads(completed.stdout) == {"created": False, "inputs": 0, "pending": 0}
 
 
+@_POSIX_IMPORT
 def test_import_stages_an_empty_replay_ledger_when_archives_have_no_event_keys(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -650,6 +657,7 @@ def _import_v2_local_checkpoint(
     return migrated, store, database
 
 
+@_POSIX_IMPORT
 def test_v2_import_consumes_staged_prefix_and_recovers_after_host_adoption_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -755,6 +763,7 @@ def test_v2_import_consumes_staged_prefix_and_recovers_after_host_adoption_crash
     assert restored_status["checkpoints"][0]["state"] == "needs_reproof"
 
 
+@_POSIX_IMPORT
 def test_staged_local_checkpoint_rejects_store_and_vault_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1060,6 +1069,7 @@ def test_direction_redundancy_and_review_thread_are_validated(tmp_path: Path) ->
         resident_import.inspect_resident_export(export, tmp_path / "target-b")
 
 
+@_POSIX_IMPORT
 def test_apply_refuses_update_before_staging_and_before_publish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1094,6 +1104,7 @@ def test_apply_refuses_update_before_staging_and_before_publish(
     assert Vault(stages[0]).doctor().healthy
 
 
+@_POSIX_IMPORT
 def test_publish_race_never_replaces_new_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1135,6 +1146,7 @@ def test_publish_race_never_replaces_new_target(
     assert (target / "keep.txt").read_text(encoding="utf-8") == "competitor"
 
 
+@_POSIX_IMPORT
 def test_publish_parent_swap_preserves_verified_stage_and_foreign_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1188,6 +1200,7 @@ def test_import_requires_owner_only_export(tmp_path: Path) -> None:
         resident_import.inspect_resident_export(export, tmp_path / "target")
 
 
+@_POSIX_IMPORT
 def test_cli_migration_round_trip_needs_no_existing_config_or_vault(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

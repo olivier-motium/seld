@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, cast
 
 from continuity_kernel import __version__
 from continuity_kernel.atomic import PinnedPathRoot, open_regular_file
@@ -52,6 +52,8 @@ _SHA256_LENGTH: Final = 64
 _INSTALL_ID_LENGTH: Final = 64
 _LIFECYCLE_FORMAT_VERSION: Final = 1
 _LIFECYCLE_PATH: Final = "state/lifecycle.json"
+_POSIX_OS = cast(Any, os)
+_POSIX_SIGNAL = cast(Any, signal)
 
 
 class Completed(Protocol):
@@ -1532,7 +1534,7 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         process.wait()
         return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        _POSIX_OS.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         process.wait()
         return
@@ -1551,7 +1553,7 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         pass
     with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
+        _POSIX_OS.killpg(process.pid, _POSIX_SIGNAL.SIGKILL)
     process.wait()
 
 

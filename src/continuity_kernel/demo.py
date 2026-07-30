@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from continuity_kernel.atomic import durable_unlink
 from continuity_kernel.errors import ConflictError
 from continuity_kernel.vault import Vault
 
@@ -85,12 +86,7 @@ and next action without a rebrief.
     )
     # The demo created this exact synthetic path, so it can remove it explicitly after proving
     # that the conservative doctor retained unknown crash state for inspection.
-    orphan.unlink()
-    directory = os.open(orphan.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    durable_unlink(orphan)
     repaired = vault.doctor()
     demo_owned_crash_residue_cleaned = (
         interrupted_write_retained_for_review and repaired.healthy and not orphan.exists()

@@ -175,7 +175,12 @@ class MacOSScheduler:
             raise ValidationError("scheduler interval must be between 60 and 3600 seconds")
         self.interval_seconds = interval_seconds
         self.data_root = _absolute(data_root or data_dir(), "scheduler data directory")
-        self.uid = os.getuid() if uid is None else uid
+        if uid is None:
+            getuid = getattr(os, "getuid", None)
+            if not callable(getuid):
+                raise SetupError("the sense sweep scheduler requires a macOS user ID")
+            uid = getuid()
+        self.uid = uid
         if not isinstance(self.uid, int) or isinstance(self.uid, bool) or self.uid < 0:
             raise ValidationError("scheduler user ID is invalid")
         self.launch_agents_dir = _absolute(

@@ -24,7 +24,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Final
+from typing import Any, BinaryIO, Final, cast
 from urllib.parse import unquote, urlsplit
 
 from continuity_kernel.atomic import exclusive_lock
@@ -62,6 +62,8 @@ _MARKDOWN_TREES: Final = (
 )
 _RESIDENT_CONTEXT: Final = PurePosixPath("context/resident")
 _LEGACY_RESIDENT_CONTROL: Final = PurePosixPath("context/resident/control")
+_POSIX_OS = cast(Any, os)
+_POSIX_SIGNAL = cast(Any, signal)
 
 
 @dataclass(frozen=True)
@@ -643,12 +645,12 @@ class RecallCompanion:
         self.index_root.mkdir(parents=True, exist_ok=True)
         with _pinned_index_root(self.index_root) as descriptor:
             if os.name != "nt":
-                os.fchmod(descriptor, 0o700)
+                _POSIX_OS.fchmod(descriptor, 0o700)
             for name in ("cache", "config"):
                 child = _open_index_directory(descriptor, (name,), create=True)
                 try:
                     if os.name != "nt":
-                        os.fchmod(child, 0o700)
+                        _POSIX_OS.fchmod(child, 0o700)
                 finally:
                     os.close(child)
 
@@ -1635,7 +1637,7 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
 
 def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        _POSIX_OS.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
     except OSError:
@@ -1646,14 +1648,14 @@ def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
     deadline = time.monotonic() + 0.2
     while time.monotonic() < deadline:
         try:
-            os.killpg(process.pid, 0)
+            _POSIX_OS.killpg(process.pid, 0)
         except ProcessLookupError:
             return
         except OSError:
             break
         time.sleep(0.01)
     with suppress(OSError, ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
+        _POSIX_OS.killpg(process.pid, _POSIX_SIGNAL.SIGKILL)
     with suppress(OSError, subprocess.TimeoutExpired):
         process.wait(timeout=1.0)
 

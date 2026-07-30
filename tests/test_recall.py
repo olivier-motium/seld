@@ -17,6 +17,10 @@ from continuity_kernel.errors import ValidationError
 from continuity_kernel.recall import RecallCompanion
 from continuity_kernel.vault import Vault
 
+_POSIX_INDEX = pytest.mark.skipif(
+    os.name == "nt", reason="secure QMD recall storage requires POSIX directory descriptors"
+)
+
 
 def _executable(tmp_path: Path) -> Path:
     path = tmp_path / "qmd"
@@ -74,7 +78,8 @@ def test_discovery_covers_resident_markdown_and_never_follows_symlinks(
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.md").write_text("# Not part of Seld\n", encoding="utf-8")
-    (vault.root / "context/resident/escape").symlink_to(outside, target_is_directory=True)
+    if os.name != "nt":
+        (vault.root / "context/resident/escape").symlink_to(outside, target_is_directory=True)
 
     discovery = RecallCompanion(
         vault.root,
@@ -96,6 +101,7 @@ def test_discovery_covers_resident_markdown_and_never_follows_symlinks(
     assert discovery.complete
 
 
+@_POSIX_INDEX
 def test_resident_privacy_and_legacy_control_stay_out_of_every_recall_path(
     vault: Vault,
     tmp_path: Path,
@@ -222,6 +228,7 @@ def test_placeholder_is_skipped_before_open(
     assert not discovery.complete
 
 
+@_POSIX_INDEX
 def test_plan_and_healthy_status_keep_the_index_outside_the_vault(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -261,6 +268,7 @@ def test_plan_and_healthy_status_keep_the_index_outside_the_vault(
     assert status.reason is None
 
 
+@_POSIX_INDEX
 def test_refresh_is_content_fingerprint_idempotent(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -292,6 +300,7 @@ def test_refresh_is_content_fingerprint_idempotent(
     assert first.discovery.fingerprint != third.discovery.fingerprint
 
 
+@_POSIX_INDEX
 def test_refresh_rebinds_drifted_collection_before_update(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -329,6 +338,7 @@ def test_refresh_rebinds_drifted_collection_before_update(
     )
 
 
+@_POSIX_INDEX
 def test_unchanged_refresh_repairs_a_foreign_collection_binding(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -376,6 +386,7 @@ def test_unchanged_refresh_repairs_a_foreign_collection_binding(
     )
 
 
+@_POSIX_INDEX
 def test_rebuild_tolerates_missing_old_collection_but_not_other_failures(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -401,6 +412,7 @@ def test_rebuild_tolerates_missing_old_collection_but_not_other_failures(
     assert calls[-1][-2:] == ("embed", "-f")
 
 
+@_POSIX_INDEX
 def test_qmd_search_is_bounded_to_known_documents(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -500,6 +512,7 @@ def test_absent_qmd_uses_exact_keyword_then_recency_fallback(vault: Vault, tmp_p
     assert result.reason == "QMD executable is unavailable; exact Markdown recall was used"
 
 
+@_POSIX_INDEX
 def test_qmd_failure_is_sanitized_before_markdown_fallback(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -530,6 +543,7 @@ def test_qmd_failure_is_sanitized_before_markdown_fallback(
     assert "token" not in result.reason
 
 
+@_POSIX_INDEX
 def test_recall_lifecycle_does_not_change_canonical_digest(
     vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -574,6 +588,7 @@ def test_index_root_must_be_disjoint_and_subprocess_output_is_bounded(
     assert len(result.stdout) <= 128
 
 
+@_POSIX_INDEX
 def test_cross_process_refresh_is_single_flight_and_search_waits_for_readback(
     vault: Vault, tmp_path: Path
 ) -> None:
@@ -821,6 +836,7 @@ def test_qmd_timeout_terminates_descendants_not_only_the_parent(tmp_path: Path) 
     assert not marker.exists()
 
 
+@_POSIX_INDEX
 def test_snapshot_publication_refuses_symlink_and_index_root_swaps(
     vault: Vault,
     tmp_path: Path,

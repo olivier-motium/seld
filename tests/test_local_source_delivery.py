@@ -35,6 +35,10 @@ from continuity_kernel.local_source_delivery import (
 from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
 from continuity_kernel.vault import Vault
 
+_POSIX_STORAGE = pytest.mark.skipif(
+    os.name == "nt", reason="local source delivery requires POSIX pinned storage"
+)
+
 APPLE_TEST_TIMESTAMP = 800_000_000
 
 
@@ -224,6 +228,7 @@ def test_whatsapp_service_label_env_is_validated_and_explicit_value_wins(
     )
 
 
+@_POSIX_STORAGE
 def test_forward_baseline_discard_replay_and_semantic_ack_are_content_free(
     tmp_path: Path,
 ) -> None:
@@ -274,6 +279,7 @@ def test_forward_baseline_discard_replay_and_semantic_ack_are_content_free(
     assert empty_observation.result.value == "explicit_empty"
 
 
+@_POSIX_STORAGE
 def test_ack_rejects_noncanonical_result_reference_before_any_persistence(
     tmp_path: Path,
 ) -> None:
@@ -303,6 +309,7 @@ def test_ack_rejects_noncanonical_result_reference_before_any_persistence(
     assert vault.get_source_snapshot().observation("apple_messages") is None
 
 
+@_POSIX_STORAGE
 def test_result_ref_source_receipt_and_checkpoint_share_one_vault_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -385,6 +392,7 @@ def test_result_ref_source_receipt_and_checkpoint_share_one_vault_lock(
     assert fresh_vault.get_task(task.identifier).revision == changed.revision
 
 
+@_POSIX_STORAGE
 def test_receipt_commit_precedes_checkpoint_and_exact_retry_recovers(
     tmp_path: Path,
 ) -> None:
@@ -429,6 +437,7 @@ def test_receipt_commit_precedes_checkpoint_and_exact_retry_recovers(
     assert _ack(LocalSourceDelivery(vault, store_root=store), poll)["already_acknowledged"]
 
 
+@_POSIX_STORAGE
 def test_receipt_recovery_requires_exact_semantics_even_after_result_record_advances(
     tmp_path: Path,
 ) -> None:
@@ -522,6 +531,7 @@ def test_receipt_recovery_requires_exact_semantics_even_after_result_record_adva
     ]
 
 
+@_POSIX_STORAGE
 def test_receipt_recovery_survives_an_unrelated_later_source_commit(tmp_path: Path) -> None:
     vault, selected = _selected_vault(tmp_path, "apple_messages", "whatsapp")
     store = tmp_path / "Messages"
@@ -564,6 +574,7 @@ def test_receipt_recovery_survives_an_unrelated_later_source_commit(tmp_path: Pa
     assert not LocalSourceDelivery(vault, store_root=store).status("apple_messages")["pending"]
 
 
+@_POSIX_STORAGE
 def test_receipt_recovery_survives_later_same_source_observation_and_large_journal(
     tmp_path: Path,
 ) -> None:
@@ -609,6 +620,7 @@ def test_receipt_recovery_survives_later_same_source_observation_and_large_journ
     assert not LocalSourceDelivery(vault, store_root=store).status("apple_messages")["pending"]
 
 
+@_POSIX_STORAGE
 def test_uncommitted_attempt_rebases_after_source_state_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -653,6 +665,7 @@ def test_uncommitted_attempt_rebases_after_source_state_changes(
     assert delivery.status("apple_messages")["pending"] is False
 
 
+@_POSIX_STORAGE
 def test_invisible_partial_page_preserves_prefix_horizon_until_visible_continuation(
     tmp_path: Path,
 ) -> None:
@@ -705,6 +718,7 @@ def test_invisible_partial_page_preserves_prefix_horizon_until_visible_continuat
     assert final_observation.covered_through == first_observation.covered_through
 
 
+@_POSIX_STORAGE
 def test_unrelated_source_revision_rebases_verified_delivery_without_replay(
     tmp_path: Path,
 ) -> None:
@@ -740,6 +754,7 @@ def test_unrelated_source_revision_rebases_verified_delivery_without_replay(
 
 
 @pytest.mark.parametrize(("mutation", "message"), [("content", "content"), ("store", "store")])
+@_POSIX_STORAGE
 def test_changed_content_or_store_fails_before_source_receipt(
     tmp_path: Path, mutation: str, message: str
 ) -> None:
@@ -763,6 +778,7 @@ def test_changed_content_or_store_fails_before_source_receipt(
 
 
 @pytest.mark.parametrize("swapped", ("authority", "checkpoints"))
+@_POSIX_STORAGE
 def test_checkpoint_operation_rejects_ancestor_or_checkpoint_directory_swap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -802,6 +818,7 @@ def test_checkpoint_operation_rejects_ancestor_or_checkpoint_directory_swap(
     assert list(moved.rglob("*.json"))
 
 
+@_POSIX_STORAGE
 def test_explicit_rebaseline_preserves_receipt_and_pending_history(tmp_path: Path) -> None:
     vault, _selected = _selected_vault(tmp_path, "apple_messages")
     store = tmp_path / "Messages"
@@ -860,6 +877,7 @@ def test_explicit_rebaseline_preserves_receipt_and_pending_history(tmp_path: Pat
     assert retry["already_rebaselined"] is True
 
 
+@_POSIX_STORAGE
 def test_rebaseline_rejects_new_messages_from_the_same_store(tmp_path: Path) -> None:
     vault, _selected = _selected_vault(tmp_path, "apple_messages")
     store = tmp_path / "Messages"
@@ -886,6 +904,7 @@ def test_rebaseline_rejects_new_messages_from_the_same_store(tmp_path: Path) -> 
     assert list(history.rglob("*.json")) == []
 
 
+@_POSIX_STORAGE
 def test_rebaseline_requires_exact_cas_and_explicit_forward_only_disposition(
     tmp_path: Path,
 ) -> None:
@@ -914,6 +933,7 @@ def test_rebaseline_requires_exact_cas_and_explicit_forward_only_disposition(
     assert delivery.status("apple_messages") == before
 
 
+@_POSIX_STORAGE
 def test_rebaseline_crash_after_history_keeps_old_checkpoint_and_retry_completes(
     tmp_path: Path,
 ) -> None:
@@ -953,6 +973,7 @@ def test_rebaseline_crash_after_history_keeps_old_checkpoint_and_retry_completes
     assert recovered["sequence"] == cast(int, before["sequence"]) + 1
 
 
+@_POSIX_STORAGE
 def test_apple_checkpoint_adoption_preserves_the_exact_prefix_without_a_gap(
     tmp_path: Path,
 ) -> None:
@@ -983,6 +1004,7 @@ def test_apple_checkpoint_adoption_preserves_the_exact_prefix_without_a_gap(
     assert "arrived during cutover" not in durable
 
 
+@_POSIX_STORAGE
 def test_whatsapp_checkpoint_adoption_preserves_the_exact_prefix_without_a_gap(
     tmp_path: Path,
 ) -> None:
@@ -1019,6 +1041,7 @@ def test_whatsapp_checkpoint_adoption_preserves_the_exact_prefix_without_a_gap(
     assert delivery.status("whatsapp")["adoption"]["disposition"] == "adopt_verified_prefix"
 
 
+@_POSIX_STORAGE
 def test_checkpoint_adoption_rejects_unproven_prefix_store_and_cas(
     tmp_path: Path,
 ) -> None:
@@ -1065,6 +1088,7 @@ def test_checkpoint_adoption_rejects_unproven_prefix_store_and_cas(
     assert delivery.status("apple_messages")["initialized"] is False
 
 
+@_POSIX_STORAGE
 def test_token_is_bound_to_exact_vault_root_host_and_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1110,6 +1134,7 @@ def test_token_is_bound_to_exact_vault_root_host_and_checkpoint(
         )
 
 
+@_POSIX_STORAGE
 def test_whatsapp_delivery_uses_external_companion_without_routing_leaks(tmp_path: Path) -> None:
     vault, _selected = _selected_vault(tmp_path, "whatsapp")
     store = tmp_path / "wacli-store"
@@ -1158,6 +1183,7 @@ def _exchange(
     return cast(dict[str, Any], json.loads(line))
 
 
+@_POSIX_STORAGE
 def test_fresh_cli_custom_store_is_visible_to_generated_manifest_mcp_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1249,6 +1275,7 @@ def test_fresh_cli_custom_store_is_visible_to_generated_manifest_mcp_process(
     assert server["env"][codex_integration.GSV_DATA_DIR_ENV] == str(config.data_dir())
 
 
+@_POSIX_STORAGE
 def test_host_local_adapter_binding_rejects_wrong_or_replaced_store_root(
     tmp_path: Path,
 ) -> None:
@@ -1294,6 +1321,7 @@ def test_host_local_adapter_binding_rejects_wrong_or_replaced_store_root(
         LocalSourceDelivery(vault).status("apple_messages")
 
 
+@_POSIX_STORAGE
 def test_raw_cursor_adoption_is_internal_and_fresh_cli_delivers_only_the_gap(
     tmp_path: Path,
 ) -> None:
@@ -1364,6 +1392,7 @@ def test_raw_cursor_adoption_is_internal_and_fresh_cli_delivers_only_the_gap(
     assert [message["body"] for message in messages] == ["gap after CLI cutover"]
 
 
+@_POSIX_STORAGE
 def test_fresh_cli_rebaseline_requires_exact_replacement_disposition(tmp_path: Path) -> None:
     vault, _selected = _selected_vault(tmp_path, "apple_messages")
     store = tmp_path / "Messages"
