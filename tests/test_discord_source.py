@@ -305,7 +305,8 @@ def test_binding_is_cas_bound_owner_only_and_contains_no_provider_secret(
     encoded = bridge.binding_path.read_text()
     assert TOKEN not in encoded
     assert CHANNEL not in encoded
-    assert bridge.binding_path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert bridge.binding_path.stat().st_mode & 0o777 == 0o600
     with pytest.raises(ConflictError):
         bridge.bind(runtime, expected_revision="absent")
 
