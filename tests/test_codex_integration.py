@@ -24,6 +24,7 @@ from continuity_kernel import (
 from continuity_kernel import resident_context, whatsapp
 from continuity_kernel.config import data_dir
 from continuity_kernel.errors import ConflictError, SetupError, ValidationError
+from continuity_kernel.vault import Vault
 
 
 @dataclass
@@ -112,6 +113,8 @@ def _generated_mcp_environment(vault: Path) -> dict[str, str]:
     payload = json.loads(encoded.decode("utf-8"))
     environment = payload["mcpServers"]["gsv"]["env"]
     assert isinstance(environment, dict)
+    assert payload["mcpServers"]["gsv_connectors"]["env"] == environment
+    assert payload["mcpServers"]["gsv_connectors"]["args"][-2:] == ["--profile", "connectors"]
     return environment
 
 
@@ -2156,9 +2159,9 @@ def test_conflicting_marketplace_root_fails_without_plugin_or_instruction_mutati
     assert not (home / "AGENTS.md").exists()
 
 
-def _launch_generated_manifest(marketplace: Path) -> dict[str, Any]:
+def _launch_generated_manifest(marketplace: Path, *, server_name: str = "gsv") -> dict[str, Any]:
     payload = json.loads((marketplace / "plugins/gsv/.mcp.json").read_text(encoding="utf-8"))
-    server = payload["mcpServers"]["gsv"]
+    server = payload["mcpServers"][server_name]
     environment = os.environ.copy()
     for name in (integration.GSV_DATA_DIR_ENV, "GSV_VAULT", whatsapp.SERVICE_LABEL_ENV):
         environment.pop(name, None)
@@ -2209,6 +2212,28 @@ def test_exact_source_runtime_manifest_executes(tmp_path: Path) -> None:
     assert result["server"]["args"] == ["-m", "continuity_kernel", "mcp", "serve"]
     assert result["server"]["env"][integration.GSV_DATA_DIR_ENV] == str(data_dir())
     assert result["response"]["result"]["serverInfo"]["name"] == "gsv"
+
+
+def test_exact_source_runtime_manifest_exposes_isolated_connector_server(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    Vault(vault).initialize(name="Connector manifest test")
+    marketplace = _prepare_test_marketplace(
+        tmp_path,
+        vault,
+        (sys.executable, ["-m", "continuity_kernel"]),
+    )
+
+    result = _launch_generated_manifest(marketplace, server_name="gsv_connectors")
+
+    assert result["server"]["args"] == [
+        "-m",
+        "continuity_kernel",
+        "mcp",
+        "serve",
+        "--profile",
+        "connectors",
+    ]
+    assert result["response"]["result"]["serverInfo"]["name"] == "gsv-connectors"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="executable shebang fixture is POSIX-specific")
