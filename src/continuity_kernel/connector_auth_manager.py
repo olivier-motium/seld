@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import webbrowser
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from continuity_kernel.config import connector_auth_dir
 from continuity_kernel.connector_auth import (
+    AccountMetadata,
     ConnectionHealth,
     ConnectionMetadata,
     CredentialKind,
@@ -484,6 +485,52 @@ class ConnectorAuthManager:
             observed_at=datetime.now(UTC),
             verified=True,
         )
+
+    def verify_existing_connection_identity(
+        self,
+        connection_id: ConnectionId | str,
+        *,
+        fingerprint: str,
+        label: str,
+        expected_revision: str,
+        expected_token_version: int,
+    ) -> dict[str, Any]:
+        """Publish the confirmed identity for one resumable unverified credential."""
+
+        clean_id = parse_connection_id(connection_id)
+        with self.tokens.exclusive_lifecycle(clean_id):
+            snapshot = self.vault.get_connection_snapshot()
+            if snapshot.revision != expected_revision:
+                raise ConflictError("connection changed; restart identity confirmation")
+            metadata = snapshot.connection(clean_id)
+            if metadata is None:
+                raise NotFoundError("connection was not found")
+            if metadata.health is not ConnectionHealth.UNVERIFIED:
+                raise ValidationError("only an unverified connection can resume identity setup")
+            if metadata.account.fingerprint is None:
+                raise ValidationError("unverified connection has no bound account identity")
+            if metadata.account.fingerprint != fingerprint:
+                raise ConflictError("verified account does not match the connection binding")
+            token_state = self.tokens.state(clean_id)
+            if token_state is None or token_state.version != expected_token_version:
+                raise ConflictError("connector credential changed; restart identity confirmation")
+            observed_at = max(
+                datetime.now(UTC),
+                metadata.updated_at + timedelta(microseconds=1),
+            )
+            verified = replace(
+                metadata,
+                account=AccountMetadata(fingerprint=fingerprint, label=label),
+                health=ConnectionHealth.READY,
+                last_verified_at=observed_at,
+                updated_at=observed_at,
+                version=metadata.version + 1,
+            )
+            return self.vault.put_connection(
+                expected_revision=expected_revision,
+                connection=verified,
+                observed_at=observed_at,
+            )
 
     def remove(
         self,

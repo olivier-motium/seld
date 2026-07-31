@@ -35,6 +35,10 @@ class _Onboarding:
         self.calls.append(("disconnect", {"connection_id": connection_id}))
         return {"connection_id": connection_id, "status": "disconnected_locally"}
 
+    def resume(self, connection_id: str, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("resume", {"connection_id": connection_id, **kwargs}))
+        return {"connection_id": connection_id, "status": "connected"}
+
 
 def _install_fake_onboarding(
     monkeypatch: pytest.MonkeyPatch,
@@ -106,6 +110,17 @@ def test_oauth_connect_passes_firefox_and_manual_url_fallback_without_credential
     assert callable(opener) and opener("https://accounts.example/authorize") is True
     assert opened == ["https://accounts.example/authorize"]
     assert "client_id" not in kwargs and "token" not in kwargs
+
+
+def test_authorization_url_is_always_printed_even_when_browser_opened(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    url = "https://accounts.example/authorize?state=opaque"
+    cli._present_authorization_url(url, True)
+    stderr = capsys.readouterr().err
+    assert "browser is open" in stderr
+    assert "safe to copy" in stderr
+    assert url in stderr
 
 
 def test_identity_confirmation_shows_exact_account_and_defaults_to_no(
@@ -181,4 +196,53 @@ def test_connector_interrupt_returns_130_with_safe_recovery_instruction(
     )
 
     assert result == 130
-    assert "connectors list" in capsys.readouterr().err
+    stderr = capsys.readouterr().err
+    assert "provider access may remain" in stderr
+    assert "installed apps" in stderr
+    assert "connectors list" in stderr
+
+
+def test_connector_resume_and_gmail_purge_step_up_are_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = tmp_path / "vault"
+    Vault(vault).initialize(name="Connector CLI")
+    fake = _Onboarding()
+    _install_fake_onboarding(monkeypatch, fake)
+    connection_id = "con-" + "a" * 32
+
+    assert (
+        cli.main(
+            [
+                "--vault",
+                str(vault),
+                "connectors",
+                "resume",
+                connection_id,
+                "--alias",
+                "Work Mail",
+            ]
+        )
+        == 0
+    )
+    assert fake.calls[-1][0] == "resume"
+    assert fake.calls[-1][1]["alias"] == "Work Mail"
+
+    assert (
+        cli.main(
+            [
+                "--vault",
+                str(vault),
+                "connectors",
+                "connect",
+                "gmail",
+                "--access",
+                "full",
+                "--with-permanent-delete",
+                "--no-browser",
+            ]
+        )
+        == 0
+    )
+    assert fake.calls[-1][1]["include_permanent_delete"] is True

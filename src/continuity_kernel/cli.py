@@ -47,7 +47,11 @@ from continuity_kernel.config import (
 )
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_identifiers import parse_connection_id
-from continuity_kernel.connector_onboarding import ConnectorIdentityReview, ConnectorOnboarding
+from continuity_kernel.connector_onboarding import (
+    ConnectorIdentityReview,
+    ConnectorOnboarding,
+    provider_revocation_guidance,
+)
 from continuity_kernel.connector_operations import CONNECTOR_PROFILE
 from continuity_kernel.connector_profiles import CONNECTOR_PROFILES
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
@@ -128,10 +132,24 @@ def main(arguments: list[str] | None = None) -> int:
             print(f"Error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print(
-            "Cancelled. Run `gsv connectors list` before retrying if sign-in had already finished.",
-            file=sys.stderr,
-        )
+        if (
+            getattr(args, "command", None) == "connectors"
+            and getattr(args, "connectors_command", None) == "connect"
+        ):
+            connector = getattr(args, "connector", None)
+            profile = CONNECTOR_PROFILES.get(connector) if isinstance(connector, str) else None
+            guidance = (
+                provider_revocation_guidance(profile.provider)
+                if profile is not None
+                else "Review the provider's connected-app settings."
+            )
+            print(
+                "Cancelled locally. If provider sign-in had completed, provider access may "
+                f"remain. {guidance} Run `gsv connectors list` before retrying.",
+                file=sys.stderr,
+            )
+        else:
+            print("Cancelled.", file=sys.stderr)
         return 130
 
 
@@ -576,6 +594,12 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
     if args.connectors_command == "status":
         return onboarding.status(args.target)
     if args.connectors_command == "connect":
+        if args.with_permanent_delete and (
+            args.connector != "gmail" or args.access != "full"
+        ):
+            raise ValidationError(
+                "--with-permanent-delete is available only for Gmail Full access"
+            )
         print(
             f"Connecting {args.connector.replace('_', ' ').title()} with {args.access.title()} "
             "access…",
@@ -593,6 +617,7 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
                 access=args.access,
                 confirm_identity=_confirm_connector_identity,
                 new_account=args.new_account,
+                alias=args.alias,
             )
         opener = _connector_browser_opener(args)
         if opener is _USE_DEFAULT_BROWSER:
@@ -601,6 +626,8 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
                 access=args.access,
                 confirm_identity=_confirm_connector_identity,
                 new_account=args.new_account,
+                alias=args.alias,
+                include_permanent_delete=args.with_permanent_delete,
                 present_authorization_url=_present_authorization_url,
                 timeout_seconds=args.timeout,
             )
@@ -609,9 +636,17 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
             access=args.access,
             confirm_identity=_confirm_connector_identity,
             new_account=args.new_account,
+            alias=args.alias,
+            include_permanent_delete=args.with_permanent_delete,
             browser_opener=cast(Callable[[str], bool] | None, opener),
             present_authorization_url=_present_authorization_url,
             timeout_seconds=args.timeout,
+        )
+    if args.connectors_command == "resume":
+        return onboarding.resume(
+            args.connection_id,
+            confirm_identity=_confirm_connector_identity,
+            alias=args.alias,
         )
     if args.connectors_command == "disconnect":
         if not args.yes and not _confirm(
@@ -673,8 +708,9 @@ def _connector_browser_opener(args: argparse.Namespace) -> object:
 def _present_authorization_url(url: str, browser_opened: bool) -> None:
     if browser_opened:
         print("Your browser is open. Finish sign-in there; Seld is waiting…", file=sys.stderr)
-        return
-    print("Open this sign-in URL in a browser, then finish there:", file=sys.stderr)
+    else:
+        print("Open this sign-in URL in a browser, then finish there:", file=sys.stderr)
+    print("Sign-in URL (safe to copy into your browser):", file=sys.stderr)
     print(url, file=sys.stderr)
 
 
@@ -697,28 +733,10 @@ def _confirm(prompt: str) -> bool:
 
 
 def _revocation_guidance(provider: str) -> str:
-    guidance = {
-        "discord": (
-            "Reset or delete the bot token in the Discord Developer Portal, then run `gsv "
-            "connectors disconnect <connection-id>` locally."
-        ),
-        "google": (
-            "Remove Seld from your Google Account third-party access page, then run `gsv "
-            "connectors disconnect <connection-id>` locally."
-        ),
-        "microsoft": (
-            "Remove Seld from your Microsoft account or organization app-consent page, then run "
-            "`gsv connectors disconnect <connection-id>` locally."
-        ),
-        "slack": (
-            "Remove Seld from the workspace's installed apps, then run `gsv connectors "
-            "disconnect <connection-id>` locally."
-        ),
-    }
-    try:
-        return guidance[provider]
-    except KeyError as exc:
-        raise ValidationError("connector provider has no revocation guidance") from exc
+    return (
+        provider_revocation_guidance(provider)
+        + " Then run `gsv connectors disconnect <connection-id>` locally if it still exists."
+    )
 
 
 def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | None:
@@ -1406,9 +1424,33 @@ def _parser() -> argparse.ArgumentParser:
     connector_connect.add_argument("connector", choices=tuple(sorted(CONNECTOR_PROFILES)))
     connector_connect.add_argument("--access", choices=("read", "full"), required=True)
     connector_connect.add_argument("--new-account", action="store_true")
+    connector_connect.add_argument(
+        "--alias",
+        help=(
+            "Optional privacy-safe local account label; provider email is never stored by "
+            "default."
+        ),
+    )
+    connector_connect.add_argument(
+        "--with-permanent-delete",
+        action="store_true",
+        help="Gmail Full only: request the separate irreversible-delete permission.",
+    )
     connector_connect.add_argument("--timeout", type=float, default=180.0)
     connector_connect.add_argument("--browser", choices=("default", "firefox"), default="default")
     connector_connect.add_argument("--no-browser", action="store_true")
+    connector_resume = connector_commands.add_parser(
+        "resume",
+        help="Finish identity confirmation for one retained unverified connection.",
+    )
+    connector_resume.add_argument("connection_id")
+    connector_resume.add_argument(
+        "--alias",
+        help=(
+            "Optional privacy-safe local account label; provider email is never stored by "
+            "default."
+        ),
+    )
     connector_disconnect = connector_commands.add_parser(
         "disconnect",
         help="Forget one local connection without claiming provider-side revocation.",
