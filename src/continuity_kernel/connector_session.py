@@ -30,6 +30,7 @@ DEFAULT_TTL_SECONDS: Final = 10 * 60
 MAX_TTL_SECONDS: Final = 15 * 60
 MAX_TOKEN_LENGTH: Final = MAX_SEALED_TOKEN_LENGTH
 MAX_SPENT_NONCES: Final = 4_096
+MAX_CURSOR_HANDLES: Final = 4_096
 
 _SECRET_BYTES = 32
 _NONCE_BYTES = 16
@@ -49,6 +50,7 @@ class ConnectorSession:
         secret: bytes | None = None,
         clock: Clock | None = None,
         max_spent_nonces: int = MAX_SPENT_NONCES,
+        max_cursor_handles: int = MAX_CURSOR_HANDLES,
     ) -> None:
         key = _PROCESS_SECRET if secret is None else secret
         if not isinstance(key, bytes) or len(key) != _SECRET_BYTES:
@@ -57,11 +59,15 @@ class ConnectorSession:
             raise ValidationError("connector session clock is invalid")
         if type(max_spent_nonces) is not int or not 1 <= max_spent_nonces <= 65_536:
             raise ValidationError("connector confirmation capacity is invalid")
+        if type(max_cursor_handles) is not int or not 1 <= max_cursor_handles <= 65_536:
+            raise ValidationError("connector cursor capacity is invalid")
         self._secret = key
         self._clock: Clock = clock or time.time
         self._max_spent_nonces = max_spent_nonces
+        self._max_cursor_handles = max_cursor_handles
         self._spent_nonces: dict[str, float] = {}
-        self._spent_lock = Lock()
+        self._cursor_values: dict[str, tuple[object, float]] = {}
+        self._state_lock = Lock()
 
     def issue_cursor(
         self,
@@ -76,12 +82,16 @@ class ConnectorSession:
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
     ) -> str:
         issued_at = self._now()
+        expires_at = issued_at + _ttl(ttl_seconds)
+        stored_continuation = canonicalize_json(continuation)
+        handle = _b64encode(secrets.token_bytes(_NONCE_BYTES))
         payload: dict[str, object] = {
             "connection_id": _binding_text(connection_id),
             "connection_revision": _binding_text(connection_revision),
-            "continuation": canonicalize_json(continuation),
+            "continuation_digest": canonical_json_digest(stored_continuation),
+            "continuation_handle": handle,
             "credential_version": _positive_version(credential_version),
-            "expires_at": issued_at + _ttl(ttl_seconds),
+            "expires_at": expires_at,
             "input_digest": canonical_json_digest(input_value),
             "issued_at": issued_at,
             "kind": "cursor",
@@ -89,7 +99,13 @@ class ConnectorSession:
             "provider": _binding_text(provider),
             "version": TOKEN_VERSION,
         }
-        return self._encode(payload)
+        token = self._encode(payload)
+        with self._state_lock:
+            self._prune_state(issued_at)
+            if len(self._cursor_values) >= self._max_cursor_handles:
+                raise ConflictError("cursor capacity is full; wait for a cursor to expire")
+            self._cursor_values[handle] = (stored_continuation, expires_at)
+        return token
 
     def open_cursor(
         self,
@@ -113,7 +129,16 @@ class ConnectorSession:
             "provider": _binding_text(provider),
         }
         _require_bindings(payload, expected, kind="cursor")
-        return canonicalize_json(payload["continuation"])
+        handle = cast(str, payload["continuation_handle"])
+        with self._state_lock:
+            self._prune_state(self._now())
+            stored = self._cursor_values.get(handle)
+            if stored is None:
+                raise ConflictError("cursor continuation is unavailable; restart the read")
+            continuation, _expiry = stored
+            if canonical_json_digest(continuation) != payload["continuation_digest"]:
+                raise ConflictError("cursor continuation does not match")
+            return canonicalize_json(continuation)
 
     def issue_confirmation(
         self,
@@ -179,8 +204,8 @@ class ConnectorSession:
         }
         _require_bindings(payload, expected, kind="confirmation")
         nonce = cast(str, payload["nonce"])
-        with self._spent_lock:
-            self._prune_spent(now)
+        with self._state_lock:
+            self._prune_state(now)
             if nonce in self._spent_nonces:
                 raise ConflictError("confirmation token has already been consumed")
             if len(self._spent_nonces) >= self._max_spent_nonces:
@@ -272,17 +297,21 @@ class ConnectorSession:
             raise ConflictError(f"sealed {kind} has expired")
         return now, float(expires_at)
 
-    def _prune_spent(self, now: float) -> None:
+    def _prune_state(self, now: float) -> None:
         for nonce, expiry in tuple(self._spent_nonces.items()):
             if expiry <= now:
                 del self._spent_nonces[nonce]
+        for handle, (_continuation, expiry) in tuple(self._cursor_values.items()):
+            if expiry <= now:
+                del self._cursor_values[handle]
 
 
 _CURSOR_KEYS: Final = frozenset(
     {
         "connection_id",
         "connection_revision",
-        "continuation",
+        "continuation_digest",
+        "continuation_handle",
         "credential_version",
         "expires_at",
         "input_digest",
@@ -320,7 +349,10 @@ def _validate_payload_fields(payload: Mapping[str, object], *, kind: str) -> Non
     if kind == "cursor":
         _binding_text(payload["connection_revision"])
         _digest(payload["input_digest"])
-        canonicalize_json(payload["continuation"])
+        _digest(payload["continuation_digest"])
+        handle = payload["continuation_handle"]
+        if not isinstance(handle, str) or len(_b64decode(handle)) != _NONCE_BYTES:
+            raise ValidationError("cursor continuation handle is invalid")
         return
     _binding_text(payload["authorization_tier"])
     _positive_version(payload["connection_version"])

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -24,11 +26,17 @@ class FakeClock:
         self.value += timedelta(seconds=seconds)
 
 
-def _session(clock: FakeClock | None = None, *, capacity: int = 4_096) -> ConnectorSession:
+def _session(
+    clock: FakeClock | None = None,
+    *,
+    capacity: int = 4_096,
+    cursor_capacity: int = 4_096,
+) -> ConnectorSession:
     return ConnectorSession(
         secret=b"a" * 32,
         clock=clock or FakeClock(),
         max_spent_nonces=capacity,
+        max_cursor_handles=cursor_capacity,
     )
 
 
@@ -98,6 +106,27 @@ def test_cursor_is_canonical_detached_and_invalid_after_restart() -> None:
     assert _open(session, token) == {"opaque": [1, 2]}
     with pytest.raises(ValidationError):
         _open(ConnectorSession(secret=b"b" * 32, clock=clock), token)
+
+
+def test_cursor_keeps_provider_continuation_process_local_and_fails_closed_at_capacity() -> None:
+    clock = FakeClock()
+    session = _session(clock, cursor_capacity=1)
+    token = _cursor(session)
+    encoded_payload = token.split(".")[1]
+    payload = json.loads(
+        base64.urlsafe_b64decode(encoded_payload + "=" * (-len(encoded_payload) % 4))
+    )
+    assert "continuation" not in payload
+    assert "opaque" not in json.dumps(payload)
+    assert payload["continuation_handle"]
+
+    with pytest.raises(ConflictError, match="cursor capacity"):
+        _cursor(session)
+    assert _open(session, token) == {"opaque": [1, 2]}
+
+    clock.advance(DEFAULT_TTL_SECONDS + 1)
+    fresh = _cursor(session)
+    assert _open(session, fresh) == {"opaque": [1, 2]}
 
 
 def test_cursor_rejects_tamper_cross_binding_credential_change_and_expiry() -> None:
