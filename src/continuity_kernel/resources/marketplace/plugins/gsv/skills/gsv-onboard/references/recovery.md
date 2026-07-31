@@ -16,13 +16,24 @@ Pulse or silently replace another active hand.
 Preserve the last successful coverage boundary, open one fresh ChatGPT task,
 and repeat the selected source's identity plus bounded-read check. For a
 host-owned app, let the person reauthenticate only in that provider-owned app.
-For a Seld-managed profile, inspect `gsv-auth status`, then let the person rerun
-`gsv-auth oauth <connection-id>` or the hidden credential command. The agent
-must not perform consent, enter or reuse credentials or second factors, or
-change provider account, application, access, permission, or security settings.
-A restored auth archive does not restore Slack or Discord channel policy; the
-person configures that host-private policy again. A failed recheck is current
-evidence of stale or unavailable coverage, not an empty source.
+For a Seld-managed profile, inspect `gsv connectors status <source-or-id>`.
+Then let the person rerun `gsv connectors connect <logical-source> --access
+read|full`. The old Read connection remains available while a Full upgrade is
+in progress and is replaced only after the same verified account is published.
+Use `--new-account` only when the person explicitly wants to keep a different
+account. The agent must not perform consent, enter or reuse credentials or
+second factors, or change provider account, application, access, permission,
+or security settings. A restored auth archive does not restore host-private
+Discord Pulse channel policy; the person configures that policy again. A failed
+recheck is current evidence of stale or unavailable coverage, not an empty
+source.
+
+An interrupted interactive upload or download is process-local by design. Do
+not reconstruct a provider upload URL or transfer token from logs, the vault,
+or a transcript. Reopen the exact local-file grant or source object and begin a
+fresh preview. Completed download artifacts are owner-only host cache files;
+expired or partial artifacts are removed rather than treated as durable source
+state.
 
 For a same-host migration, read `local-source staged-status`, then use
 `local-source adopt-staged` only with its exact migration and source revisions

@@ -3,18 +3,20 @@
 Seld's connectors are the read-capable ChatGPT apps, custom MCP apps,
 Seld-managed connector implementations, and local tools the person chooses. A
 host-owned app keeps provider access and OAuth in that host account. A
-Seld-managed connector uses its own public client registration plus `gsv-auth`
+A Seld-managed connector uses `gsv connectors connect`, its packaged public
+client registration, provider OAuth with PKCE and a loopback callback, and
 OS-keyring custody. It never copies a ChatGPT, OpenAI, browser, Codex, OpenCode,
-or Open Interpreter session. Neither path moves semantic judgment into
-deterministic code.
+or Open Interpreter session. If the installed build has no registration for
+that provider, sign-in stops before OAuth and saves nothing. Neither path moves
+semantic judgment into deterministic code.
 
-`gsv-auth profiles` is the authority for the finite built-in Google, Microsoft,
-Slack, and Discord profile shapes. The person registers the provider client or
-bot, reviews scopes, performs OAuth consent, and enters any credential through
-the hidden local prompt. The agent may explain the flow and read redacted
-status, but it never consents, enters or reuses credentials or second factors,
-or changes provider applications, accounts, permissions, access, or security
-settings.
+`gsv connectors list` and `gsv connectors status` are the ordinary redacted
+status surfaces. The person chooses Read or Full per logical source, performs
+OAuth consent, and confirms the exact verified provider identity. Discord is
+Full-only and accepts a bot token through hidden input. The agent may explain
+the flow and read redacted status, but it never consents, enters or reuses
+credentials or second factors, or changes provider applications, accounts,
+permissions, access, or security settings.
 
 For every selected source in the fresh setup task:
 
@@ -53,12 +55,15 @@ mutate a credential. A restored age-encrypted credential remains `unverified`
 until the identity check and bounded read above succeed.
 
 Use `gsv_connector_source_read` with the exact portable connection ID for the
-implemented Gmail, Google Calendar, Google Drive, Outlook mail, Outlook
-Calendar, or Slack source. Slack additionally requires one exact private-
-process `SLACK_CHANNEL_ID`; it reads only that conversation and does not claim
-thread replies. The reader's connection, credential state, and source selection
-must remain unchanged through the provider call.
+narrow Pulse verification of Gmail, Google Calendar, Google Drive, Outlook
+mail, Outlook Calendar, or Slack. The reader's connection, credential state,
+and source selection must remain unchanged through the provider call.
 
-External sends, posts, edits, reactions, bookings, purchases, and account
-changes remain outside this read contract and require a fresh interactive user
-approval.
+The separate `gsv_connectors` MCP server is the interactive lane. It exposes
+one typed read and one typed write tool per logical connector. Read access can
+use only the read catalog. Full access can use the user-content mutation
+catalog. Outward, destructive, and permanent effects require a short-lived
+preview-bound confirmation; recoverable delete and permanent purge remain
+distinct. Those operations never count as Pulse verification or source
+coverage. Account, permission, security, billing, and other administrative APIs
+remain outside both lanes.

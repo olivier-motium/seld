@@ -1,24 +1,45 @@
-# Google Calendar connection check
+# Google Calendar
 
-Use this note after Google Calendar is selected and either its host-owned app or
-a Seld-managed `google` connection is available. Never request credentials,
-authorization codes, tokens, or second factors.
+Use this note after the person selects Google Calendar. A host-owned app may
+satisfy the bounded Pulse recipe. Portable Seld custody uses its own logical
+Calendar connection and never borrows another host's session.
 
-1. Ask which Google account and calendar set the person expects. With a host-
-   owned app, use a read-only identity call when available. With Seld-managed
-   auth, the person confirms the account during Google's consent flow and Seld
-   returns only a stable hashed calendar/account binding.
-2. For Seld-managed auth, call `gsv_connector_source_read` with the exact
-   `google` connection ID and source `google_calendar`. Read a bounded current
-   window, including a successful empty window. Keep the covered time span
-   separate from the observation time.
-3. Do not create, edit, move, RSVP to, or delete events. One Google profile also
-   grants Gmail and Drive's fixed read-only scopes, but those sources still need
-   separate reads and receipts.
-4. Missing host tools require one new-task retry after enablement. For Seld-
-   managed auth, inspect redacted status and let the person handle OAuth,
-   account selection, Workspace policy, or administrator approval. Do not use
-   another host session as a credential source.
-5. Hand the identity basis, result, tool shape, observation time, covered
-   window, and stable references to `$gsv-onboard` for the CAS-protected Seld
-   receipt.
+## Connect
+
+```text
+gsv connectors connect google_calendar --access read --browser firefox
+gsv connectors connect google_calendar --access full --browser firefox
+```
+
+Read grants calendar, event, instance, and free/busy reads. Full adds calendar
+and event create/update/move/respond/delete operations. The command opens Google
+OAuth with PKCE and a loopback callback, verifies the returned Google identity,
+shows it with the selected access tier, and asks `Use this account? [y/N]`
+before publishing. The default is no. A Read connection remains ready while a
+same-account Full upgrade is in progress.
+
+The person owns account selection, consent, Workspace policy, administrator
+approval, and second factors. If the installed build lacks a public Google
+client registration, sign-in stops before OAuth and saves nothing.
+
+## Verify the source
+
+Use `gsv connectors status google_calendar`, confirm the expected account and
+calendar set, then call `gsv_connector_source_read` with that exact connection
+ID and source `google_calendar`. Read one bounded current event window and keep
+its covered interval separate from observation time. An empty successful window
+counts. This verification is intentionally bounded because it proves Pulse
+coverage; it is not the interactive feature boundary.
+
+The isolated `gsv_connectors` server exposes `gsv_google_calendar_read` and
+`gsv_google_calendar_write`. Their closed schemas cover the ordinary calendar
+and event fields, recurrence instances, free/busy, moves, and responses. Event
+deletion is destructive, while whole-calendar deletion is permanent. An event
+mutation becomes
+outward when it notifies or affects attendees, and then requires an exact
+preview plus short-lived bound confirmation. Permanent provider-side effects
+remain separately classified.
+
+Return only the identity basis, bounded-read result, covered interval, and
+stable references to `$gsv-onboard`. Do not persist provider bodies, raw account
+identifiers, OAuth material, or error text.

@@ -1,23 +1,44 @@
-# Google Drive connection check
+# Google Drive
 
-Use this note after Google Drive is selected and either its host-owned app or a
-Seld-managed `google` connection is available. Never request or handle Google
-credentials, authorization codes, tokens, or second factors.
+Use this note after the person selects Google Drive. A host-owned Drive app may
+satisfy the bounded Pulse recipe. Portable Seld custody uses its own logical
+Drive connection and never copies an AI-host or browser session.
 
-1. Ask for the expected Google account. With a host-owned app, use its read-only
-   identity call when available. With Seld-managed auth, the person confirms the
-   account during consent and the reader exposes only a stable hashed binding.
-2. For Seld-managed auth, call `gsv_connector_source_read` with the exact
-   `google` connection ID and source `google_drive`. It reads a small recent
-   metadata set, not file bodies. Do not broaden a search merely to prove
-   access.
-3. Do not create, edit, move, share, download in bulk, delete, or change file
-   permissions. Gmail and Calendar share this profile's fixed grant but remain
-   separate logical reads and receipts.
-4. For a missing host-owned tool, enable the app and open one new task. For
-   Seld-managed auth, inspect redacted status and let the person resolve OAuth,
-   wrong-account, shared-drive, Workspace, or administrator policy. Never fall
-   back to an AI-host or browser session.
-5. Return the identity basis, read result, tool shape, horizon, and stable
-   references to `$gsv-onboard`, which records only hashed bindings and
-   content-free coverage through fresh CAS.
+## Connect
+
+```text
+gsv connectors connect google_drive --access read --browser firefox
+gsv connectors connect google_drive --access full --browser firefox
+```
+
+Read grants typed My Drive and shared-drive metadata, content, permission,
+comment, reply, and revision reads within the provider grant. Full adds file
+create/update/copy/move/trash/restore/purge plus permission, comment, reply, and
+revision mutations. The command opens Google OAuth with PKCE and a loopback
+callback, verifies the account, shows it, and asks `Use this account? [y/N]`
+before publishing. The default is no. A Read connection remains ready during a
+same-account Full upgrade.
+
+The person owns Google account selection, consent, Workspace policy,
+administrator approval, and second factors. If the installed build lacks a
+public Google client registration, sign-in stops and saves nothing.
+
+## Verify the source
+
+Use `gsv connectors status google_drive`, confirm the expected account, then
+call `gsv_connector_source_read` with that exact connection ID and source
+`google_drive`. Read one small recent metadata set. A successful empty result
+counts. This small read proves Pulse coverage; it is not an artificial cap on
+interactive Drive access.
+
+The isolated `gsv_connectors` server exposes `gsv_google_drive_read` and
+`gsv_google_drive_write`. It uses fixed Google routes, sealed page cursors,
+shared-drive flags, and range-aware content reads. User-content writes remain
+closed and typed. Sharing is outward, trash is recoverable, and purge is
+permanent; each receives the matching preview and confirmation policy. Large
+binary content uses the connector's local-file/artifact transfer lane rather
+than inflating JSON or placing bytes in the vault.
+
+Return only the verified identity basis, bounded-read result, horizon, and
+stable references to `$gsv-onboard`. Do not persist file bodies, provider
+cursors, raw account IDs, OAuth material, or error text.
