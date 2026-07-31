@@ -222,6 +222,7 @@ def test_google_catalog_validates_representative_rich_inputs() -> None:
         ],
         "calendar_id": "primary",
         "description": "Planning meeting",
+        "drive_attachments": [{"file_id": "drive-file-1"}],
         "end": {"date_time": "2026-08-01T10:00:00+02:00", "time_zone": "Europe/Brussels"},
         "event_id": "client-event-01",
         "guests_can_invite_others": False,
@@ -437,3 +438,27 @@ def test_gmail_normal_message_bodies_allow_the_documented_bound() -> None:
     assert operation.validate_input({"text_body": body}) == {"text_body": body}
     with pytest.raises(ValidationError):
         operation.validate_input({"text_body": body + "x"})
+
+
+def test_calendar_drive_attachment_references_are_closed_and_bounded() -> None:
+    operation = _operation("google_calendar", ConnectorMode.WRITE, "events.create")
+    event_time = {
+        "date_time": "2026-08-01T09:00:00+02:00",
+        "time_zone": "Europe/Brussels",
+    }
+    base = {"calendar_id": "primary", "end": event_time, "start": event_time}
+    attachments = [{"file_id": f"file-{index}"} for index in range(25)]
+    assert operation.validate_input({**base, "drive_attachments": attachments}) == {
+        **base,
+        "drive_attachments": attachments,
+    }
+    with pytest.raises(ValidationError):
+        operation.validate_input(
+            {**base, "drive_attachments": [*attachments, {"file_id": "file-26"}]}
+        )
+    for untrusted in (
+        {"file_id": "file", "file_url": "https://attacker.example/file"},
+        {"file_id": "file", "title": "caller-controlled"},
+    ):
+        with pytest.raises(ValidationError):
+            operation.validate_input({**base, "drive_attachments": [untrusted]})

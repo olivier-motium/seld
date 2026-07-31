@@ -5,9 +5,11 @@ from __future__ import annotations
 import base64
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from email.message import EmailMessage
 from email.policy import SMTP
 from typing import Final
+from urllib.parse import urlsplit
 
 from continuity_kernel.connector_adapter import (
     ConnectorAdapterResult,
@@ -30,9 +32,26 @@ _JSON_STATUSES: Final = frozenset({200, 201, 202})
 _DELETE_STATUSES: Final = frozenset({200, 202, 204})
 _MAX_CONTENT_BYTES: Final = 180_000
 _CONTENT_RANGE: Final = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
+_MESSAGE_ID: Final = re.compile(r"^<[^<>\s]+@[^<>\s]+>$")
+_MESSAGE_ID_REFERENCE: Final = re.compile(r"<[^<>\s]+@[^<>\s]+>")
 _PAGINATION_FIELDS: Final = frozenset({"nextPageToken", "nextSyncToken", "nextLink", "nextPage"})
 _UPLOAD_FIELDS: Final = frozenset({"uploadUrl", "resumableUploadUrl", "location"})
 _UNRESERVED: Final = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+_DRIVE_ATTACHMENT_SCOPES: Final = frozenset(
+    {
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive.readonly",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _GmailReplyContext:
+    message_id: str
+    references: tuple[str, ...]
+    subject: str
+    thread_id: str
 
 
 class GoogleConnectorAdapter:
@@ -165,13 +184,14 @@ def _execute_gmail(
         if name == "drafts.update":
             method = ConnectorMethod.PUT
             draft_path += f"/{_segment(_required(values, 'draft_id'))}"
+        reply_context = _gmail_reply_context(values, credential, transport)
         return _json_request(
             transport,
             origin=ConnectorOrigin.GMAIL,
             method=method,
             path=draft_path,
             credential=credential,
-            json_body={"message": _gmail_message(values)},
+            json_body={"message": _gmail_message(values, reply_context=reply_context)},
             expected_statuses=_JSON_STATUSES,
         )
     if name == "drafts.delete":
@@ -395,14 +415,19 @@ def _execute_calendar(
             method = ConnectorMethod.PATCH
             path += f"/{_segment(_required(values, 'event_id'))}"
             headers = _etag_headers(values)
+        event_body = _calendar_event_body(values, include_client_id=name == "events.create")
+        query = list(_optional_query(values, {"send_updates": "sendUpdates"}))
+        if "drive_attachments" in values:
+            event_body["attachments"] = _calendar_drive_attachments(values, credential, transport)
+            query.append(("supportsAttachments", "true"))
         return _json_request(
             transport,
             origin=ConnectorOrigin.GOOGLE,
             method=method,
             path=path,
             credential=credential,
-            query=_optional_query(values, {"send_updates": "sendUpdates"}),
-            json_body=_calendar_event_body(values, include_client_id=name == "events.create"),
+            query=tuple(query),
+            json_body=event_body,
             headers=headers,
             expected_statuses=_JSON_STATUSES,
         )
@@ -421,21 +446,31 @@ def _execute_calendar(
             expected_statuses=_JSON_STATUSES,
         )
     if name == "events.respond":
+        event_path = (
+            f"{base}/calendars/{_segment(_required(values, 'calendar_id'))}/events/"
+            f"{_segment(_required(values, 'event_id'))}"
+        )
+        event = _provider_mapping(
+            _json_request(
+                transport,
+                origin=ConnectorOrigin.GOOGLE,
+                method=ConnectorMethod.GET,
+                path=event_path,
+                credential=credential,
+                query=(("maxAttendees", "1"), ("fields", "attendees,etag")),
+            ),
+            context="Google Calendar RSVP preflight",
+        )
+        attendee, etag = _calendar_self_attendee(event, values)
         return _json_request(
             transport,
             origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.PATCH,
-            path=(
-                f"{base}/calendars/{_segment(_required(values, 'calendar_id'))}/events/"
-                f"{_segment(_required(values, 'event_id'))}"
-            ),
+            path=event_path,
             credential=credential,
             query=_optional_query(values, {"send_updates": "sendUpdates"}),
-            json_body={
-                "attendees": [
-                    {"self": True, "responseStatus": _required(values, "response_status")}
-                ]
-            },
+            json_body={"attendees": [attendee], "attendeesOmitted": True},
+            headers={"If-Match": etag},
             expected_statuses=_JSON_STATUSES,
         )
     if name == "events.delete":
@@ -934,6 +969,12 @@ def _json_result(payload: object) -> ConnectorAdapterResult:
     return ConnectorAdapterResult(_strip_provider_state(payload), continuation=continuation)
 
 
+def _provider_mapping(result: ConnectorAdapterResult, *, context: str) -> Mapping[str, object]:
+    if not isinstance(result.payload, Mapping):
+        raise ValidationError(f"{context} returned an invalid resource")
+    return result.payload
+
+
 def _strip_provider_state(value: object) -> object:
     if isinstance(value, Mapping):
         return {
@@ -1191,6 +1232,80 @@ def _calendar_fields(values: dict[str, object]) -> dict[str, object]:
     )
 
 
+def _calendar_drive_attachments(
+    values: dict[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> list[dict[str, str]]:
+    references = _mappings(_required_value(values, "drive_attachments"))
+    if references and not _DRIVE_ATTACHMENT_SCOPES.intersection(credential.granted_scopes):
+        raise ValidationError(
+            "Google Calendar Drive attachments require Drive access on this Google connection"
+        )
+    attachments: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for reference in references:
+        file_id = _required(reference, "file_id")
+        if file_id in seen:
+            raise ValidationError("Google Calendar Drive attachment IDs must be unique")
+        seen.add(file_id)
+        file = _provider_mapping(
+            _json_request(
+                transport,
+                origin=ConnectorOrigin.GOOGLE,
+                method=ConnectorMethod.GET,
+                path=f"/drive/v3/files/{_segment(file_id)}",
+                credential=credential,
+                query=(
+                    ("fields", "id,mimeType,name,webViewLink"),
+                    ("supportsAllDrives", "true"),
+                ),
+            ),
+            context="Google Drive attachment preflight",
+        )
+        if _provider_text(file, "id", context="Google Drive attachment preflight") != file_id:
+            raise ValidationError("Google Drive attachment preflight returned a different file")
+        attachments.append(
+            {
+                "fileUrl": _drive_web_view_link(file),
+                "mimeType": _mime_type(
+                    _provider_text(file, "mimeType", context="Google Drive attachment preflight")
+                ),
+                "title": _provider_text(
+                    file,
+                    "name",
+                    context="Google Drive attachment preflight",
+                    allow_empty=True,
+                ),
+            }
+        )
+    return attachments
+
+
+def _drive_web_view_link(file: Mapping[str, object]) -> str:
+    link = _provider_text(file, "webViewLink", context="Google Drive attachment preflight")
+    if len(link) > 8_192:
+        raise ValidationError("Google Drive attachment preflight returned an invalid web link")
+    try:
+        parsed = urlsplit(link)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValidationError(
+            "Google Drive attachment preflight returned an invalid web link"
+        ) from exc
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or not (hostname == "google.com" or hostname.endswith(".google.com"))
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+    ):
+        raise ValidationError("Google Drive attachment preflight returned an invalid web link")
+    return link
+
+
 def _calendar_event_body(
     values: dict[str, object], *, include_client_id: bool
 ) -> dict[str, object]:
@@ -1234,6 +1349,30 @@ def _calendar_event_body(
     return body
 
 
+def _calendar_self_attendee(
+    event: Mapping[str, object], values: Mapping[str, object]
+) -> tuple[dict[str, object], str]:
+    etag = _safe_header(_provider_text(event, "etag", context="Google Calendar RSVP preflight"))
+    attendees = _mappings(event.get("attendees"))
+    participants = [attendee for attendee in attendees if attendee.get("self") is True]
+    if len(participants) != 1:
+        raise ValidationError("Google Calendar RSVP preflight did not identify one self attendee")
+    participant = participants[0]
+    attendee: dict[str, object] = {
+        "email": _provider_text(
+            participant,
+            "email",
+            context="Google Calendar RSVP preflight",
+        ),
+        "responseStatus": _required(values, "response_status"),
+    }
+    if "comment" in values:
+        attendee["comment"] = _text(values["comment"])
+    elif isinstance(participant.get("comment"), str):
+        attendee["comment"] = participant["comment"]
+    return attendee, etag
+
+
 def _calendar_time(value: object) -> dict[str, str]:
     if not isinstance(value, Mapping):
         raise ValidationError("Google Calendar event time is invalid")
@@ -1260,7 +1399,12 @@ def _calendar_reminders(value: object) -> dict[str, object]:
 
 
 def _calendar_has_external_effect(values: Mapping[str, object]) -> bool:
-    if "attendee_emails" in values or "attendees" in values or "send_updates" in values:
+    if (
+        "attendee_emails" in values
+        or "attendees" in values
+        or "drive_attachments" in values
+        or "send_updates" in values
+    ):
         return True
     calendar_ids = [values.get("calendar_id"), values.get("destination_calendar_id")]
     return any(isinstance(value, str) and value != "primary" for value in calendar_ids)
@@ -1294,15 +1438,117 @@ def _drive_comment_body(values: dict[str, object]) -> dict[str, object]:
     )
 
 
-def _gmail_message(values: dict[str, object]) -> dict[str, object]:
+def _gmail_reply_context(
+    values: dict[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> _GmailReplyContext | None:
+    if "reply_to_message_id" not in values:
+        if "thread_id" in values:
+            raise ValidationError("Gmail thread ID is derived from reply_to_message_id")
+        return None
+    provider_message_id = _required(values, "reply_to_message_id")
+    message = _provider_mapping(
+        _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.GET,
+            path=f"/gmail/v1/users/me/messages/{_segment(provider_message_id)}",
+            credential=credential,
+            query=(
+                ("format", "metadata"),
+                ("metadataHeaders", "Message-ID"),
+                ("metadataHeaders", "References"),
+                ("metadataHeaders", "Subject"),
+            ),
+        ),
+        context="Gmail reply preflight",
+    )
+    thread_id = _provider_text(message, "threadId", context="Gmail reply preflight")
+    if "thread_id" in values and _required(values, "thread_id") != thread_id:
+        raise ValidationError("Gmail reply thread does not match the original message")
+    headers = _gmail_metadata_headers(message)
+    message_id_values = headers.get("message-id", ())
+    if len(message_id_values) != 1:
+        raise ValidationError("Gmail reply preflight did not return one RFC Message-ID")
+    message_id = _rfc_message_id(message_id_values[0])
+    references: list[str] = []
+    for value in headers.get("references", ()):
+        if len(value) > 8_192:
+            raise ValidationError("Gmail reply References header is invalid")
+        parsed = _MESSAGE_ID_REFERENCE.findall(_safe_header(value))
+        if _MESSAGE_ID_REFERENCE.sub("", value).strip() or len(parsed) > 100:
+            raise ValidationError("Gmail reply References header is invalid")
+        for reference in parsed:
+            normalized = _rfc_message_id(reference)
+            if normalized not in references:
+                references.append(normalized)
+    if message_id not in references:
+        references.append(message_id)
+    subject_values = headers.get("subject", ())
+    if len(subject_values) > 1:
+        raise ValidationError("Gmail reply preflight returned multiple Subject headers")
+    original_subject = subject_values[0] if subject_values else ""
+    subject = _gmail_reply_subject(original_subject)
+    if "subject" in values and _text(values["subject"]) != subject:
+        raise ValidationError("Gmail reply Subject must match the original message")
+    return _GmailReplyContext(
+        message_id=message_id,
+        references=tuple(references),
+        subject=subject,
+        thread_id=thread_id,
+    )
+
+
+def _gmail_metadata_headers(message: Mapping[str, object]) -> dict[str, tuple[str, ...]]:
+    payload = message.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ValidationError("Gmail reply preflight returned invalid metadata")
+    raw_headers = payload.get("headers")
+    if not isinstance(raw_headers, list):
+        raise ValidationError("Gmail reply preflight returned invalid metadata")
+    selected: dict[str, list[str]] = {}
+    wanted = {"message-id", "references", "subject"}
+    for raw_header in raw_headers:
+        if not isinstance(raw_header, Mapping):
+            raise ValidationError("Gmail reply preflight returned invalid metadata")
+        name = raw_header.get("name")
+        if not isinstance(name, str) or name.casefold() not in wanted:
+            continue
+        value = raw_header.get("value")
+        if not isinstance(value, str):
+            raise ValidationError("Gmail reply preflight returned invalid metadata")
+        selected.setdefault(name.casefold(), []).append(value)
+    return {name: tuple(values) for name, values in selected.items()}
+
+
+def _rfc_message_id(value: str) -> str:
+    safe = _safe_header(value).strip()
+    if len(safe) > 998 or _MESSAGE_ID.fullmatch(safe) is None:
+        raise ValidationError("Gmail reply Message-ID is invalid")
+    return safe
+
+
+def _gmail_reply_subject(value: str) -> str:
+    subject = _safe_header(value).strip()
+    if len(subject) > 998:
+        raise ValidationError("Gmail reply Subject is invalid")
+    return subject
+
+
+def _gmail_message(
+    values: dict[str, object], *, reply_context: _GmailReplyContext | None
+) -> dict[str, object]:
     message = EmailMessage()
     for source, header in (("to", "To"), ("cc", "Cc"), ("bcc", "Bcc")):
         if source in values:
             message[header] = ", ".join(_safe_header(value) for value in _strings(values[source]))
-    if "subject" in values:
+    if reply_context is not None:
+        message["Subject"] = reply_context.subject
+        message["In-Reply-To"] = reply_context.message_id
+        message["References"] = " ".join(reply_context.references)
+    elif "subject" in values:
         message["Subject"] = _safe_header(_text(values["subject"]))
-    if "reply_to_message_id" in values:
-        message["In-Reply-To"] = f"<{_safe_header(_text(values['reply_to_message_id']))}>"
     message.set_content(_text(values.get("text_body", "")))
     if "html_body" in values:
         message.add_alternative(_text(values["html_body"]), subtype="html")
@@ -1317,8 +1563,8 @@ def _gmail_message(values: dict[str, object]) -> dict[str, object]:
         )
     raw = base64.urlsafe_b64encode(message.as_bytes(policy=SMTP)).decode("ascii").rstrip("=")
     result: dict[str, object] = {"raw": raw}
-    if "thread_id" in values:
-        result["threadId"] = _text(values["thread_id"])
+    if reply_context is not None:
+        result["threadId"] = reply_context.thread_id
     return result
 
 
@@ -1363,6 +1609,19 @@ def _required_value(values: Mapping[str, object], name: str) -> object:
 def _text(value: object) -> str:
     if not isinstance(value, str):
         raise ValidationError("connector operation text is invalid")
+    return value
+
+
+def _provider_text(
+    values: Mapping[str, object],
+    name: str,
+    *,
+    context: str,
+    allow_empty: bool = False,
+) -> str:
+    value = values.get(name)
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise ValidationError(f"{context} omitted required provider metadata")
     return value
 
 

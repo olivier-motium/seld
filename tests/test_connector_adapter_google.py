@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from email import policy
+from email.parser import BytesParser
 from typing import Any
 
 import pytest
@@ -23,13 +25,21 @@ from continuity_kernel.errors import ValidationError
 
 
 class _Transport(ConnectorTransport):
-    def __init__(self, *, body: bytes = b"{}", headers: Mapping[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        body: bytes = b"{}",
+        bodies: Sequence[bytes] = (),
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         self.body = body
+        self.bodies = list(bodies)
         self.headers = dict(headers or {})
         self.calls: list[dict[str, Any]] = []
 
     def request(self, **kwargs: Any) -> ConnectorResponse:
         self.calls.append({"kind": "request", **kwargs})
+        body = self.bodies.pop(0) if self.bodies else self.body
         headers = dict(self.headers)
         status = 200
         if kwargs["path"].startswith("/upload/drive/v3/"):
@@ -40,10 +50,10 @@ class _Transport(ConnectorTransport):
             start = int(range_value.removeprefix("bytes=").split("-", 1)[0])
             headers.setdefault(
                 "content-range",
-                f"bytes {start}-{start + len(self.body) - 1}/{start + len(self.body)}",
+                f"bytes {start}-{start + len(body) - 1}/{start + len(body)}",
             )
             status = 206
-        return ConnectorResponse(kwargs["origin"], status, headers, self.body)
+        return ConnectorResponse(kwargs["origin"], status, headers, body)
 
     def request_provider_location(self, **kwargs: Any) -> ConnectorResponse:
         self.calls.append({"kind": "provider_location", **kwargs})
@@ -200,12 +210,21 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
     raise AssertionError(f"no sample for {operation.provider}:{name}")
 
 
-def test_every_google_operation_has_one_fixed_adapter_request() -> None:
+def test_every_google_operation_uses_only_bounded_fixed_adapter_requests() -> None:
     adapter = GoogleConnectorAdapter()
     transport = _Transport()
     credential = _credential()
     for operation in GOOGLE_OPERATIONS:
         before = len(transport.calls)
+        expected_requests = 1
+        if operation.provider == "google_calendar" and operation.name == "events.respond":
+            transport.body = json.dumps(
+                {
+                    "attendees": [{"email": "owner@example.test", "self": True}],
+                    "etag": "event-etag",
+                }
+            ).encode()
+            expected_requests = 2
         adapter.execute(
             operation,
             _sample(operation),
@@ -213,8 +232,8 @@ def test_every_google_operation_has_one_fixed_adapter_request() -> None:
             credential=credential,
             transport=transport,
         )
-        assert len(transport.calls) == before + 1
-    assert len(transport.calls) == len(GOOGLE_OPERATIONS)
+        assert len(transport.calls) == before + expected_requests
+    assert len(transport.calls) == len(GOOGLE_OPERATIONS) + 1
     assert {call["origin"] for call in transport.calls} == {
         ConnectorOrigin.GMAIL,
         ConnectorOrigin.GOOGLE,
@@ -302,6 +321,95 @@ def test_gmail_drafts_use_safe_mime_and_draft_then_send() -> None:
         )
 
 
+def test_gmail_reply_preflights_rfc_headers_and_provider_thread() -> None:
+    metadata = json.dumps(
+        {
+            "id": "gmail-resource-42",
+            "payload": {
+                "headers": [
+                    {"name": "Message-ID", "value": "<original@example.test>"},
+                    {"name": "References", "value": "<root@example.test>"},
+                    {"name": "Subject", "value": "Planning"},
+                ]
+            },
+            "threadId": "provider-thread-7",
+        }
+    ).encode()
+    transport = _Transport(bodies=(metadata, b"{}"))
+    GoogleConnectorAdapter().execute(
+        _operation("gmail", "drafts.create"),
+        {
+            "reply_to_message_id": "gmail-resource-42",
+            "text_body": "Reply body",
+            "thread_id": "provider-thread-7",
+            "to": ["recipient@example.test"],
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+
+    preflight, create = transport.calls
+    assert preflight["method"] is ConnectorMethod.GET
+    assert preflight["path"] == "/gmail/v1/users/me/messages/gmail-resource-42"
+    assert preflight["query"] == (
+        ("format", "metadata"),
+        ("metadataHeaders", "Message-ID"),
+        ("metadataHeaders", "References"),
+        ("metadataHeaders", "Subject"),
+    )
+    assert create["json_body"]["message"]["threadId"] == "provider-thread-7"
+    encoded = create["json_body"]["message"]["raw"]
+    raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    mime = BytesParser(policy=policy.default).parsebytes(raw)
+    assert mime["In-Reply-To"] == "<original@example.test>"
+    assert mime["References"] == "<root@example.test> <original@example.test>"
+    assert mime["Subject"] == "Planning"
+    assert "gmail-resource-42" not in str(mime["In-Reply-To"])
+
+
+def test_gmail_reply_rejects_unverified_thread_or_subject() -> None:
+    metadata = json.dumps(
+        {
+            "payload": {
+                "headers": [
+                    {"name": "Message-ID", "value": "<original@example.test>"},
+                    {"name": "Subject", "value": "Planning"},
+                ]
+            },
+            "threadId": "provider-thread-7",
+        }
+    ).encode()
+    adapter = GoogleConnectorAdapter()
+    with pytest.raises(ValidationError, match="thread does not match"):
+        adapter.execute(
+            _operation("gmail", "drafts.create"),
+            {
+                "reply_to_message_id": "gmail-resource-42",
+                "thread_id": "caller-guessed-thread",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=_Transport(body=metadata),
+        )
+    with pytest.raises(ValidationError, match="Subject must match"):
+        adapter.execute(
+            _operation("gmail", "drafts.create"),
+            {"reply_to_message_id": "gmail-resource-42", "subject": "Different"},
+            continuation=None,
+            credential=_credential(),
+            transport=_Transport(body=metadata),
+        )
+    with pytest.raises(ValidationError, match="derived from reply_to_message_id"):
+        adapter.execute(
+            _operation("gmail", "drafts.create"),
+            {"thread_id": "caller-guessed-thread"},
+            continuation=None,
+            credential=_credential(),
+            transport=_Transport(),
+        )
+
+
 def test_calendar_effect_escalates_shared_or_notified_event_changes() -> None:
     adapter = GoogleConnectorAdapter()
     operation = _operation("google_calendar", "events.create")
@@ -326,6 +434,77 @@ def test_calendar_effect_escalates_shared_or_notified_event_changes() -> None:
         adapter.classify_effect(operation, {**safe, "calendar_id": "team"})
         is ConnectorEffect.OUTWARD
     )
+    assert (
+        adapter.classify_effect(operation, {**safe, "drive_attachments": [{"file_id": "file"}]})
+        is ConnectorEffect.OUTWARD
+    )
+
+
+def test_calendar_rsvp_preflights_self_attendee_and_etag() -> None:
+    event = json.dumps(
+        {
+            "attendees": [
+                {"email": "guest@example.test", "responseStatus": "accepted"},
+                {
+                    "comment": "Earlier note",
+                    "displayName": "Owner",
+                    "email": "owner@example.test",
+                    "optional": True,
+                    "responseStatus": "needsAction",
+                    "self": True,
+                },
+            ],
+            "etag": '"event-version-4"',
+        }
+    ).encode()
+    transport = _Transport(bodies=(event, b"{}"))
+    GoogleConnectorAdapter().execute(
+        _operation("google_calendar", "events.respond"),
+        {
+            "calendar_id": "primary",
+            "comment": "See you there",
+            "event_id": "event-1",
+            "response_status": "tentative",
+            "send_updates": "all",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+
+    preflight, response = transport.calls
+    assert preflight["method"] is ConnectorMethod.GET
+    assert preflight["path"] == "/calendar/v3/calendars/primary/events/event-1"
+    assert preflight["query"] == (("maxAttendees", "1"), ("fields", "attendees,etag"))
+    assert response["method"] is ConnectorMethod.PATCH
+    assert response["headers"] == {"If-Match": '"event-version-4"'}
+    assert response["query"] == (("sendUpdates", "all"),)
+    assert response["json_body"] == {
+        "attendees": [
+            {
+                "comment": "See you there",
+                "email": "owner@example.test",
+                "responseStatus": "tentative",
+            }
+        ],
+        "attendeesOmitted": True,
+    }
+
+
+def test_calendar_rsvp_fails_closed_without_one_self_attendee() -> None:
+    event = json.dumps(
+        {"attendees": [{"email": "guest@example.test"}], "etag": '"event-version-4"'}
+    ).encode()
+    transport = _Transport(body=event)
+    with pytest.raises(ValidationError, match="one self attendee"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_calendar", "events.respond"),
+            {"calendar_id": "primary", "event_id": "event-1", "response_status": "accepted"},
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+        )
+    assert len(transport.calls) == 1
 
 
 def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -> None:
@@ -394,6 +573,86 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
     assert sent["kind"] == "provider_location"
     assert sent["location"] == "https://www.googleapis.com/upload/session/one"
     assert sent["body"] == b"hello"
+
+
+def test_calendar_resolves_typed_drive_attachments_and_enables_support() -> None:
+    first_file = json.dumps(
+        {
+            "id": "file-1",
+            "mimeType": "application/vnd.google-apps.document",
+            "name": "Plan",
+            "webViewLink": "https://docs.google.com/document/d/file-1/edit",
+        }
+    ).encode()
+    second_file = json.dumps(
+        {
+            "id": "file-2",
+            "mimeType": "application/pdf",
+            "name": "Brief.pdf",
+            "webViewLink": "https://drive.google.com/file/d/file-2/view",
+        }
+    ).encode()
+    transport = _Transport(bodies=(first_file, second_file, b"{}"))
+    GoogleConnectorAdapter().execute(
+        _operation("google_calendar", "events.create"),
+        {
+            "calendar_id": "primary",
+            "drive_attachments": [{"file_id": "file-1"}, {"file_id": "file-2"}],
+            "end": _event_time(),
+            "start": _event_time(),
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+
+    first_preflight, second_preflight, create = transport.calls
+    assert first_preflight["path"] == "/drive/v3/files/file-1"
+    assert second_preflight["path"] == "/drive/v3/files/file-2"
+    assert first_preflight["query"] == (
+        ("fields", "id,mimeType,name,webViewLink"),
+        ("supportsAllDrives", "true"),
+    )
+    assert create["path"] == "/calendar/v3/calendars/primary/events"
+    assert create["query"] == (("supportsAttachments", "true"),)
+    assert create["json_body"]["attachments"] == [
+        {
+            "fileUrl": "https://docs.google.com/document/d/file-1/edit",
+            "mimeType": "application/vnd.google-apps.document",
+            "title": "Plan",
+        },
+        {
+            "fileUrl": "https://drive.google.com/file/d/file-2/view",
+            "mimeType": "application/pdf",
+            "title": "Brief.pdf",
+        },
+    ]
+
+
+def test_calendar_drive_attachments_reject_untrusted_provider_link() -> None:
+    file = json.dumps(
+        {
+            "id": "file-1",
+            "mimeType": "application/pdf",
+            "name": "Brief.pdf",
+            "webViewLink": "https://attacker.example/file-1",
+        }
+    ).encode()
+    transport = _Transport(body=file)
+    with pytest.raises(ValidationError, match="invalid web link"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_calendar", "events.update"),
+            {
+                "calendar_id": "primary",
+                "drive_attachments": [{"file_id": "file-1"}],
+                "etag": "event-etag",
+                "event_id": "event-1",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+        )
+    assert len(transport.calls) == 1
 
 
 def test_drive_metadata_scope_and_preconditions_remain_fixed() -> None:

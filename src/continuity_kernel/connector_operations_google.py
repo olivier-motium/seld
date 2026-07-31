@@ -138,6 +138,10 @@ def _event_attendee() -> dict[str, object]:
     )
 
 
+def _drive_attachment_reference() -> dict[str, object]:
+    return _object({"file_id": _id()}, required=("file_id",))
+
+
 def _event_reminder() -> dict[str, object]:
     return _object(
         {
@@ -171,6 +175,7 @@ def _event_fields() -> dict[str, object]:
         "attendee_emails": _email_addresses(),
         "attendees": _array(_event_attendee(), maximum=64),
         "description": _text(200_000, minimum=0),
+        "drive_attachments": _array(_drive_attachment_reference(), maximum=25),
         "end": _event_time(),
         "event_id": _id(),
         "guests_can_invite_others": {"type": "boolean"},
