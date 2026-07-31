@@ -217,6 +217,11 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests() -> No
     for operation in GOOGLE_OPERATIONS:
         before = len(transport.calls)
         expected_requests = 1
+        if operation.provider == "google_calendar" and operation.name in {
+            "events.move",
+            "events.update",
+        }:
+            expected_requests = 2
         if operation.provider == "google_calendar" and operation.name == "events.respond":
             transport.body = json.dumps(
                 {
@@ -233,7 +238,7 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests() -> No
             transport=transport,
         )
         assert len(transport.calls) == before + expected_requests
-    assert len(transport.calls) == len(GOOGLE_OPERATIONS) + 1
+    assert len(transport.calls) == len(GOOGLE_OPERATIONS) + 3
     assert {call["origin"] for call in transport.calls} == {
         ConnectorOrigin.GMAIL,
         ConnectorOrigin.GOOGLE,
@@ -438,6 +443,112 @@ def test_calendar_effect_escalates_shared_or_notified_event_changes() -> None:
         adapter.classify_effect(operation, {**safe, "drive_attachments": [{"file_id": "file"}]})
         is ConnectorEffect.OUTWARD
     )
+
+
+def test_existing_calendar_event_effect_uses_live_sharing_state_and_rechecks_execution() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    mutation = {
+        "calendar_id": "primary",
+        "etag": "event-version-1",
+        "event_id": "event-1",
+        "summary": "Updated",
+    }
+    private = json.dumps(
+        {
+            "attendees": [{"email": "owner@example.test", "self": True}],
+            "organizer": {"email": "owner@example.test", "self": True},
+        }
+    ).encode()
+    shared = json.dumps(
+        {
+            "attendees": [
+                {"email": "owner@example.test", "self": True},
+                {"email": "guest@example.test"},
+            ],
+            "organizer": {"email": "owner@example.test", "self": True},
+        }
+    ).encode()
+
+    private_transport = _Transport(body=private)
+    assert (
+        adapter.classify_effect(
+            operation,
+            mutation,
+            credential=_credential(),
+            transport=private_transport,
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert private_transport.calls[0]["query"] == (("fields", "attendees,organizer"),)
+    assert adapter.classify_effect(operation, mutation) is ConnectorEffect.OUTWARD
+
+    shared_transport = _Transport(body=shared)
+    assert (
+        adapter.classify_effect(
+            operation,
+            mutation,
+            credential=_credential(),
+            transport=shared_transport,
+        )
+        is ConnectorEffect.OUTWARD
+    )
+    with pytest.raises(ValidationError, match="fresh outward confirmation"):
+        adapter.execute(
+            operation,
+            mutation,
+            continuation=None,
+            credential=_credential(),
+            transport=_Transport(body=shared),
+        )
+
+    changed_transport = _Transport(bodies=(private, shared))
+    assert (
+        adapter.classify_effect(
+            operation,
+            mutation,
+            credential=_credential(),
+            transport=changed_transport,
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    with pytest.raises(ValidationError, match="fresh outward confirmation"):
+        adapter.execute(
+            operation,
+            mutation,
+            continuation=None,
+            credential=_credential(),
+            transport=changed_transport,
+        )
+    assert all(call["method"] is ConnectorMethod.GET for call in changed_transport.calls)
+
+
+def test_confirmed_shared_calendar_event_update_rechecks_then_writes() -> None:
+    shared = json.dumps(
+        {
+            "attendees": [{"email": "guest@example.test"}],
+            "organizer": {"email": "owner@example.test", "self": True},
+        }
+    ).encode()
+    transport = _Transport(bodies=(shared, b"{}"))
+    GoogleConnectorAdapter().execute(
+        _operation("google_calendar", "events.update"),
+        {
+            "calendar_id": "primary",
+            "etag": "event-version-1",
+            "event_id": "event-1",
+            "summary": "Confirmed update",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        write_idempotency_key="confirmed-change",
+    )
+
+    preflight, update = transport.calls
+    assert preflight["method"] is ConnectorMethod.GET
+    assert update["method"] is ConnectorMethod.PATCH
+    assert update["headers"] == {"If-Match": "event-version-1"}
 
 
 def test_calendar_rsvp_preflights_self_attendee_and_etag() -> None:
@@ -652,7 +763,10 @@ def test_calendar_drive_attachments_reject_untrusted_provider_link() -> None:
             credential=_credential(),
             transport=transport,
         )
-    assert len(transport.calls) == 1
+    assert [call["path"] for call in transport.calls] == [
+        "/calendar/v3/calendars/primary/events/event-1",
+        "/drive/v3/files/file-1",
+    ]
 
 
 def test_drive_metadata_scope_and_preconditions_remain_fixed() -> None:

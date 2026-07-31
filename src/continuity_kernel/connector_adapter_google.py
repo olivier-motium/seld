@@ -44,6 +44,7 @@ _DRIVE_ATTACHMENT_SCOPES: Final = frozenset(
         "https://www.googleapis.com/auth/drive.readonly",
     }
 )
+_EXISTING_CALENDAR_EVENT_MUTATIONS: Final = frozenset({"events.move", "events.update"})
 
 
 @dataclass(frozen=True)
@@ -61,16 +62,35 @@ class GoogleConnectorAdapter:
     def providers(self) -> frozenset[str]:
         return _GOOGLE_PROVIDERS
 
-    def classify_effect(self, operation: OperationSpec, input_value: object) -> ConnectorEffect:
+    def classify_effect(
+        self,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        credential: ConnectorRuntimeCredential | None = None,
+        transport: ConnectorTransport | None = None,
+    ) -> ConnectorEffect:
         operation, values = _known_operation(operation, input_value)
-        if operation.provider != "google_calendar" or operation.name not in {
-            "events.create",
-            "events.update",
-            "events.move",
-        }:
+        if (credential is None) is not (transport is None):
+            raise ValidationError("Google effect preflight requires credential and transport")
+        if operation.provider != "google_calendar":
             return operation.effect
-        if _calendar_has_external_effect(values):
+        if operation.name == "calendars.update" and values.get("calendar_id") != "primary":
             return ConnectorEffect.OUTWARD
+        if operation.name == "events.create":
+            return (
+                ConnectorEffect.OUTWARD
+                if _calendar_has_external_effect(values)
+                else operation.effect
+            )
+        if operation.name in _EXISTING_CALENDAR_EVENT_MUTATIONS:
+            if _calendar_has_external_effect(values):
+                return ConnectorEffect.OUTWARD
+            if credential is None or transport is None:
+                return ConnectorEffect.OUTWARD
+            event = _calendar_event_effect_preflight(values, credential, transport)
+            if _calendar_event_is_shared(event):
+                return ConnectorEffect.OUTWARD
         return operation.effect
 
     def execute(
@@ -83,12 +103,21 @@ class GoogleConnectorAdapter:
         transport: ConnectorTransport,
         write_idempotency_key: str | None = None,
     ) -> ConnectorAdapterResult:
-        del write_idempotency_key
         operation, values = _known_operation(operation, input_value)
         if not isinstance(credential, ConnectorRuntimeCredential):
             raise ValidationError("connector runtime credential is invalid")
         if not operation.scope_grant_satisfies(credential.granted_scopes):
             raise ValidationError("connector credential does not satisfy the operation scope")
+        if (
+            operation.provider == "google_calendar"
+            and operation.name in _EXISTING_CALENDAR_EVENT_MUTATIONS
+        ):
+            event = _calendar_event_effect_preflight(values, credential, transport)
+            if _calendar_event_is_shared(event) and write_idempotency_key is None:
+                raise ValidationError(
+                    "the Google Calendar event is shared; request a fresh outward "
+                    "confirmation preview"
+                )
         if operation.provider == "gmail":
             return _execute_gmail(operation, values, continuation, credential, transport)
         if operation.provider == "google_calendar":
@@ -1408,6 +1437,48 @@ def _calendar_has_external_effect(values: Mapping[str, object]) -> bool:
         return True
     calendar_ids = [values.get("calendar_id"), values.get("destination_calendar_id")]
     return any(isinstance(value, str) and value != "primary" for value in calendar_ids)
+
+
+def _calendar_event_effect_preflight(
+    values: Mapping[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> Mapping[str, object]:
+    path = (
+        "/calendar/v3/calendars/"
+        f"{_segment(_required(values, 'calendar_id'))}/events/"
+        f"{_segment(_required(values, 'event_id'))}"
+    )
+    return _provider_mapping(
+        _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path=path,
+            credential=credential,
+            query=(("fields", "attendees,organizer"),),
+        ),
+        context="Google Calendar event effect preflight",
+    )
+
+
+def _calendar_event_is_shared(event: Mapping[str, object]) -> bool:
+    attendees = event.get("attendees", [])
+    if not isinstance(attendees, list):
+        raise ValidationError("Google Calendar event effect preflight returned invalid attendees")
+    for attendee in attendees:
+        if not isinstance(attendee, Mapping):
+            raise ValidationError(
+                "Google Calendar event effect preflight returned invalid attendees"
+            )
+        if attendee.get("self") is not True:
+            return True
+    organizer = event.get("organizer")
+    if organizer is None:
+        return False
+    if not isinstance(organizer, Mapping):
+        raise ValidationError("Google Calendar event effect preflight returned invalid organizer")
+    return organizer.get("self") is not True
 
 
 def _drive_file_metadata(values: dict[str, object]) -> dict[str, object]:
