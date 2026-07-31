@@ -11,17 +11,19 @@ import hashlib
 import json
 import os
 import stat
+import time
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Condition, Event, RLock
 from typing import Any, Final, cast
 
 from continuity_kernel.atomic import atomic_write, exclusive_lock, read_regular_file, sha256_bytes
 from continuity_kernel.config import data_dir
-from continuity_kernel.errors import NotFoundError, ValidationError
+from continuity_kernel.errors import ConflictError, NotFoundError, ValidationError
 from continuity_kernel.privacy import (
     AwarenessDecision,
     assess_local_path,
@@ -66,6 +68,10 @@ _GRANT_KEYS: Final = frozenset(
     }
 )
 _LEGACY_GRANT_KEYS: Final = _GRANT_KEYS - {"vault_device", "vault_inode"}
+_AUTHORITY_CANCEL_TIMEOUT_SECONDS: Final = 10.0
+_AUTHORITY_LOCK = RLock()
+_AUTHORITY_CONDITION = Condition(_AUTHORITY_LOCK)
+_AUTHORITY_USES: dict[tuple[str, str, str], set[LocalFileAuthorityUse]] = {}
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,40 @@ class LocalFileGrant:
         if current is not None:
             value["current"] = current
         return value
+
+
+@dataclass(frozen=True, repr=False)
+class LocalFileTransferCandidate:
+    """Metadata-only identity inspected before quota reservation and content reads."""
+
+    grant_id: str
+    relative_path: str
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    _store: LocalFileGrantStore
+    _root: str
+    _relative: Path
+
+    def __repr__(self) -> str:
+        return (
+            "LocalFileTransferCandidate(grant_id=<redacted>, relative_path=<redacted>, "
+            f"device={self.device!r}, inode={self.inode!r}, size={self.size!r}, "
+            f"modified_ns={self.modified_ns!r})"
+        )
+
+    def iter_chunks(
+        self,
+        *,
+        authority: LocalFileAuthorityUse,
+        chunk_size: int = FILE_TRANSFER_CHUNK_BYTES,
+    ) -> Iterator[bytes]:
+        yield from self._store.iter_file_candidate(
+            self,
+            authority=authority,
+            chunk_size=chunk_size,
+        )
 
 
 @dataclass(frozen=True, repr=False)
@@ -120,10 +160,19 @@ class LocalFileRef:
 
         self._store.revalidate_file_ref(self)
 
-    def iter_chunks(self, *, chunk_size: int = FILE_TRANSFER_CHUNK_BYTES) -> Iterator[bytes]:
-        """Yield bounded chunks while holding the grant lock and rechecking the file."""
+    def iter_chunks(
+        self,
+        *,
+        chunk_size: int = FILE_TRANSFER_CHUNK_BYTES,
+        authority: LocalFileAuthorityUse | None = None,
+    ) -> Iterator[bytes]:
+        """Yield bounded chunks, optionally through one cancellable authority."""
 
-        yield from self._store.iter_file_ref(self, chunk_size=chunk_size)
+        yield from self._store.iter_file_ref(
+            self,
+            chunk_size=chunk_size,
+            authority=authority,
+        )
 
     @property
     def mtime_ns(self) -> int:
@@ -132,6 +181,97 @@ class LocalFileRef:
     @property
     def content_length(self) -> int:
         return self.size
+
+
+class LocalFileAuthorityUse:
+    """One cancellable prepared-snapshot authority registered to exact grants."""
+
+    def __init__(
+        self,
+        *,
+        store: LocalFileGrantStore,
+        grant_ids: tuple[str, ...],
+        invalidator: Callable[[], None],
+    ) -> None:
+        self._store = store
+        self._grant_ids = grant_ids
+        self._invalidator = invalidator
+        self._cancelled = Event()
+        self._active_chunks = 0
+        self._closed = False
+
+    @contextmanager
+    def chunk(self) -> Iterator[None]:
+        """Authorize one local source read while holding the grant lock only for that read."""
+
+        with _AUTHORITY_CONDITION:
+            if self._closed or self._cancelled.is_set():
+                raise ConflictError("local-file upload authority was revoked")
+            self._active_chunks += 1
+        try:
+            with self._store._authority_chunk(self._grant_ids):
+                if self._cancelled.is_set():
+                    raise ConflictError("local-file upload authority was revoked")
+                yield
+        finally:
+            with _AUTHORITY_CONDITION:
+                self._active_chunks -= 1
+                _AUTHORITY_CONDITION.notify_all()
+
+    @contextmanager
+    def delivery(self) -> Iterator[None]:
+        """Count one delivered snapshot chunk without holding the grant-store lock."""
+
+        with _AUTHORITY_CONDITION:
+            if self._closed or self._cancelled.is_set():
+                raise ConflictError("local-file upload authority was revoked")
+            self._active_chunks += 1
+        try:
+            if self._cancelled.is_set():
+                raise ConflictError("local-file upload authority was revoked")
+            yield
+        finally:
+            with _AUTHORITY_CONDITION:
+                self._active_chunks -= 1
+                _AUTHORITY_CONDITION.notify_all()
+
+    def close(self) -> None:
+        with _AUTHORITY_CONDITION:
+            if self._closed:
+                return
+            self._closed = True
+            self._cancelled.set()
+            for key in self._keys:
+                uses = _AUTHORITY_USES.get(key)
+                if uses is None:
+                    continue
+                uses.discard(self)
+                if not uses:
+                    _AUTHORITY_USES.pop(key, None)
+            _AUTHORITY_CONDITION.notify_all()
+
+    @property
+    def _keys(self) -> tuple[tuple[str, str, str], ...]:
+        return tuple(
+            (self._store.vault_id, self._store.vault_root, grant_id) for grant_id in self._grant_ids
+        )
+
+    def _cancel(self) -> None:
+        self._cancelled.set()
+        self._invalidator()
+
+    def _wait_quiescent(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with _AUTHORITY_CONDITION:
+            while self._active_chunks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                _AUTHORITY_CONDITION.wait(remaining)
+            return True
+
+    def _authorizes(self, store: LocalFileGrantStore, grant_id: str) -> bool:
+        return self._store is store and grant_id in self._grant_ids
 
 
 class LocalFileGrantStore:
@@ -230,6 +370,7 @@ class LocalFileGrantStore:
 
     def revoke(self, grant_id: str) -> dict[str, Any]:
         clean_id = _grant_id(grant_id)
+        cancelled: tuple[LocalFileAuthorityUse, ...] = ()
         with self._locked():
             grants = list(self._load())
             matched = next(
@@ -239,18 +380,24 @@ class LocalFileGrantStore:
             if matched is None:
                 raise NotFoundError("local-file grant not found for this vault")
             self._save(tuple(grant for grant in grants if grant.grant_id != clean_id))
-            return {"grant": matched.to_dict(current=_root_matches(matched)), "revoked": True}
+            cancelled = self._cancel_authority((clean_id,))
+        _await_authority_cancellation(cancelled)
+        return {"grant": matched.to_dict(current=_root_matches(matched)), "revoked": True}
 
     def revoke_all(self) -> dict[str, Any]:
         """Remove every host grant for this exact vault identity and path."""
 
+        cancelled: tuple[LocalFileAuthorityUse, ...] = ()
         with self._locked():
             grants = list(self._load())
+            revoked_ids = tuple(grant.grant_id for grant in grants if self._belongs(grant))
             retained = tuple(grant for grant in grants if not self._belongs(grant))
             revoked = len(grants) - len(retained)
             if revoked:
                 self._save(retained)
-            return {"revoked": revoked}
+                cancelled = self._cancel_authority(revoked_ids)
+        _await_authority_cancellation(cancelled)
+        return {"revoked": revoked}
 
     def read(self, *, grant_id: str, relative_path: str) -> dict[str, Any]:
         """Read while holding the grant lock so completed revocation is final."""
@@ -274,44 +421,96 @@ class LocalFileGrantStore:
                 )
             return _read_granted_file(grant=grant, relative=relative)
 
+    def inspect_file_candidate(
+        self,
+        grant_id: str,
+        relative_path: str,
+        *,
+        authority: LocalFileAuthorityUse,
+        max_bytes: int,
+    ) -> LocalFileTransferCandidate:
+        """Inspect stable file metadata without reading source content."""
+
+        clean_id = _grant_id(grant_id)
+        relative = _relative_path(relative_path)
+        bound = _file_transfer_bound(max_bytes)
+        self._require_transfer_authority(authority, clean_id)
+        with authority.chunk():
+            grant = self._grant_for_file_ref(clean_id)
+            with _open_granted_file(grant, relative) as descriptor:
+                metadata = _stable_file_metadata(os.fstat(descriptor))
+                if metadata[2] > bound:
+                    raise ValidationError("local file exceeds this provider operation's size limit")
+        return LocalFileTransferCandidate(
+            grant_id=clean_id,
+            relative_path=relative.as_posix(),
+            device=metadata[0],
+            inode=metadata[1],
+            size=metadata[2],
+            modified_ns=metadata[3],
+            _store=self,
+            _root=grant.root,
+            _relative=relative,
+        )
+
     def resolve_file_ref(
         self,
         grant_id: str,
         relative_path: str,
         *,
         max_bytes: int = MAX_FILE_TRANSFER_BYTES,
+        authority: LocalFileAuthorityUse | None = None,
     ) -> LocalFileRef:
         """Resolve one internal binary reference through the current grant set."""
 
         clean_id = _grant_id(grant_id)
         relative = _relative_path(relative_path)
         _file_transfer_bound(max_bytes)
-        with self._locked():
-            grant = self._grant_for_file_ref(clean_id)
+        if authority is None:
+            with self._locked():
+                grant = self._grant_for_file_ref(clean_id)
+                with _open_granted_file(grant, relative) as descriptor:
+                    metadata = _stable_file_metadata(os.fstat(descriptor))
+                    if metadata[2] > max_bytes:
+                        raise ValidationError("local file exceeds its transfer size bound")
+                    digest = _hash_descriptor(
+                        descriptor,
+                        label="local file",
+                        max_bytes=max_bytes,
+                    )
+                    current = _stable_file_metadata(os.fstat(descriptor))
+                    if current != metadata:
+                        raise ValidationError("local file changed while its reference was created")
+        else:
+            self._require_transfer_authority(authority, clean_id)
+            with authority.chunk():
+                grant = self._grant_for_file_ref(clean_id)
             with _open_granted_file(grant, relative) as descriptor:
                 metadata = _stable_file_metadata(os.fstat(descriptor))
                 if metadata[2] > max_bytes:
                     raise ValidationError("local file exceeds its transfer size bound")
-                digest = _hash_descriptor(
+                digest = _hash_descriptor_authorized(
                     descriptor,
+                    authority=authority,
                     label="local file",
                     max_bytes=max_bytes,
                 )
-                current = _stable_file_metadata(os.fstat(descriptor))
-                if current != metadata:
-                    raise ValidationError("local file changed while its reference was created")
-            return LocalFileRef(
-                grant_id=clean_id,
-                relative_path=relative.as_posix(),
-                device=metadata[0],
-                inode=metadata[1],
-                size=metadata[2],
-                modified_ns=metadata[3],
-                sha256=digest,
-                _store=self,
-                _root=grant.root,
-                _relative=relative,
-            )
+                with authority.chunk():
+                    current = _stable_file_metadata(os.fstat(descriptor))
+                    if current != metadata:
+                        raise ValidationError("local file changed while its reference was created")
+        return LocalFileRef(
+            grant_id=clean_id,
+            relative_path=relative.as_posix(),
+            device=metadata[0],
+            inode=metadata[1],
+            size=metadata[2],
+            modified_ns=metadata[3],
+            sha256=digest,
+            _store=self,
+            _root=grant.root,
+            _relative=relative,
+        )
 
     def assert_transfer_authorized(self, grant_id: str, relative_path: str) -> None:
         """Recheck grant authority without reopening or replacing a prepared snapshot."""
@@ -320,6 +519,39 @@ class LocalFileGrantStore:
         _relative_path(relative_path)
         with self._locked():
             self._grant_for_file_ref(clean_id)
+
+    def register_transfer_authority(
+        self,
+        grant_ids: Sequence[str],
+        *,
+        invalidator: Callable[[], None],
+    ) -> LocalFileAuthorityUse:
+        """Atomically check grants and register cancellable prepared-snapshot use."""
+
+        if (
+            isinstance(grant_ids, (str, bytes, bytearray))
+            or not isinstance(grant_ids, Sequence)
+            or not grant_ids
+            or len(grant_ids) > MAX_LOCAL_GRANTS
+        ):
+            raise ValidationError("local-file authority lease is invalid")
+        clean_ids = tuple(_grant_id(grant_id) for grant_id in grant_ids)
+        if len(set(clean_ids)) != len(clean_ids):
+            raise ValidationError("local-file authority lease contains duplicate grants")
+        if not callable(invalidator):
+            raise ValidationError("local-file authority invalidator is invalid")
+        with self._locked():
+            for grant_id in clean_ids:
+                self._grant_for_file_ref(grant_id)
+            use = LocalFileAuthorityUse(
+                store=self,
+                grant_ids=clean_ids,
+                invalidator=invalidator,
+            )
+            with _AUTHORITY_CONDITION:
+                for key in use._keys:
+                    _AUTHORITY_USES.setdefault(key, set()).add(use)
+            return use
 
     def revalidate_file_ref(self, reference: LocalFileRef) -> None:
         """Recheck grant, path, identity, size, timestamp, and content digest."""
@@ -349,6 +581,7 @@ class LocalFileGrantStore:
         reference: LocalFileRef,
         *,
         chunk_size: int = FILE_TRANSFER_CHUNK_BYTES,
+        authority: LocalFileAuthorityUse | None = None,
     ) -> Iterator[bytes]:
         """Stream a reference without materializing its content in memory."""
 
@@ -357,26 +590,82 @@ class LocalFileGrantStore:
         if type(chunk_size) is not int or not 1 <= chunk_size <= FILE_TRANSFER_CHUNK_BYTES:
             raise ValidationError("local file transfer chunk size is invalid")
         relative = _relative_path(reference.relative_path)
-        with self._locked():
+        if authority is None:
+            with self._locked():
+                grant = self._grant_for_file_ref(reference.grant_id)
+                if grant.root != reference._root:
+                    raise ValidationError("local file reference grant root changed")
+            yield from _stream_file_ref(
+                reference,
+                grant=grant,
+                relative=relative,
+                chunk_size=chunk_size,
+            )
+            return
+
+        self._require_transfer_authority(authority, reference.grant_id)
+        with authority.chunk():
             grant = self._grant_for_file_ref(reference.grant_id)
             if grant.root != reference._root:
                 raise ValidationError("local file reference grant root changed")
-            with _open_granted_file(grant, relative) as descriptor:
-                metadata = _stable_file_metadata(os.fstat(descriptor))
-                _match_file_ref(reference, metadata)
-                digest = hashlib.sha256()
-                total = 0
-                while True:
+        yield from _stream_file_ref(
+            reference,
+            grant=grant,
+            relative=relative,
+            chunk_size=chunk_size,
+            authority=authority,
+        )
+
+    def iter_file_candidate(
+        self,
+        candidate: LocalFileTransferCandidate,
+        *,
+        authority: LocalFileAuthorityUse,
+        chunk_size: int = FILE_TRANSFER_CHUNK_BYTES,
+    ) -> Iterator[bytes]:
+        """Read a metadata-inspected candidate once under chunk-bound authority."""
+
+        if not isinstance(candidate, LocalFileTransferCandidate) or candidate._store is not self:
+            raise ValidationError("local file candidate belongs to another grant store")
+        if type(chunk_size) is not int or not 1 <= chunk_size <= FILE_TRANSFER_CHUNK_BYTES:
+            raise ValidationError("local file transfer chunk size is invalid")
+        self._require_transfer_authority(authority, candidate.grant_id)
+        relative = _relative_path(candidate.relative_path)
+        if relative != candidate._relative:
+            raise ValidationError("local file candidate is invalid")
+        with authority.chunk():
+            grant = self._grant_for_file_ref(candidate.grant_id)
+            if grant.root != candidate._root:
+                raise ValidationError("local file candidate grant root changed")
+        with _open_granted_file(grant, relative) as descriptor:
+            metadata = _stable_file_metadata(os.fstat(descriptor))
+            _match_file_candidate(candidate, metadata)
+            total = 0
+            while True:
+                with authority.chunk():
                     block = os.read(descriptor, chunk_size)
-                    if not block:
-                        break
-                    total += len(block)
-                    if total > reference.size:
-                        raise ValidationError("local file grew beyond its captured identity")
-                    digest.update(block)
-                    yield block
-                if total != reference.size or digest.hexdigest() != reference.sha256:
-                    raise ValidationError("local file reference content changed while streamed")
+                if not block:
+                    break
+                total += len(block)
+                if total > candidate.size:
+                    raise ValidationError("local file grew beyond its inspected identity")
+                yield block
+            with authority.chunk():
+                current = _stable_file_metadata(os.fstat(descriptor))
+                _match_file_candidate(candidate, current)
+            if total != candidate.size:
+                raise ValidationError("local file changed while its upload was prepared")
+
+    def _require_transfer_authority(
+        self,
+        authority: LocalFileAuthorityUse,
+        grant_id: str,
+    ) -> None:
+        if not isinstance(authority, LocalFileAuthorityUse) or not authority._authorizes(
+            self,
+            grant_id,
+        ):
+            raise ValidationError("local-file transfer authority does not match its reference")
 
     def _grant_for_file_ref(self, grant_id: str) -> LocalFileGrant:
         grant = next(
@@ -390,6 +679,27 @@ class LocalFileGrantStore:
                 "local-file grant root changed; revoke it and grant the root again"
             )
         return grant
+
+    @contextmanager
+    def _authority_chunk(self, grant_ids: tuple[str, ...]) -> Iterator[None]:
+        with self._locked():
+            for grant_id in grant_ids:
+                self._grant_for_file_ref(grant_id)
+            yield
+
+    def _cancel_authority(
+        self,
+        grant_ids: tuple[str, ...],
+    ) -> tuple[LocalFileAuthorityUse, ...]:
+        keys = {(self.vault_id, self.vault_root, grant_id) for grant_id in grant_ids}
+        with _AUTHORITY_CONDITION:
+            uses = tuple({use for key in keys for use in _AUTHORITY_USES.get(key, set())})
+            for use in uses:
+                use._cancelled.set()
+        for use in uses:
+            with suppress(Exception):
+                use._invalidator()
+        return uses
 
     def _belongs(self, grant: LocalFileGrant) -> bool:
         return (
@@ -475,6 +785,14 @@ def validate_local_file_tool_binding(
         )
 
 
+def _await_authority_cancellation(uses: Sequence[LocalFileAuthorityUse]) -> None:
+    for use in uses:
+        if not use._wait_quiescent(_AUTHORITY_CANCEL_TIMEOUT_SECONDS):
+            raise ConflictError(
+                "local-file authority was revoked, but an in-flight chunk is still cancelling"
+            )
+
+
 def _file_transfer_bound(value: object) -> int:
     if type(value) is not int or not 0 <= value <= MAX_FILE_TRANSFER_BYTES:
         raise ValidationError("local file transfer size bound is invalid")
@@ -501,6 +819,19 @@ def _match_file_ref(
         reference.modified_ns,
     ):
         raise ValidationError("local file reference identity changed")
+
+
+def _match_file_candidate(
+    candidate: LocalFileTransferCandidate,
+    metadata: tuple[int, int, int, int],
+) -> None:
+    if metadata != (
+        candidate.device,
+        candidate.inode,
+        candidate.size,
+        candidate.modified_ns,
+    ):
+        raise ValidationError("local file candidate identity changed")
 
 
 @contextmanager
@@ -626,6 +957,67 @@ def _hash_descriptor(descriptor: int, *, label: str, max_bytes: int) -> str:
         digest.update(block)
     os.lseek(descriptor, 0, os.SEEK_SET)
     return digest.hexdigest()
+
+
+def _hash_descriptor_authorized(
+    descriptor: int,
+    *,
+    authority: LocalFileAuthorityUse,
+    label: str,
+    max_bytes: int,
+) -> str:
+    """Hash source bytes with revocation checked around every read boundary."""
+
+    digest = hashlib.sha256()
+    total = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        with authority.chunk():
+            block = os.read(descriptor, FILE_TRANSFER_CHUNK_BYTES)
+        if not block:
+            break
+        total += len(block)
+        if total > max_bytes:
+            raise ValidationError(f"{label} exceeds its transfer size bound")
+        digest.update(block)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def _stream_file_ref(
+    reference: LocalFileRef,
+    *,
+    grant: LocalFileGrant,
+    relative: Path,
+    chunk_size: int,
+    authority: LocalFileAuthorityUse | None = None,
+) -> Iterator[bytes]:
+    """Stream one stable file, checking a cancellable authority at every source read."""
+
+    with _open_granted_file(grant, relative) as descriptor:
+        metadata = _stable_file_metadata(os.fstat(descriptor))
+        _match_file_ref(reference, metadata)
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            if authority is None:
+                with reference._store._locked():
+                    current_grant = reference._store._grant_for_file_ref(reference.grant_id)
+                    if current_grant.root != reference._root:
+                        raise ValidationError("local file reference grant root changed")
+                    block = os.read(descriptor, chunk_size)
+            else:
+                with authority.chunk():
+                    block = os.read(descriptor, chunk_size)
+            if not block:
+                break
+            total += len(block)
+            if total > reference.size:
+                raise ValidationError("local file grew beyond its captured identity")
+            digest.update(block)
+            yield block
+        if total != reference.size or digest.hexdigest() != reference.sha256:
+            raise ValidationError("local file reference content changed while streamed")
 
 
 def _is_cloud_placeholder_metadata(name: str, metadata: os.stat_result) -> bool:

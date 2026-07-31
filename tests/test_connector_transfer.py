@@ -5,6 +5,7 @@ import hashlib
 import io
 import os
 import stat
+from collections.abc import Callable
 from email.message import Message
 from pathlib import Path
 from typing import Protocol, cast
@@ -13,7 +14,15 @@ from urllib.request import Request
 
 import pytest
 
-from continuity_kernel.connector_transfer import ArtifactStore, TransferStore
+from continuity_kernel.connector_contract import canonical_json_digest
+from continuity_kernel.connector_transfer import (
+    ArtifactStore,
+    PreparedUpload,
+    PreparedUploadBinding,
+    PreparedUploadBundle,
+    PreparedUploadCache,
+    TransferStore,
+)
 from continuity_kernel.connector_transport import (
     MAX_STREAM_BODY_BYTES,
     AuthorizationScheme,
@@ -57,6 +66,30 @@ class _Response:
 
 class _BodyReader(Protocol):
     def read(self, amount: int = -1) -> bytes: ...
+
+
+class _Scheduled:
+    def __init__(self, callback: Callable[[], None]) -> None:
+        self.callback = callback
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _Scheduler:
+    def __init__(self) -> None:
+        self.calls: list[_Scheduled] = []
+
+    def __call__(self, _delay: float, callback: Callable[[], None]) -> _Scheduled:
+        scheduled = _Scheduled(callback)
+        self.calls.append(scheduled)
+        return scheduled
+
+    def fire(self) -> None:
+        scheduled = next(call for call in reversed(self.calls) if not call.cancelled)
+        scheduled.cancelled = True
+        scheduled.callback()
 
 
 def _grant_store(
@@ -170,11 +203,14 @@ def test_artifact_store_is_private_atomic_bounded_and_cleans_up(tmp_path: Path) 
     assert receipt.to_dict() == {
         "artifact_id": receipt.artifact_id,
         "bytes": 3,
+        "cleanup": "after_expiry_while_runtime_active_or_on_next_start",
         "expires_at": "1970-01-02T00:01:40+00:00",
         "filename": "report.txt",
         "media_type": None,
         "path": str(final),
         "sha256": hashlib.sha256(b"abc").hexdigest(),
+        "storage": "owner_only_transient_host_cache",
+        "transient": True,
     }
 
     second = artifacts.start("report.txt", expected_size=3)
@@ -209,6 +245,27 @@ def test_artifact_store_is_private_atomic_bounded_and_cleans_up(tmp_path: Path) 
     restarted = ArtifactStore(tmp_path / "expiring", clock=lambda: now[0], max_bytes=32)
     assert not completed_receipt.path.exists()
     restarted.close()
+
+
+def test_artifact_store_timer_removes_completed_artifact_at_expiry(tmp_path: Path) -> None:
+    now = [100.0]
+    scheduler = _Scheduler()
+    artifacts = ArtifactStore(
+        tmp_path / "artifacts",
+        clock=lambda: now[0],
+        scheduler=scheduler,
+    )
+    writer = artifacts.start("automatic.bin", expected_size=2, ttl_seconds=1)
+    writer.write(b"ok")
+    receipt = writer.finish()
+    assert receipt.path.exists()
+    assert scheduler.calls
+
+    now[0] = receipt.expires_at
+    scheduler.fire()
+
+    assert not receipt.path.exists()
+    artifacts.close()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
@@ -265,6 +322,97 @@ def test_prepared_upload_is_anonymous_and_immutable(
     with pytest.raises(ValidationError, match="closed"):
         list(prepared.iter_chunks())
     artifacts.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
+def test_prepared_upload_cache_keeps_mismatches_retryable_and_closes_owned_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    _, grants = _grant_store(tmp_path, monkeypatch)
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    original = selected / "payload.bin"
+    original.write_bytes(b"original")
+    grant_id = grants.create(selected)["grant"]["grant_id"]
+    reference = grants.resolve_file_ref(grant_id, "payload.bin")
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+
+    def bundle() -> tuple[PreparedUploadBundle, PreparedUpload]:
+        upload = artifacts.prepare_upload(reference)
+        marker = {"grant_id": grant_id, "relative_path": "payload.bin"}
+        return (
+            PreparedUploadBundle(
+                (
+                    PreparedUploadBinding(
+                        path=("attachments", 0, "local_file"),
+                        selector_digest=canonical_json_digest(marker),
+                        grant_id=grant_id,
+                        upload=upload,
+                    ),
+                )
+            ),
+            upload,
+        )
+
+    scheduler = _Scheduler()
+    cache = PreparedUploadCache(clock=lambda: now[0], scheduler=scheduler)
+    first, first_upload = bundle()
+    token = "v1.reviewed.signature"
+    cache.put(token, first, ttl_seconds=2)
+    assert cache.peek("v1.other.signature") is None
+    assert cache.peek(token) is first
+
+    taken = cache.take(token, expected=first)
+    assert taken is first
+    assert cache.peek(token) is None
+    assert b"".join(first_upload.iter_chunks()) == b"original"
+    taken.close()
+    with pytest.raises(ValidationError, match="closed"):
+        list(first_upload.iter_chunks())
+
+    timed, timed_upload = bundle()
+    cache.put(token, timed, ttl_seconds=1)
+    now[0] += 1
+    scheduler.fire()
+    with pytest.raises(ValidationError, match="closed"):
+        list(timed_upload.iter_chunks())
+
+    expiring, expiring_upload = bundle()
+    cache.put(token, expiring, ttl_seconds=1)
+    pending_expiry = scheduler.calls[-1]
+    with cache.hold(token) as held:
+        assert held is expiring
+        now[0] += 1
+        pending_expiry.callback()
+        assert b"".join(expiring_upload.iter_chunks()) == b"original"
+    assert cache.peek(token) is None
+    with pytest.raises(ValidationError, match="closed"):
+        list(expiring_upload.iter_chunks())
+
+    outstanding, outstanding_upload = bundle()
+    cache.put(token, outstanding)
+    cache.close()
+    with pytest.raises(ValidationError, match="closed"):
+        list(outstanding_upload.iter_chunks())
+    with pytest.raises(ValidationError, match="cache is closed"):
+        cache.peek(token)
+    artifacts.close()
+
+
+def test_prepared_upload_cache_reserves_aggregate_bytes_before_snapshotting() -> None:
+    cache = PreparedUploadCache(
+        scheduler=_Scheduler(),
+        max_snapshot_bytes=8,
+    )
+    reservation = cache.reserve(8)
+    with pytest.raises(ConflictError, match="byte capacity"):
+        cache.reserve(1)
+    reservation.release()
+    replacement = cache.reserve(8)
+    replacement.release()
+    cache.close()
 
 
 def test_stream_transport_counts_bytes_generates_headers_and_cleans_sink(

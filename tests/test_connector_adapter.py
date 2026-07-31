@@ -36,8 +36,9 @@ class _Adapter:
         continuation: object | None,
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
+        write_idempotency_key: str | None = None,
     ) -> ConnectorAdapterResult:
-        del operation, input_value, continuation, credential, transport
+        del operation, input_value, continuation, credential, transport, write_idempotency_key
         return ConnectorAdapterResult({"ok": True})
 
 

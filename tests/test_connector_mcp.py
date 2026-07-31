@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -8,15 +9,20 @@ from continuity_kernel import cli, mcp_server
 from continuity_kernel.connector_operations import CONNECTOR_PROFILE, CONNECTOR_TOOL_NAMES
 from continuity_kernel.connector_runtime import ConnectorRuntime
 from continuity_kernel.errors import ValidationError
+from continuity_kernel.vault import Vault
 
 
 class _Runtime:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.closed = False
 
     def call_tool(self, name: str, values: dict[str, Any]) -> dict[str, object]:
         self.calls.append((name, values))
         return {"operation": values["operation"], "status": "synthetic-ok"}
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_connector_profile_advertises_exactly_fourteen_closed_tools() -> None:
@@ -124,3 +130,38 @@ def test_cli_accepts_connector_profile_without_guided_review_event() -> None:
     args = cli._parser().parse_args(["mcp", "serve", "--profile", CONNECTOR_PROFILE])
     assert args.profile == CONNECTOR_PROFILE
     assert args.event_id is None
+
+
+def test_one_shot_connector_runtime_is_always_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="One-shot connector runtime")
+    runtime = _Runtime()
+    monkeypatch.setattr(mcp_server, "ConnectorRuntime", lambda *args, **kwargs: runtime)
+    result = mcp_server._call(
+        "gsv_gmail_read",
+        {
+            "connection_id": "con-" + "a" * 32,
+            "input": {"page_size": 5},
+            "operation": "messages.list",
+        },
+        vault=vault,
+        profile=CONNECTOR_PROFILE,
+    )
+    assert result["status"] == "synthetic-ok"
+    assert runtime.closed is True
+
+
+def test_connector_server_closes_process_runtime_on_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Connector server runtime")
+    runtime = _Runtime()
+    monkeypatch.setattr(mcp_server, "ConnectorRuntime", lambda *args, **kwargs: runtime)
+    monkeypatch.setattr(mcp_server, "_bounded_lines", lambda _stream: iter(()))
+    assert mcp_server.serve(vault, profile=CONNECTOR_PROFILE) == 0
+    assert runtime.closed is True

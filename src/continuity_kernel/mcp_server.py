@@ -131,35 +131,39 @@ def serve(
         if profile == CONNECTOR_PROFILE
         else None
     )
-    for raw_line in _bounded_lines(sys.stdin.buffer):
-        if raw_line is None:
-            _write(_error(None, -32600, "JSON-RPC request exceeds its size bound"))
-            continue
-        if not raw_line.strip():
-            continue
-        request_id: object = None
-        try:
-            message = json.loads(raw_line.decode("utf-8"))
-            if not isinstance(message, dict):
-                raise ValidationError("JSON-RPC message must be an object")
-            request_id = message.get("id")
-            response = _handle(
-                message,
-                vault=bound,
-                operation_session=operation_session,
-                connector_runtime=connector_runtime,
-                profile=profile,
-                event_id=bound_event_id,
-            )
-            if response is not None:
-                _write(response)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            _write(_error(request_id, -32700, "invalid JSON"))
-        except ContinuityError as exc:
-            _write(_error(request_id, -32000, str(exc)))
-        except Exception as exc:  # pragma: no cover - final protocol safety net
-            _write(_error(request_id, -32603, f"internal error: {type(exc).__name__}"))
-    return 0
+    try:
+        for raw_line in _bounded_lines(sys.stdin.buffer):
+            if raw_line is None:
+                _write(_error(None, -32600, "JSON-RPC request exceeds its size bound"))
+                continue
+            if not raw_line.strip():
+                continue
+            request_id: object = None
+            try:
+                message = json.loads(raw_line.decode("utf-8"))
+                if not isinstance(message, dict):
+                    raise ValidationError("JSON-RPC message must be an object")
+                request_id = message.get("id")
+                response = _handle(
+                    message,
+                    vault=bound,
+                    operation_session=operation_session,
+                    connector_runtime=connector_runtime,
+                    profile=profile,
+                    event_id=bound_event_id,
+                )
+                if response is not None:
+                    _write(response)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                _write(_error(request_id, -32700, "invalid JSON"))
+            except ContinuityError as exc:
+                _write(_error(request_id, -32000, str(exc)))
+            except Exception as exc:  # pragma: no cover - final protocol safety net
+                _write(_error(request_id, -32603, f"internal error: {type(exc).__name__}"))
+        return 0
+    finally:
+        if connector_runtime is not None:
+            connector_runtime.close()
 
 
 def _bounded_lines(stream: IO[bytes]) -> Iterator[bytes | None]:
@@ -287,7 +291,10 @@ def _call(
             vault,
             adapters=default_connector_adapters(),
         )
-        return runtime.call_tool(name, values)
+        try:
+            return runtime.call_tool(name, values)
+        finally:
+            runtime.close()
     if name in OPERATION_TOOL_NAMES:
         if operation_session is not None:
             if operation_session.binding is None:

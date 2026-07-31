@@ -12,16 +12,21 @@ import stat
 import time
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import RLock
-from typing import Final
+from threading import RLock, Timer
+from typing import Final, Protocol
 
 from continuity_kernel.config import data_dir
 from continuity_kernel.errors import ConflictError, ValidationError
-from continuity_kernel.local_files import MAX_FILE_TRANSFER_BYTES, LocalFileRef
+from continuity_kernel.local_files import (
+    MAX_FILE_TRANSFER_BYTES,
+    LocalFileAuthorityUse,
+    LocalFileRef,
+    LocalFileTransferCandidate,
+)
 
 DEFAULT_TRANSFER_TTL_SECONDS: Final = 10 * 60
 MAX_TRANSFER_TTL_SECONDS: Final = 15 * 60
@@ -49,6 +54,14 @@ _SECURE_ARTIFACT_STORE_SUPPORTED: Final = (
 )
 
 Clock = Callable[[], float]
+ConnectorInputPath = tuple[str | int, ...]
+
+
+class ScheduledCall(Protocol):
+    def cancel(self) -> None: ...
+
+
+Scheduler = Callable[[float, Callable[[], None]], ScheduledCall]
 
 
 @dataclass(frozen=True, repr=False)
@@ -147,7 +160,7 @@ class TransferStore:
 
 @dataclass(frozen=True, repr=False)
 class ArtifactReceipt:
-    """A privacy-safe receipt for one completed local artifact."""
+    """A privacy-safe receipt for one owner-only host-cache artifact."""
 
     artifact_id: str
     filename: str
@@ -180,11 +193,14 @@ class ArtifactReceipt:
         return {
             "artifact_id": self.artifact_id,
             "bytes": self.size,
+            "cleanup": "after_expiry_while_runtime_active_or_on_next_start",
             "expires_at": datetime.fromtimestamp(self.expires_at, UTC).isoformat(),
             "filename": self.filename,
             "media_type": self.media_type,
             "path": str(self._path),
             "sha256": self.sha256,
+            "storage": "owner_only_transient_host_cache",
+            "transient": True,
         }
 
 
@@ -205,6 +221,7 @@ class PreparedUpload:
         self.size = size
         self.sha256 = sha256
         self._descriptor = descriptor
+        self._authority: LocalFileAuthorityUse | None = None
         self._closed = False
         self._lock = RLock()
         self._finalizer = weakref.finalize(self, _close_quietly, descriptor)
@@ -244,6 +261,7 @@ class PreparedUpload:
         with self._lock:
             if self._closed or self._descriptor < 0:
                 raise ValidationError("prepared upload is closed")
+            authority = self._authority
             try:
                 descriptor = os.dup(self._descriptor)
             except OSError as exc:
@@ -251,11 +269,19 @@ class PreparedUpload:
         try:
             os.lseek(descriptor, offset, os.SEEK_SET)
             while remaining:
-                block = os.read(descriptor, min(chunk_size, remaining))
-                if not block:
-                    raise ValidationError("prepared upload ended before its captured length")
-                remaining -= len(block)
-                yield block
+                if authority is None:
+                    block = os.read(descriptor, min(chunk_size, remaining))
+                    if not block:
+                        raise ValidationError("prepared upload ended before its captured length")
+                    remaining -= len(block)
+                    yield block
+                    continue
+                with authority.delivery():
+                    block = os.read(descriptor, min(chunk_size, remaining))
+                    if not block:
+                        raise ValidationError("prepared upload ended before its captured length")
+                    remaining -= len(block)
+                    yield block
         except OSError as exc:
             raise ValidationError("prepared upload could not be read") from exc
         finally:
@@ -263,10 +289,25 @@ class PreparedUpload:
 
     def close(self) -> None:
         with self._lock:
+            authority = self._authority
+            self._authority = None
             if self._descriptor >= 0:
                 self._finalizer()
                 self._descriptor = -1
             self._closed = True
+        if authority is not None:
+            authority.close()
+
+    def bind_authority(self, authority: LocalFileAuthorityUse) -> None:
+        if not isinstance(authority, LocalFileAuthorityUse):
+            raise ValidationError("prepared upload authority is invalid")
+        with self._lock:
+            if self._closed:
+                authority.close()
+                raise ConflictError("prepared upload was invalidated before it could be used")
+            if self._authority is not None and self._authority is not authority:
+                raise ConflictError("prepared upload authority is already bound")
+            self._authority = authority
 
     def __enter__(self) -> PreparedUpload:
         return self
@@ -274,6 +315,402 @@ class PreparedUpload:
     def __exit__(self, *args: object) -> None:
         del args
         self.close()
+
+
+@dataclass(frozen=True, repr=False)
+class PreparedUploadBinding:
+    """One anonymous upload bound to its exact caller selector and input position."""
+
+    path: ConnectorInputPath
+    selector_digest: str
+    grant_id: str
+    upload: PreparedUpload
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.path, tuple)
+            or not self.path
+            or any(
+                (not isinstance(part, str) or not part or "\x00" in part)
+                if not isinstance(part, int) or isinstance(part, bool)
+                else part < 0
+                for part in self.path
+            )
+        ):
+            raise ValidationError("prepared upload input path is invalid")
+        if (
+            not isinstance(self.selector_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", self.selector_digest) is None
+        ):
+            raise ValidationError("prepared upload selector digest is invalid")
+        if (
+            not isinstance(self.grant_id, str)
+            or not self.grant_id
+            or len(self.grant_id) > 128
+            or "\x00" in self.grant_id
+        ):
+            raise ValidationError("prepared upload grant binding is invalid")
+        if not isinstance(self.upload, PreparedUpload):
+            raise ValidationError("prepared upload binding has no immutable snapshot")
+
+    def __repr__(self) -> str:
+        return (
+            "PreparedUploadBinding(path=<redacted>, selector_digest=<redacted>, "
+            "grant_id=<redacted>, upload=<redacted>)"
+        )
+
+
+class PreparedUploadReservation:
+    """One atomic aggregate-byte reservation released with its prepared snapshot."""
+
+    def __init__(self, cache: PreparedUploadCache, size: int) -> None:
+        self._cache = cache
+        self.size = size
+        self._released = False
+        self._lock = RLock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._cache._release_bytes(self.size)
+
+    def _belongs_to(self, cache: PreparedUploadCache) -> bool:
+        with self._lock:
+            return self._cache is cache and not self._released
+
+
+class PreparedUploadBundle:
+    """A closeable set of snapshots for one exact connector mutation."""
+
+    def __init__(
+        self,
+        bindings: Sequence[PreparedUploadBinding],
+        *,
+        reservations: Sequence[PreparedUploadReservation] = (),
+    ) -> None:
+        if (
+            isinstance(bindings, (str, bytes, bytearray))
+            or not isinstance(bindings, Sequence)
+            or not bindings
+            or len(bindings) > 128
+            or any(not isinstance(binding, PreparedUploadBinding) for binding in bindings)
+        ):
+            raise ValidationError("prepared upload bundle is invalid")
+        exact = tuple(bindings)
+        if len({binding.path for binding in exact}) != len(exact):
+            raise ValidationError("prepared upload bundle contains duplicate input paths")
+        if (
+            isinstance(reservations, (str, bytes, bytearray))
+            or not isinstance(reservations, Sequence)
+            or any(
+                not isinstance(reservation, PreparedUploadReservation)
+                for reservation in reservations
+            )
+        ):
+            raise ValidationError("prepared upload reservations are invalid")
+        self.bindings = exact
+        self._reservations = tuple(reservations)
+        self._closed = False
+        self._lock = RLock()
+
+    def __repr__(self) -> str:
+        return (
+            f"PreparedUploadBundle(bindings=<{len(self.bindings)} redacted>, closed={self._closed})"
+        )
+
+    @property
+    def uploads(self) -> Mapping[ConnectorInputPath, PreparedUpload]:
+        return {binding.path: binding.upload for binding in self.bindings}
+
+    @property
+    def size(self) -> int:
+        return sum(binding.upload.size for binding in self.bindings)
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def bind_authority(self, authority: LocalFileAuthorityUse) -> None:
+        with self._lock:
+            if self._closed:
+                authority.close()
+                raise ConflictError("prepared upload bundle was already invalidated")
+            for binding in self.bindings:
+                binding.upload.bind_authority(authority)
+
+    def _ensure_reserved_by(self, cache: PreparedUploadCache) -> None:
+        with self._lock:
+            if self._closed:
+                raise ConflictError("prepared upload bundle is closed")
+            if self._reservations:
+                if sum(reservation.size for reservation in self._reservations) != self.size or any(
+                    not reservation._belongs_to(cache) for reservation in self._reservations
+                ):
+                    raise ValidationError("prepared upload byte reservation is invalid")
+                return
+            self._reservations = (cache.reserve(self.size),)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for binding in self.bindings:
+                binding.upload.close()
+            reservations = self._reservations
+            self._reservations = ()
+        for reservation in reservations:
+            reservation.release()
+
+
+@dataclass(repr=False)
+class _PreparedUploadEntry:
+    bundle: PreparedUploadBundle
+    expires_at: float
+    active: int = 0
+
+
+class PreparedUploadCache:
+    """Process-local ownership for snapshots awaiting a sealed confirmation."""
+
+    def __init__(
+        self,
+        *,
+        clock: Clock | None = None,
+        scheduler: Scheduler | None = None,
+        max_entries: int = MAX_TRANSFER_HANDLES,
+        max_snapshot_bytes: int = MAX_FILE_TRANSFER_BYTES,
+    ) -> None:
+        if clock is not None and not callable(clock):
+            raise ValidationError("prepared upload cache clock is invalid")
+        if scheduler is not None and not callable(scheduler):
+            raise ValidationError("prepared upload cache scheduler is invalid")
+        if type(max_entries) is not int or not 1 <= max_entries <= MAX_TRANSFER_HANDLES:
+            raise ValidationError("prepared upload cache capacity is invalid")
+        if (
+            type(max_snapshot_bytes) is not int
+            or not 0 <= max_snapshot_bytes <= MAX_FILE_TRANSFER_BYTES
+        ):
+            raise ValidationError("prepared upload cache byte capacity is invalid")
+        self._clock = clock or time.monotonic
+        self._scheduler = scheduler or _schedule_timer
+        self._max_entries = max_entries
+        self._max_snapshot_bytes = max_snapshot_bytes
+        self._entries: dict[str, _PreparedUploadEntry] = {}
+        self._live_bytes = 0
+        self._timer: ScheduledCall | None = None
+        self._timer_generation = 0
+        self._closed = False
+        self._lock = RLock()
+
+    def put(
+        self,
+        confirmation_token: object,
+        bundle: PreparedUploadBundle,
+        *,
+        ttl_seconds: int = DEFAULT_TRANSFER_TTL_SECONDS,
+    ) -> None:
+        """Take ownership of snapshots under a hash of one confirmation token."""
+
+        if not isinstance(bundle, PreparedUploadBundle):
+            raise ValidationError("prepared upload cache value is invalid")
+        bundle._ensure_reserved_by(self)
+        key = _confirmation_key(confirmation_token)
+        now = self._now()
+        ttl = _ttl(ttl_seconds)
+        with self._lock:
+            self._require_open()
+            self._prune_locked(now)
+            if key in self._entries:
+                raise ConflictError("prepared uploads already exist for this confirmation")
+            if len(self._entries) >= self._max_entries:
+                raise ConflictError(
+                    "prepared upload capacity is full; wait for an approval to expire"
+                )
+            self._entries[key] = _PreparedUploadEntry(bundle=bundle, expires_at=now + ttl)
+            self._reschedule_locked(now)
+
+    def reserve(self, size: int) -> PreparedUploadReservation:
+        """Atomically reserve aggregate snapshot bytes before copying source content."""
+
+        if type(size) is not int or not 0 <= size <= MAX_FILE_TRANSFER_BYTES:
+            raise ValidationError("prepared upload reservation size is invalid")
+        with self._lock:
+            self._require_open()
+            now = self._now()
+            self._prune_locked(now)
+            if self._live_bytes + size > self._max_snapshot_bytes:
+                raise ConflictError(
+                    "prepared upload byte capacity is full; wait for an approval to expire"
+                )
+            self._live_bytes += size
+            return PreparedUploadReservation(self, size)
+
+    def peek(self, confirmation_token: object) -> PreparedUploadBundle | None:
+        """Borrow a current bundle without consuming it so mismatches remain retryable."""
+
+        key = _confirmation_key(confirmation_token)
+        with self._lock:
+            self._require_open()
+            now = self._now()
+            self._prune_locked(now)
+            self._reschedule_locked(now)
+            entry = self._entries.get(key)
+            return None if entry is None else entry.bundle
+
+    @contextmanager
+    def hold(self, confirmation_token: object) -> Iterator[PreparedUploadBundle | None]:
+        """Pin a current cache entry while a confirmation is rebound and consumed."""
+
+        key = _confirmation_key(confirmation_token)
+        with self._lock:
+            self._require_open()
+            now = self._now()
+            self._prune_locked(now)
+            entry = self._entries.get(key)
+            if entry is not None:
+                entry.active += 1
+            self._reschedule_locked(now)
+        try:
+            yield None if entry is None else entry.bundle
+        finally:
+            if entry is not None:
+                with self._lock:
+                    current = self._entries.get(key)
+                    if current is entry:
+                        entry.active -= 1
+                        now = self._now()
+                        self._prune_locked(now)
+                        self._reschedule_locked(now)
+
+    def take(
+        self,
+        confirmation_token: object,
+        *,
+        expected: PreparedUploadBundle,
+    ) -> PreparedUploadBundle:
+        """Atomically transfer ownership after the sealed confirmation was spent."""
+
+        key = _confirmation_key(confirmation_token)
+        with self._lock:
+            self._require_open()
+            now = self._now()
+            self._prune_locked(now)
+            entry = self._entries.get(key)
+            if entry is None or entry.bundle is not expected:
+                self._reschedule_locked(now)
+                raise ConflictError(
+                    "prepared upload is unavailable or expired; request a fresh preview"
+                )
+            del self._entries[key]
+            self._reschedule_locked(now)
+            return entry.bundle
+
+    def discard(self, confirmation_token: object) -> bool:
+        """Close and remove a bundle whose authority can no longer be used."""
+
+        key = _confirmation_key(confirmation_token)
+        with self._lock:
+            self._require_open()
+            entry = self._entries.pop(key, None)
+            self._reschedule_locked(self._now())
+        if entry is None:
+            return False
+        entry.bundle.close()
+        return True
+
+    def prune(self) -> int:
+        with self._lock:
+            self._require_open()
+            now = self._now()
+            removed = self._prune_locked(now)
+            self._reschedule_locked(now)
+            return removed
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            entries = tuple(self._entries.values())
+            self._entries.clear()
+            self._timer_generation += 1
+            timer = self._timer
+            self._timer = None
+            self._closed = True
+        if timer is not None:
+            timer.cancel()
+        for entry in entries:
+            entry.bundle.close()
+
+    def _now(self) -> float:
+        try:
+            value = self._clock()
+        except Exception as exc:
+            raise ValidationError("prepared upload cache clock is unavailable") from exc
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValidationError("prepared upload cache clock returned an invalid time")
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValidationError("prepared upload cache clock returned a non-finite time")
+        return result
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise ValidationError("prepared upload cache is closed")
+
+    def _prune_locked(self, now: float) -> int:
+        expired = [
+            key
+            for key, entry in self._entries.items()
+            if entry.bundle.closed or (entry.active == 0 and entry.expires_at <= now)
+        ]
+        entries = [self._entries.pop(key) for key in expired]
+        for entry in entries:
+            entry.bundle.close()
+        return len(entries)
+
+    def _release_bytes(self, size: int) -> None:
+        with self._lock:
+            self._live_bytes -= size
+            if self._live_bytes < 0:
+                self._live_bytes = 0
+
+    def _reschedule_locked(self, now: float) -> None:
+        self._timer_generation += 1
+        generation = self._timer_generation
+        timer = self._timer
+        self._timer = None
+        if timer is not None:
+            timer.cancel()
+        if not self._entries or self._closed:
+            return
+        expiries = [
+            entry.expires_at
+            for entry in self._entries.values()
+            if entry.active == 0 and not entry.bundle.closed
+        ]
+        if not expiries:
+            return
+        expires_at = min(expiries)
+        self._timer = self._scheduler(
+            max(0.0, expires_at - now),
+            lambda: self._expire_scheduled(generation),
+        )
+
+    def _expire_scheduled(self, generation: int) -> None:
+        with self._lock:
+            if self._closed or generation != self._timer_generation:
+                return
+            self._timer = None
+            try:
+                now = self._now()
+            except ValidationError:
+                return
+            self._prune_locked(now)
+            self._reschedule_locked(now)
 
 
 @dataclass
@@ -403,6 +840,7 @@ class ArtifactStore:
         *,
         max_bytes: int = MAX_ARTIFACT_BYTES,
         clock: Clock | None = None,
+        scheduler: Scheduler | None = None,
     ) -> None:
         if not _SECURE_ARTIFACT_STORE_SUPPORTED:
             raise ValidationError("secure connector artifact storage is unavailable on this host")
@@ -410,6 +848,8 @@ class ArtifactStore:
             raise ValidationError("artifact store size bound is invalid")
         if clock is not None and not callable(clock):
             raise ValidationError("artifact store clock is invalid")
+        if scheduler is not None and not callable(scheduler):
+            raise ValidationError("artifact store scheduler is invalid")
         self.root = (
             Path(root) if root is not None else data_dir() / "connector-artifacts"
         ).expanduser()
@@ -417,10 +857,14 @@ class ArtifactStore:
             raise ValidationError("artifact store requires an absolute root")
         self.max_bytes = max_bytes
         self._clock = clock or time.time
+        self._scheduler = scheduler or _schedule_timer
         self._lock = RLock()
         self._pending: dict[str, _PendingArtifact] = {}
         self._completed: dict[str, float] = {}
         self._active_stages: set[str] = set()
+        self._timer: ScheduledCall | None = None
+        self._timer_generation = 0
+        self._closed = False
         self._root_fd = -1
         self._root_identity: tuple[int, int] | None = None
         self._open_root()
@@ -473,20 +917,24 @@ class ArtifactStore:
             except OSError as exc:
                 raise ValidationError("artifact temporary file could not be created") from exc
             self._pending[pending_id] = pending
+            self._reschedule_locked(now)
             return ArtifactWriter(self, pending_id, pending, descriptor, expected_size)
 
     def prepare_upload(
         self,
-        reference: LocalFileRef,
+        reference: LocalFileRef | LocalFileTransferCandidate,
         *,
+        authority: LocalFileAuthorityUse | None = None,
         filename: str | None = None,
         media_type: str | None = None,
         max_bytes: int | None = None,
     ) -> PreparedUpload:
         """Copy a granted file into an anonymous immutable snapshot before preview."""
 
-        if not isinstance(reference, LocalFileRef):
-            raise ValidationError("prepared upload requires a local file reference")
+        if not isinstance(reference, (LocalFileRef, LocalFileTransferCandidate)):
+            raise ValidationError("prepared upload requires an inspected local file")
+        if isinstance(reference, LocalFileTransferCandidate) and authority is None:
+            raise ValidationError("prepared upload candidate requires transfer authority")
         bound = self.max_bytes if max_bytes is None else max_bytes
         if type(bound) is not int or not 0 <= bound <= self.max_bytes:
             raise ValidationError("prepared upload size bound is invalid")
@@ -517,15 +965,27 @@ class ArtifactStore:
                 raise ValidationError("prepared upload snapshot could not be created") from exc
             self._active_stages.add(stage_name)
         try:
-            for block in reference.iter_chunks(chunk_size=ARTIFACT_CHUNK_BYTES):
+            if isinstance(reference, LocalFileTransferCandidate):
+                if authority is None:
+                    raise ValidationError("prepared upload candidate requires transfer authority")
+                chunks = reference.iter_chunks(
+                    chunk_size=ARTIFACT_CHUNK_BYTES,
+                    authority=authority,
+                )
+            else:
+                chunks = reference.iter_chunks(
+                    chunk_size=ARTIFACT_CHUNK_BYTES,
+                    authority=authority,
+                )
+            for block in chunks:
                 total += len(block)
                 if total > bound:
-                    raise ValidationError(
-                        "local file exceeds this provider operation's size limit"
-                    )
+                    raise ValidationError("local file exceeds this provider operation's size limit")
                 _write_all(descriptor, block)
                 digest.update(block)
-            if total != reference.size or digest.hexdigest() != reference.sha256:
+            if total != reference.size or (
+                isinstance(reference, LocalFileRef) and digest.hexdigest() != reference.sha256
+            ):
                 raise ValidationError("local file changed while its upload was prepared")
             os.fsync(descriptor)
             os.fchmod(descriptor, 0o600)
@@ -572,10 +1032,49 @@ class ArtifactStore:
             self._ensure_root()
             now = self._now()
             removed = self._prune_locked(now)
-            return removed + self._prune_orphan_parts_locked(now)
+            removed += self._prune_orphan_parts_locked(now)
+            self._reschedule_locked(now)
+            return removed
+
+    def discard(self, receipt: ArtifactReceipt) -> None:
+        """Delete one exact completed receipt still owned by this store."""
+
+        if not isinstance(receipt, ArtifactReceipt):
+            raise ValidationError("artifact receipt is invalid")
+        final_name = receipt.path.name
+        match = _FINAL_NAME.fullmatch(final_name)
+        now = self._now()
+        with self._lock:
+            self._ensure_root()
+            if (
+                match is None
+                or receipt.path != self.root / final_name
+                or match.group(1) != receipt.artifact_id
+                or float(int(match.group(2))) != receipt.expires_at
+                or self._completed.get(final_name) != receipt.expires_at
+            ):
+                raise ValidationError("artifact receipt does not belong to this store")
+            try:
+                metadata = os.stat(final_name, dir_fd=self._root_fd, follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                    raise ValidationError("artifact receipt does not name a regular file")
+                os.unlink(final_name, dir_fd=self._root_fd)
+                os.fsync(self._root_fd)
+            except FileNotFoundError as exc:
+                raise ValidationError("artifact receipt is no longer available") from exc
+            except OSError as exc:
+                raise ValidationError("artifact receipt could not be discarded") from exc
+            self._completed.pop(final_name, None)
+            self._reschedule_locked(now)
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._timer_generation += 1
+            timer = self._timer
+            self._timer = None
             for pending_id, pending in tuple(self._pending.items()):
                 writer = pending.writer() if pending.writer is not None else None
                 if writer is not None:
@@ -586,6 +1085,8 @@ class ArtifactStore:
             if self._root_fd >= 0:
                 os.close(self._root_fd)
                 self._root_fd = -1
+        if timer is not None:
+            timer.cancel()
 
     def _open_root(self) -> None:
         if not os.path.lexists(self.root):
@@ -634,7 +1135,8 @@ class ArtifactStore:
     def _publish(self, pending: _PendingArtifact) -> float:
         with self._lock:
             self._ensure_root()
-            expires_at = float(int(self._now() + pending.ttl_seconds))
+            now = self._now()
+            expires_at = float(int(now + pending.ttl_seconds))
             final_name = f"{pending.artifact_id}--{int(expires_at)}--{pending.filename}"
             if _FINAL_NAME.fullmatch(final_name) is None:
                 raise ValidationError("artifact destination name is invalid")
@@ -661,6 +1163,7 @@ class ArtifactStore:
             pending.final_name = final_name
             pending.expires_at = expires_at
             self._completed[final_name] = expires_at
+            self._reschedule_locked(now)
             return expires_at
 
     def _finished(self, pending_id: str) -> None:
@@ -703,10 +1206,12 @@ class ArtifactStore:
                 continue
             try:
                 metadata = os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
-                if (
-                    stat.S_ISREG(metadata.st_mode)
-                    and float(metadata.st_mtime) + MAX_ARTIFACT_TTL_SECONDS <= now
-                ):
+                max_age = (
+                    DEFAULT_TRANSFER_TTL_SECONDS
+                    if _STAGE_NAME.fullmatch(name) is not None
+                    else MAX_ARTIFACT_TTL_SECONDS
+                )
+                if stat.S_ISREG(metadata.st_mode) and float(metadata.st_mtime) + max_age <= now:
                     os.unlink(name, dir_fd=self._root_fd)
                     removed += 1
             except FileNotFoundError:
@@ -730,6 +1235,7 @@ class ArtifactStore:
 
     def _prune_completed_files_locked(self, now: float) -> int:
         removed = 0
+        current: set[str] = set()
         try:
             names = os.listdir(self._root_fd)
         except OSError as exc:
@@ -738,7 +1244,12 @@ class ArtifactStore:
             if not isinstance(name, str):
                 continue
             match = _FINAL_NAME.fullmatch(name)
-            if match is None or float(int(match.group(2))) > now:
+            if match is None:
+                continue
+            expires_at = float(int(match.group(2)))
+            if expires_at > now:
+                self._completed[name] = expires_at
+                current.add(name)
                 continue
             try:
                 metadata = os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
@@ -751,7 +1262,38 @@ class ArtifactStore:
                 raise ValidationError("expired artifact cleanup failed") from exc
             self._completed.pop(name, None)
             removed += 1
+        for name in tuple(self._completed):
+            if name not in current:
+                self._completed.pop(name, None)
         return removed
+
+    def _reschedule_locked(self, now: float) -> None:
+        self._timer_generation += 1
+        generation = self._timer_generation
+        timer = self._timer
+        self._timer = None
+        if timer is not None:
+            timer.cancel()
+        if self._closed or not self._completed:
+            return
+        expires_at = min(self._completed.values())
+        self._timer = self._scheduler(
+            max(0.0, expires_at - now),
+            lambda: self._expire_scheduled(generation),
+        )
+
+    def _expire_scheduled(self, generation: int) -> None:
+        with self._lock:
+            if self._closed or generation != self._timer_generation:
+                return
+            self._timer = None
+            try:
+                now = self._now()
+                self._ensure_root()
+                self._prune_locked(now)
+                self._reschedule_locked(now)
+            except ValidationError:
+                return
 
     def _now(self) -> float:
         try:
@@ -764,6 +1306,120 @@ class ArtifactStore:
         if not math.isfinite(result):
             raise ValidationError("artifact store clock returned a non-finite time")
         return result
+
+
+class ScopedArtifactWriter:
+    """Artifact writer whose completed receipt is owned by one adapter call."""
+
+    def __init__(self, scope: ConnectorArtifactScope, writer: ArtifactWriter) -> None:
+        self._scope = scope
+        self._writer = writer
+        self._closed = False
+
+    @property
+    def size(self) -> int:
+        return self._writer.size
+
+    def write(self, content: bytes) -> int:
+        return self._writer.write(content)
+
+    def finish(self) -> ArtifactReceipt:
+        if self._closed:
+            raise ValidationError("scoped artifact writer is closed")
+        receipt = self._writer.finish()
+        self._closed = True
+        self._scope._finished(self, receipt)
+        return receipt
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._writer.abort()
+        self._scope._aborted(self)
+
+    def __enter__(self) -> ScopedArtifactWriter:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc, traceback
+        if exc_type is None:
+            self.finish()
+        else:
+            self.abort()
+
+
+class ConnectorArtifactScope:
+    """Per-call facade that retains only the exact receipt returned by its adapter."""
+
+    def __init__(self, store: ArtifactStore) -> None:
+        if not isinstance(store, ArtifactStore):
+            raise ValidationError("connector artifact scope requires an artifact store")
+        self._store = store
+        self._writers: set[ScopedArtifactWriter] = set()
+        self._receipts: dict[int, ArtifactReceipt] = {}
+        self._closed = False
+        self._lock = RLock()
+
+    def start(
+        self,
+        name: str,
+        *,
+        media_type: str | None = None,
+        expected_size: int | None = None,
+        ttl_seconds: int = DEFAULT_ARTIFACT_TTL_SECONDS,
+    ) -> ScopedArtifactWriter:
+        with self._lock:
+            if self._closed:
+                raise ValidationError("connector artifact scope is closed")
+            writer = ScopedArtifactWriter(
+                self,
+                self._store.start(
+                    name,
+                    media_type=media_type,
+                    expected_size=expected_size,
+                    ttl_seconds=ttl_seconds,
+                ),
+            )
+            self._writers.add(writer)
+            return writer
+
+    def complete(self, returned: ArtifactReceipt | None) -> None:
+        """Close the call, rejecting foreign receipts and deleting all unreturned output."""
+
+        with self._lock:
+            if self._closed:
+                raise ValidationError("connector artifact scope is closed")
+            owned = returned is None or self._receipts.get(id(returned)) is returned
+            writers = tuple(self._writers)
+            receipts = tuple(self._receipts.values())
+            self._writers.clear()
+            self._receipts.clear()
+            self._closed = True
+        for writer in writers:
+            writer.abort()
+        for receipt in receipts:
+            if receipt is not returned:
+                self._store.discard(receipt)
+        if not owned:
+            raise ValidationError("connector adapter returned a foreign artifact receipt")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.complete(None)
+
+    def _finished(self, writer: ScopedArtifactWriter, receipt: ArtifactReceipt) -> None:
+        with self._lock:
+            if self._closed or writer not in self._writers:
+                self._store.discard(receipt)
+                raise ValidationError("connector artifact scope closed before completion")
+            self._writers.remove(writer)
+            self._receipts[id(receipt)] = receipt
+
+    def _aborted(self, writer: ScopedArtifactWriter) -> None:
+        with self._lock:
+            self._writers.discard(writer)
 
 
 def sanitize_artifact_name(value: object) -> str:
@@ -791,6 +1447,19 @@ def _handle(value: object) -> str:
     if not isinstance(value, str) or _HANDLE.fullmatch(value) is None:
         raise ValidationError("transfer handle is invalid")
     return value
+
+
+def _confirmation_key(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 8_192 or not value.isascii():
+        raise ValidationError("prepared upload confirmation token is invalid")
+    return hashlib.sha256(b"seld-prepared-upload\0" + value.encode("ascii")).hexdigest()
+
+
+def _schedule_timer(delay_seconds: float, callback: Callable[[], None]) -> ScheduledCall:
+    timer = Timer(delay_seconds, callback)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def _ttl(value: object) -> int:
