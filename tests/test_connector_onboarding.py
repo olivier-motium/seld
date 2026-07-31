@@ -46,7 +46,7 @@ def _manager(tmp_path: Path) -> ConnectorAuthManager:
 def _registration(provider: str) -> PublicClientRegistration:
     redirects = {
         "google": "http://127.0.0.1:0",
-        "microsoft": "http://127.0.0.1:0/oauth/callback",
+        "microsoft": "http://localhost:0/oauth/callback",
         "slack": "http://localhost:43127/oauth/callback",
     }
     return PublicClientRegistration(

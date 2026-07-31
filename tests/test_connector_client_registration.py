@@ -27,7 +27,7 @@ def _all_providers() -> dict[str, object]:
         },
         "microsoft": {
             "client_id": "microsoft-public",
-            "redirect_template": "http://127.0.0.1:0/oauth/callback",
+            "redirect_template": "http://localhost:0/oauth/callback",
         },
         "slack": {
             "client_id": "slack-public",
@@ -79,7 +79,7 @@ def test_missing_provider_is_a_friendly_setup_error_without_writing_anything(
     [
         ("google", "http://localhost:0"),
         ("google", "http://127.0.0.1:0/"),
-        ("microsoft", "http://localhost:0/oauth/callback"),
+        ("microsoft", "http://127.0.0.1:0/oauth/callback"),
         ("microsoft", "http://127.0.0.1:7000/oauth/callback"),
         ("slack", "http://localhost:0/oauth/callback"),
         ("slack", "http://127.0.0.1:43127/oauth/callback"),

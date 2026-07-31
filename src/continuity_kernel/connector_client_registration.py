@@ -190,7 +190,10 @@ def _redirect_template(provider: str, value: object) -> str:
     if provider == "google":
         valid = host in _LOOPBACK_IPS and port == 0 and parsed.path == ""
     elif provider == "microsoft":
-        valid = host in _LOOPBACK_IPS and port == 0 and parsed.path in {"", "/oauth/callback"}
+        # Microsoft public desktop clients ignore the ephemeral port only for
+        # localhost redirect URIs. Numeric loopback hosts require an exact
+        # registered port and therefore cannot support Seld's dynamic listener.
+        valid = host == "localhost" and port == 0 and parsed.path == "/oauth/callback"
     else:
         valid = host == "localhost" and port not in {None, 0} and parsed.path == "/oauth/callback"
     if not valid:
