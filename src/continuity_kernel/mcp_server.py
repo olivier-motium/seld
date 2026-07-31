@@ -9,12 +9,19 @@ import sys
 import uuid
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
-from typing import IO, Any, Final
+from typing import IO, Any, Final, cast
 
 import continuity_kernel.update as self_update
 from continuity_kernel import __version__, resident_import
 from continuity_kernel.config import resolve_vault
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_contract import validate_json
+from continuity_kernel.connector_operations import (
+    CONNECTOR_PROFILE,
+    CONNECTOR_TOOL_NAMES,
+    connector_tool_definitions,
+)
+from continuity_kernel.connector_runtime import ConnectorRuntime, default_connector_adapters
 from continuity_kernel.connector_sources import SUPPORTED_SOURCE_IDS, read_connector_source
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.direction import direction_aim, direction_dict
@@ -119,6 +126,11 @@ def serve(
     bound_event_id = _profile_event_id(profile, event_id)
     bound = vault or Vault(resolve_vault())
     operation_session = _OperationSession() if CONTROL_STORE_SUPPORTED else None
+    connector_runtime = (
+        ConnectorRuntime(bound, adapters=default_connector_adapters())
+        if profile == CONNECTOR_PROFILE
+        else None
+    )
     for raw_line in _bounded_lines(sys.stdin.buffer):
         if raw_line is None:
             _write(_error(None, -32600, "JSON-RPC request exceeds its size bound"))
@@ -135,6 +147,7 @@ def serve(
                 message,
                 vault=bound,
                 operation_session=operation_session,
+                connector_runtime=connector_runtime,
                 profile=profile,
                 event_id=bound_event_id,
             )
@@ -168,6 +181,7 @@ def _handle(
     vault: Vault | None = None,
     operation_binding: OperationBinding | None = None,
     operation_session: _OperationSession | None = None,
+    connector_runtime: ConnectorRuntime | None = None,
     profile: str | None = None,
     event_id: str | None = None,
 ) -> dict[str, Any] | None:
@@ -186,13 +200,12 @@ def _handle(
             request_id,
             {
                 "capabilities": {"tools": {"listChanged": False}},
-                "instructions": (
-                    "Seld is a private local resident Mind. Read exact records before writes, "
-                    "use compare-and-swap revisions, and never store secrets or raw provider "
-                    "payloads."
-                ),
+                "instructions": _profile_instructions(profile),
                 "protocolVersion": protocol_version,
-                "serverInfo": {"name": "gsv", "version": __version__},
+                "serverInfo": {
+                    "name": "gsv-connectors" if profile == CONNECTOR_PROFILE else "gsv",
+                    "version": __version__,
+                },
             },
         )
     if method == "ping":
@@ -213,6 +226,7 @@ def _handle(
                 vault=vault,
                 operation_binding=operation_binding,
                 operation_session=operation_session,
+                connector_runtime=connector_runtime,
                 profile=profile,
                 event_id=bound_event_id,
             )
@@ -251,6 +265,7 @@ def _call(
     vault: Vault | None = None,
     operation_binding: OperationBinding | None = None,
     operation_session: _OperationSession | None = None,
+    connector_runtime: ConnectorRuntime | None = None,
     profile: str | None = None,
     event_id: str | None = None,
 ) -> dict[str, Any]:
@@ -259,12 +274,20 @@ def _call(
         raise ValidationError(f"unknown tool: {name}")
     if name in OPERATION_TOOL_NAMES and not CONTROL_STORE_SUPPORTED:
         raise ValidationError(f"unknown tool: {name}")
-    _require_advertised_input_shape(name, values)
+    _require_advertised_input_shape(name, values, profile=profile)
     if name in {"gsv_operation_accept", "gsv_operation_reject"} and event_id is not None:
         requested_event_id = _string(values, "event_id")
         if requested_event_id != event_id:
             raise ValidationError("operation event is outside this guided-review MCP binding")
+    if name in CONNECTOR_TOOL_NAMES and connector_runtime is not None:
+        return connector_runtime.call_tool(name, values)
     vault = vault or Vault(resolve_vault())
+    if name in CONNECTOR_TOOL_NAMES:
+        runtime = ConnectorRuntime(
+            vault,
+            adapters=default_connector_adapters(),
+        )
+        return runtime.call_tool(name, values)
     if name in OPERATION_TOOL_NAMES:
         if operation_session is not None:
             if operation_session.binding is None:
@@ -2023,6 +2046,8 @@ def _advertised_tools(*, profile: str | None = None) -> list[dict[str, Any]]:
     """Apply an explicit profile and hide an unavailable secure operation lane."""
 
     allowed = _profile_tool_names(profile)
+    if profile == CONNECTOR_PROFILE:
+        return cast(list[dict[str, Any]], connector_tool_definitions())
     tools = TOOLS if allowed is None else [tool for tool in TOOLS if tool["name"] in allowed]
     if not CONTROL_STORE_SUPPORTED:
         tools = [tool for tool in tools if tool["name"] not in OPERATION_TOOL_NAMES]
@@ -2034,7 +2059,23 @@ def _profile_tool_names(profile: str | None) -> frozenset[str] | None:
         return None
     if profile == GUIDED_REVIEW_PROFILE:
         return GUIDED_REVIEW_TOOL_NAMES
+    if profile == CONNECTOR_PROFILE:
+        return CONNECTOR_TOOL_NAMES
     raise ValidationError(f"unknown MCP profile: {profile}")
+
+
+def _profile_instructions(profile: str | None) -> str:
+    if profile == CONNECTOR_PROFILE:
+        return (
+            "Use only the closed provider operations shown here. A confirmation_required result "
+            "has not changed the provider: show the exact account, effect, preview, and warning "
+            "to the person, obtain fresh approval, then repeat the identical call with its token. "
+            "Never paste, request, store, or reveal connector credentials."
+        )
+    return (
+        "Seld is a private local resident Mind. Read exact records before writes, use "
+        "compare-and-swap revisions, and never store secrets or raw provider payloads."
+    )
 
 
 def _profile_event_id(profile: str | None, event_id: str | None) -> str | None:
@@ -2042,6 +2083,10 @@ def _profile_event_id(profile: str | None, event_id: str | None) -> str | None:
     if profile is None:
         if event_id is not None:
             raise ValidationError("an MCP event binding requires an explicit profile")
+        return None
+    if profile == CONNECTOR_PROFILE:
+        if event_id is not None:
+            raise ValidationError("connector MCP profile does not accept an event binding")
         return None
     if event_id is None:
         raise ValidationError("guided-review MCP profile requires an exact event ID")
@@ -2213,11 +2258,19 @@ def _require_shape(
         raise ValidationError(f"{label} has unknown field {sorted(extra)[0]}")
 
 
-def _require_advertised_input_shape(name: str, values: dict[str, Any]) -> None:
-    for tool in TOOLS:
+def _require_advertised_input_shape(
+    name: str,
+    values: dict[str, Any],
+    *,
+    profile: str | None = None,
+) -> None:
+    for tool in _advertised_tools(profile=profile):
         if tool["name"] != name:
             continue
         schema = tool["inputSchema"]
+        if "oneOf" in schema:
+            validate_json(values, schema)
+            return
         properties = schema["properties"]
         required = set(schema["required"])
         if missing := required - set(values):

@@ -54,7 +54,7 @@ from continuity_kernel.local_source_delivery import (
     VERIFIED_PREFIX_ADOPTION,
     LocalSourceDelivery,
 )
-from continuity_kernel.mcp_server import GUIDED_REVIEW_PROFILE, serve
+from continuity_kernel.mcp_server import CONNECTOR_PROFILE, GUIDED_REVIEW_PROFILE, serve
 from continuity_kernel.operations import OperationLedger, capture_operation_binding
 from continuity_kernel.portfolio import (
     portfolio_dict,
@@ -1871,7 +1871,10 @@ def _parser() -> argparse.ArgumentParser:
     mcp = commands.add_parser("mcp", help="Run the local MCP server.")
     mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
     mcp_serve = mcp_commands.add_parser("serve")
-    mcp_serve.add_argument("--profile", choices=(GUIDED_REVIEW_PROFILE,))
+    mcp_serve.add_argument(
+        "--profile",
+        choices=(CONNECTOR_PROFILE, GUIDED_REVIEW_PROFILE),
+    )
     mcp_serve.add_argument("--event-id")
     rollback_check = commands.add_parser("rollback-check", help=argparse.SUPPRESS)
     rollback_check.add_argument("previous_executable")
