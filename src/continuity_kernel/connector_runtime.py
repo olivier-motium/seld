@@ -25,7 +25,7 @@ from continuity_kernel.connector_operations import (
     CONNECTOR_TOOL_BINDINGS,
     OPERATION_CATALOG,
 )
-from continuity_kernel.connector_profiles import ConnectorAccessTier, get_profile
+from continuity_kernel.connector_profiles import ConnectorAccessTier, get_profile_for_connection
 from continuity_kernel.connector_session import ConnectorSession
 from continuity_kernel.connector_transport import (
     AuthorizationScheme,
@@ -101,7 +101,11 @@ class ConnectorRuntime:
             raise ValidationError("connection does not authorize this connector")
         if connection.health not in {ConnectionHealth.READY, ConnectionHealth.DEGRADED}:
             raise ValidationError("connection must be verified before interactive use")
-        profile = get_profile(profile_provider)
+        profile = get_profile_for_connection(
+            connection.provider,
+            connection.source_ids,
+            connection.scopes,
+        )
         access = profile.access_for_scopes(connection.scopes)
         if mode is ConnectorMode.WRITE and access is not ConnectorAccessTier.FULL:
             raise ValidationError(

@@ -33,7 +33,7 @@ from continuity_kernel.connector_http import (
 )
 from continuity_kernel.connector_identifiers import ConnectionId, parse_connection_id
 from continuity_kernel.connector_oauth import OAuthTokenEndpointError, OAuthTransportError
-from continuity_kernel.connector_profiles import get_profile
+from continuity_kernel.connector_profiles import get_profile_for_connection
 from continuity_kernel.connector_token_store import TokenState
 from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
 from continuity_kernel.records import format_time
@@ -374,7 +374,11 @@ def _preflight(
     if actual_endpoints != expected_endpoints:
         raise ValidationError("connection OAuth endpoints do not match the built-in provider")
     scopes = frozenset(connection.scopes)
-    get_profile(expected_provider).access_for_scopes(connection.scopes)
+    get_profile_for_connection(
+        connection.provider,
+        connection.source_ids,
+        connection.scopes,
+    ).access_for_scopes(connection.scopes)
     if not any(
         alternative.issubset(scopes)
         for alternative in _SOURCE_REQUIRED_SCOPE_ALTERNATIVES[source_id]

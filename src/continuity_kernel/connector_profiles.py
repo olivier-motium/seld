@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -219,11 +219,166 @@ PROFILES: Final[Mapping[str, ConnectorProfile]] = MappingProxyType(
 )
 
 
+CONNECTOR_PROFILES: Final[Mapping[str, ConnectorProfile]] = MappingProxyType(
+    {
+        "discord": PROFILES["discord"],
+        "slack": PROFILES["slack"],
+        "gmail": ConnectorProfile(
+            name="gmail",
+            provider="google",
+            source_ids=("gmail",),
+            credential_kind=CredentialKind.OAUTH2,
+            read_scopes=(
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/gmail.readonly",
+            ),
+            full_scopes=(
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/gmail.modify",
+            ),
+            supplemental_scopes=("https://mail.google.com/",),
+            legacy_read_scopes=(("https://www.googleapis.com/auth/gmail.readonly",),),
+            authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+            token_endpoint="https://oauth2.googleapis.com/token",
+        ),
+        "google_calendar": ConnectorProfile(
+            name="google_calendar",
+            provider="google",
+            source_ids=("google_calendar",),
+            credential_kind=CredentialKind.OAUTH2,
+            read_scopes=(
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+                "https://www.googleapis.com/auth/calendar.events.readonly",
+                "https://www.googleapis.com/auth/calendar.freebusy",
+            ),
+            full_scopes=(
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+                "https://www.googleapis.com/auth/calendar.events",
+                "https://www.googleapis.com/auth/calendar.calendars",
+                "https://www.googleapis.com/auth/calendar.freebusy",
+            ),
+            legacy_read_scopes=(("https://www.googleapis.com/auth/calendar.readonly",),),
+            authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+            token_endpoint="https://oauth2.googleapis.com/token",
+        ),
+        "google_drive": ConnectorProfile(
+            name="google_drive",
+            provider="google",
+            source_ids=("google_drive",),
+            credential_kind=CredentialKind.OAUTH2,
+            read_scopes=(
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/drive.metadata.readonly",
+                "https://www.googleapis.com/auth/drive.readonly",
+            ),
+            full_scopes=(
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/drive",
+            ),
+            legacy_read_scopes=(("https://www.googleapis.com/auth/drive.metadata.readonly",),),
+            authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+            token_endpoint="https://oauth2.googleapis.com/token",
+        ),
+        "outlook_mail": ConnectorProfile(
+            name="outlook_mail",
+            provider="microsoft",
+            source_ids=("outlook_mail",),
+            credential_kind=CredentialKind.OAUTH2,
+            read_scopes=("offline_access", "User.Read", "Mail.Read"),
+            full_scopes=("offline_access", "User.Read", "Mail.ReadWrite", "Mail.Send"),
+            legacy_read_scopes=(("Mail.Read",),),
+            authorization_endpoint=(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+            ),
+            token_endpoint="https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        ),
+        "outlook_calendar": ConnectorProfile(
+            name="outlook_calendar",
+            provider="microsoft",
+            source_ids=("outlook_calendar",),
+            credential_kind=CredentialKind.OAUTH2,
+            read_scopes=("offline_access", "User.Read", "Calendars.Read"),
+            full_scopes=("offline_access", "User.Read", "Calendars.ReadWrite"),
+            legacy_read_scopes=(("Calendars.Read",),),
+            authorization_endpoint=(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+            ),
+            token_endpoint="https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        ),
+    }
+)
+
+
 def get_profile(name: str) -> ConnectorProfile:
     try:
         return PROFILES[name]
     except KeyError as exc:
         raise ValidationError("connector profile is unsupported") from exc
+
+
+def get_connector_profile(name: str) -> ConnectorProfile:
+    if not isinstance(name, str):
+        raise ValidationError("connector profile is unsupported")
+    try:
+        return CONNECTOR_PROFILES[name]
+    except KeyError as exc:
+        raise ValidationError("connector profile is unsupported") from exc
+
+
+def get_profile_for_connection(
+    provider: str,
+    source_ids: Sequence[str],
+    scopes: tuple[str, ...] | None = None,
+) -> ConnectorProfile:
+    if (
+        not isinstance(provider, str)
+        or isinstance(source_ids, str)
+        or not isinstance(source_ids, Sequence)
+        or not source_ids
+        or any(not isinstance(source_id, str) or not source_id for source_id in source_ids)
+    ):
+        raise ValidationError("connector connection profile is unsupported")
+    exact_source_ids = tuple(sorted(source_ids))
+    if len(set(exact_source_ids)) != len(exact_source_ids):
+        raise ValidationError("connector connection profile is unsupported")
+    logical: ConnectorProfile | None = None
+    for profile in CONNECTOR_PROFILES.values():
+        if profile.provider == provider and tuple(sorted(profile.source_ids)) == exact_source_ids:
+            logical = profile
+            break
+    if logical is not None:
+        if scopes is None:
+            return logical
+        try:
+            logical.access_for_scopes(scopes)
+        except ValidationError:
+            pass
+        else:
+            return logical
+    try:
+        aggregate = PROFILES[provider]
+    except KeyError as exc:
+        raise ValidationError("connector connection profile is unsupported") from exc
+    if scopes is not None:
+        try:
+            aggregate.access_for_scopes(scopes)
+        except ValidationError:
+            pass
+        else:
+            # Compatibility for pre-logical records, whose source subset and
+            # provider-wide grant were stored independently.
+            return aggregate
+    if tuple(sorted(aggregate.source_ids)) != exact_source_ids:
+        raise ValidationError("connector connection profile is unsupported")
+    return aggregate
 
 
 def list_profiles() -> list[dict[str, object]]:
