@@ -14,9 +14,11 @@ from urllib.parse import urlsplit
 from continuity_kernel.connector_adapter import (
     ConnectorAdapterResult,
     ConnectorRuntimeCredential,
+    ConnectorTransferContext,
 )
 from continuity_kernel.connector_contract import ConnectorEffect, OperationSpec
 from continuity_kernel.connector_operations_google import GOOGLE_OPERATIONS
+from continuity_kernel.connector_transfer import MAX_ARTIFACT_BYTES, PreparedUpload
 from continuity_kernel.connector_transport import (
     ConnectorMethod,
     ConnectorOrigin,
@@ -102,6 +104,7 @@ class GoogleConnectorAdapter:
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
         write_idempotency_key: str | None = None,
+        transfer: ConnectorTransferContext | None = None,
     ) -> ConnectorAdapterResult:
         operation, values = _known_operation(operation, input_value)
         if not isinstance(credential, ConnectorRuntimeCredential):
@@ -123,7 +126,14 @@ class GoogleConnectorAdapter:
         if operation.provider == "google_calendar":
             return _execute_calendar(operation, values, continuation, credential, transport)
         if operation.provider == "google_drive":
-            return _execute_drive(operation, values, continuation, credential, transport)
+            return _execute_drive(
+                operation,
+                values,
+                continuation,
+                credential,
+                transport,
+                transfer=transfer,
+            )
         raise ValidationError("connector operation is not handled by Google")
 
 
@@ -525,6 +535,8 @@ def _execute_drive(
     continuation: object | None,
     credential: ConnectorRuntimeCredential,
     transport: ConnectorTransport,
+    *,
+    transfer: ConnectorTransferContext | None,
 ) -> ConnectorAdapterResult:
     base = "/drive/v3"
     name = operation.name
@@ -590,20 +602,20 @@ def _execute_drive(
             transport,
             path=path,
             credential=credential,
-            byte_offset=_integer(values.get("byte_offset", 0)),
-            maximum=_integer(values.get("max_chunk_size", _MAX_CONTENT_BYTES)),
             query=_with_supports_all_drives(values, (("alt", "media"),)),
             range_download=True,
+            values=values,
+            transfer=transfer,
         )
     if name == "files.export":
         return _drive_content_request(
             transport,
             path=f"{base}/files/{_segment(_required(values, 'file_id'))}/export",
             credential=credential,
-            byte_offset=0,
-            maximum=_MAX_CONTENT_BYTES,
             query=(("mimeType", _required(values, "export_mime_type")),),
             range_download=False,
+            values=values,
+            transfer=transfer,
         )
     if name in {"files.create", "files.update"}:
         file_id = values.get("file_id")
@@ -619,14 +631,16 @@ def _execute_drive(
             headers = _etag_headers(values)
         metadata = _drive_file_metadata(values)
         content = values.get("content_base64")
-        if content is not None:
+        upload = _drive_local_upload(values, transfer)
+        if content is not None or upload is not None:
             return _drive_resumable_upload(
                 transport,
                 method=method,
                 path=upload_path,
                 credential=credential,
                 metadata=metadata,
-                content_base64=_text(content),
+                content_base64=None if content is None else _text(content),
+                upload=upload,
                 mime_type=_text(values.get("mime_type", "application/octet-stream")),
                 headers=headers,
                 query=_with_supports_all_drives(values, (("uploadType", "resumable"),)),
@@ -888,16 +902,81 @@ def _json_request(
     return _json_result(response.json())
 
 
+def _drive_delivery(values: Mapping[str, object]) -> str:
+    delivery = values.get("delivery", "artifact")
+    if not isinstance(delivery, str) or delivery not in {"artifact", "inline_chunk"}:
+        raise ValidationError("Google Drive delivery is invalid")
+    return delivery
+
+
+def _drive_artifact_media_type(values: Mapping[str, object], *, export: bool) -> str:
+    value = values.get("mime_type")
+    if value is None and export:
+        value = values.get("export_mime_type")
+    if value is None:
+        value = "application/octet-stream"
+    return _mime_type(_text(value))
+
+
+def _drive_artifact_filename(values: Mapping[str, object], *, export: bool) -> str:
+    filename = values.get("filename")
+    if filename is not None:
+        return _text(filename)
+    file_id = _required(values, "file_id")
+    media_type = _drive_artifact_media_type(values, export=export)
+    suffix = {
+        "application/json": ".json",
+        "application/pdf": ".pdf",
+        "application/zip": ".zip",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "text/csv": ".csv",
+        "text/plain": ".txt",
+    }.get(media_type, "")
+    if export:
+        return f"drive-export-{file_id}{suffix}"
+    revision_id = values.get("revision_id")
+    if revision_id is not None:
+        return f"drive-file-{file_id}-revision-{_text(revision_id)}{suffix}"
+    return f"drive-file-{file_id}{suffix}"
+
+
 def _drive_content_request(
     transport: ConnectorTransport,
     *,
     path: str,
     credential: ConnectorRuntimeCredential,
-    byte_offset: int,
-    maximum: int,
     query: Sequence[tuple[str, str]],
     range_download: bool,
+    values: dict[str, object],
+    transfer: ConnectorTransferContext | None,
 ) -> ConnectorAdapterResult:
+    delivery = _drive_delivery(values)
+    if delivery == "artifact":
+        if transfer is None:
+            raise ValidationError("Google Drive artifact delivery requires transfer context")
+        media_type = _drive_artifact_media_type(values, export=not range_download)
+        writer = transfer.artifacts.start(
+            _drive_artifact_filename(values, export=not range_download),
+            media_type=media_type,
+        )
+        artifact_response = transport.download_stream(
+            origin=ConnectorOrigin.GOOGLE,
+            sink=writer,
+            path=path,
+            credential=credential.credential,
+            query=query,
+            max_bytes=MAX_ARTIFACT_BYTES,
+        )
+        if artifact_response.artifact is None:
+            raise ValidationError("Google Drive artifact delivery produced no receipt")
+        return ConnectorAdapterResult(
+            {"bytes": artifact_response.bytes_transferred, "delivery": "artifact"},
+            artifact=artifact_response.artifact,
+        )
+
+    byte_offset = _integer(values.get("byte_offset", 0))
+    maximum = _integer(values.get("max_chunk_size", _MAX_CONTENT_BYTES))
     if maximum < 1:
         raise ValidationError("Google Drive content chunk bound is invalid")
     headers: Mapping[str, str] | None = None
@@ -951,6 +1030,19 @@ def _drive_content_range(
     return content_range, end + 1
 
 
+def _drive_local_upload(
+    values: Mapping[str, object], transfer: ConnectorTransferContext | None
+) -> PreparedUpload | None:
+    has_bound_upload = transfer is not None and ("local_file",) in transfer.uploads
+    if "local_file" not in values and not has_bound_upload:
+        return None
+    if transfer is None:
+        raise ValidationError("Google Drive local-file upload requires transfer context")
+    if values.get("content_base64") is not None:
+        raise ValidationError("Google Drive upload has multiple binary sources")
+    return transfer.upload(("local_file",))
+
+
 def _drive_resumable_upload(
     transport: ConnectorTransport,
     *,
@@ -958,11 +1050,14 @@ def _drive_resumable_upload(
     path: str,
     credential: ConnectorRuntimeCredential,
     metadata: dict[str, object],
-    content_base64: str,
+    content_base64: str | None,
+    upload: PreparedUpload | None,
     mime_type: str,
     headers: Mapping[str, str] | None,
     query: Sequence[tuple[str, str]],
 ) -> ConnectorAdapterResult:
+    if (content_base64 is None) == (upload is None):
+        raise ValidationError("Google Drive upload requires exactly one binary source")
     initiated = transport.request(
         origin=ConnectorOrigin.GOOGLE,
         method=method,
@@ -974,17 +1069,31 @@ def _drive_resumable_upload(
         expected_statuses=_JSON_STATUSES,
     )
     location = _response_location(initiated.headers)
-    uploaded = transport.request_provider_location(
-        origin=ConnectorOrigin.GOOGLE,
-        method=ConnectorMethod.PUT,
-        location=location,
-        credential=credential.credential,
-        body=_decode_base64(content_base64),
-        content_type=_mime_type(mime_type),
-        headers=headers,
-        expected_statuses=_JSON_STATUSES,
-    )
-    return _json_result(uploaded.json())
+    if upload is not None:
+        streamed = transport.request_stream(
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.PUT,
+            source=upload,
+            content_length=upload.size,
+            location=location,
+            credential=None,
+            content_type=_mime_type(upload.media_type or mime_type),
+            expected_statuses=_JSON_STATUSES,
+        )
+        return _json_result(streamed.json())
+    else:
+        assert content_base64 is not None
+        uploaded = transport.request_provider_location(
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.PUT,
+            location=location,
+            credential=credential.credential,
+            body=_decode_base64(content_base64),
+            content_type=_mime_type(mime_type),
+            headers=headers,
+            expected_statuses=_JSON_STATUSES,
+        )
+        return _json_result(uploaded.json())
 
 
 def _json_result(payload: object) -> ConnectorAdapterResult:

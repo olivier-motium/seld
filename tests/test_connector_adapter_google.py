@@ -1,24 +1,33 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
 from collections.abc import Mapping, Sequence
 from email import policy
 from email.parser import BytesParser
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from continuity_kernel.connector_adapter import ConnectorRuntimeCredential
+from continuity_kernel.connector_adapter import ConnectorRuntimeCredential, ConnectorTransferContext
 from continuity_kernel.connector_adapter_google import GoogleConnectorAdapter
 from continuity_kernel.connector_contract import ConnectorEffect, OperationSpec
 from continuity_kernel.connector_operations_google import GOOGLE_OPERATIONS
+from continuity_kernel.connector_transfer import (
+    ArtifactStore,
+    ConnectorArtifactScope,
+    PreparedUpload,
+)
 from continuity_kernel.connector_transport import (
     AuthorizationScheme,
     ConnectorCredential,
     ConnectorMethod,
     ConnectorOrigin,
     ConnectorResponse,
+    ConnectorStreamResponse,
     ConnectorTransport,
 )
 from continuity_kernel.errors import ValidationError
@@ -31,10 +40,12 @@ class _Transport(ConnectorTransport):
         body: bytes = b"{}",
         bodies: Sequence[bytes] = (),
         headers: Mapping[str, str] | None = None,
+        download_body: bytes | None = None,
     ) -> None:
         self.body = body
         self.bodies = list(bodies)
         self.headers = dict(headers or {})
+        self.download_body = body if download_body is None else download_body
         self.calls: list[dict[str, Any]] = []
 
     def request(self, **kwargs: Any) -> ConnectorResponse:
@@ -59,6 +70,36 @@ class _Transport(ConnectorTransport):
         self.calls.append({"kind": "provider_location", **kwargs})
         return ConnectorResponse(kwargs["origin"], 200, self.headers, self.body)
 
+    def request_stream(self, **kwargs: Any) -> ConnectorStreamResponse:
+        self.calls.append({"kind": "stream", **kwargs})
+        source = kwargs["source"]
+        if isinstance(source, PreparedUpload):
+            body = b"".join(source.iter_chunks())
+        else:
+            body = b"".join(source)
+        return ConnectorStreamResponse(
+            kwargs["origin"],
+            200,
+            self.headers,
+            len(body),
+            hashlib.sha256(body).hexdigest(),
+            control_body=self.body,
+        )
+
+    def download_stream(self, **kwargs: Any) -> ConnectorStreamResponse:
+        self.calls.append({"kind": "download_stream", **kwargs})
+        sink = kwargs["sink"]
+        sink.write(self.download_body)
+        artifact = sink.finish()
+        return ConnectorStreamResponse(
+            kwargs["origin"],
+            200,
+            self.headers,
+            len(self.download_body),
+            hashlib.sha256(self.download_body).hexdigest(),
+            artifact=artifact,
+        )
+
 
 def _credential() -> ConnectorRuntimeCredential:
     return ConnectorRuntimeCredential(
@@ -80,6 +121,20 @@ def _operation(provider: str, name: str) -> OperationSpec:
 
 def _event_time() -> dict[str, str]:
     return {"date_time": "2026-08-01T09:00:00+02:00", "time_zone": "Europe/Brussels"}
+
+
+def _prepared_upload(tmp_path: Path) -> PreparedUpload:
+    content = b"streamed Google Drive content"
+    path = tmp_path / "private-source.bin"
+    path.write_bytes(content)
+    descriptor = os.open(path, os.O_RDONLY)
+    return PreparedUpload(
+        filename="source.bin",
+        media_type="application/octet-stream",
+        size=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        descriptor=descriptor,
+    )
 
 
 def _sample(operation: OperationSpec) -> dict[str, object]:
@@ -158,12 +213,22 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
             return {"file_id": "file", "page_size": 1}
         if name == "replies.list":
             return {"comment_id": "comment", "file_id": "file", "page_size": 1}
-        if name in {"files.get", "files.download"}:
+        if name == "files.get":
             return {"file_id": "file"}
+        if name == "files.download":
+            return {"delivery": "inline_chunk", "file_id": "file"}
         if name == "files.export":
-            return {"export_mime_type": "text/plain", "file_id": "file"}
+            return {
+                "delivery": "inline_chunk",
+                "export_mime_type": "text/plain",
+                "file_id": "file",
+            }
         if name == "revisions.download":
-            return {"file_id": "file", "revision_id": "revision"}
+            return {
+                "delivery": "inline_chunk",
+                "file_id": "file",
+                "revision_id": "revision",
+            }
         if name == "files.create":
             return {"mime_type": "text/plain", "name": "plan.txt"}
         if name == "files.update":
@@ -686,6 +751,118 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
     assert sent["body"] == b"hello"
 
 
+def test_drive_local_file_upload_uses_the_prepared_snapshot_and_fixed_routes(
+    tmp_path: Path,
+) -> None:
+    adapter = GoogleConnectorAdapter()
+    credential = _credential()
+    cases = (
+        (
+            _operation("google_drive", "files.create"),
+            {"mime_type": "text/plain", "name": "note.txt"},
+            ConnectorMethod.POST,
+            "/upload/drive/v3/files",
+        ),
+        (
+            _operation("google_drive", "files.update"),
+            {"etag": "etag", "file_id": "file", "mime_type": "text/plain"},
+            ConnectorMethod.PATCH,
+            "/upload/drive/v3/files/file",
+        ),
+    )
+    for operation, values, method, path in cases:
+        upload = _prepared_upload(tmp_path)
+        transfer = ConnectorTransferContext(uploads={("local_file",): upload})
+        transport = _Transport()
+        try:
+            result = adapter.execute(
+                operation,
+                {**values, "local_file": {"grant_id": "grant", "relative_path": "note.txt"}},
+                continuation=None,
+                credential=credential,
+                transport=transport,
+                transfer=transfer,
+            )
+        finally:
+            upload.close()
+
+        initiated, sent = transport.calls
+        assert result.payload == {}
+        assert initiated["method"] is method
+        assert initiated["path"] == path
+        assert initiated["query"] == (("uploadType", "resumable"),)
+        assert sent["kind"] == "stream"
+        assert sent["source"] is upload
+        assert sent["location"] == "https://www.googleapis.com/upload/session/one"
+        assert sent["credential"] is None
+        assert sent["content_length"] == upload.size
+        assert sent["content_type"] == "application/octet-stream"
+        assert "body" not in sent
+        assert "headers" not in sent
+        assert "relative_path" not in repr(sent)
+
+
+def test_drive_artifact_download_uses_streaming_receipt_without_path_payload(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    scope = ConnectorArtifactScope(store)
+    transfer = ConnectorTransferContext(_artifact_scope_factory=lambda: scope)
+    transport = _Transport(download_body=b"provider-bytes")
+    result = GoogleConnectorAdapter().execute(
+        _operation("google_drive", "files.download"),
+        {
+            "delivery": "artifact",
+            "file_id": "file",
+            "filename": "report.pdf",
+            "mime_type": "application/pdf",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        transfer=transfer,
+    )
+    try:
+        assert result.payload == {"bytes": len(b"provider-bytes"), "delivery": "artifact"}
+        assert result.artifact is not None
+        assert result.artifact.filename == "report.pdf"
+        assert result.artifact.media_type == "application/pdf"
+        assert "path" not in result.payload
+        call = transport.calls[-1]
+        assert call["kind"] == "download_stream"
+        assert call["path"] == "/drive/v3/files/file"
+        assert call["query"] == (("alt", "media"),)
+        assert call["max_bytes"] == 5 * 1024**4
+    finally:
+        if result.artifact is not None:
+            scope.complete(result.artifact)
+        store.close()
+
+
+def test_drive_transfer_delivery_requires_a_transfer_context() -> None:
+    adapter = GoogleConnectorAdapter()
+    with pytest.raises(ValidationError, match="transfer context"):
+        adapter.execute(
+            _operation("google_drive", "files.download"),
+            {"file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=_Transport(),
+        )
+    with pytest.raises(ValidationError, match="transfer context"):
+        adapter.execute(
+            _operation("google_drive", "files.create"),
+            {
+                "local_file": {"grant_id": "grant", "relative_path": "note.txt"},
+                "mime_type": "text/plain",
+                "name": "note.txt",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=_Transport(),
+        )
+
+
 def test_calendar_resolves_typed_drive_attachments_and_enables_support() -> None:
     first_file = json.dumps(
         {
@@ -939,7 +1116,12 @@ def test_drive_downloads_construct_ranges_and_return_provider_offsets() -> None:
     for name, values, path in requests:
         result = adapter.execute(
             _operation("google_drive", name),
-            {**values, "byte_offset": 5, "max_chunk_size": 3},
+            {
+                **values,
+                "byte_offset": 5,
+                "delivery": "inline_chunk",
+                "max_chunk_size": 3,
+            },
             continuation=None,
             credential=credential,
             transport=transport,
@@ -959,7 +1141,12 @@ def test_drive_downloads_construct_ranges_and_return_provider_offsets() -> None:
     with pytest.raises(ValidationError, match="does not match"):
         adapter.execute(
             _operation("google_drive", "files.download"),
-            {"byte_offset": 1, "file_id": "file", "max_chunk_size": 3},
+            {
+                "byte_offset": 1,
+                "delivery": "inline_chunk",
+                "file_id": "file",
+                "max_chunk_size": 3,
+            },
             continuation=None,
             credential=credential,
             transport=malformed,

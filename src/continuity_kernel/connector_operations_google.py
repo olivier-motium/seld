@@ -142,6 +142,16 @@ def _drive_attachment_reference() -> dict[str, object]:
     return _object({"file_id": _id()}, required=("file_id",))
 
 
+def _local_file() -> dict[str, object]:
+    return _object(
+        {
+            "grant_id": _text(128),
+            "relative_path": _text(16 * 1024),
+        },
+        required=("grant_id", "relative_path"),
+    )
+
+
 def _event_reminder() -> dict[str, object]:
     return _object(
         {
@@ -291,6 +301,72 @@ def _file_fields() -> dict[str, object]:
         "parent_ids": _array(_id(), maximum=32),
         "supports_all_drives": {"type": "boolean"},
     }
+
+
+def _drive_file_mutation_schema(
+    required: tuple[str, ...],
+    *,
+    leading_fields: dict[str, object] | None = None,
+) -> dict[str, object]:
+    metadata_fields = {**(leading_fields or {}), **_file_fields()}
+    metadata_fields.pop("content_base64")
+    source_fields = {
+        **metadata_fields,
+        "content_base64": _text(240_000),
+        "local_file": _local_file(),
+    }
+    schema = _object(source_fields, required=required)
+    schema["oneOf"] = [
+        _object(
+            {**metadata_fields, "content_base64": source_fields["content_base64"]},
+            required=(*required, "content_base64"),
+        ),
+        _object(
+            {**metadata_fields, "local_file": source_fields["local_file"]},
+            required=(*required, "local_file"),
+        ),
+        _object(metadata_fields, required=required),
+    ]
+    return schema
+
+
+def _drive_delivery() -> dict[str, object]:
+    return {"enum": ["artifact", "inline_chunk"], "type": "string"}
+
+
+def _drive_content_schema(
+    properties: dict[str, object],
+    required: tuple[str, ...],
+    *,
+    inline_fields: dict[str, object] | None = None,
+) -> dict[str, object]:
+    inline_fields = {} if inline_fields is None else inline_fields
+    artifact_fields = {
+        **properties,
+        "delivery": {"const": "artifact", "type": "string"},
+        "filename": _text(512),
+        "mime_type": _text(256),
+    }
+    inline_properties = {
+        **properties,
+        "delivery": {"const": "inline_chunk", "type": "string"},
+        **inline_fields,
+    }
+    schema = _object(
+        {
+            **properties,
+            "delivery": _drive_delivery(),
+            "filename": _text(512),
+            "mime_type": _text(256),
+            **inline_fields,
+        },
+        required=required,
+    )
+    schema["oneOf"] = [
+        _object(artifact_fields, required=required),
+        _object(inline_properties, required=(*required, "delivery")),
+    ]
+    return schema
 
 
 def _drive_list() -> dict[str, object]:
@@ -808,14 +884,20 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.download",
         ConnectorEffect.READ,
         _DRIVE_CONTENT_SCOPES,
-        _object(
+        _drive_content_schema(
             {
-                "byte_offset": {"maximum": _MAX_DRIVE_BYTE_OFFSET, "minimum": 0, "type": "integer"},
                 "file_id": _id(),
-                "max_chunk_size": {"maximum": 240_000, "minimum": 1, "type": "integer"},
                 "supports_all_drives": {"type": "boolean"},
             },
-            required=("file_id",),
+            ("file_id",),
+            inline_fields={
+                "byte_offset": {
+                    "maximum": _MAX_DRIVE_BYTE_OFFSET,
+                    "minimum": 0,
+                    "type": "integer",
+                },
+                "max_chunk_size": {"maximum": 240_000, "minimum": 1, "type": "integer"},
+            },
         ),
     ),
     _operation(
@@ -824,9 +906,9 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.export",
         ConnectorEffect.READ,
         _DRIVE_CONTENT_SCOPES,
-        _object(
+        _drive_content_schema(
             {"export_mime_type": _text(256), "file_id": _id()},
-            required=("export_mime_type", "file_id"),
+            ("export_mime_type", "file_id"),
         ),
     ),
     _operation(
@@ -893,14 +975,20 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "revisions.download",
         ConnectorEffect.READ,
         _DRIVE_CONTENT_SCOPES,
-        _object(
+        _drive_content_schema(
             {
-                "byte_offset": {"maximum": _MAX_DRIVE_BYTE_OFFSET, "minimum": 0, "type": "integer"},
                 "file_id": _id(),
-                "max_chunk_size": {"maximum": 240_000, "minimum": 1, "type": "integer"},
                 "revision_id": _id(),
             },
-            required=("file_id", "revision_id"),
+            ("file_id", "revision_id"),
+            inline_fields={
+                "byte_offset": {
+                    "maximum": _MAX_DRIVE_BYTE_OFFSET,
+                    "minimum": 0,
+                    "type": "integer",
+                },
+                "max_chunk_size": {"maximum": 240_000, "minimum": 1, "type": "integer"},
+            },
         ),
     ),
     _operation(
@@ -909,7 +997,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.create",
         ConnectorEffect.SAFE_MUTATION,
         _DRIVE_WRITE_SCOPES,
-        _object(_file_fields(), required=("mime_type", "name")),
+        _drive_file_mutation_schema(("mime_type", "name")),
     ),
     _operation(
         "google_drive",
@@ -917,8 +1005,9 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.update",
         ConnectorEffect.SAFE_MUTATION,
         _DRIVE_WRITE_SCOPES,
-        _object(
-            {"etag": _text(1_024), "file_id": _id(), **_file_fields()}, required=("etag", "file_id")
+        _drive_file_mutation_schema(
+            ("etag", "file_id"),
+            leading_fields={"etag": _text(1_024), "file_id": _id()},
         ),
     ),
     _operation(

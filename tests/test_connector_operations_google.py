@@ -370,13 +370,95 @@ def test_google_catalog_uses_provider_page_limits_and_drive_capacity() -> None:
         byte_offset = properties["byte_offset"]
         assert isinstance(byte_offset, Mapping)
         assert byte_offset["maximum"] == 5 * 1024**4
-        required = {"file_id": "file", "byte_offset": 5 * 1024**4}
+        required = {
+            "delivery": "inline_chunk",
+            "file_id": "file",
+            "byte_offset": 5 * 1024**4,
+        }
         if name == "revisions.download":
             required["revision_id"] = "revision"
         operation = _operation("google_drive", ConnectorMode.READ, name)
         assert operation.validate_input(required) == required
         with pytest.raises(ValidationError):
             operation.validate_input({**required, "byte_offset": 5 * 1024**4 + 1})
+
+
+def test_drive_file_sources_are_closed_while_metadata_only_mutations_remain_valid() -> None:
+    create = _operation("google_drive", ConnectorMode.WRITE, "files.create")
+    update = _operation("google_drive", ConnectorMode.WRITE, "files.update")
+    create_metadata = {"mime_type": "text/plain", "name": "note.txt"}
+    update_metadata = {"etag": "etag", "file_id": "file"}
+    local_file = {"grant_id": "grant", "relative_path": "note.txt"}
+
+    assert create.validate_input(create_metadata) == create_metadata
+    assert update.validate_input(update_metadata) == update_metadata
+    assert create.validate_input({**create_metadata, "content_base64": "aGVsbG8="}) == {
+        **create_metadata,
+        "content_base64": "aGVsbG8=",
+    }
+    assert create.validate_input({**create_metadata, "local_file": local_file}) == {
+        **create_metadata,
+        "local_file": local_file,
+    }
+    assert update.validate_input({**update_metadata, "local_file": local_file}) == {
+        **update_metadata,
+        "local_file": local_file,
+    }
+    for operation, values in (
+        (
+            create,
+            {
+                **create_metadata,
+                "content_base64": "aGVsbG8=",
+                "local_file": local_file,
+            },
+        ),
+        (
+            update,
+            {
+                **update_metadata,
+                "content_base64": "aGVsbG8=",
+                "local_file": local_file,
+            },
+        ),
+    ):
+        with pytest.raises(ValidationError):
+            operation.validate_input(values)
+    with pytest.raises(ValidationError):
+        create.validate_input({**create_metadata, "local_file": {"grant_id": "grant"}})
+    with pytest.raises(ValidationError):
+        create.validate_input({**create_metadata, "local_file": {**local_file, "extra": "nope"}})
+
+
+def test_drive_content_delivery_defaults_to_artifact_and_inline_is_explicitly_bounded() -> None:
+    for name, base in (
+        ("files.download", {"file_id": "file"}),
+        ("revisions.download", {"file_id": "file", "revision_id": "revision"}),
+        ("files.export", {"export_mime_type": "text/plain", "file_id": "file"}),
+    ):
+        operation = _operation("google_drive", ConnectorMode.READ, name)
+        properties = operation.input_schema["properties"]
+        assert isinstance(properties, Mapping)
+        delivery = properties["delivery"]
+        assert isinstance(delivery, Mapping)
+        assert delivery["enum"] == ("artifact", "inline_chunk")
+        assert operation.validate_input(base) == base
+        assert operation.validate_input({**base, "delivery": "artifact"}) == {
+            **base,
+            "delivery": "artifact",
+        }
+        inline = {**base, "delivery": "inline_chunk"}
+        if name != "files.export":
+            inline.update({"byte_offset": 5, "max_chunk_size": 3})
+        assert operation.validate_input(inline) == inline
+
+    download = _operation("google_drive", ConnectorMode.READ, "files.download")
+    with pytest.raises(ValidationError):
+        download.validate_input({"delivery": "artifact", "file_id": "file", "byte_offset": 1})
+    with pytest.raises(ValidationError):
+        download.validate_input({"delivery": "inline_chunk", "file_id": "file", "filename": "x"})
+    with pytest.raises(ValidationError):
+        download.validate_input({"byte_offset": 1, "file_id": "file"})
 
 
 def test_drive_shared_drive_inputs_are_finite_without_admin_or_ownership_transfer() -> None:
