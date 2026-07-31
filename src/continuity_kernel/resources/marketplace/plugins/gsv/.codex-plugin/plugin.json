@@ -21,8 +21,7 @@
     "defaultPrompt": [
       "Set up Seld and help me describe my world",
       "Show me what Seld currently knows",
-      "Create a durable task for this outcome",
-      "Prepare my next Rundown"
+      "Create a durable task for this outcome"
     ],
     "screenshots": []
   }
