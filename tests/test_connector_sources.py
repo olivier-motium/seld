@@ -384,7 +384,7 @@ def test_write_scope_is_rejected_before_secret_resolution(
         pytest.fail("secret resolution was reached")
 
     monkeypatch.setattr(connector_sources, "ConnectorAuthManager", fail_manager)
-    with pytest.raises(ValidationError, match="read-only source profile"):
+    with pytest.raises(ValidationError, match="built-in access tier"):
         read_connector_source(
             vault,
             connection_id=str(connection_id),

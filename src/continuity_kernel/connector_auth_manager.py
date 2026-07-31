@@ -31,7 +31,7 @@ from continuity_kernel.connector_oauth import (
     refresh_access_token,
 )
 from continuity_kernel.connector_oauth_loopback import BoundLoopbackCallback, begin_authorization
-from continuity_kernel.connector_profiles import get_profile
+from continuity_kernel.connector_profiles import ConnectorAccessTier, get_profile
 from continuity_kernel.connector_secrets import KeyringSecretStore
 from continuity_kernel.connector_token_store import AtomicTokenStore, ResolvedToken, TokenState
 from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
@@ -57,9 +57,13 @@ _PINNED_OAUTH_ENDPOINTS: Final = {
 class ResolvedOAuthAccessToken:
     access_token: str
     state: TokenState
+    scopes: tuple[str, ...]
 
     def __repr__(self) -> str:
-        return "ResolvedOAuthAccessToken(access_token=<redacted>)"
+        return (
+            "ResolvedOAuthAccessToken(access_token=<redacted>, "
+            f"state={self.state!r}, scopes={self.scopes!r})"
+        )
 
 
 class ConnectorAuthManager:
@@ -250,7 +254,14 @@ class ConnectorAuthManager:
             return ResolvedOAuthAccessToken(
                 access_token=credential.access_token,
                 state=resolved.state,
+                scopes=credential.scopes,
             )
+
+    def access_tier(self, connection_id: ConnectionId | str) -> ConnectorAccessTier:
+        """Read the exact locally selected tier without resolving a credential."""
+
+        metadata = self._metadata(connection_id)
+        return get_profile(metadata.provider).access_for_scopes(metadata.scopes)
 
     def authorize_oauth(
         self,
@@ -449,12 +460,11 @@ class ConnectorAuthManager:
         profile = get_profile(metadata.provider)
         if profile.credential_kind is not CredentialKind.OAUTH2:
             raise ValidationError("connection provider does not have a built-in OAuth profile")
-        allowed = frozenset(profile.scopes)
+        allowed = profile.allowed_scopes
         configured = frozenset(metadata.scopes)
+        profile.access_for_scopes(metadata.scopes)
         if not configured or not configured.issubset(allowed):
-            raise ValidationError("OAuth scopes do not match a built-in read-only profile")
-        if metadata.provider == "slack" and configured != allowed:
-            raise ValidationError("Slack OAuth requires the complete built-in read-only scope set")
+            raise ValidationError("OAuth scopes do not match a built-in access tier")
         return allowed
 
     @staticmethod
@@ -466,11 +476,7 @@ class ConnectorAuthManager:
         granted = frozenset(credential.scopes)
         configured = frozenset(metadata.scopes)
         if not granted or not granted.issubset(configured) or not granted.issubset(allowed):
-            raise ValidationError("OAuth credential grants scopes outside its read-only profile")
-        if metadata.provider == "slack" and granted != allowed:
-            raise ValidationError(
-                "Slack OAuth credential scopes do not match its read-only profile"
-            )
+            raise ValidationError("OAuth credential grants scopes outside its selected access")
 
     @staticmethod
     def _credential_binding(metadata: ConnectionMetadata) -> tuple[object, ...]:

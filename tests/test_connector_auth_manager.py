@@ -298,7 +298,7 @@ def test_oauth_credential_rejects_provider_grants_outside_the_profile(
         expires_at=None,
     )
 
-    with pytest.raises(ValidationError, match="outside its read-only profile"):
+    with pytest.raises(ValidationError, match="outside its selected access"):
         manager.store_oauth_credential(
             CONNECTION_ID,
             overbroad,

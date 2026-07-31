@@ -33,6 +33,7 @@ from continuity_kernel.connector_http import (
 )
 from continuity_kernel.connector_identifiers import ConnectionId, parse_connection_id
 from continuity_kernel.connector_oauth import OAuthTokenEndpointError, OAuthTransportError
+from continuity_kernel.connector_profiles import get_profile
 from continuity_kernel.connector_token_store import TokenState
 from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
 from continuity_kernel.records import format_time
@@ -75,61 +76,55 @@ _OAUTH_ENDPOINTS: Final[Mapping[str, tuple[str, str]]] = MappingProxyType(
         ),
     }
 )
-_PROVIDER_ALLOWED_SCOPES: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
-    {
-        "google": frozenset(
-            {
-                "https://www.googleapis.com/auth/gmail.readonly",
-                "https://www.googleapis.com/auth/calendar.readonly",
-                "https://www.googleapis.com/auth/drive.metadata.readonly",
-            }
-        ),
-        "microsoft": frozenset(
-            {
-                "offline_access",
-                "User.Read",
-                "Mail.Read",
-                "Calendars.Read",
-            }
-        ),
-        "slack": frozenset(
-            {
-                "channels:history",
-                "groups:history",
-                "mpim:history",
-                "im:history",
-            }
-        ),
-    }
-)
-_SOURCE_REQUIRED_SCOPES: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
-    {
-        "gmail": frozenset({"https://www.googleapis.com/auth/gmail.readonly"}),
-        "google_calendar": frozenset({"https://www.googleapis.com/auth/calendar.readonly"}),
-        "google_drive": frozenset({"https://www.googleapis.com/auth/drive.metadata.readonly"}),
-        "outlook_mail": frozenset(
-            {
-                "offline_access",
-                "User.Read",
-                "Mail.Read",
-            }
-        ),
-        "outlook_calendar": frozenset(
-            {
-                "offline_access",
-                "User.Read",
-                "Calendars.Read",
-            }
-        ),
-        "slack": frozenset(
-            {
-                "channels:history",
-                "groups:history",
-                "mpim:history",
-                "im:history",
-            }
-        ),
-    }
+_SOURCE_REQUIRED_SCOPE_ALTERNATIVES: Final[Mapping[str, tuple[frozenset[str], ...]]] = (
+    MappingProxyType(
+        {
+            "gmail": tuple(
+                frozenset({scope})
+                for scope in (
+                    "https://www.googleapis.com/auth/gmail.readonly",
+                    "https://www.googleapis.com/auth/gmail.modify",
+                    "https://mail.google.com/",
+                )
+            ),
+            "google_calendar": tuple(
+                frozenset({scope})
+                for scope in (
+                    "https://www.googleapis.com/auth/calendar.readonly",
+                    "https://www.googleapis.com/auth/calendar.events.readonly",
+                    "https://www.googleapis.com/auth/calendar.events",
+                    "https://www.googleapis.com/auth/calendar",
+                )
+            ),
+            "google_drive": tuple(
+                frozenset({scope})
+                for scope in (
+                    "https://www.googleapis.com/auth/drive.metadata.readonly",
+                    "https://www.googleapis.com/auth/drive.readonly",
+                    "https://www.googleapis.com/auth/drive.file",
+                    "https://www.googleapis.com/auth/drive",
+                )
+            ),
+            "outlook_mail": (
+                frozenset({"Mail.Read"}),
+                frozenset({"Mail.ReadWrite"}),
+            ),
+            "outlook_calendar": (
+                frozenset({"Calendars.Read"}),
+                frozenset({"Calendars.ReadWrite"}),
+            ),
+            "slack": (
+                frozenset(
+                    {
+                        "channels:history",
+                        "groups:history",
+                        "mpim:history",
+                        "im:history",
+                    }
+                ),
+            ),
+        }
+    )
 )
 _GOOGLE_GMAIL_BASE: Final = "https://gmail.googleapis.com/gmail/v1/users/me"
 _GOOGLE_CALENDAR_BASE: Final = "https://www.googleapis.com/calendar/v3"
@@ -379,10 +374,12 @@ def _preflight(
     if actual_endpoints != expected_endpoints:
         raise ValidationError("connection OAuth endpoints do not match the built-in provider")
     scopes = frozenset(connection.scopes)
-    if not _SOURCE_REQUIRED_SCOPES[source_id].issubset(scopes) or not scopes.issubset(
-        _PROVIDER_ALLOWED_SCOPES[expected_provider]
+    get_profile(expected_provider).access_for_scopes(connection.scopes)
+    if not any(
+        alternative.issubset(scopes)
+        for alternative in _SOURCE_REQUIRED_SCOPE_ALTERNATIVES[source_id]
     ):
-        raise ValidationError("connection scopes do not match the read-only source profile")
+        raise ValidationError("connection scopes do not permit the selected source read")
     return clean_connection_id, source_snapshot.revision, connection_snapshot.revision
 
 

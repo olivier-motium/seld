@@ -10,6 +10,7 @@ import pytest
 from continuity_kernel import auth_cli
 from continuity_kernel.connector_auth import CredentialKind
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_profiles import ConnectorAccessTier, get_profile
 from continuity_kernel.connector_secrets import InMemorySecretStore
 from continuity_kernel.errors import ValidationError
 from continuity_kernel.vault import Vault
@@ -105,11 +106,8 @@ def test_profile_add_creates_exact_google_oauth_metadata(tmp_path: Path) -> None
     assert connection.provider == "google"
     assert connection.source_ids == ("gmail", "google_calendar", "google_drive")
     assert connection.credential_kind is CredentialKind.OAUTH2
-    assert connection.scopes == (
-        "https://www.googleapis.com/auth/calendar.readonly",
-        "https://www.googleapis.com/auth/drive.metadata.readonly",
-        "https://www.googleapis.com/auth/gmail.readonly",
-    )
+    assert set(connection.scopes) == set(get_profile("google").read_scopes)
+    assert get_profile("google").access_for_scopes(connection.scopes) is ConnectorAccessTier.READ
     assert connection.client.identifier == "public-google-client"
     assert connection.client.redirect_uris == ("http://127.0.0.1:0",)
     assert connection.client.authorization_endpoint == (
