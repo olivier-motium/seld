@@ -16,7 +16,6 @@ from continuity_kernel.connector_adapter import (
     ConnectorAdapter,
     ConnectorAdapterRegistry,
     ConnectorAdapterResult,
-    ConnectorEffectPreflightAdapter,
     ConnectorRuntimeCredential,
     ConnectorTransferAdapter,
     ConnectorTransferContext,
@@ -306,6 +305,7 @@ class ConnectorRuntime:
                             prepared.adapter_input,
                             credential=credential,
                             transport=self.transport,
+                            transfer=_prepared_transfer_context(prepared.bundle),
                         ),
                     )
                     effect = _promote_prepared_upload_effect(effect, prepared.bundle)
@@ -370,6 +370,7 @@ class ConnectorRuntime:
                             prepared.adapter_input,
                             credential=credential,
                             transport=self.transport,
+                            transfer=_prepared_transfer_context(prepared.bundle),
                         ),
                     )
                     effect = _promote_prepared_upload_effect(effect, prepared.bundle)
@@ -960,6 +961,7 @@ def _classify_adapter_effect(
     *,
     credential: ConnectorRuntimeCredential,
     transport: ConnectorTransport,
+    transfer: ConnectorTransferContext | None = None,
 ) -> ConnectorEffect:
     parameters: Mapping[str, Parameter]
     try:
@@ -969,15 +971,23 @@ def _classify_adapter_effect(
     accepts_preflight = all(
         _accepts_keyword(parameters, name) for name in ("credential", "transport")
     )
+    kwargs: dict[str, object] = {}
     if accepts_preflight:
-        preflight_adapter = cast(ConnectorEffectPreflightAdapter, adapter)
-        return preflight_adapter.classify_effect(
-            operation,
-            input_value,
-            credential=credential,
-            transport=transport,
-        )
-    return adapter.classify_effect(operation, input_value)
+        kwargs.update(credential=credential, transport=transport)
+    if _accepts_keyword(parameters, "transfer"):
+        kwargs["transfer"] = transfer
+    if not kwargs:
+        return adapter.classify_effect(operation, input_value)
+    classify_effect = cast(Callable[..., ConnectorEffect], adapter.classify_effect)
+    return classify_effect(operation, input_value, **kwargs)
+
+
+def _prepared_transfer_context(
+    bundle: PreparedUploadBundle | None,
+) -> ConnectorTransferContext | None:
+    if bundle is None:
+        return None
+    return ConnectorTransferContext(uploads=bundle.uploads)
 
 
 def _accepts_keyword(parameters: Mapping[str, Parameter], name: str) -> bool:

@@ -15,6 +15,7 @@ import pytest
 from continuity_kernel.connector_adapter import ConnectorRuntimeCredential, ConnectorTransferContext
 from continuity_kernel.connector_adapter_google import GoogleConnectorAdapter
 from continuity_kernel.connector_contract import ConnectorEffect, OperationSpec
+from continuity_kernel.connector_gmail_transfer import GMAIL_UPLOAD_MAX_BYTES
 from continuity_kernel.connector_operations_google import GOOGLE_OPERATIONS
 from continuity_kernel.connector_transfer import (
     ArtifactStore,
@@ -55,6 +56,8 @@ class _Transport(ConnectorTransport):
         status = 200
         if kwargs["path"].startswith("/upload/drive/v3/"):
             headers = {"location": "https://www.googleapis.com/upload/session/one"}
+        if kwargs["path"].startswith("/upload/gmail/v1/"):
+            headers = {"location": "https://gmail.googleapis.com/upload/session/one"}
         request_headers = kwargs.get("headers")
         if isinstance(request_headers, Mapping) and isinstance(request_headers.get("Range"), str):
             range_value = request_headers["Range"]
@@ -89,14 +92,17 @@ class _Transport(ConnectorTransport):
     def download_stream(self, **kwargs: Any) -> ConnectorStreamResponse:
         self.calls.append({"kind": "download_stream", **kwargs})
         sink = kwargs["sink"]
-        sink.write(self.download_body)
+        body = self.download_body
+        if kwargs["path"].startswith("/gmail/v1/users/me/messages/") and body == b"{}":
+            body = b'{"data":"","size":0}'
+        sink.write(body)
         artifact = sink.finish()
         return ConnectorStreamResponse(
             kwargs["origin"],
             200,
             self.headers,
-            len(self.download_body),
-            hashlib.sha256(self.download_body).hexdigest(),
+            len(body),
+            hashlib.sha256(body).hexdigest(),
             artifact=artifact,
         )
 
@@ -137,6 +143,73 @@ def _prepared_upload(tmp_path: Path) -> PreparedUpload:
     )
 
 
+def test_google_local_file_limit_hook_allows_only_sanitized_provider_shapes() -> None:
+    adapter = GoogleConnectorAdapter()
+    gmail_operation = _operation("gmail", "drafts.create")
+    gmail_input = {
+        "attachments": [
+            {
+                "filename": "note.txt",
+                "local_file": "opaque-local-file",
+                "mime_type": "text/plain",
+            }
+        ],
+        "text_body": "body",
+    }
+    assert (
+        adapter.max_local_file_bytes(
+            gmail_operation,
+            gmail_input,
+            path=("attachments", 0, "local_file"),
+        )
+        == (GMAIL_UPLOAD_MAX_BYTES * 3) // 4
+    )
+
+    drive_operation = _operation("google_drive", "files.update")
+    drive_input = {
+        "etag": "etag",
+        "file_id": "file",
+        "local_file": "opaque-local-file",
+        "mime_type": "text/plain",
+    }
+    assert adapter.max_local_file_bytes(drive_operation, drive_input, path=("local_file",)) == (
+        5 * 1024**4
+    )
+
+    rejected = (
+        (gmail_operation, gmail_input, ("local_file",)),
+        (
+            gmail_operation,
+            {"attachments": [{"mime_type": "text/plain"}]},
+            ("attachments", 0, "local_file"),
+        ),
+        (
+            gmail_operation,
+            {
+                "attachments": [
+                    {
+                        "filename": "note.txt",
+                        "local_file": {"grant_id": "opaque", "relative_path": "note.txt"},
+                        "mime_type": "text/plain",
+                    }
+                ]
+            },
+            ("attachments", 0, "local_file"),
+        ),
+        (_operation("gmail", "drafts.send"), gmail_input, ("attachments", 0, "local_file")),
+        (
+            _operation("google_calendar", "events.create"),
+            drive_input,
+            ("local_file",),
+        ),
+        (drive_operation, drive_input, ("attachments", 0, "local_file")),
+        (drive_operation, {"mime_type": "text/plain"}, ("local_file",)),
+    )
+    for operation, input_value, path in rejected:
+        with pytest.raises(ValidationError, match="local-file upload path"):
+            adapter.max_local_file_bytes(operation, input_value, path=path)
+
+
 def _sample(operation: OperationSpec) -> dict[str, object]:
     name = operation.name
     if operation.provider == "gmail":
@@ -145,7 +218,11 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
         if name.endswith(".list"):
             return {"page_size": 1}
         if name == "attachments.get":
-            return {"attachment_id": "attachment", "message_id": "message"}
+            return {
+                "attachment_id": "attachment",
+                "delivery": "inline_chunk",
+                "message_id": "message",
+            }
         if name in {
             "messages.get",
             "messages.modify",
@@ -478,6 +555,159 @@ def test_gmail_reply_rejects_unverified_thread_or_subject() -> None:
             credential=_credential(),
             transport=_Transport(),
         )
+
+
+def test_gmail_attachment_defaults_to_a_private_streaming_artifact(tmp_path: Path) -> None:
+    content = b"attachment bytes from Gmail"
+    encoded = base64.urlsafe_b64encode(content).decode("ascii").rstrip("=")
+    body = json.dumps({"data": encoded, "size": len(content)}).encode("utf-8")
+    store = ArtifactStore(tmp_path / "artifacts")
+    scope = ConnectorArtifactScope(store)
+    transfer = ConnectorTransferContext(_artifact_scope_factory=lambda: scope)
+    result = GoogleConnectorAdapter().execute(
+        _operation("gmail", "attachments.get"),
+        {"attachment_id": "attachment", "message_id": "message"},
+        continuation=None,
+        credential=_credential(),
+        transport=_Transport(download_body=body),
+        transfer=transfer,
+    )
+    try:
+        assert result.payload == {"bytes": len(content), "delivery": "artifact"}
+        assert result.artifact is not None
+        assert result.artifact.path.read_bytes() == content
+        assert "path" not in result.payload
+    finally:
+        if result.artifact is not None:
+            scope.complete(result.artifact)
+        store.close()
+
+
+def test_gmail_attachment_inline_compatibility_decodes_base64url_without_artifact(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    content = b"\xfb\xff\x00"
+    encoded = base64.urlsafe_b64encode(content).decode("ascii").rstrip("=")
+    transport = _Transport(
+        download_body=json.dumps({"size": len(content), "data": encoded}).encode("utf-8")
+    )
+    result = GoogleConnectorAdapter().execute(
+        _operation("gmail", "attachments.get"),
+        {"attachment_id": "attachment", "delivery": "inline_chunk", "message_id": "message"},
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    assert result.payload == {
+        "content_base64": base64.b64encode(content).decode("ascii"),
+        "delivery": "inline_chunk",
+    }
+    assert result.artifact is None
+
+
+@pytest.mark.parametrize(
+    ("name", "method", "draft_path", "extra"),
+    (
+        ("drafts.create", ConnectorMethod.POST, "/upload/gmail/v1/users/me/drafts", {}),
+        (
+            "drafts.update",
+            ConnectorMethod.PUT,
+            "/upload/gmail/v1/users/me/drafts/draft",
+            {"draft_id": "draft"},
+        ),
+    ),
+)
+def test_gmail_local_file_attachment_uses_resumable_rfc822_upload(
+    tmp_path: Path,
+    name: str,
+    method: ConnectorMethod,
+    draft_path: str,
+    extra: dict[str, object],
+) -> None:
+    upload = _prepared_upload(tmp_path)
+    transfer = ConnectorTransferContext(uploads={("attachments", 0, "local_file"): upload})
+    transport = _Transport()
+    try:
+        result = GoogleConnectorAdapter().execute(
+            _operation("gmail", name),
+            {
+                **extra,
+                "attachments": [{"filename": "résumé.txt", "mime_type": "text/plain"}],
+                "html_body": "<p>HTML body</p>",
+                "text_body": "Plain body",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            transfer=transfer,
+        )
+        assert result.payload == {}
+        initiated, sent = transport.calls
+        assert initiated["method"] is method
+        assert initiated["path"] == draft_path
+        assert initiated["query"] == (("uploadType", "resumable"),)
+        assert initiated["headers"] == {
+            "X-Upload-Content-Length": str(sent["content_length"]),
+            "X-Upload-Content-Type": "message/rfc822",
+        }
+        assert initiated["json_body"] == {"message": {}}
+        assert sent["credential"] is None
+        assert sent["content_type"] == "message/rfc822"
+        serialized = b"".join(sent["source"])
+        assert len(serialized) == sent["content_length"]
+        message = BytesParser(policy=policy.default).parsebytes(serialized)
+        plain = next(part for part in message.walk() if part.get_content_type() == "text/plain")
+        assert plain.get_content().strip() == "Plain body"
+        attachment = next(message.iter_attachments())
+        assert attachment.get_filename() == "résumé.txt"
+        assert attachment.get_payload(decode=True) == b"streamed Google Drive content"
+        assert "relative_path" not in repr(sent["source"])
+    finally:
+        upload.close()
+
+
+def test_gmail_local_file_reply_preserves_verified_headers_and_thread_metadata(
+    tmp_path: Path,
+) -> None:
+    metadata = json.dumps(
+        {
+            "payload": {
+                "headers": [
+                    {"name": "Message-ID", "value": "<original@example.test>"},
+                    {"name": "References", "value": "<root@example.test>"},
+                    {"name": "Subject", "value": "Planning"},
+                ]
+            },
+            "threadId": "provider-thread-7",
+        }
+    ).encode()
+    upload = _prepared_upload(tmp_path)
+    transfer = ConnectorTransferContext(uploads={("attachments", 0, "local_file"): upload})
+    transport = _Transport(bodies=(metadata, b"{}"))
+    try:
+        GoogleConnectorAdapter().execute(
+            _operation("gmail", "drafts.create"),
+            {
+                "attachments": [{"filename": "reply.txt", "mime_type": "text/plain"}],
+                "reply_to_message_id": "gmail-resource-42",
+                "text_body": "Reply body",
+                "thread_id": "provider-thread-7",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            transfer=transfer,
+        )
+        preflight, initiated, sent = transport.calls
+        assert preflight["path"] == "/gmail/v1/users/me/messages/gmail-resource-42"
+        assert initiated["json_body"] == {"message": {"threadId": "provider-thread-7"}}
+        message = BytesParser(policy=policy.default).parsebytes(b"".join(sent["source"]))
+        assert message["In-Reply-To"] == "<original@example.test>"
+        assert message["References"] == "<root@example.test> <original@example.test>"
+        assert message["Subject"] == "Planning"
+    finally:
+        upload.close()
 
 
 def test_calendar_effect_escalates_shared_or_notified_event_changes() -> None:

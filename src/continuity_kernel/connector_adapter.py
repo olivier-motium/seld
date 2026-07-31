@@ -152,6 +152,7 @@ class ConnectorEffectPreflightAdapter(Protocol):
         *,
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
+        transfer: ConnectorTransferContext | None = None,
     ) -> ConnectorEffect: ...
 
 

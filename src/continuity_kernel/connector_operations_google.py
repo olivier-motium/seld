@@ -73,14 +73,51 @@ def _email_addresses() -> dict[str, object]:
 
 
 def _attachment() -> dict[str, object]:
-    return _object(
+    metadata: dict[str, object] = {"filename": _text(512), "mime_type": _text(256)}
+    source_fields: dict[str, object] = {
+        **metadata,
+        "content_base64": _text(240_000),
+        "local_file": _local_file(),
+    }
+    schema = _object(source_fields)
+    schema["oneOf"] = [
+        _object(
+            {**metadata, "content_base64": source_fields["content_base64"]},
+            required=("content_base64", "filename", "mime_type"),
+        ),
+        _object(
+            {**metadata, "local_file": source_fields["local_file"]},
+            required=("filename", "local_file", "mime_type"),
+        ),
+    ]
+    return schema
+
+
+def _gmail_attachment_delivery() -> dict[str, object]:
+    return {"enum": ["artifact", "inline_chunk"], "type": "string"}
+
+
+def _gmail_attachment_content() -> dict[str, object]:
+    identifiers: dict[str, object] = {"attachment_id": _id(), "message_id": _id()}
+    schema = _object(
         {
-            "content_base64": _text(240_000),
-            "filename": _text(512),
-            "mime_type": _text(256),
+            **identifiers,
+            "delivery": _gmail_attachment_delivery(),
         },
-        required=("content_base64", "filename", "mime_type"),
+        required=("attachment_id", "message_id"),
     )
+    schema["oneOf"] = [
+        _object(identifiers, required=("attachment_id", "message_id")),
+        _object(
+            {**identifiers, "delivery": {"const": "artifact", "type": "string"}},
+            required=("attachment_id", "delivery", "message_id"),
+        ),
+        _object(
+            {**identifiers, "delivery": {"const": "inline_chunk", "type": "string"}},
+            required=("attachment_id", "delivery", "message_id"),
+        ),
+    ]
+    return schema
 
 
 def _mail_fields() -> dict[str, object]:
@@ -488,10 +525,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "attachments.get",
         ConnectorEffect.READ,
         _GMAIL_READ_SCOPES,
-        _object(
-            {"attachment_id": _id(), "message_id": _id()},
-            required=("attachment_id", "message_id"),
-        ),
+        _gmail_attachment_content(),
     ),
     _operation(
         "gmail",

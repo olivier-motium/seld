@@ -17,8 +17,18 @@ from continuity_kernel.connector_adapter import (
     ConnectorTransferContext,
 )
 from continuity_kernel.connector_contract import ConnectorEffect, OperationSpec
+from continuity_kernel.connector_gmail_transfer import (
+    GMAIL_UPLOAD_MAX_BYTES,
+    GmailMessagePartBodyDecoder,
+    GmailMimeAttachment,
+    GmailMimeUpload,
+)
 from continuity_kernel.connector_operations_google import GOOGLE_OPERATIONS
-from continuity_kernel.connector_transfer import MAX_ARTIFACT_BYTES, PreparedUpload
+from continuity_kernel.connector_transfer import (
+    MAX_ARTIFACT_BYTES,
+    ConnectorInputPath,
+    PreparedUpload,
+)
 from continuity_kernel.connector_transport import (
     ConnectorMethod,
     ConnectorOrigin,
@@ -33,6 +43,11 @@ _GMAIL_PURGE_SCOPE: Final = "https://mail.google.com/"
 _JSON_STATUSES: Final = frozenset({200, 201, 202})
 _DELETE_STATUSES: Final = frozenset({200, 202, 204})
 _MAX_CONTENT_BYTES: Final = 180_000
+_LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
+_GMAIL_LOCAL_UPLOAD_OPERATIONS: Final = frozenset({"drafts.create", "drafts.update"})
+_DRIVE_LOCAL_UPLOAD_OPERATIONS: Final = frozenset({"files.create", "files.update"})
+_GMAIL_MAX_RAW_ATTACHMENT_BYTES: Final = (GMAIL_UPLOAD_MAX_BYTES * 3) // 4
+_DRIVE_MAX_LOCAL_FILE_BYTES: Final = 5 * 1024**4
 _CONTENT_RANGE: Final = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
 _MESSAGE_ID: Final = re.compile(r"^<[^<>\s]+@[^<>\s]+>$")
 _MESSAGE_ID_REFERENCE: Final = re.compile(r"<[^<>\s]+@[^<>\s]+>")
@@ -64,6 +79,34 @@ class GoogleConnectorAdapter:
     def providers(self) -> frozenset[str]:
         return _GOOGLE_PROVIDERS
 
+    def max_local_file_bytes(
+        self,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        path: ConnectorInputPath,
+    ) -> int:
+        """Return a provider-native cap for one sanitized local-file input."""
+
+        if not isinstance(operation, OperationSpec):
+            raise ValidationError("Google operation is invalid")
+        expected = _GOOGLE_BY_KEY.get(operation.key)
+        if expected is None or operation != expected:
+            raise ValidationError("Google operation is not in the Google catalog")
+        if (
+            operation.provider == "gmail"
+            and operation.name in _GMAIL_LOCAL_UPLOAD_OPERATIONS
+            and _gmail_local_file_shape(input_value, path)
+        ):
+            return _GMAIL_MAX_RAW_ATTACHMENT_BYTES
+        if (
+            operation.provider == "google_drive"
+            and operation.name in _DRIVE_LOCAL_UPLOAD_OPERATIONS
+            and _drive_local_file_shape(input_value, path)
+        ):
+            return _DRIVE_MAX_LOCAL_FILE_BYTES
+        raise ValidationError("Google local-file upload path is not permitted")
+
     def classify_effect(
         self,
         operation: OperationSpec,
@@ -71,10 +114,31 @@ class GoogleConnectorAdapter:
         *,
         credential: ConnectorRuntimeCredential | None = None,
         transport: ConnectorTransport | None = None,
+        transfer: ConnectorTransferContext | None = None,
     ) -> ConnectorEffect:
-        operation, values = _known_operation(operation, input_value)
+        operation, values = _known_operation(
+            operation,
+            input_value,
+            allow_prepared_gmail=True,
+            transfer=transfer,
+        )
         if (credential is None) is not (transport is None):
             raise ValidationError("Google effect preflight requires credential and transport")
+        if (
+            operation.provider == "gmail"
+            and operation.name in _GMAIL_LOCAL_UPLOAD_OPERATIONS
+            and transfer is not None
+            and _gmail_has_local_attachment(values, transfer)
+        ):
+            reply_context = None
+            if "reply_to_message_id" in values:
+                if credential is None or transport is None:
+                    raise ValidationError(
+                        "Google effect preflight requires credential and transport"
+                    )
+                reply_context = _gmail_reply_context(values, credential, transport)
+            _gmail_mime_upload(values, transfer, reply_context=reply_context)
+            return operation.effect
         if operation.provider != "google_calendar":
             return operation.effect
         if operation.name == "calendars.update" and values.get("calendar_id") != "primary":
@@ -106,7 +170,7 @@ class GoogleConnectorAdapter:
         write_idempotency_key: str | None = None,
         transfer: ConnectorTransferContext | None = None,
     ) -> ConnectorAdapterResult:
-        operation, values = _known_operation(operation, input_value)
+        operation, values = _known_operation(operation, input_value, transfer=transfer)
         if not isinstance(credential, ConnectorRuntimeCredential):
             raise ValidationError("connector runtime credential is invalid")
         if not operation.scope_grant_satisfies(credential.granted_scopes):
@@ -122,7 +186,14 @@ class GoogleConnectorAdapter:
                     "confirmation preview"
                 )
         if operation.provider == "gmail":
-            return _execute_gmail(operation, values, continuation, credential, transport)
+            return _execute_gmail(
+                operation,
+                values,
+                continuation,
+                credential,
+                transport,
+                transfer=transfer,
+            )
         if operation.provider == "google_calendar":
             return _execute_calendar(operation, values, continuation, credential, transport)
         if operation.provider == "google_drive":
@@ -138,17 +209,98 @@ class GoogleConnectorAdapter:
 
 
 def _known_operation(
-    operation: object, input_value: object
+    operation: object,
+    input_value: object,
+    *,
+    allow_prepared_gmail: bool = False,
+    transfer: ConnectorTransferContext | None = None,
 ) -> tuple[OperationSpec, dict[str, object]]:
     if not isinstance(operation, OperationSpec):
         raise ValidationError("connector operation is invalid")
     expected = _GOOGLE_BY_KEY.get(operation.key)
     if expected is None or operation != expected:
         raise ValidationError("connector operation is not in the Google catalog")
-    validated = operation.validate_input(input_value)
+    validation_input = _gmail_prepared_validation_input(
+        operation,
+        input_value,
+        allow_placeholder=allow_prepared_gmail,
+        transfer=transfer,
+    )
+    validated = operation.validate_input(validation_input)
     if not isinstance(validated, dict):
         raise ValidationError("connector operation input is invalid")
     return operation, validated
+
+
+def _gmail_prepared_validation_input(
+    operation: OperationSpec,
+    input_value: object,
+    *,
+    allow_placeholder: bool,
+    transfer: ConnectorTransferContext | None,
+) -> object:
+    if (
+        operation.provider != "gmail"
+        or operation.name not in {"drafts.create", "drafts.update"}
+        or not isinstance(input_value, Mapping)
+    ):
+        return input_value
+    raw_attachments = input_value.get("attachments")
+    if not isinstance(raw_attachments, list):
+        return input_value
+    attachments: list[object] = []
+    changed = False
+    for index, item in enumerate(raw_attachments):
+        if not isinstance(item, Mapping):
+            attachments.append(item)
+            continue
+        if "content_base64" in item or "local_file" in item:
+            attachments.append(item)
+            continue
+        bound = transfer is not None and ("attachments", index, "local_file") in transfer.uploads
+        if not allow_placeholder and not bound:
+            attachments.append(item)
+            continue
+        prepared = dict(item)
+        prepared["local_file"] = {
+            "grant_id": "prepared",
+            "relative_path": "prepared",
+        }
+        attachments.append(prepared)
+        changed = True
+    if not changed:
+        return input_value
+    result = dict(input_value)
+    result["attachments"] = attachments
+    return result
+
+
+def _gmail_local_file_shape(input_value: object, path: ConnectorInputPath) -> bool:
+    if (
+        not isinstance(path, tuple)
+        or len(path) != 3
+        or path[0] != "attachments"
+        or type(path[1]) is not int
+        or path[1] < 0
+        or path[2] != "local_file"
+        or not isinstance(input_value, Mapping)
+    ):
+        return False
+    attachments = input_value.get("attachments")
+    if not isinstance(attachments, list) or path[1] >= len(attachments):
+        return False
+    attachment = attachments[path[1]]
+    return (
+        isinstance(attachment, Mapping) and attachment.get("local_file") == _LOCAL_FILE_LIMIT_MARKER
+    )
+
+
+def _drive_local_file_shape(input_value: object, path: ConnectorInputPath) -> bool:
+    return (
+        path == ("local_file",)
+        and isinstance(input_value, Mapping)
+        and input_value.get("local_file") == _LOCAL_FILE_LIMIT_MARKER
+    )
 
 
 def _execute_gmail(
@@ -157,6 +309,8 @@ def _execute_gmail(
     continuation: object | None,
     credential: ConnectorRuntimeCredential,
     transport: ConnectorTransport,
+    *,
+    transfer: ConnectorTransferContext | None,
 ) -> ConnectorAdapterResult:
     base = "/gmail/v1/users/me"
     name = operation.name
@@ -181,15 +335,11 @@ def _execute_gmail(
             query=_optional_query(values, {"format": "format"}),
         )
     if name == "attachments.get":
-        return _json_request(
+        return _gmail_attachment_request(
             transport,
-            origin=ConnectorOrigin.GMAIL,
-            method=ConnectorMethod.GET,
-            path=(
-                f"{base}/messages/{_segment(_required(values, 'message_id'))}/attachments/"
-                f"{_segment(_required(values, 'attachment_id'))}"
-            ),
             credential=credential,
+            values=values,
+            transfer=transfer,
         )
     if name == "threads.get":
         return _json_request(
@@ -224,6 +374,18 @@ def _execute_gmail(
             method = ConnectorMethod.PUT
             draft_path += f"/{_segment(_required(values, 'draft_id'))}"
         reply_context = _gmail_reply_context(values, credential, transport)
+        if _gmail_has_local_attachment(values, transfer):
+            if transfer is None:
+                raise ValidationError("Gmail local-file upload requires transfer context")
+            return _gmail_resumable_draft_upload(
+                transport,
+                method=method,
+                draft_path=draft_path,
+                credential=credential,
+                values=values,
+                reply_context=reply_context,
+                transfer=transfer,
+            )
         return _json_request(
             transport,
             origin=ConnectorOrigin.GMAIL,
@@ -1716,9 +1878,171 @@ def _gmail_reply_subject(value: str) -> str:
     return subject
 
 
-def _gmail_message(
-    values: dict[str, object], *, reply_context: _GmailReplyContext | None
-) -> dict[str, object]:
+def _gmail_attachment_request(
+    transport: ConnectorTransport,
+    *,
+    credential: ConnectorRuntimeCredential,
+    values: Mapping[str, object],
+    transfer: ConnectorTransferContext | None,
+) -> ConnectorAdapterResult:
+    path = (
+        f"/gmail/v1/users/me/messages/{_segment(_required(values, 'message_id'))}/attachments/"
+        f"{_segment(_required(values, 'attachment_id'))}"
+    )
+    delivery = values.get("delivery", "artifact")
+    if delivery == "artifact":
+        if transfer is None:
+            raise ValidationError("Gmail attachment artifact delivery requires transfer context")
+        writer = transfer.artifacts.start(
+            "gmail-attachment.bin",
+            media_type="application/octet-stream",
+        )
+        decoder = GmailMessagePartBodyDecoder(writer=writer)
+        try:
+            response = transport.download_stream(
+                origin=ConnectorOrigin.GMAIL,
+                sink=decoder,
+                path=path,
+                credential=credential.credential,
+                max_bytes=MAX_ARTIFACT_BYTES,
+            )
+        except Exception:
+            decoder.abort()
+            raise
+        if response.artifact is None:
+            decoder.abort()
+            raise ValidationError("Gmail attachment artifact delivery produced no receipt")
+        return ConnectorAdapterResult(
+            {"bytes": decoder.decoded_size, "delivery": "artifact"},
+            artifact=response.artifact,
+        )
+
+    if delivery != "inline_chunk":
+        raise ValidationError("Gmail attachment delivery is invalid")
+    decoder = GmailMessagePartBodyDecoder()
+    try:
+        transport.download_stream(
+            origin=ConnectorOrigin.GMAIL,
+            sink=decoder,
+            path=path,
+            credential=credential.credential,
+            max_bytes=MAX_ARTIFACT_BYTES,
+        )
+    except Exception:
+        decoder.abort()
+        raise
+    content = decoder.inline_content
+    return ConnectorAdapterResult(
+        {
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "delivery": "inline_chunk",
+        }
+    )
+
+
+def _gmail_has_local_attachment(
+    values: Mapping[str, object], transfer: ConnectorTransferContext | None
+) -> bool:
+    for index, attachment in enumerate(_mappings(values.get("attachments", []))):
+        if "local_file" in attachment:
+            return True
+        if transfer is not None and ("attachments", index, "local_file") in transfer.uploads:
+            return True
+    return False
+
+
+def _gmail_attachment_uploads(
+    values: Mapping[str, object], transfer: ConnectorTransferContext | None
+) -> tuple[GmailMimeAttachment, ...]:
+    attachments: list[GmailMimeAttachment] = []
+    for index, attachment in enumerate(_mappings(values.get("attachments", []))):
+        filename = _safe_header(_text(attachment.get("filename")))
+        mime_type = _mime_type(_text(attachment.get("mime_type")))
+        path = ("attachments", index, "local_file")
+        has_marker = "local_file" in attachment
+        has_bound_upload = transfer is not None and path in transfer.uploads
+        if has_marker or has_bound_upload:
+            if "content_base64" in attachment:
+                raise ValidationError("Gmail attachment has multiple binary sources")
+            if transfer is None:
+                raise ValidationError("Gmail local-file upload requires transfer context")
+            attachments.append(
+                GmailMimeAttachment(
+                    filename=filename,
+                    mime_type=mime_type,
+                    upload=transfer.upload(path),
+                )
+            )
+            continue
+        if "content_base64" not in attachment:
+            raise ValidationError("Gmail attachment has no supported binary source")
+        attachments.append(
+            GmailMimeAttachment(
+                filename=filename,
+                mime_type=mime_type,
+                inline_content=_decode_base64(_text(attachment["content_base64"])),
+            )
+        )
+    return tuple(attachments)
+
+
+def _gmail_mime_upload(
+    values: Mapping[str, object],
+    transfer: ConnectorTransferContext,
+    *,
+    reply_context: _GmailReplyContext | None,
+) -> GmailMimeUpload:
+    return GmailMimeUpload(
+        headers=tuple(_gmail_header_message(values, reply_context=reply_context).items()),
+        body=_gmail_body_bytes(values),
+        attachments=_gmail_attachment_uploads(values, transfer),
+    )
+
+
+def _gmail_resumable_draft_upload(
+    transport: ConnectorTransport,
+    *,
+    method: ConnectorMethod,
+    draft_path: str,
+    credential: ConnectorRuntimeCredential,
+    values: Mapping[str, object],
+    reply_context: _GmailReplyContext | None,
+    transfer: ConnectorTransferContext,
+) -> ConnectorAdapterResult:
+    mime = _gmail_mime_upload(values, transfer, reply_context=reply_context)
+    metadata: dict[str, object] = {"message": {}}
+    if reply_context is not None:
+        metadata["message"] = {"threadId": reply_context.thread_id}
+    initiated = transport.request(
+        origin=ConnectorOrigin.GMAIL,
+        method=method,
+        path=f"/upload{draft_path}",
+        credential=credential.credential,
+        query=(("uploadType", "resumable"),),
+        json_body=metadata,
+        headers={
+            "X-Upload-Content-Length": str(mime.size),
+            "X-Upload-Content-Type": "message/rfc822",
+        },
+        expected_statuses=_JSON_STATUSES,
+    )
+    location = _response_location(initiated.headers)
+    uploaded = transport.request_stream(
+        origin=ConnectorOrigin.GMAIL,
+        method=ConnectorMethod.PUT,
+        source=mime,
+        content_length=mime.size,
+        location=location,
+        credential=None,
+        content_type="message/rfc822",
+        expected_statuses=_JSON_STATUSES,
+    )
+    return _json_result(uploaded.json())
+
+
+def _gmail_header_message(
+    values: Mapping[str, object], *, reply_context: _GmailReplyContext | None
+) -> EmailMessage:
     message = EmailMessage()
     for source, header in (("to", "To"), ("cc", "Cc"), ("bcc", "Bcc")):
         if source in values:
@@ -1729,10 +2053,27 @@ def _gmail_message(
         message["References"] = " ".join(reply_context.references)
     elif "subject" in values:
         message["Subject"] = _safe_header(_text(values["subject"]))
+    return message
+
+
+def _gmail_body_bytes(values: Mapping[str, object]) -> bytes:
+    message = EmailMessage()
+    message.set_content(_text(values.get("text_body", "")))
+    if "html_body" in values:
+        message.add_alternative(_text(values["html_body"]), subtype="html")
+    return message.as_bytes(policy=SMTP)
+
+
+def _gmail_message(
+    values: dict[str, object], *, reply_context: _GmailReplyContext | None
+) -> dict[str, object]:
+    message = _gmail_header_message(values, reply_context=reply_context)
     message.set_content(_text(values.get("text_body", "")))
     if "html_body" in values:
         message.add_alternative(_text(values["html_body"]), subtype="html")
     for attachment in _mappings(values.get("attachments", [])):
+        if "content_base64" not in attachment:
+            raise ValidationError("Gmail local-file upload requires transfer context")
         mime_type = _mime_type(_text(attachment.get("mime_type")))
         main_type, sub_type = mime_type.split("/", 1)
         message.add_attachment(
@@ -1773,7 +2114,7 @@ def _response_location(headers: Mapping[str, str]) -> str:
     for name, value in headers.items():
         if name.casefold() == "location" and isinstance(value, str) and value:
             return value
-    raise ValidationError("Google Drive upload response has no provider location")
+    raise ValidationError("Google upload response has no provider location")
 
 
 def _required(values: Mapping[str, object], name: str) -> str:

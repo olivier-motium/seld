@@ -269,6 +269,50 @@ def test_google_catalog_validates_representative_rich_inputs() -> None:
     )
 
 
+def test_gmail_attachment_delivery_and_typed_local_file_sources_are_explicit() -> None:
+    attachment = _operation("gmail", ConnectorMode.READ, "attachments.get")
+    identifiers = {"attachment_id": "attachment", "message_id": "message"}
+    assert attachment.validate_input(identifiers) == identifiers
+    assert attachment.validate_input({**identifiers, "delivery": "artifact"}) == {
+        **identifiers,
+        "delivery": "artifact",
+    }
+    assert attachment.validate_input({**identifiers, "delivery": "inline_chunk"}) == {
+        **identifiers,
+        "delivery": "inline_chunk",
+    }
+    with pytest.raises(ValidationError):
+        attachment.validate_input({**identifiers, "delivery": "inline_chunk", "byte_offset": 1})
+
+    draft = _operation("gmail", ConnectorMode.WRITE, "drafts.create")
+    local = {
+        "attachments": [
+            {
+                "filename": "note.txt",
+                "local_file": {"grant_id": "grant", "relative_path": "note.txt"},
+                "mime_type": "text/plain",
+            }
+        ],
+        "text_body": "body",
+    }
+    assert draft.validate_input(local) == local
+    with pytest.raises(ValidationError):
+        draft.validate_input({"attachments": [{"filename": "note.txt", "mime_type": "text/plain"}]})
+    with pytest.raises(ValidationError):
+        draft.validate_input(
+            {
+                "attachments": [
+                    {
+                        "content_base64": "YQ==",
+                        "filename": "note.txt",
+                        "local_file": {"grant_id": "grant", "relative_path": "note.txt"},
+                        "mime_type": "text/plain",
+                    }
+                ]
+            }
+        )
+
+
 def test_google_inputs_reject_unknown_and_proxy_like_fields() -> None:
     operation = _operation("gmail", ConnectorMode.WRITE, "drafts.create")
     valid = {"text_body": "bounded", "to": ["recipient@example.test"]}
@@ -447,7 +491,7 @@ def test_drive_content_delivery_defaults_to_artifact_and_inline_is_explicitly_bo
             **base,
             "delivery": "artifact",
         }
-        inline = {**base, "delivery": "inline_chunk"}
+        inline: dict[str, object] = {**base, "delivery": "inline_chunk"}
         if name != "files.export":
             inline.update({"byte_offset": 5, "max_chunk_size": 3})
         assert operation.validate_input(inline) == inline
