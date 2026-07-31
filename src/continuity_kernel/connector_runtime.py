@@ -308,6 +308,7 @@ class ConnectorRuntime:
                             transport=self.transport,
                         ),
                     )
+                    effect = _promote_prepared_upload_effect(effect, prepared.bundle)
                     if effect is ConnectorEffect.SAFE_MUTATION:
                         result = self._execute_adapter(
                             adapter,
@@ -371,6 +372,7 @@ class ConnectorRuntime:
                             transport=self.transport,
                         ),
                     )
+                    effect = _promote_prepared_upload_effect(effect, prepared.bundle)
                     if effect is ConnectorEffect.SAFE_MUTATION:
                         raise ValidationError("this operation does not use a confirmation token")
                     write_idempotency_key = self.session.consume_confirmation(
@@ -1012,6 +1014,15 @@ def _classified_effect(
     if _EFFECT_ORDER[adapter_effect] < _EFFECT_ORDER[catalog_effect]:
         raise ValidationError("connector adapter cannot downgrade a catalog effect")
     return adapter_effect
+
+
+def _promote_prepared_upload_effect(
+    effect: ConnectorEffect,
+    bundle: PreparedUploadBundle | None,
+) -> ConnectorEffect:
+    if bundle is not None and _EFFECT_ORDER[effect] < _EFFECT_ORDER[ConnectorEffect.OUTWARD]:
+        return ConnectorEffect.OUTWARD
+    return effect
 
 
 def _scope_error(provider: str, operation: str) -> str:

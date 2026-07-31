@@ -229,7 +229,11 @@ def _prepared(
     return vault, manager, adapter, runtime
 
 
-def _install_local_upload_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+def _install_local_upload_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    effect: ConnectorEffect = ConnectorEffect.OUTWARD,
+) -> None:
     local_file = {
         "additionalProperties": False,
         "properties": {
@@ -253,7 +257,7 @@ def _install_local_upload_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
         provider="gmail",
         mode=ConnectorMode.WRITE,
         name="attachments.send",
-        effect=ConnectorEffect.OUTWARD,
+        effect=effect,
         endpoint="attachments.send",
         required_scopes=(frozenset({"https://www.googleapis.com/auth/gmail.modify"}),),
         input_schema={
@@ -498,6 +502,51 @@ def test_effect_preflight_receives_live_credential_and_transport(tmp_path: Path)
     assert preflight.preflight is not None
     assert preflight.preflight[0].version == 1
     assert preflight.preflight[1] is runtime.transport
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
+def test_safe_mutation_with_local_upload_requires_exact_outward_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host-data"))
+    _install_local_upload_catalog(monkeypatch, effect=ConnectorEffect.SAFE_MUTATION)
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    vault, _manager, adapter, runtime = _prepared(tmp_path, artifact_store=artifacts)
+    vault.select_sources(
+        expected_revision=vault.get_source_snapshot().revision,
+        sources=("local_files",),
+    )
+    selected = tmp_path / "selected"
+    source = selected / "private" / "source-document.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"draft attachment")
+    grant_id = vault.grant_local_file_root(selected)["grant"]["grant_id"]
+    values = _local_upload_values(grant_id)
+
+    preview = runtime.call_tool("gsv_gmail_write", values)
+    assert preview["status"] == "confirmation_required"
+    assert preview["effect"] == ConnectorEffect.OUTWARD.value
+    assert adapter.calls == []
+    token = preview["confirmation_token"]
+    assert isinstance(token, str)
+    wrong_token = token[:-1] + ("A" if token[-1] != "A" else "B")
+    with pytest.raises(ConflictError, match="fresh preview"):
+        runtime.call_tool(
+            "gsv_gmail_write",
+            {**values, "confirmation_token": wrong_token},
+        )
+    assert adapter.calls == []
+
+    completed = runtime.call_tool(
+        "gsv_gmail_write",
+        {**values, "confirmation_token": token},
+    )
+    assert completed["status"] == "ok"
+    assert completed["effect"] == ConnectorEffect.OUTWARD.value
+    assert [call[0] for call in adapter.calls] == ["attachments.send"]
+    assert adapter.transferred[-1] == {("attachments", 0, "local_file"): b"draft attachment"}
+    runtime.close()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
