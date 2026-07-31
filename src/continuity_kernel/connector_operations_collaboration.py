@@ -72,6 +72,8 @@ _EMPTY = _object({})
 _BOOLEAN: Final = {"type": "boolean"}
 _LIMIT: Final = {"maximum": 100, "minimum": 1, "type": "integer"}
 _POSITION: Final = {"maximum": 10_000, "minimum": 0, "type": "integer"}
+_PAGE: Final = {"maximum": 1_000_000, "minimum": 1, "type": "integer"}
+_SLACK_FILE_COUNT: Final = {"maximum": 1_000, "minimum": 1, "type": "integer"}
 _SLACK_ID: Final = _text(128, minimum=1, pattern=r"^[A-Za-z0-9]+$")
 _SLACK_TIMESTAMP: Final = _text(
     32,
@@ -79,6 +81,14 @@ _SLACK_TIMESTAMP: Final = _text(
     pattern=r"^[0-9]{1,20}\.[0-9]{1,9}$",
 )
 _SNOWFLAKE: Final = _text(20, minimum=1, pattern=r"^[0-9]{1,20}$")
+_ISO8601: Final = _text(
+    35,
+    minimum=20,
+    pattern=(
+        r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    ),
+)
 _EMOJI: Final = _text(128, minimum=1)
 _BASE64: Final = _text(
     240_000,
@@ -106,55 +116,145 @@ _SLACK_WRITE: Final = (
 )
 _SLACK_USERS: Final = (frozenset({"users:read"}),)
 _SLACK_CHAT: Final = (frozenset({"chat:write"}),)
+_SLACK_CHAT_HISTORY: Final = tuple(
+    frozenset({"chat:write"}) | history for history in _SLACK_HISTORY
+)
 _SLACK_FILES_READ: Final = (frozenset({"files:read"}),)
 _SLACK_FILES_WRITE: Final = (frozenset({"files:write"}),)
+_SLACK_FILES_UPLOAD: Final = (frozenset({"files:read", "files:write"}),)
 _SLACK_REACTIONS_READ: Final = (frozenset({"reactions:read"}),)
 _SLACK_REACTIONS_WRITE: Final = (frozenset({"reactions:write"}),)
 _DISCORD_BOT: Final[tuple[frozenset[str], ...]] = (frozenset(),)
 
 _SLACK_TEXT = _text(40_000, minimum=1)
+_SLACK_REPLY_LIMIT: Final = {"maximum": 1_000, "minimum": 1, "type": "integer"}
 _SLACK_BLOCK_TEXT = _text(3_000, minimum=1)
-_SLACK_BLOCK_TEXT_ELEMENT = _object(
+_SLACK_PLAIN_TEXT_ELEMENT = _object(
     {
+        "emoji": _BOOLEAN,
         "text": _SLACK_BLOCK_TEXT,
-        "type": {"enum": ["mrkdwn", "plain_text"], "type": "string"},
+        "type": {"const": "plain_text", "type": "string"},
     },
     ("text", "type"),
 )
-_SLACK_BLOCKS = _array(
+_SLACK_MRKDWN_TEXT_ELEMENT = _object(
     {
-        "oneOf": [
-            _object(
-                {
-                    "text": _SLACK_BLOCK_TEXT_ELEMENT,
-                    "type": {"const": "section", "type": "string"},
-                },
-                ("text", "type"),
-            ),
-            _object(
-                {
-                    "elements": _array(_SLACK_BLOCK_TEXT_ELEMENT, 10, minimum=1),
-                    "type": {"const": "context", "type": "string"},
-                },
-                ("elements", "type"),
-            ),
-            _object(
-                {"type": {"const": "divider", "type": "string"}},
-                ("type",),
-            ),
-        ]
+        "text": _SLACK_BLOCK_TEXT,
+        "type": {"const": "mrkdwn", "type": "string"},
+        "verbatim": _BOOLEAN,
     },
-    50,
-    minimum=1,
+    ("text", "type"),
 )
+_SLACK_BLOCK_TEXT_ELEMENT: Final[dict[str, object]] = {
+    "oneOf": [_SLACK_PLAIN_TEXT_ELEMENT, _SLACK_MRKDWN_TEXT_ELEMENT]
+}
+_SLACK_SECTION_FIELD_TEXT: Final[dict[str, object]] = {
+    "oneOf": [
+        _object(
+            {
+                "text": _text(2_000, minimum=1),
+                "type": {"const": "plain_text", "type": "string"},
+            },
+            ("text", "type"),
+        ),
+        _object(
+            {
+                "text": _text(2_000, minimum=1),
+                "type": {"const": "mrkdwn", "type": "string"},
+                "verbatim": _BOOLEAN,
+            },
+            ("text", "type"),
+        ),
+    ]
+}
+_SLACK_BLOCK_ITEM: Final[dict[str, object]] = {
+    "oneOf": [
+        _object(
+            {
+                "block_id": _text(255, minimum=1),
+                "fields": _array(_SLACK_SECTION_FIELD_TEXT, 10, minimum=1),
+                "text": _SLACK_BLOCK_TEXT_ELEMENT,
+                "type": {"const": "section", "type": "string"},
+            },
+            ("type",),
+        ),
+        _object(
+            {
+                "block_id": _text(255, minimum=1),
+                "elements": _array(_SLACK_BLOCK_TEXT_ELEMENT, 10, minimum=1),
+                "type": {"const": "context", "type": "string"},
+            },
+            ("elements", "type"),
+        ),
+        _object(
+            {
+                "block_id": _text(255, minimum=1),
+                "type": {"const": "divider", "type": "string"},
+            },
+            ("type",),
+        ),
+        _object(
+            {
+                "block_id": _text(255, minimum=1),
+                "text": _object(
+                    {
+                        "emoji": _BOOLEAN,
+                        "text": _text(150, minimum=1),
+                        "type": {"const": "plain_text", "type": "string"},
+                    },
+                    ("text", "type"),
+                ),
+                "type": {"const": "header", "type": "string"},
+            },
+            ("text", "type"),
+        ),
+    ]
+}
+_SLACK_BLOCKS = _array(_SLACK_BLOCK_ITEM, 50, minimum=1)
+_SLACK_UPDATE_BLOCKS = _array(_SLACK_BLOCK_ITEM, 50)
+_SLACK_ATTACHMENT_FIELD = _object(
+    {
+        "short": _BOOLEAN,
+        "title": _text(255, minimum=1),
+        "value": _text(2_000, minimum=1),
+    },
+    ("title", "value"),
+)
+_SLACK_ATTACHMENT = _object(
+    {
+        "color": _text(
+            7,
+            minimum=3,
+            pattern=r"^(?:#[0-9A-Fa-f]{6}|good|warning|danger)$",
+        ),
+        "fallback": _text(2_000, minimum=1),
+        "fields": _array(_SLACK_ATTACHMENT_FIELD, 10, minimum=1),
+        "footer": _text(300, minimum=1),
+        "mrkdwn_in": _array(
+            {"enum": ["fallback", "fields", "pretext", "text"], "type": "string"},
+            4,
+            minimum=1,
+        ),
+        "pretext": _text(2_000, minimum=1),
+        "text": _text(3_000, minimum=1),
+        "title": _text(255, minimum=1),
+    }
+)
+_SLACK_ATTACHMENTS = _array(_SLACK_ATTACHMENT, 100, minimum=1)
+_SLACK_UPDATE_ATTACHMENTS = _array(_SLACK_ATTACHMENT, 100)
 _SLACK_MESSAGE_FIELDS: Final = {
+    "attachments": _SLACK_ATTACHMENTS,
     "blocks": _SLACK_BLOCKS,
-    "client_msg_id": _text(128, minimum=1),
     "reply_broadcast": _BOOLEAN,
     "text": _SLACK_TEXT,
     "thread_ts": _SLACK_TIMESTAMP,
     "unfurl_links": _BOOLEAN,
     "unfurl_media": _BOOLEAN,
+}
+_SLACK_MESSAGE_UPDATE_FIELDS: Final = {
+    "attachments": _SLACK_UPDATE_ATTACHMENTS,
+    "blocks": _SLACK_UPDATE_BLOCKS,
+    "text": _text(40_000),
 }
 _DISCORD_EMBED_FIELD = _object(
     {
@@ -166,14 +266,77 @@ _DISCORD_EMBED_FIELD = _object(
 )
 _DISCORD_EMBED = _object(
     {
+        "author": _object({"name": _text(256, minimum=1)}, ("name",)),
         "color": {"maximum": 16_777_215, "minimum": 0, "type": "integer"},
         "description": _text(4_096, minimum=1),
         "fields": _array(_DISCORD_EMBED_FIELD, 25, minimum=1),
         "footer": _object({"text": _text(2_048, minimum=1)}, ("text",)),
+        "timestamp": _ISO8601,
         "title": _text(256, minimum=1),
     }
 )
-_DISCORD_MESSAGE_FIELDS: Final = {
+_DISCORD_ALLOWED_MENTIONS = _object(
+    {
+        "parse": _array(
+            {"enum": ["everyone", "roles", "users"], "type": "string"},
+            3,
+        ),
+        "replied_user": _BOOLEAN,
+        "roles": _array(_SNOWFLAKE, 100),
+        "users": _array(_SNOWFLAKE, 100),
+    }
+)
+_DISCORD_PARTIAL_EMOJI: Final = {
+    "oneOf": [
+        _object({"id": _SNOWFLAKE}, ("id",)),
+        _object({"name": _text(64, minimum=1)}, ("name",)),
+    ]
+}
+_DISCORD_LINK_BUTTON = _object(
+    {
+        "destination": _text(2_048, minimum=9, pattern=r"^https://[^\s]+$"),
+        "disabled": _BOOLEAN,
+        "emoji": _DISCORD_PARTIAL_EMOJI,
+        "label": _text(80, minimum=1),
+        "type": {"const": "link_button", "type": "string"},
+    },
+    ("destination", "label", "type"),
+)
+_DISCORD_ACTION_ROW = _object(
+    {
+        "components": _array(_DISCORD_LINK_BUTTON, 5, minimum=1),
+        "type": {"const": "action_row", "type": "string"},
+    },
+    ("components", "type"),
+)
+_DISCORD_COMPONENTS = _array(_DISCORD_ACTION_ROW, 5, minimum=1)
+_DISCORD_UPDATE_COMPONENTS = _array(_DISCORD_ACTION_ROW, 5)
+_DISCORD_POLL_MEDIA = _object({"text": _text(300, minimum=1)}, ("text",))
+_DISCORD_POLL_ANSWER = _object(
+    {
+        "poll_media": _object(
+            {
+                "emoji": _DISCORD_PARTIAL_EMOJI,
+                "text": _text(55, minimum=1),
+            },
+            ("text",),
+        )
+    },
+    ("poll_media",),
+)
+_DISCORD_POLL = _object(
+    {
+        "allow_multiselect": _BOOLEAN,
+        "answers": _array(_DISCORD_POLL_ANSWER, 10, minimum=2),
+        "duration": {"maximum": 768, "minimum": 1, "type": "integer"},
+        "layout_type": {"const": 1, "type": "integer"},
+        "question": _DISCORD_POLL_MEDIA,
+    },
+    ("answers", "question"),
+)
+_DISCORD_MESSAGE_CREATE_FIELDS: Final = {
+    "allowed_mentions": _DISCORD_ALLOWED_MENTIONS,
+    "components": _DISCORD_COMPONENTS,
     "content": _text(2_000, minimum=1),
     "embeds": _array(_DISCORD_EMBED, 10, minimum=1),
     "message_reference": _object(
@@ -185,6 +348,13 @@ _DISCORD_MESSAGE_FIELDS: Final = {
         },
         ("message_id",),
     ),
+    "poll": _DISCORD_POLL,
+}
+_DISCORD_MESSAGE_UPDATE_FIELDS: Final = {
+    "allowed_mentions": _DISCORD_ALLOWED_MENTIONS,
+    "components": _DISCORD_UPDATE_COMPONENTS,
+    "content": _text(2_000),
+    "embeds": _array(_DISCORD_EMBED, 10),
 }
 
 
@@ -267,10 +437,11 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
             {
                 "channel": _SLACK_ID,
                 "latest": _SLACK_TIMESTAMP,
-                "limit": _LIMIT,
+                "limit": _SLACK_REPLY_LIMIT,
                 "oldest": _SLACK_TIMESTAMP,
+                "thread_ts": _SLACK_TIMESTAMP,
             },
-            ("channel",),
+            ("channel", "thread_ts"),
         ),
     ),
     _operation(
@@ -282,9 +453,10 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _object(
             {
                 "channel": _SLACK_ID,
+                "count": _SLACK_FILE_COUNT,
                 "latest": _SLACK_TIMESTAMP,
-                "limit": _LIMIT,
                 "oldest": _SLACK_TIMESTAMP,
+                "page": _PAGE,
             }
         ),
     ),
@@ -413,7 +585,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "messages.create",
         ConnectorEffect.OUTWARD,
         _SLACK_CHAT,
-        _object({"channel": _SLACK_ID, **_SLACK_MESSAGE_FIELDS}, ("channel", "text")),
+        _object({"channel": _SLACK_ID, **_SLACK_MESSAGE_FIELDS}, ("channel",)),
     ),
     _operation(
         "slack",
@@ -422,8 +594,8 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.OUTWARD,
         _SLACK_CHAT,
         _object(
-            {"channel": _SLACK_ID, "ts": _SLACK_TIMESTAMP, **_SLACK_MESSAGE_FIELDS},
-            ("channel", "text", "ts"),
+            {"channel": _SLACK_ID, "ts": _SLACK_TIMESTAMP, **_SLACK_MESSAGE_UPDATE_FIELDS},
+            ("channel", "ts"),
         ),
     ),
     _operation(
@@ -442,7 +614,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _SLACK_CHAT,
         _object(
             {"channel": _SLACK_ID, **_SLACK_MESSAGE_FIELDS},
-            ("channel", "text", "thread_ts"),
+            ("channel", "thread_ts"),
         ),
     ),
     _operation(
@@ -450,10 +622,15 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorMode.WRITE,
         "threads.update",
         ConnectorEffect.OUTWARD,
-        _SLACK_CHAT,
+        _SLACK_CHAT_HISTORY,
         _object(
-            {"channel": _SLACK_ID, "ts": _SLACK_TIMESTAMP, **_SLACK_MESSAGE_FIELDS},
-            ("channel", "text", "thread_ts", "ts"),
+            {
+                "channel": _SLACK_ID,
+                "thread_ts": _SLACK_TIMESTAMP,
+                "ts": _SLACK_TIMESTAMP,
+                **_SLACK_MESSAGE_UPDATE_FIELDS,
+            },
+            ("channel", "thread_ts", "ts"),
         ),
     ),
     _operation(
@@ -461,7 +638,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorMode.WRITE,
         "threads.delete",
         ConnectorEffect.PERMANENT,
-        _SLACK_CHAT,
+        _SLACK_CHAT_HISTORY,
         _object(
             {"channel": _SLACK_ID, "thread_ts": _SLACK_TIMESTAMP, "ts": _SLACK_TIMESTAMP},
             ("channel", "thread_ts", "ts"),
@@ -472,7 +649,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorMode.WRITE,
         "files.upload",
         ConnectorEffect.OUTWARD,
-        _SLACK_FILES_WRITE,
+        _SLACK_FILES_UPLOAD,
         _object(
             {
                 "channel": _SLACK_ID,
@@ -555,7 +732,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "threads.archived_public",
         ConnectorEffect.READ,
         _DISCORD_BOT,
-        _object({"before": _SNOWFLAKE, "channel_id": _SNOWFLAKE, "limit": _LIMIT}, ("channel_id",)),
+        _object({"before": _ISO8601, "channel_id": _SNOWFLAKE, "limit": _LIMIT}, ("channel_id",)),
     ),
     _operation(
         "discord",
@@ -563,7 +740,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "threads.archived_private",
         ConnectorEffect.READ,
         _DISCORD_BOT,
-        _object({"before": _SNOWFLAKE, "channel_id": _SNOWFLAKE, "limit": _LIMIT}, ("channel_id",)),
+        _object({"before": _ISO8601, "channel_id": _SNOWFLAKE, "limit": _LIMIT}, ("channel_id",)),
     ),
     _operation(
         "discord",
@@ -779,8 +956,8 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.OUTWARD,
         _DISCORD_BOT,
         _object(
-            {"channel_id": _SNOWFLAKE, **_DISCORD_MESSAGE_FIELDS},
-            ("channel_id", "content"),
+            {"channel_id": _SNOWFLAKE, **_DISCORD_MESSAGE_CREATE_FIELDS},
+            ("channel_id",),
         ),
     ),
     _operation(
@@ -790,8 +967,12 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.OUTWARD,
         _DISCORD_BOT,
         _object(
-            {"channel_id": _SNOWFLAKE, "message_id": _SNOWFLAKE, **_DISCORD_MESSAGE_FIELDS},
-            ("channel_id", "content", "message_id"),
+            {
+                "channel_id": _SNOWFLAKE,
+                "message_id": _SNOWFLAKE,
+                **_DISCORD_MESSAGE_UPDATE_FIELDS,
+            },
+            ("channel_id", "message_id"),
         ),
     ),
     _operation(

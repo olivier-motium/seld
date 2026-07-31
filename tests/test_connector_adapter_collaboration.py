@@ -9,14 +9,19 @@ from typing import cast
 import pytest
 
 from continuity_kernel.connector_adapter import ConnectorRuntimeCredential
-from continuity_kernel.connector_adapter_collaboration import CollaborationConnectorAdapter
-from continuity_kernel.connector_contract import ConnectorMode, OperationSpec
+from continuity_kernel.connector_adapter_collaboration import (
+    CollaborationConnectorAdapter,
+    SlackUploadOutcomeUnknown,
+)
+from continuity_kernel.connector_contract import ConnectorEffect, ConnectorMode, OperationSpec
 from continuity_kernel.connector_operations_collaboration import COLLABORATION_OPERATIONS
+from continuity_kernel.connector_session import ConnectorSession
 from continuity_kernel.connector_transport import (
     AuthorizationScheme,
     ConnectorCredential,
     ConnectorMethod,
     ConnectorOrigin,
+    ConnectorOutcomeUnknown,
     ConnectorProviderError,
     ConnectorResponse,
     ConnectorTransport,
@@ -26,11 +31,35 @@ from continuity_kernel.errors import ValidationError
 
 @dataclass
 class _FakeTransport:
+    application_flags: int | None = 1 << 19
     bot: bool = True
     message_author: str = "bot-1"
     message_content: str = "confirmed"
     slack_cursor: str | None = None
     slack_error: str | None = None
+    slack_complete_outcome_unknown: bool = False
+    slack_complete_files: list[dict[str, object]] = field(default_factory=lambda: [{"id": "F1"}])
+    slack_info_file: dict[str, object] | None = field(
+        default_factory=lambda: cast(
+            dict[str, object],
+            {
+                "channels": ["C123"],
+                "id": "F1",
+                "shares": {
+                    "public": {
+                        "C123": [{"thread_ts": "1712345678.000001"}],
+                    }
+                },
+                "url_private_download": "https://files.slack.com/private",
+            },
+        )
+    )
+    slack_thread_messages: list[dict[str, object]] = field(
+        default_factory=lambda: [
+            {"ts": "1712345678.000001"},
+            {"thread_ts": "1712345678.000001", "ts": "1712345678.000002"},
+        ]
+    )
     requests: list[dict[str, object]] = field(default_factory=list)
     locations: list[dict[str, object]] = field(default_factory=list)
 
@@ -48,23 +77,42 @@ class _FakeTransport:
                     {"ok": True, "file_id": "F1", "upload_url": "https://files.slack.com/upload"},
                 )
             if path == "/api/files.info":
+                if self.slack_info_file is None:
+                    return _response(origin, {"error": "file_not_found", "ok": False})
                 return _response(
                     origin,
                     {
                         "ok": True,
-                        "file": {"url_private_download": "https://files.slack.com/private"},
+                        "file": self.slack_info_file,
                     },
                 )
+            if path == "/api/files.completeUploadExternal":
+                if self.slack_complete_outcome_unknown:
+                    raise ConnectorOutcomeUnknown("completion response was lost")
+                return _response(origin, {"files": self.slack_complete_files, "ok": True})
             metadata: dict[str, object] = {}
             if self.slack_cursor is not None:
                 metadata["next_cursor"] = self.slack_cursor
                 self.slack_cursor = None
             response: dict[str, object] = {"ok": True}
+            if path == "/api/conversations.replies":
+                query = cast(tuple[tuple[str, str], ...], kwargs.get("query", ()))
+                oldest = next((item for key, item in query if key == "oldest"), None)
+                response["messages"] = [
+                    message
+                    for message in self.slack_thread_messages
+                    if oldest is None or message.get("ts") == oldest
+                ]
             if metadata:
                 response["response_metadata"] = metadata
             return _response(origin, response)
         if path == "/api/v10/users/@me":
             return _response(origin, {"bot": self.bot, "id": "bot-1"})
+        if path == "/api/v10/oauth2/applications/@me":
+            payload: dict[str, object] = {"id": "application-1"}
+            if self.application_flags is not None:
+                payload["flags"] = self.application_flags
+            return _response(origin, payload)
         if "/messages/" in path and method is ConnectorMethod.GET:
             return _response(
                 origin,
@@ -146,8 +194,12 @@ def _input(operation: OperationSpec) -> dict[str, object]:
         ("slack", "conversations.get"): {"channel": "C123"},
         ("slack", "messages.list"): {"channel": "C123", "limit": 50},
         ("slack", "messages.get"): {"channel": "C123", "ts": "1712345678.000001"},
-        ("slack", "threads.list"): {"channel": "C123", "limit": 50},
-        ("slack", "files.list"): {"limit": 50},
+        ("slack", "threads.list"): {
+            "channel": "C123",
+            "limit": 50,
+            "thread_ts": "1712345678.000001",
+        },
+        ("slack", "files.list"): {"count": 50, "page": 1},
         ("slack", "files.get"): {"file_id": "F123"},
         ("slack", "files.download"): {"file_id": "F123"},
         ("slack", "reactions.list"): {"channel": "C123", "timestamp": "1712345678.000001"},
@@ -263,7 +315,11 @@ def test_adapter_executes_every_catalog_operation_through_fixed_provider_routes(
             transport=cast(ConnectorTransport, transport),
             write_idempotency_key=(
                 "confirmed-write-id"
-                if operation.provider == "discord" and operation.name == "messages.create"
+                if (operation.provider == "discord" and operation.name == "messages.create")
+                or (
+                    operation.provider == "slack"
+                    and operation.name in {"messages.create", "threads.reply"}
+                )
                 else None
             ),
         )
@@ -345,6 +401,283 @@ def test_slack_pagination_extracts_the_provider_cursor_and_never_exposes_it_in_p
     assert second.continuation is None
 
 
+def test_slack_thread_replies_use_the_required_parent_and_sealed_cursor_lane() -> None:
+    adapter = CollaborationConnectorAdapter()
+    transport = _FakeTransport(slack_cursor="provider-replies-cursor")
+    operation = _operation("slack", ConnectorMode.READ, "threads.list")
+    value = {
+        "channel": "C123",
+        "limit": 15,
+        "thread_ts": "1712345678.000001",
+    }
+
+    first = adapter.execute(
+        operation,
+        value,
+        continuation=None,
+        credential=_credential(operation),
+        transport=cast(ConnectorTransport, transport),
+    )
+    adapter.execute(
+        operation,
+        value,
+        continuation=first.continuation,
+        credential=_credential(operation),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert transport.requests[0]["path"] == "/api/conversations.replies"
+    assert transport.requests[1]["path"] == "/api/conversations.replies"
+    assert transport.requests[0]["query"] == (
+        ("channel", "C123"),
+        ("ts", "1712345678.000001"),
+        ("limit", "15"),
+    )
+    assert ("cursor", "provider-replies-cursor") in cast(
+        tuple[tuple[str, str], ...], transport.requests[1]["query"]
+    )
+
+
+def test_slack_files_list_uses_provider_page_and_count_without_cursor_fiction() -> None:
+    adapter = CollaborationConnectorAdapter()
+    transport = _FakeTransport()
+    operation = _operation("slack", ConnectorMode.READ, "files.list")
+
+    adapter.execute(
+        operation,
+        {"channel": "C123", "count": 200, "page": 3},
+        continuation=None,
+        credential=_credential(operation),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert transport.requests[-1]["query"] == (
+        ("channel", "C123"),
+        ("count", "200"),
+        ("page", "3"),
+    )
+    with pytest.raises(ValidationError, match="does not accept a continuation"):
+        adapter.execute(
+            operation,
+            {"count": 50, "page": 2},
+            continuation={"next_cursor": "not-supported"},
+            credential=_credential(operation),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+
+@pytest.mark.parametrize("name", ["threads.update", "threads.delete"])
+def test_slack_thread_mutations_require_membership_in_the_confirmed_parent(name: str) -> None:
+    adapter = CollaborationConnectorAdapter()
+    operation = _operation("slack", ConnectorMode.WRITE, name)
+    transport = _FakeTransport(
+        slack_thread_messages=[{"thread_ts": "1712345678.999999", "ts": "1712345678.000002"}]
+    )
+
+    with pytest.raises(ValidationError, match="approved thread"):
+        adapter.execute(
+            operation,
+            _input(operation),
+            continuation=None,
+            credential=_credential(operation),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+    assert transport.requests[-1]["path"] == "/api/conversations.replies"
+    assert transport.requests[-1]["query"] == (
+        ("channel", "C123"),
+        ("ts", "1712345678.000001"),
+        ("oldest", "1712345678.000002"),
+        ("latest", "1712345678.000002"),
+        ("inclusive", "true"),
+        ("limit", "1"),
+    )
+    assert not any(
+        request["path"] in {"/api/chat.delete", "/api/chat.update"}
+        for request in transport.requests
+    )
+
+
+def test_slack_rich_messages_need_no_text_and_keep_thread_routing_fields() -> None:
+    adapter = CollaborationConnectorAdapter()
+    transport = _FakeTransport()
+    create = _operation("slack", ConnectorMode.WRITE, "messages.create")
+    update = _operation("slack", ConnectorMode.WRITE, "messages.update")
+    reply = _operation("slack", ConnectorMode.WRITE, "threads.reply")
+    blocks = [
+        {
+            "text": {"emoji": True, "text": "Status", "type": "plain_text"},
+            "type": "header",
+        },
+        {
+            "fields": [{"text": "*Owner*\nOlivier", "type": "mrkdwn"}],
+            "type": "section",
+        },
+    ]
+    attachments = [{"color": "good", "fallback": "Ready", "text": "Ready to ship"}]
+
+    adapter.execute(
+        create,
+        {"attachments": attachments, "channel": "C123"},
+        continuation=None,
+        credential=_credential(create),
+        transport=cast(ConnectorTransport, transport),
+        write_idempotency_key="runtime-create-key",
+    )
+    adapter.execute(
+        update,
+        {
+            "blocks": blocks,
+            "channel": "C123",
+            "ts": "1712345678.000002",
+        },
+        continuation=None,
+        credential=_credential(update),
+        transport=cast(ConnectorTransport, transport),
+    )
+    adapter.execute(
+        reply,
+        {
+            "blocks": blocks,
+            "channel": "C123",
+            "reply_broadcast": True,
+            "thread_ts": "1712345678.000001",
+        },
+        continuation=None,
+        credential=_credential(reply),
+        transport=cast(ConnectorTransport, transport),
+        write_idempotency_key="runtime-thread-key",
+    )
+
+    assert transport.requests[-3]["json_body"] == {
+        "attachments": attachments,
+        "channel": "C123",
+        "client_msg_id": "runtime-create-key",
+    }
+    assert transport.requests[-2]["json_body"] == {
+        "blocks": blocks,
+        "channel": "C123",
+        "ts": "1712345678.000002",
+    }
+    assert transport.requests[-1]["json_body"] == {
+        "blocks": blocks,
+        "channel": "C123",
+        "client_msg_id": "runtime-thread-key",
+        "reply_broadcast": True,
+        "thread_ts": "1712345678.000001",
+    }
+    with pytest.raises(ValidationError, match="text, blocks, or attachments"):
+        adapter.execute(
+            create,
+            {"channel": "C123"},
+            continuation=None,
+            credential=_credential(create),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+
+def test_slack_message_idempotency_comes_from_the_consumed_runtime_confirmation() -> None:
+    adapter = CollaborationConnectorAdapter()
+    operation = _operation("slack", ConnectorMode.WRITE, "messages.create")
+    credential = _credential(operation)
+    value = {"channel": "C123", "text": "One confirmed message"}
+    session = ConnectorSession(secret=b"s" * 32, clock=lambda: 1_000.0)
+    token = session.issue_confirmation(
+        provider="slack",
+        operation="messages.create",
+        connection_id="con-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        effect=ConnectorEffect.OUTWARD,
+        authorization_tier="full",
+        granted_scopes=credential.granted_scopes,
+        mutation=value,
+        connection_version=1,
+        credential_version=credential.version,
+    )
+    runtime_key = session.consume_confirmation(
+        token,
+        provider="slack",
+        operation="messages.create",
+        connection_id="con-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        effect=ConnectorEffect.OUTWARD,
+        authorization_tier="full",
+        granted_scopes=credential.granted_scopes,
+        mutation=value,
+        connection_version=1,
+        credential_version=credential.version,
+    )
+    transport = _FakeTransport()
+
+    adapter.execute(
+        operation,
+        value,
+        continuation=None,
+        credential=credential,
+        transport=cast(ConnectorTransport, transport),
+        write_idempotency_key=runtime_key,
+    )
+
+    assert (
+        cast(Mapping[str, object], transport.requests[-1]["json_body"])["client_msg_id"]
+        == runtime_key
+    )
+    with pytest.raises(ValidationError, match="confirmed idempotency"):
+        adapter.execute(
+            operation,
+            value,
+            continuation=None,
+            credential=credential,
+            transport=cast(ConnectorTransport, _FakeTransport()),
+        )
+
+
+def test_message_updates_preserve_exact_empty_removal_fields() -> None:
+    adapter = CollaborationConnectorAdapter()
+    slack = _operation("slack", ConnectorMode.WRITE, "messages.update")
+    discord = _operation("discord", ConnectorMode.WRITE, "messages.update")
+    transport = _FakeTransport()
+
+    adapter.execute(
+        slack,
+        {
+            "attachments": [],
+            "blocks": [],
+            "channel": "C123",
+            "text": "",
+            "ts": "1712345678.000002",
+        },
+        continuation=None,
+        credential=_credential(slack),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.requests[-1]["json_body"] == {
+        "attachments": [],
+        "blocks": [],
+        "channel": "C123",
+        "text": "",
+        "ts": "1712345678.000002",
+    }
+
+    adapter.execute(
+        discord,
+        {
+            "channel_id": "123456789012345678",
+            "components": [],
+            "content": "",
+            "embeds": [],
+            "message_id": "223456789012345678",
+        },
+        continuation=None,
+        credential=_credential(discord),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.requests[-1]["json_body"] == {
+        "allowed_mentions": {"parse": []},
+        "components": [],
+        "content": "",
+        "embeds": [],
+    }
+
+
 def test_slack_ok_false_is_a_central_provider_error_even_on_http_200() -> None:
     adapter = CollaborationConnectorAdapter()
     operation = _operation("slack", ConnectorMode.READ, "users.list")
@@ -405,6 +738,81 @@ def test_slack_external_upload_and_private_download_use_only_response_bound_loca
     assert transport.locations[1]["credential"] == _credential(download).credential
     assert transport.locations[1]["location"] == "https://files.slack.com/private"
     assert downloaded.payload == {"content_base64": "ZG93bmxvYWRlZA==", "file_id": "F123"}
+
+
+def test_slack_upload_verifies_completion_and_reconciles_unknown_outcome_once() -> None:
+    adapter = CollaborationConnectorAdapter()
+    operation = _operation("slack", ConnectorMode.WRITE, "files.upload")
+    credential = _credential(operation)
+
+    mismatch = _FakeTransport(
+        slack_complete_files=[{"id": "F-other"}],
+        slack_info_file=None,
+    )
+    with pytest.raises(SlackUploadOutcomeUnknown):
+        adapter.execute(
+            operation,
+            _input(operation),
+            continuation=None,
+            credential=credential,
+            transport=cast(ConnectorTransport, mismatch),
+        )
+    assert [request["path"] for request in mismatch.requests].count(
+        "/api/files.completeUploadExternal"
+    ) == 1
+    assert [request["path"] for request in mismatch.requests].count("/api/files.info") == 1
+
+    reconciled_transport = _FakeTransport(slack_complete_outcome_unknown=True)
+    reconciled = adapter.execute(
+        operation,
+        {**_input(operation), "thread_ts": "1712345678.000001"},
+        continuation=None,
+        credential=credential,
+        transport=cast(ConnectorTransport, reconciled_transport),
+    )
+    assert reconciled.payload == {"file_id": "F1", "reconciliation": "confirmed"}
+    assert [request["path"] for request in reconciled_transport.requests].count(
+        "/api/files.getUploadURLExternal"
+    ) == 1
+    assert [request["path"] for request in reconciled_transport.requests].count(
+        "/api/files.completeUploadExternal"
+    ) == 1
+    assert [request["path"] for request in reconciled_transport.requests].count(
+        "/api/files.info"
+    ) == 1
+
+
+def test_slack_upload_unresolved_completion_exposes_only_safe_recovery_identity() -> None:
+    adapter = CollaborationConnectorAdapter()
+    operation = _operation("slack", ConnectorMode.WRITE, "files.upload")
+    transport = _FakeTransport(
+        slack_complete_outcome_unknown=True,
+        slack_info_file={
+            "channels": ["C123"],
+            "id": "F1",
+            "shares": {"public": {"C123": [{"thread_ts": "1712345678.999999"}]}},
+        },
+    )
+
+    with pytest.raises(SlackUploadOutcomeUnknown) as caught:
+        adapter.execute(
+            operation,
+            {**_input(operation), "thread_ts": "1712345678.000001"},
+            continuation=None,
+            credential=_credential(operation),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+    assert caught.value.file_id == "F1"
+    assert caught.value.recovery_action == "inspect_file_before_retry"
+    assert caught.value.may_allocate_replacement is False
+    assert "files.get" in str(caught.value)
+    assert [request["path"] for request in transport.requests].count(
+        "/api/files.getUploadURLExternal"
+    ) == 1
+    assert [request["path"] for request in transport.requests].count(
+        "/api/files.completeUploadExternal"
+    ) == 1
 
 
 def test_discord_requires_a_verified_bot_and_enforces_bot_authorship_before_mutation() -> None:
@@ -471,6 +879,214 @@ def test_discord_message_nonce_is_enforced_and_empty_content_is_detected() -> No
             transport=cast(ConnectorTransport, _FakeTransport(message_content="")),
             write_idempotency_key="another-confirmed-id",
         )
+
+
+def test_discord_messages_suppress_mentions_by_default_and_shape_safe_rich_content() -> None:
+    adapter = CollaborationConnectorAdapter()
+    operation = _operation("discord", ConnectorMode.WRITE, "messages.create")
+    transport = _FakeTransport(message_content="")
+    poll = {
+        "answers": [
+            {"poll_media": {"text": "Now"}},
+            {"poll_media": {"emoji": {"name": "🕐"}, "text": "Later"}},
+        ],
+        "duration": 24,
+        "question": {"text": "When should we ship?"},
+    }
+    components = [
+        {
+            "components": [
+                {
+                    "destination": "https://example.com/status",
+                    "label": "View status",
+                    "type": "link_button",
+                }
+            ],
+            "type": "action_row",
+        }
+    ]
+
+    adapter.execute(
+        operation,
+        {
+            "channel_id": "123456789012345678",
+            "components": components,
+            "poll": poll,
+        },
+        continuation=None,
+        credential=_credential(operation),
+        transport=cast(ConnectorTransport, transport),
+        write_idempotency_key="rich-message-id",
+    )
+
+    body = cast(Mapping[str, object], transport.requests[-1]["json_body"])
+    assert body["allowed_mentions"] == {"parse": []}
+    assert body["poll"] == poll
+    assert body["components"] == [
+        {
+            "components": [
+                {
+                    "label": "View status",
+                    "style": 5,
+                    "type": 2,
+                    "url": "https://example.com/status",
+                }
+            ],
+            "type": 1,
+        }
+    ]
+
+    update = _operation("discord", ConnectorMode.WRITE, "messages.update")
+    adapter.execute(
+        update,
+        {
+            "channel_id": "123456789012345678",
+            "embeds": [{"description": "Updated without plain-text content"}],
+            "message_id": "223456789012345678",
+        },
+        continuation=None,
+        credential=_credential(update),
+        transport=cast(ConnectorTransport, transport),
+    )
+    update_body = cast(Mapping[str, object], transport.requests[-1]["json_body"])
+    assert update_body == {
+        "allowed_mentions": {"parse": []},
+        "embeds": [{"description": "Updated without plain-text content"}],
+    }
+
+
+def test_discord_explicit_mentions_and_pagination_are_semantically_closed() -> None:
+    adapter = CollaborationConnectorAdapter()
+    message = _operation("discord", ConnectorMode.WRITE, "messages.create")
+    listing = _operation("discord", ConnectorMode.READ, "messages.list")
+    guilds = _operation("discord", ConnectorMode.READ, "guilds.list")
+    transport = _FakeTransport()
+
+    adapter.execute(
+        message,
+        {
+            "allowed_mentions": {"replied_user": False, "users": ["123"]},
+            "channel_id": "123456789012345678",
+            "content": "Hello <@123>",
+        },
+        continuation=None,
+        credential=_credential(message),
+        transport=cast(ConnectorTransport, transport),
+        write_idempotency_key="mention-message-id",
+    )
+    assert cast(Mapping[str, object], transport.requests[-1]["json_body"])["allowed_mentions"] == {
+        "replied_user": False,
+        "users": ["123"],
+    }
+
+    adapter.execute(
+        message,
+        {
+            "allowed_mentions": {
+                "parse": ["everyone"],
+                "roles": ["456"],
+                "users": ["123"],
+            },
+            "channel_id": "123456789012345678",
+            "content": "Hello @everyone <@123> <@&456>",
+        },
+        continuation=None,
+        credential=_credential(message),
+        transport=cast(ConnectorTransport, transport),
+        write_idempotency_key="non-overlap-message-id",
+    )
+    assert cast(Mapping[str, object], transport.requests[-1]["json_body"])["allowed_mentions"] == {
+        "parse": ["everyone"],
+        "roles": ["456"],
+        "users": ["123"],
+    }
+
+    adapter.execute(
+        message,
+        {
+            "allowed_mentions": {"parse": ["users"], "users": []},
+            "channel_id": "123456789012345678",
+            "content": "No explicit user IDs",
+        },
+        continuation=None,
+        credential=_credential(message),
+        transport=cast(ConnectorTransport, transport),
+        write_idempotency_key="empty-overlap-message-id",
+    )
+
+    with pytest.raises(ValidationError, match="overlap"):
+        adapter.execute(
+            message,
+            {
+                "allowed_mentions": {"parse": ["users"], "users": ["123"]},
+                "channel_id": "123456789012345678",
+                "content": "Hello <@123>",
+            },
+            continuation=None,
+            credential=_credential(message),
+            transport=cast(ConnectorTransport, transport),
+            write_idempotency_key="invalid-mention-message-id",
+        )
+    with pytest.raises(ValidationError, match="message cursor"):
+        adapter.execute(
+            listing,
+            {
+                "after": "123",
+                "before": "456",
+                "channel_id": "123456789012345678",
+            },
+            continuation=None,
+            credential=_credential(listing),
+            transport=cast(ConnectorTransport, transport),
+        )
+    with pytest.raises(ValidationError, match="guild cursor"):
+        adapter.execute(
+            guilds,
+            {"after": "123", "before": "456"},
+            continuation=None,
+            credential=_credential(guilds),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+
+def test_discord_identity_reports_message_content_redaction_from_application_flags() -> None:
+    adapter = CollaborationConnectorAdapter()
+    operation = _operation("discord", ConnectorMode.READ, "identity.get")
+
+    redacted = adapter.execute(
+        operation,
+        {},
+        continuation=None,
+        credential=_credential(operation),
+        transport=cast(ConnectorTransport, _FakeTransport(application_flags=0)),
+    )
+    available = adapter.execute(
+        operation,
+        {},
+        continuation=None,
+        credential=_credential(operation),
+        transport=cast(ConnectorTransport, _FakeTransport(application_flags=1 << 19)),
+    )
+    unknown = adapter.execute(
+        operation,
+        {},
+        continuation=None,
+        credential=_credential(operation),
+        transport=cast(ConnectorTransport, _FakeTransport(application_flags=None)),
+    )
+
+    assert cast(Mapping[str, object], redacted.payload)["message_content_readback"] == {
+        "source": "current_application_flags",
+        "status": "redacted",
+    }
+    assert cast(Mapping[str, object], available.payload)["message_content_readback"] == {
+        "source": "current_application_flags",
+        "status": "available",
+    }
+    assert cast(Mapping[str, object], unknown.payload)["message_content_readback"] == {
+        "source": "current_application_flags",
+        "status": "unknown",
+    }
 
 
 def test_discord_attachment_multipart_and_raw_transport_fields_are_rejected() -> None:

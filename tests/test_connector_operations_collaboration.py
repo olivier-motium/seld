@@ -128,7 +128,6 @@ def test_representative_message_thread_and_file_inputs_are_exactly_validated() -
                     },
                 ],
                 "channel": "C123",
-                "client_msg_id": "client-123",
                 "text": "Hello team",
                 "unfurl_links": False,
             },
@@ -199,6 +198,12 @@ def test_representative_message_thread_and_file_inputs_are_exactly_validated() -
     ("provider", "mode", "name", "value"),
     [
         ("slack", ConnectorMode.READ, "messages.list", {"channel": "C123", "cursor": "opaque"}),
+        (
+            "slack",
+            ConnectorMode.WRITE,
+            "messages.create",
+            {"channel": "C123", "client_msg_id": "caller-controlled", "text": "unsafe"},
+        ),
         (
             "slack",
             ConnectorMode.WRITE,
@@ -289,6 +294,14 @@ def test_slack_history_scope_alternatives_require_one_complete_history_grant() -
     assert not history.scope_grant_satisfies({"channels:read"})
     assert not history.scope_grant_satisfies({"channels:read", "groups:read"})
 
+    thread_update = _operation("slack", ConnectorMode.WRITE, "threads.update")
+    assert thread_update.scope_grant_satisfies({"channels:history", "chat:write"})
+    assert not thread_update.scope_grant_satisfies({"chat:write"})
+
+    upload = _operation("slack", ConnectorMode.WRITE, "files.upload")
+    assert upload.scope_grant_satisfies({"files:read", "files:write"})
+    assert not upload.scope_grant_satisfies({"files:write"})
+
 
 def test_rich_slack_message_text_fits_the_explicit_bound() -> None:
     text = "x" * 40_000
@@ -297,3 +310,122 @@ def test_rich_slack_message_text_fits_the_explicit_bound() -> None:
     assert _validated_input(operation, {"channel": "C123", "text": text})["text"] == text
     with pytest.raises(ValidationError):
         operation.validate_input({"channel": "C123", "text": text + "x"})
+
+
+def test_thread_file_and_archived_pagination_match_provider_shapes() -> None:
+    thread = _operation("slack", ConnectorMode.READ, "threads.list")
+    files = _operation("slack", ConnectorMode.READ, "files.list")
+    archived = _operation("discord", ConnectorMode.READ, "threads.archived_public")
+
+    assert (
+        _validated_input(
+            thread,
+            {"channel": "C123", "limit": 15, "thread_ts": "1712345678.000001"},
+        )["thread_ts"]
+        == "1712345678.000001"
+    )
+    with pytest.raises(ValidationError):
+        thread.validate_input({"channel": "C123", "limit": 15})
+    assert _validated_input(files, {"count": 200, "page": 3}) == {
+        "count": 200,
+        "page": 3,
+    }
+    with pytest.raises(ValidationError):
+        files.validate_input({"limit": 200})
+    assert (
+        _validated_input(
+            archived,
+            {"before": "2026-07-31T12:34:56.123Z", "channel_id": "123"},
+        )["before"]
+        == "2026-07-31T12:34:56.123Z"
+    )
+    with pytest.raises(ValidationError):
+        archived.validate_input({"before": "123", "channel_id": "123"})
+
+
+def test_discord_catalog_accepts_closed_poll_and_noninteractive_link_components() -> None:
+    operation = _operation("discord", ConnectorMode.WRITE, "messages.create")
+    value = {
+        "allowed_mentions": {"parse": []},
+        "channel_id": "123456789012345678",
+        "components": [
+            {
+                "components": [
+                    {
+                        "destination": "https://example.com/status",
+                        "label": "View status",
+                        "type": "link_button",
+                    }
+                ],
+                "type": "action_row",
+            }
+        ],
+        "poll": {
+            "answers": [
+                {"poll_media": {"text": "Now"}},
+                {"poll_media": {"text": "Later"}},
+            ],
+            "question": {"text": "When?"},
+        },
+    }
+
+    assert _validated_input(operation, value)["poll"] == value["poll"]
+    with pytest.raises(ValidationError):
+        operation.validate_input(
+            {
+                "channel_id": "123456789012345678",
+                "components": [
+                    {
+                        "components": [
+                            {
+                                "custom_id": "requires-an-inbound-receiver",
+                                "label": "Click",
+                                "type": "button",
+                            }
+                        ],
+                        "type": "action_row",
+                    }
+                ],
+            }
+        )
+
+
+def test_message_edit_schemas_allow_exact_removal_without_weakening_create() -> None:
+    slack_create = _operation("slack", ConnectorMode.WRITE, "messages.create")
+    slack_update = _operation("slack", ConnectorMode.WRITE, "messages.update")
+    discord_create = _operation("discord", ConnectorMode.WRITE, "messages.create")
+    discord_update = _operation("discord", ConnectorMode.WRITE, "messages.update")
+
+    assert (
+        _validated_input(
+            slack_update,
+            {
+                "attachments": [],
+                "blocks": [],
+                "channel": "C123",
+                "text": "",
+                "ts": "1712345678.000001",
+            },
+        )["blocks"]
+        == []
+    )
+    for field, empty in (("attachments", []), ("blocks", []), ("text", "")):
+        with pytest.raises(ValidationError):
+            slack_create.validate_input({"channel": "C123", field: empty})
+
+    assert (
+        _validated_input(
+            discord_update,
+            {
+                "channel_id": "123",
+                "components": [],
+                "content": "",
+                "embeds": [],
+                "message_id": "456",
+            },
+        )["content"]
+        == ""
+    )
+    for field, empty in (("components", []), ("content", ""), ("embeds", [])):
+        with pytest.raises(ValidationError):
+            discord_create.validate_input({"channel_id": "123", field: empty})

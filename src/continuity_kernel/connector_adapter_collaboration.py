@@ -16,13 +16,14 @@ from continuity_kernel.connector_transport import (
     AuthorizationScheme,
     ConnectorMethod,
     ConnectorOrigin,
+    ConnectorOutcomeUnknown,
     ConnectorProviderError,
     ConnectorResponse,
     ConnectorTransport,
 )
-from continuity_kernel.errors import ValidationError
+from continuity_kernel.errors import ContinuityError, ValidationError
 
-__all__ = ["CollaborationConnectorAdapter"]
+__all__ = ["CollaborationConnectorAdapter", "SlackUploadOutcomeUnknown"]
 
 
 _PROVIDERS: Final = frozenset({"discord", "slack"})
@@ -41,6 +42,21 @@ _DISCORD_CHANNEL_TYPES: Final = {
     "voice": 2,
 }
 _DISCORD_THREAD_TYPES: Final = {"private": 12, "public": 11}
+_DISCORD_MESSAGE_CONTENT_FLAGS: Final = (1 << 18) | (1 << 19)
+
+
+class SlackUploadOutcomeUnknown(ConnectorOutcomeUnknown):
+    """Completion may have committed; expose only the allocated ID and safe recovery."""
+
+    def __init__(self, file_id: str) -> None:
+        safe_file_id = _required_slack_id(file_id, "Slack file identifier")
+        self.file_id = safe_file_id
+        self.recovery_action = "inspect_file_before_retry"
+        self.may_allocate_replacement = False
+        super().__init__(
+            f"Slack upload completion is unresolved for allocated file {safe_file_id}; "
+            "inspect it with files.get before retrying and do not allocate a replacement"
+        )
 
 
 class CollaborationConnectorAdapter:
@@ -67,7 +83,14 @@ class CollaborationConnectorAdapter:
         value = self._validated_input(operation, input_value)
         self._validate_runtime(operation, credential)
         if operation.provider == "slack":
-            return self._execute_slack(operation, value, continuation, credential, transport)
+            return self._execute_slack(
+                operation,
+                value,
+                continuation,
+                credential,
+                transport,
+                write_idempotency_key=write_idempotency_key,
+            )
         return self._execute_discord(
             operation,
             value,
@@ -93,6 +116,7 @@ class CollaborationConnectorAdapter:
         value = canonical.validate_input(input_value)
         if not isinstance(value, dict):
             raise ValidationError("connector operation input is invalid")
+        _validate_collaboration_semantics(canonical, value)
         return value
 
     def _validate_runtime(
@@ -117,6 +141,8 @@ class CollaborationConnectorAdapter:
         continuation: object | None,
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
+        *,
+        write_idempotency_key: str | None,
     ) -> ConnectorAdapterResult:
         name = operation.name
         if name == "files.upload":
@@ -185,7 +211,7 @@ class CollaborationConnectorAdapter:
                 transport,
                 credential,
                 ConnectorMethod.GET,
-                "/api/conversations.history",
+                "/api/conversations.replies",
                 query=_slack_threads_list_query(value, continuation),
             )
         if name == "files.list":
@@ -217,11 +243,17 @@ class CollaborationConnectorAdapter:
             )
 
         _reject_continuation(continuation)
+        if name in {"threads.delete", "threads.update"}:
+            self._slack_assert_thread_member(value, credential, transport)
         route = _SLACK_WRITE_ROUTES.get(name)
         if route is None:
             raise ValidationError("Slack connector operation has no fixed route")
         method, path = route
-        body = _slack_write_body(name, value)
+        body = _slack_write_body(
+            name,
+            value,
+            write_idempotency_key=write_idempotency_key,
+        )
         return self._slack_request(transport, credential, method, path, body=body)
 
     def _slack_request(
@@ -246,6 +278,39 @@ class CollaborationConnectorAdapter:
         payload, continuation = _slack_payload(response)
         return ConnectorAdapterResult(payload, continuation=continuation)
 
+    def _slack_assert_thread_member(
+        self,
+        value: Mapping[str, object],
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+    ) -> None:
+        target = _query_text(value["ts"])
+        parent = _query_text(value["thread_ts"])
+        result = self._slack_request(
+            transport,
+            credential,
+            ConnectorMethod.GET,
+            "/api/conversations.replies",
+            query=(
+                ("channel", _query_text(value["channel"])),
+                ("ts", parent),
+                ("oldest", target),
+                ("latest", target),
+                ("inclusive", "true"),
+                ("limit", "1"),
+            ),
+        )
+        payload = result.payload
+        messages = payload.get("messages") if isinstance(payload, Mapping) else None
+        if not isinstance(messages, list) or len(messages) > 1:
+            raise ValidationError("Slack thread membership response is invalid")
+        for message in messages:
+            if not isinstance(message, Mapping) or message.get("ts") != target:
+                continue
+            if target == parent or message.get("thread_ts") == parent:
+                return
+        raise ValidationError("Slack message is not a member of the approved thread")
+
     def _slack_upload(
         self,
         value: dict[str, object],
@@ -263,7 +328,7 @@ class CollaborationConnectorAdapter:
         )
         start_payload, _ = _slack_payload(start)
         upload_location = _required_text(start_payload.get("upload_url"), "Slack upload location")
-        external_file_id = _required_text(start_payload.get("file_id"), "Slack file identifier")
+        external_file_id = _required_slack_id(start_payload.get("file_id"), "Slack file identifier")
         transport.request_provider_location(
             origin=ConnectorOrigin.SLACK,
             method=ConnectorMethod.POST,
@@ -283,13 +348,74 @@ class CollaborationConnectorAdapter:
         }
         if "thread_ts" in value:
             complete_body["thread_ts"] = value["thread_ts"]
-        return self._slack_request(
-            transport,
-            credential,
-            ConnectorMethod.POST,
-            "/api/files.completeUploadExternal",
-            body=complete_body,
-        )
+        try:
+            completed = self._slack_request(
+                transport,
+                credential,
+                ConnectorMethod.POST,
+                "/api/files.completeUploadExternal",
+                body=complete_body,
+            )
+        except ConnectorOutcomeUnknown:
+            return self._slack_reconcile_or_raise(
+                external_file_id,
+                value,
+                credential,
+                transport,
+            )
+        try:
+            _slack_completed_file(completed.payload, external_file_id)
+        except ConnectorProviderError as exc:
+            if exc.code != "upload_completion_mismatch":
+                raise
+            return self._slack_reconcile_or_raise(
+                external_file_id,
+                value,
+                credential,
+                transport,
+            )
+        return completed
+
+    def _slack_reconcile_or_raise(
+        self,
+        file_id: str,
+        value: Mapping[str, object],
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+    ) -> ConnectorAdapterResult:
+        if self._slack_reconcile_upload(file_id, value, credential, transport):
+            return ConnectorAdapterResult(
+                {
+                    "file_id": file_id,
+                    "reconciliation": "confirmed",
+                }
+            )
+        raise SlackUploadOutcomeUnknown(file_id) from None
+
+    def _slack_reconcile_upload(
+        self,
+        file_id: str,
+        value: Mapping[str, object],
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+    ) -> bool:
+        try:
+            result = self._slack_request(
+                transport,
+                credential,
+                ConnectorMethod.GET,
+                "/api/files.info",
+                query=(("file", file_id),),
+            )
+            file_value = result.payload.get("file") if isinstance(result.payload, Mapping) else None
+            return isinstance(file_value, Mapping) and _slack_file_matches_completion(
+                file_value,
+                file_id=file_id,
+                channel=_query_text(value["channel"]),
+                thread_ts=(_query_text(value["thread_ts"]) if "thread_ts" in value else None),
+            )
+        except ContinuityError:
+            return False
 
     def _slack_download(
         self,
@@ -342,7 +468,8 @@ class CollaborationConnectorAdapter:
         _reject_continuation(continuation)
         bot = self._discord_identity(credential, transport)
         if operation.name == "identity.get":
-            return ConnectorAdapterResult(bot)
+            application = self._discord_application(credential, transport)
+            return ConnectorAdapterResult(_discord_identity_report(bot, application))
         bot_id = _required_text(bot.get("id"), "Discord bot identifier")
         name = operation.name
 
@@ -573,6 +700,25 @@ class CollaborationConnectorAdapter:
             )
         return result.payload
 
+    def _discord_application(
+        self,
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+    ) -> dict[str, object]:
+        result = self._discord_request(
+            transport,
+            credential,
+            ConnectorMethod.GET,
+            "/api/v10/oauth2/applications/@me",
+        )
+        if not isinstance(result.payload, dict):
+            raise ConnectorProviderError(
+                origin=ConnectorOrigin.DISCORD,
+                status=200,
+                code="invalid_application_response",
+            )
+        return result.payload
+
     def _discord_owned_message(
         self,
         value: dict[str, object],
@@ -738,7 +884,12 @@ _SLACK_WRITE_ROUTES: Final = {
 }
 
 
-def _slack_write_body(name: str, value: dict[str, object]) -> dict[str, object]:
+def _slack_write_body(
+    name: str,
+    value: dict[str, object],
+    *,
+    write_idempotency_key: str | None,
+) -> dict[str, object]:
     if name == "dms.open":
         return {"users": ",".join(cast(list[str], value["users"]))}
     if name in {
@@ -758,12 +909,12 @@ def _slack_write_body(name: str, value: dict[str, object]) -> dict[str, object]:
     if name == "channels.purpose":
         return _selected(value, ("channel", "purpose"))
     if name in {"messages.create", "threads.reply"}:
-        return _selected(
+        body = _selected(
             value,
             (
+                "attachments",
                 "blocks",
                 "channel",
-                "client_msg_id",
                 "reply_broadcast",
                 "text",
                 "thread_ts",
@@ -771,18 +922,17 @@ def _slack_write_body(name: str, value: dict[str, object]) -> dict[str, object]:
                 "unfurl_media",
             ),
         )
+        body["client_msg_id"] = _slack_idempotency_key(write_idempotency_key)
+        return body
     if name in {"messages.update", "threads.update"}:
         return _selected(
             value,
             (
+                "attachments",
                 "blocks",
                 "channel",
-                "client_msg_id",
-                "reply_broadcast",
                 "text",
                 "ts",
-                "unfurl_links",
-                "unfurl_media",
             ),
         )
     if name in {"messages.delete", "threads.delete"}:
@@ -792,6 +942,17 @@ def _slack_write_body(name: str, value: dict[str, object]) -> dict[str, object]:
     if name in {"reactions.add", "reactions.remove"}:
         return _selected(value, ("channel", "emoji", "timestamp"))
     raise ValidationError("Slack connector operation has no fixed body")
+
+
+def _slack_idempotency_key(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not 16 <= len(value) <= 128
+        or not value.isascii()
+        or any(not (character.isalnum() or character in "_-") for character in value)
+    ):
+        raise ValidationError("Slack message creation requires confirmed idempotency")
+    return value
 
 
 def _slack_users_list_query(
@@ -847,7 +1008,10 @@ def _slack_message_query(value: Mapping[str, object]) -> tuple[tuple[str, str], 
 def _slack_threads_list_query(
     value: Mapping[str, object], continuation: object | None
 ) -> tuple[tuple[str, str], ...]:
-    query = [("channel", _query_text(value["channel"]))]
+    query = [
+        ("channel", _query_text(value["channel"])),
+        ("ts", _query_text(value["thread_ts"])),
+    ]
     if "latest" in value:
         query.append(("latest", _query_text(value["latest"])))
     if "limit" in value:
@@ -861,12 +1025,14 @@ def _slack_files_list_query(value: Mapping[str, object]) -> tuple[tuple[str, str
     query: list[tuple[str, str]] = []
     if "channel" in value:
         query.append(("channel", _query_text(value["channel"])))
-    if "limit" in value:
-        query.append(("count", _query_text(value["limit"])))
+    if "count" in value:
+        query.append(("count", _query_text(value["count"])))
     if "oldest" in value:
         query.append(("ts_from", _query_text(value["oldest"])))
     if "latest" in value:
         query.append(("ts_to", _query_text(value["latest"])))
+    if "page" in value:
+        query.append(("page", _query_text(value["page"])))
     return tuple(query)
 
 
@@ -929,6 +1095,64 @@ def _slack_payload(response: ConnectorResponse) -> tuple[dict[str, object], obje
         else:
             shaped.pop("response_metadata", None)
     return shaped, continuation
+
+
+def _slack_completed_file(payload: object, file_id: str) -> Mapping[str, object]:
+    files = payload.get("files") if isinstance(payload, Mapping) else None
+    if not isinstance(files, list) or not 1 <= len(files) <= 128:
+        raise ConnectorProviderError(
+            origin=ConnectorOrigin.SLACK,
+            status=200,
+            code="upload_completion_mismatch",
+        )
+    matches = [
+        file_value
+        for file_value in files
+        if isinstance(file_value, Mapping) and file_value.get("id") == file_id
+    ]
+    if len(matches) != 1:
+        raise ConnectorProviderError(
+            origin=ConnectorOrigin.SLACK,
+            status=200,
+            code="upload_completion_mismatch",
+        )
+    return matches[0]
+
+
+def _slack_file_matches_completion(
+    file_value: Mapping[str, object],
+    *,
+    file_id: str,
+    channel: str,
+    thread_ts: str | None,
+) -> bool:
+    if file_value.get("id") != file_id:
+        return False
+    channel_bound = any(
+        isinstance(channels, list) and channel in channels
+        for channels in (
+            file_value.get("channels"),
+            file_value.get("groups"),
+            file_value.get("ims"),
+        )
+    )
+    shares = file_value.get("shares")
+    if isinstance(shares, Mapping):
+        for visibility in shares.values():
+            if not isinstance(visibility, Mapping):
+                continue
+            records = visibility.get(channel)
+            if not isinstance(records, list):
+                continue
+            channel_bound = True
+            if thread_ts is None:
+                return True
+            if any(
+                isinstance(record, Mapping) and record.get("thread_ts") == thread_ts
+                for record in records
+            ):
+                return True
+    return channel_bound and thread_ts is None
 
 
 def _discord_payload(response: ConnectorResponse) -> object:
@@ -1006,7 +1230,10 @@ def _discord_thread_body(value: Mapping[str, object], *, from_message: bool) -> 
 def _discord_message_body(
     value: Mapping[str, object], *, nonce: str | None = None
 ) -> dict[str, object]:
-    body = _selected(value, ("content", "embeds", "message_reference"))
+    body = _selected(value, ("content", "embeds", "message_reference", "poll"))
+    body["allowed_mentions"] = _discord_allowed_mentions(value.get("allowed_mentions"))
+    if "components" in value:
+        body["components"] = _discord_components(value["components"])
     if nonce is not None:
         if not isinstance(nonce, str) or not nonce or len(nonce) > 128:
             raise ValidationError("Discord message idempotency key is invalid")
@@ -1015,12 +1242,191 @@ def _discord_message_body(
     return body
 
 
+def _discord_allowed_mentions(value: object) -> dict[str, object]:
+    if value is None:
+        return {"parse": []}
+    if not isinstance(value, Mapping):
+        raise ValidationError("Discord allowed mentions are invalid")
+    shaped = {str(key): item for key, item in value.items()}
+    if "parse" not in shaped and "roles" not in shaped and "users" not in shaped:
+        shaped["parse"] = []
+    return shaped
+
+
+def _discord_components(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        raise ValidationError("Discord message components are invalid")
+    rows: list[dict[str, object]] = []
+    for row in value:
+        if not isinstance(row, Mapping) or row.get("type") != "action_row":
+            raise ValidationError("Discord message components are invalid")
+        items = row.get("components")
+        if not isinstance(items, list):
+            raise ValidationError("Discord message components are invalid")
+        buttons: list[dict[str, object]] = []
+        for item in items:
+            if not isinstance(item, Mapping) or item.get("type") != "link_button":
+                raise ValidationError("Discord message components are invalid")
+            button = _selected(item, ("disabled", "emoji", "label"))
+            button["style"] = 5
+            button["type"] = 2
+            button["url"] = item["destination"]
+            buttons.append(button)
+        rows.append({"components": buttons, "type": 1})
+    return rows
+
+
 def _discord_reaction_path(value: Mapping[str, object]) -> str:
     emoji = _query_text(value["emoji"])
     return (
         f"/api/v10/channels/{value['channel_id']}/messages/{value['message_id']}"
         f"/reactions/{quote(emoji, safe='')}"
     )
+
+
+def _discord_identity_report(
+    bot: Mapping[str, object], application: Mapping[str, object]
+) -> dict[str, object]:
+    report = {str(key): item for key, item in bot.items()}
+    flags = _discord_application_flags(application)
+    if flags is None:
+        status = "unknown"
+    elif flags & _DISCORD_MESSAGE_CONTENT_FLAGS:
+        status = "available"
+    else:
+        status = "redacted"
+    report["message_content_readback"] = {
+        "source": "current_application_flags",
+        "status": status,
+    }
+    return report
+
+
+def _discord_application_flags(application: Mapping[str, object]) -> int | None:
+    flags = application.get("flags")
+    if type(flags) is int and flags >= 0:
+        return flags
+    flags_new = application.get("flags_new")
+    if isinstance(flags_new, str) and flags_new.isascii() and flags_new.isdigit():
+        try:
+            parsed = int(flags_new)
+        except ValueError:
+            return None
+        if parsed >= 0:
+            return parsed
+    return None
+
+
+def _validate_collaboration_semantics(
+    operation: OperationSpec, value: Mapping[str, object]
+) -> None:
+    if operation.provider == "slack":
+        if operation.name in {
+            "messages.create",
+            "messages.update",
+            "threads.reply",
+            "threads.update",
+        }:
+            _validate_slack_message(value)
+        return
+
+    if operation.name == "guilds.list":
+        _require_at_most_one(value, ("after", "before"), "Discord guild cursor")
+    elif operation.name == "messages.list":
+        _require_at_most_one(
+            value,
+            ("after", "around", "before"),
+            "Discord message cursor",
+        )
+    elif operation.name in {"messages.create", "messages.update"}:
+        _validate_discord_message(operation.name, value)
+
+
+def _validate_slack_message(value: Mapping[str, object]) -> None:
+    if not any(field in value for field in ("attachments", "blocks", "text")):
+        raise ValidationError("Slack messages require text, blocks, or attachments")
+    blocks = value.get("blocks")
+    if isinstance(blocks, list):
+        for block in blocks:
+            if (
+                isinstance(block, Mapping)
+                and block.get("type") == "section"
+                and "text" not in block
+                and "fields" not in block
+            ):
+                raise ValidationError("Slack section blocks require text or fields")
+    attachments = value.get("attachments")
+    if isinstance(attachments, list):
+        visible_fields = frozenset({"fallback", "fields", "footer", "pretext", "text", "title"})
+        for attachment in attachments:
+            if not isinstance(attachment, Mapping) or not visible_fields & set(attachment):
+                raise ValidationError("Slack attachments require visible content")
+    if value.get("reply_broadcast") is True and "thread_ts" not in value:
+        raise ValidationError("Slack reply broadcast requires a thread timestamp")
+
+
+def _validate_discord_message(name: str, value: Mapping[str, object]) -> None:
+    content_fields = ("components", "content", "embeds", "poll")
+    if not any(field in value for field in content_fields):
+        raise ValidationError("Discord messages require content, embeds, poll, or components")
+    if name == "messages.update" and "poll" in value:
+        raise ValidationError("Discord polls cannot be edited")
+
+    embeds = value.get("embeds")
+    if isinstance(embeds, list):
+        total_characters = 0
+        for embed in embeds:
+            if not isinstance(embed, Mapping):
+                raise ValidationError("Discord embeds are invalid")
+            if not any(
+                field in embed for field in ("author", "description", "fields", "footer", "title")
+            ):
+                raise ValidationError("Discord embeds require visible content")
+            total_characters += _discord_embed_characters(embed)
+        if total_characters > 6_000:
+            raise ValidationError("Discord embed text exceeds the combined message bound")
+
+    allowed_mentions = value.get("allowed_mentions")
+    if isinstance(allowed_mentions, Mapping):
+        parse = allowed_mentions.get("parse")
+        if isinstance(parse, list):
+            parsed = cast(list[str], parse)
+            if len(set(parsed)) != len(parsed):
+                raise ValidationError("Discord allowed mention types must be unique")
+            users = allowed_mentions.get("users")
+            roles = allowed_mentions.get("roles")
+            if "users" in parsed and isinstance(users, list) and users:
+                raise ValidationError("Discord parsed users overlap with explicit user mentions")
+            if "roles" in parsed and isinstance(roles, list) and roles:
+                raise ValidationError("Discord parsed roles overlap with explicit role mentions")
+
+
+def _discord_embed_characters(embed: Mapping[str, object]) -> int:
+    total = 0
+    for field in ("description", "title"):
+        value = embed.get(field)
+        if isinstance(value, str):
+            total += len(value)
+    for field in ("author", "footer"):
+        value = embed.get(field)
+        if isinstance(value, Mapping):
+            text = value.get("name" if field == "author" else "text")
+            if isinstance(text, str):
+                total += len(text)
+    fields = embed.get("fields")
+    if isinstance(fields, list):
+        for field in fields:
+            if isinstance(field, Mapping):
+                for key in ("name", "value"):
+                    text = field.get(key)
+                    if isinstance(text, str):
+                        total += len(text)
+    return total
+
+
+def _require_at_most_one(value: Mapping[str, object], fields: Sequence[str], label: str) -> None:
+    if sum(field in value for field in fields) > 1:
+        raise ValidationError(f"{label} fields are mutually exclusive")
 
 
 def _reject_empty_message_content(payload: object, value: Mapping[str, object]) -> None:
@@ -1109,6 +1515,17 @@ def _query_text(value: object) -> str:
 
 def _required_text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value or len(value) > 16_384:
+        raise ValidationError(f"{label} is invalid")
+    return value
+
+
+def _required_slack_id(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 128
+        or not value.isascii()
+        or not value.isalnum()
+    ):
         raise ValidationError(f"{label} is invalid")
     return value
 
