@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from continuity_kernel.connector_contract import (
@@ -187,11 +189,15 @@ def test_representative_message_event_and_attachment_inputs_are_exact(
         },
     )
 
-    assert draft["body"] == {"content": "Hello", "content_type": "text"}
-    assert attachment["attachment"]["name"] == "hello.txt"
-    assert event["start"]["time_zone"] == "Europe/Brussels"
-    assert event["show_as"] == "working_elsewhere"
-    assert message_update["follow_up"] == "flagged"
+    draft_value = cast(dict[str, object], draft)
+    attachment_value = cast(dict[str, object], attachment)
+    event_value = cast(dict[str, object], event)
+    update_value = cast(dict[str, object], message_update)
+    assert draft_value["body"] == {"content": "Hello", "content_type": "text"}
+    assert cast(dict[str, object], attachment_value["attachment"])["name"] == "hello.txt"
+    assert cast(dict[str, object], event_value["start"])["time_zone"] == "Europe/Brussels"
+    assert event_value["show_as"] == "working_elsewhere"
+    assert update_value["follow_up"] == "flagged"
 
 
 def test_message_page_size_and_follow_up_status_are_bounded(catalog: OperationCatalog) -> None:
@@ -214,6 +220,180 @@ def test_message_page_size_and_follow_up_status_are_bounded(catalog: OperationCa
             ConnectorMode.WRITE,
             "messages.update",
             {"follow_up": "later", "message_id": "message-1"},
+        )
+
+
+def test_existing_event_mutations_require_the_confirmed_change_key(
+    catalog: OperationCatalog,
+) -> None:
+    update = {
+        "calendar_id": "primary",
+        "change_key": "event-version-1",
+        "event_id": "event-1",
+        "subject": "Updated",
+    }
+    attachment = {
+        "attachment": {
+            "content_base64": "aGVsbG8=",
+            "content_type": "text/plain",
+            "name": "hello.txt",
+        },
+        "calendar_id": "primary",
+        "change_key": "event-version-1",
+        "event_id": "event-1",
+    }
+
+    assert (
+        catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "events.update",
+            update,
+        )
+        == update
+    )
+    assert (
+        catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "attachments.add",
+            attachment,
+        )
+        == attachment
+    )
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "events.update",
+            {key: value for key, value in update.items() if key != "change_key"},
+        )
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "attachments.add",
+            {key: value for key, value in attachment.items() if key != "change_key"},
+        )
+
+
+def test_recurrence_contract_enforces_each_graph_pattern_and_range_shape(
+    catalog: OperationCatalog,
+) -> None:
+    base = _event()
+    patterns = (
+        {"type": "daily", "interval": 2},
+        {
+            "type": "weekly",
+            "interval": 1,
+            "days_of_week": ["monday"],
+            "first_day_of_week": "monday",
+        },
+        {"type": "absolute_monthly", "interval": 1, "day_of_month": 15},
+        {
+            "type": "relative_monthly",
+            "interval": 1,
+            "days_of_week": ["thursday"],
+            "index": "second",
+        },
+        {
+            "type": "absolute_yearly",
+            "interval": 1,
+            "day_of_month": 15,
+            "month": 3,
+        },
+        {
+            "type": "relative_yearly",
+            "interval": 1,
+            "days_of_week": ["thursday"],
+            "index": "second",
+            "month": 11,
+        },
+    )
+    ranges = (
+        {"type": "no_end", "start_date": "2026-08-01"},
+        {
+            "type": "end_date",
+            "start_date": "2026-08-01",
+            "end_date": "2026-12-31",
+            "recurrence_time_zone": "Europe/Brussels",
+        },
+        {
+            "type": "numbered",
+            "start_date": "2026-08-01",
+            "number_of_occurrences": 10,
+        },
+    )
+
+    for pattern in patterns:
+        assert catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "events.create",
+            {**base, "recurrence": {"pattern": pattern, "range": ranges[0]}},
+        )
+    for event_range in ranges:
+        assert catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "events.create",
+            {**base, "recurrence": {"pattern": patterns[0], "range": event_range}},
+        )
+
+    invalid_patterns = (
+        {"type": "weekly", "interval": 1, "days_of_week": ["monday"]},
+        {"type": "absolute_monthly", "interval": 1},
+        {
+            "type": "relative_monthly",
+            "interval": 1,
+            "days_of_week": ["monday"],
+        },
+        {"type": "absolute_yearly", "interval": 1, "day_of_month": 1},
+        {
+            "type": "relative_yearly",
+            "interval": 1,
+            "days_of_week": ["monday"],
+            "index": "first",
+        },
+    )
+    invalid_ranges = (
+        {"type": "end_date", "start_date": "2026-08-01"},
+        {"type": "numbered", "start_date": "2026-08-01"},
+        {"type": "no_end", "start_date": "2026-08-01", "end_date": "2026-09-01"},
+    )
+    for pattern in invalid_patterns:
+        with pytest.raises(ValidationError):
+            catalog.validate_input(
+                "outlook_calendar",
+                ConnectorMode.WRITE,
+                "events.create",
+                {**base, "recurrence": {"pattern": pattern, "range": ranges[0]}},
+            )
+    for event_range in invalid_ranges:
+        with pytest.raises(ValidationError):
+            catalog.validate_input(
+                "outlook_calendar",
+                ConnectorMode.WRITE,
+                "events.create",
+                {**base, "recurrence": {"pattern": patterns[0], "range": event_range}},
+            )
+
+
+def test_message_restore_requires_an_opaque_process_local_handle(
+    catalog: OperationCatalog,
+) -> None:
+    assert catalog.validate_input(
+        "outlook_mail",
+        ConnectorMode.WRITE,
+        "messages.restore",
+        {"message_id": "message-1", "restore_handle": "rst-" + "A" * 43},
+    )
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "outlook_mail",
+            ConnectorMode.WRITE,
+            "messages.restore",
+            {"message_id": "message-1", "parent_folder_id": "caller-chosen"},
         )
 
 
@@ -269,13 +449,17 @@ def test_tool_envelopes_are_sealed_to_connection_operation_input_and_control_sta
 
     assert validate_json(read_call, read_schema) == read_call
     assert validate_json(write_call, write_schema) == write_call
+    read_variants = cast(list[dict[str, object]], read_schema["oneOf"])
+    write_variants = cast(list[dict[str, object]], write_schema["oneOf"])
     assert all(
-        set(variant["properties"]) <= {"connection_id", "cursor", "input", "operation"}
-        for variant in read_schema["oneOf"]
+        set(cast(dict[str, object], variant["properties"]))
+        <= {"connection_id", "cursor", "input", "operation"}
+        for variant in read_variants
     )
     assert all(
-        set(variant["properties"]) <= {"confirmation_token", "connection_id", "input", "operation"}
-        for variant in write_schema["oneOf"]
+        set(cast(dict[str, object], variant["properties"]))
+        <= {"confirmation_token", "connection_id", "input", "operation"}
+        for variant in write_variants
     )
     with pytest.raises(ValidationError):
         validate_json({**read_call, "url": "https://proxy.invalid"}, read_schema)

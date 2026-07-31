@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import base64
+import html
+import re
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
+from threading import Lock
+from time import monotonic
 from typing import Final
 from urllib.parse import parse_qsl, quote, urlsplit
 
@@ -25,6 +30,16 @@ _ORIGIN: Final = ConnectorOrigin.MICROSOFT_GRAPH
 _GRAPH_HOST: Final = "graph.microsoft.com"
 _ROOT: Final = "/v1.0/me"
 _PERMANENT_DELETE_UNSUPPORTED: Final = frozenset({404, 405, 501})
+_CALENDAR_PERMANENT_DELETE_UNSUPPORTED: Final = frozenset({400, 403, 404, 405, 501})
+_RESTORE_TTL_SECONDS: Final = 24 * 60 * 60
+_MAX_RESTORE_HANDLES: Final = 4_096
+_EXISTING_EVENT_MUTATIONS: Final = frozenset({"events.update", "attachments.add"})
+_HTML_DIV_TAG: Final = re.compile(r"<(/?)div\b[^<>]*>", re.IGNORECASE)
+_HTML_CLASS_ATTRIBUTE: Final = re.compile(
+    r"\bclass\s*=\s*(['\"])(.*?)\1",
+    re.IGNORECASE | re.DOTALL,
+)
+_MEETING_BLOB_CLASS: Final = "me-email-text"
 _CONTINUATION_KEYS: Final = frozenset(
     {"$filter", "$orderby", "$search", "$skip", "$skiptoken", "$top"}
 )
@@ -56,20 +71,117 @@ class _RequestShape:
     response_bound: int = 16 * 1024 * 1024
 
 
+@dataclass(frozen=True)
+class _RestoreRecord:
+    expires_at: float
+    message_id: str
+    parent_folder_id: str
+    subject_id: str
+
+
+class _MessageRestoreStore:
+    """Short-lived process-local bindings for recoverable Outlook message deletion."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, _RestoreRecord] = {}
+        self._lock = Lock()
+
+    def issue(
+        self,
+        *,
+        message_id: str,
+        parent_folder_id: str,
+        subject_id: str,
+    ) -> str:
+        now = monotonic()
+        with self._lock:
+            self._prune(now)
+            if len(self._records) >= _MAX_RESTORE_HANDLES:
+                raise ValidationError(
+                    "Outlook restore capacity is full; restore or let an earlier handle expire"
+                )
+            while True:
+                handle = "rst-" + secrets.token_urlsafe(32)
+                if handle not in self._records:
+                    break
+            self._records[handle] = _RestoreRecord(
+                expires_at=now + _RESTORE_TTL_SECONDS,
+                message_id=message_id,
+                parent_folder_id=parent_folder_id,
+                subject_id=subject_id,
+            )
+            return handle
+
+    def consume(
+        self,
+        handle: str,
+        *,
+        message_id: str,
+        subject_id: str,
+    ) -> _RestoreRecord:
+        now = monotonic()
+        with self._lock:
+            self._prune(now)
+            record = self._records.pop(handle, None)
+            if record is None:
+                raise ValidationError(
+                    "Outlook restore handle is unavailable; inspect Deleted Items before retrying"
+                )
+            if record.message_id != message_id or not secrets.compare_digest(
+                record.subject_id, subject_id
+            ):
+                self._records[handle] = record
+                raise ValidationError(
+                    "Outlook restore handle does not match this message or account"
+                )
+            return record
+
+    def restore(self, handle: str, record: _RestoreRecord) -> None:
+        with self._lock:
+            if record.expires_at > monotonic():
+                self._records.setdefault(handle, record)
+
+    def discard(self, handle: str) -> None:
+        with self._lock:
+            self._records.pop(handle, None)
+
+    def _prune(self, now: float) -> None:
+        for handle, record in tuple(self._records.items()):
+            if record.expires_at <= now:
+                del self._records[handle]
+
+
 class MicrosoftConnectorAdapter:
     """Translate only catalogued Outlook operations into pinned Graph requests."""
+
+    def __init__(self) -> None:
+        self._message_restores = _MessageRestoreStore()
 
     @property
     def providers(self) -> frozenset[str]:
         return frozenset({"outlook_mail", "outlook_calendar"})
 
-    def classify_effect(self, operation: OperationSpec, input_value: object) -> ConnectorEffect:
+    def classify_effect(
+        self,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        credential: ConnectorRuntimeCredential | None = None,
+        transport: ConnectorTransport | None = None,
+    ) -> ConnectorEffect:
         known = _known_operation(operation)
         data = _input(known, input_value)
+        if (credential is None) is not (transport is None):
+            raise ValidationError("Microsoft effect preflight requires credential and transport")
+        if known.provider == "outlook_calendar" and known.name in _EXISTING_EVENT_MUTATIONS:
+            if credential is None or transport is None:
+                return ConnectorEffect.OUTWARD
+            event = _preflight_event(data, credential=credential, transport=transport)
+            _event_precondition_data(data, event)
+            return _existing_event_effect(data, event)
         if (
             known.provider == "outlook_calendar"
-            and known.effect is ConnectorEffect.SAFE_MUTATION
-            and (known.name.startswith("events.") or known.name == "attachments.add")
+            and known.name == "events.create"
             and _event_mutation_is_outward(data)
         ):
             return ConnectorEffect.OUTWARD
@@ -85,7 +197,6 @@ class MicrosoftConnectorAdapter:
         transport: ConnectorTransport,
         write_idempotency_key: str | None = None,
     ) -> ConnectorAdapterResult:
-        del write_idempotency_key
         known = _known_operation(operation)
         data = _input(known, input_value)
         if not isinstance(credential, ConnectorRuntimeCredential):
@@ -93,32 +204,123 @@ class MicrosoftConnectorAdapter:
         if continuation is not None and known.mode is not ConnectorMode.READ:
             raise ValidationError("connector write operation cannot use a continuation")
 
+        if known.name.endswith(".purge"):
+            return _execute_permanent_delete(
+                known,
+                data,
+                credential=credential,
+                transport=transport,
+            )
+        if known.provider == "outlook_mail" and known.name == "messages.trash":
+            return self._trash_message(data, credential=credential, transport=transport)
+        if known.provider == "outlook_mail" and known.name == "messages.restore":
+            return self._restore_message(data, credential=credential, transport=transport)
+
+        event: Mapping[str, object] | None = None
+        if known.provider == "outlook_calendar" and known.name in _EXISTING_EVENT_MUTATIONS:
+            event = _preflight_event(data, credential=credential, transport=transport)
+            _event_precondition_data(data, event)
+            if (
+                _existing_event_effect(data, event) is ConnectorEffect.OUTWARD
+                and write_idempotency_key is None
+            ):
+                raise ValidationError(
+                    "the Outlook event is shared; request a fresh outward confirmation preview"
+                )
+
         shape = _request_shape(known, data)
+        request_data = data
+        if known.provider == "outlook_calendar" and known.name == "events.update":
+            assert event is not None
+            shape = _event_update_shape(data, event)
+            request_data = _event_precondition_data(data, event)
+        elif known.provider == "outlook_calendar" and known.name == "attachments.add":
+            assert event is not None
+            request_data = _event_precondition_data(data, event)
         query = shape.query
         if continuation is not None:
             query = _continuation_query(continuation, path=shape.path)
+        response = transport.request(
+            origin=_ORIGIN,
+            method=shape.method,
+            path=shape.path,
+            credential=credential.credential,
+            query=query,
+            json_body=shape.json_body,
+            headers=_headers(request_data, time_zone=shape.time_zone),
+            expected_statuses=shape.expected_statuses,
+            response_bound=shape.response_bound,
+        )
+        return _result(response, path=shape.path, mime=shape.mime)
+
+    def _trash_message(
+        self,
+        data: dict[str, object],
+        *,
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+    ) -> ConnectorAdapterResult:
+        message_id = _text(data, "message_id")
+        message = _preflight_message(message_id, credential=credential, transport=transport)
+        parent_folder_id = _required_provider_text(message, "parentFolderId", "parent folder")
+        subject_id = _resolve_graph_subject(credential=credential, transport=transport)
+        handle = self._message_restores.issue(
+            message_id=message_id,
+            parent_folder_id=parent_folder_id,
+            subject_id=subject_id,
+        )
+        try:
+            transport.request(
+                origin=_ORIGIN,
+                method=ConnectorMethod.DELETE,
+                path=_message_path(message_id),
+                credential=credential.credential,
+                headers=_headers(data, time_zone=None),
+                expected_statuses=frozenset({204}),
+            )
+        except ConnectorProviderError:
+            self._message_restores.discard(handle)
+            raise
+        return ConnectorAdapterResult(
+            {
+                "message_id": message_id,
+                "restore_handle": handle,
+                "restore_status": "available_for_24_hours_or_until_process_restart",
+                "restore_ttl_seconds": _RESTORE_TTL_SECONDS,
+            }
+        )
+
+    def _restore_message(
+        self,
+        data: dict[str, object],
+        *,
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+    ) -> ConnectorAdapterResult:
+        message_id = _text(data, "message_id")
+        handle = _text(data, "restore_handle")
+        headers = _headers(data, time_zone=None)
+        subject_id = _resolve_graph_subject(credential=credential, transport=transport)
+        record = self._message_restores.consume(
+            handle,
+            message_id=message_id,
+            subject_id=subject_id,
+        )
+        shape = _move_shape(_message_path(message_id), record.parent_folder_id)
         try:
             response = transport.request(
                 origin=_ORIGIN,
                 method=shape.method,
                 path=shape.path,
                 credential=credential.credential,
-                query=query,
                 json_body=shape.json_body,
-                headers=_headers(data, time_zone=shape.time_zone),
+                headers=headers,
                 expected_statuses=shape.expected_statuses,
-                response_bound=shape.response_bound,
             )
-        except ConnectorProviderError as exc:
-            if known.name.endswith(".purge") and exc.status in _PERMANENT_DELETE_UNSUPPORTED:
-                raise ConnectorProviderError(
-                    origin=_ORIGIN,
-                    status=exc.status,
-                    code="permanent_delete_unsupported",
-                    retry_after=exc.retry_after,
-                ) from exc
+        except ConnectorProviderError:
+            self._message_restores.restore(handle, record)
             raise
-        return _result(response, path=shape.path, mime=shape.mime)
+        return _result(response, path=shape.path, mime=False)
 
 
 def _known_operation(value: object) -> OperationSpec:
@@ -460,6 +662,88 @@ def _permanent_delete_shape(path: str) -> _RequestShape:
     )
 
 
+def _execute_permanent_delete(
+    operation: OperationSpec,
+    data: dict[str, object],
+    *,
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> ConnectorAdapterResult:
+    if operation.provider == "outlook_calendar" and operation.name == "events.purge":
+        _preflight_event_association(data, credential=credential, transport=transport)
+    subject = _resolve_graph_subject(credential=credential, transport=transport)
+    user_root = f"/v1.0/users/{_segment(subject)}"
+    if operation.provider == "outlook_mail" and operation.name == "messages.purge":
+        resource_path = f"{user_root}/messages/{_segment(_text(data, 'message_id'))}"
+    elif operation.provider == "outlook_mail" and operation.name == "folders.purge":
+        resource_path = f"{user_root}/mailFolders/{_segment(_text(data, 'folder_id'))}"
+    elif operation.provider == "outlook_calendar" and operation.name == "calendars.purge":
+        resource_path = f"{user_root}/calendars/{_segment(_text(data, 'calendar_id'))}"
+    elif operation.provider == "outlook_calendar" and operation.name == "events.purge":
+        resource_path = f"{user_root}/events/{_segment(_text(data, 'event_id'))}"
+    else:
+        raise ValidationError("Microsoft permanent-delete operation is not implemented")
+    shape = _permanent_delete_shape(resource_path)
+    try:
+        response = transport.request(
+            origin=_ORIGIN,
+            method=shape.method,
+            path=shape.path,
+            credential=credential.credential,
+            headers=_headers(data, time_zone=None),
+            expected_statuses=shape.expected_statuses,
+        )
+    except ConnectorProviderError as exc:
+        if (
+            operation.provider == "outlook_calendar"
+            and operation.name == "calendars.purge"
+            and exc.status in _CALENDAR_PERMANENT_DELETE_UNSUPPORTED
+        ):
+            raise ConnectorProviderError(
+                origin=_ORIGIN,
+                status=exc.status,
+                code="calendar_permanent_delete_unsupported_for_account",
+                retry_after=exc.retry_after,
+            ) from exc
+        if exc.status in _PERMANENT_DELETE_UNSUPPORTED:
+            raise ConnectorProviderError(
+                origin=_ORIGIN,
+                status=exc.status,
+                code="permanent_delete_unsupported",
+                retry_after=exc.retry_after,
+            ) from exc
+        raise
+    return _result(response, path=shape.path, mime=False)
+
+
+def _resolve_graph_subject(
+    *,
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> str:
+    response = transport.request(
+        origin=_ORIGIN,
+        method=ConnectorMethod.GET,
+        path=_ROOT,
+        credential=credential.credential,
+        query=(("$select", "id"),),
+        headers=_headers({}, time_zone=None),
+        expected_statuses=frozenset({200}),
+    )
+    subject = _required_provider_text(
+        _provider_mapping(response, "Microsoft account subject"),
+        "id",
+        "Microsoft account subject",
+    )
+    if len(subject) > 1_024:
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=response.status,
+            code="invalid_account_subject",
+        )
+    return subject
+
+
 def _draft_reply_shape(data: dict[str, object], action: str) -> _RequestShape:
     return _RequestShape(
         f"{_message_path(_text(data, 'message_id'))}/{action}",
@@ -558,6 +842,8 @@ def _headers(data: dict[str, object], *, time_zone: str | None) -> dict[str, str
     headers = {"Prefer": prefer}
     change_key = _optional_text(data, "change_key")
     if change_key is not None:
+        if any(character in change_key for character in ("\x00", "\r", "\n")):
+            raise ValidationError("Outlook change key is invalid")
         headers["If-Match"] = change_key
     return headers
 
@@ -598,6 +884,20 @@ def _message_update_body(data: dict[str, object]) -> dict[str, object]:
     if "follow_up" in data:
         body["flag"] = {"flagStatus": _FOLLOW_UP_STATUS[_text(data, "follow_up")]}
     return body
+
+
+def _event_update_shape(
+    data: dict[str, object],
+    existing: Mapping[str, object],
+) -> _RequestShape:
+    body = _event_body(data)
+    if "body" in data and _event_is_online_meeting(existing):
+        body["body"] = _preserve_online_meeting_body(data["body"], existing)
+    return _RequestShape(
+        _event_path(_text(data, "calendar_id"), _text(data, "event_id")),
+        ConnectorMethod.PATCH,
+        json_body=body,
+    )
 
 
 def _event_body(data: dict[str, object]) -> dict[str, object]:
@@ -695,11 +995,22 @@ def _graph_recurrence(value: object) -> dict[str, object]:
     event_range = _mapping(recurrence["range"])
     graph_pattern: dict[str, object] = {
         "interval": _integer(pattern["interval"]),
-        "type": _text(pattern, "type"),
+        "type": {
+            "absolute_monthly": "absoluteMonthly",
+            "absolute_yearly": "absoluteYearly",
+            "daily": "daily",
+            "relative_monthly": "relativeMonthly",
+            "relative_yearly": "relativeYearly",
+            "weekly": "weekly",
+        }[_text(pattern, "type")],
     }
     graph_range: dict[str, object] = {
         "startDate": _text(event_range, "start_date"),
-        "type": _text(event_range, "type"),
+        "type": {
+            "end_date": "endDate",
+            "no_end": "noEnd",
+            "numbered": "numbered",
+        }[_text(event_range, "type")],
     }
     for source, target in (
         ("day_of_month", "dayOfMonth"),
@@ -710,11 +1021,217 @@ def _graph_recurrence(value: object) -> dict[str, object]:
             graph_pattern[target] = pattern[source]
     if "days_of_week" in pattern:
         graph_pattern["daysOfWeek"] = _strings(pattern["days_of_week"])
+    if "first_day_of_week" in pattern:
+        graph_pattern["firstDayOfWeek"] = _text(pattern, "first_day_of_week")
     if "end_date" in event_range:
         graph_range["endDate"] = _text(event_range, "end_date")
     if "number_of_occurrences" in event_range:
         graph_range["numberOfOccurrences"] = _integer(event_range["number_of_occurrences"])
+    if "recurrence_time_zone" in event_range:
+        graph_range["recurrenceTimeZone"] = _text(event_range, "recurrence_time_zone")
     return {"pattern": graph_pattern, "range": graph_range}
+
+
+def _preflight_message(
+    message_id: str,
+    *,
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> Mapping[str, object]:
+    response = transport.request(
+        origin=_ORIGIN,
+        method=ConnectorMethod.GET,
+        path=_message_path(message_id),
+        credential=credential.credential,
+        query=(("$select", "id,parentFolderId"),),
+        headers=_headers({}, time_zone=None),
+        expected_statuses=frozenset({200}),
+    )
+    message = _provider_mapping(response, "Outlook message restore preflight")
+    if _required_provider_text(message, "id", "message ID") != message_id:
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=response.status,
+            code="message_identity_mismatch",
+        )
+    return message
+
+
+def _preflight_event(
+    data: dict[str, object],
+    *,
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> Mapping[str, object]:
+    event_id = _text(data, "event_id")
+    response = transport.request(
+        origin=_ORIGIN,
+        method=ConnectorMethod.GET,
+        path=_event_path(_text(data, "calendar_id"), event_id),
+        credential=credential.credential,
+        query=(
+            (
+                "$select",
+                "id,attendees,isOrganizer,body,isOnlineMeeting,onlineMeeting,"
+                "onlineMeetingProvider,changeKey",
+            ),
+        ),
+        headers=_headers({}, time_zone=None),
+        expected_statuses=frozenset({200}),
+    )
+    event = _provider_mapping(response, "Outlook event preflight")
+    if _required_provider_text(event, "id", "event ID") != event_id:
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=response.status,
+            code="event_identity_mismatch",
+        )
+    return event
+
+
+def _preflight_event_association(
+    data: dict[str, object],
+    *,
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> None:
+    event_id = _text(data, "event_id")
+    response = transport.request(
+        origin=_ORIGIN,
+        method=ConnectorMethod.GET,
+        path=_event_path(_text(data, "calendar_id"), event_id),
+        credential=credential.credential,
+        query=(("$select", "id"),),
+        headers=_headers({}, time_zone=None),
+        expected_statuses=frozenset({200}),
+    )
+    event = _provider_mapping(response, "Outlook event purge preflight")
+    if _required_provider_text(event, "id", "event ID") != event_id:
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=response.status,
+            code="event_calendar_binding_mismatch",
+        )
+
+
+def _existing_event_effect(
+    data: dict[str, object],
+    existing: Mapping[str, object],
+) -> ConnectorEffect:
+    if _optional_text(data, "calendar_id") != _PRIMARY_CALENDAR_ALIAS:
+        return ConnectorEffect.OUTWARD
+    attendees = existing.get("attendees")
+    if not isinstance(attendees, list):
+        raise ValidationError("Outlook event preflight did not return attendees")
+    if attendees:
+        return ConnectorEffect.OUTWARD
+    is_organizer = existing.get("isOrganizer")
+    if type(is_organizer) is not bool:
+        raise ValidationError("Outlook event preflight did not return organizer state")
+    if not is_organizer:
+        return ConnectorEffect.OUTWARD
+    requested_attendees = data.get("attendees")
+    if isinstance(requested_attendees, list) and requested_attendees:
+        return ConnectorEffect.OUTWARD
+    return ConnectorEffect.SAFE_MUTATION
+
+
+def _event_precondition_data(
+    data: dict[str, object],
+    existing: Mapping[str, object],
+) -> dict[str, object]:
+    provider_change_key = _required_provider_text(existing, "changeKey", "event change key")
+    requested_change_key = _text(data, "change_key")
+    if requested_change_key != provider_change_key:
+        raise ValidationError(
+            "Outlook event changed; read it again and request a fresh preview with its latest "
+            "change_key"
+        )
+    return data
+
+
+def _event_is_online_meeting(existing: Mapping[str, object]) -> bool:
+    flag = existing.get("isOnlineMeeting")
+    if type(flag) is not bool:
+        raise ValidationError("Outlook event preflight did not return online-meeting state")
+    return bool(flag)
+
+
+def _preserve_online_meeting_body(
+    requested_value: object,
+    existing: Mapping[str, object],
+) -> dict[str, object]:
+    requested = _graph_body(requested_value)
+    meeting_blob = _isolated_online_meeting_blob(existing)
+    requested_content = _text(requested, "content")
+    if _text(requested, "contentType") == "Text":
+        requested_content = (
+            html.escape(requested_content)
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\n", "<br>")
+        )
+    if meeting_blob not in requested_content:
+        requested_content = f"{requested_content}<br><br>{meeting_blob}"
+    return {"content": requested_content, "contentType": "HTML"}
+
+
+def _isolated_online_meeting_blob(existing: Mapping[str, object]) -> str:
+    existing_body = _mapping(existing.get("body"))
+    existing_content = _required_provider_body(existing_body, "content")
+    existing_type = _required_provider_text(
+        existing_body,
+        "contentType",
+        "online-meeting body type",
+    )
+    online_meeting = _mapping(existing.get("onlineMeeting"))
+    join_url = _required_provider_text(
+        online_meeting,
+        "joinUrl",
+        "online-meeting join URL",
+        max_length=16_384,
+    )
+    if existing_type.casefold() != "html":
+        raise _unsafe_online_meeting_body()
+
+    candidates: list[re.Match[str]] = []
+    for tag in _HTML_DIV_TAG.finditer(existing_content):
+        if tag.group(1):
+            continue
+        class_attributes = _HTML_CLASS_ATTRIBUTE.findall(tag.group(0))
+        if any(_MEETING_BLOB_CLASS in value.split() for _quote, value in class_attributes):
+            if len(class_attributes) != 1 or tag.group(0).rstrip().endswith("/>"):
+                raise _unsafe_online_meeting_body()
+            candidates.append(tag)
+    if len(candidates) != 1:
+        raise _unsafe_online_meeting_body()
+
+    start = candidates[0]
+    depth = 0
+    end_offset: int | None = None
+    for tag in _HTML_DIV_TAG.finditer(existing_content, start.start()):
+        if tag.group(1):
+            depth -= 1
+            if depth == 0:
+                end_offset = tag.end()
+                break
+            if depth < 0:
+                raise _unsafe_online_meeting_body()
+        elif not tag.group(0).rstrip().endswith("/>"):
+            depth += 1
+    if end_offset is None:
+        raise _unsafe_online_meeting_body()
+    meeting_blob = existing_content[start.start() : end_offset]
+    if join_url not in html.unescape(meeting_blob):
+        raise _unsafe_online_meeting_body()
+    return meeting_blob
+
+
+def _unsafe_online_meeting_body() -> ValidationError:
+    return ValidationError(
+        "Outlook did not expose a safely isolated online-meeting block, so Seld did not change "
+        "the body. Update other event fields here, or edit the meeting body in Outlook."
+    )
 
 
 def _event_mutation_is_outward(data: dict[str, object]) -> bool:
@@ -813,6 +1330,42 @@ def _continuation_query(value: object, *, path: str) -> tuple[tuple[str, str], .
 def _mapping(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise ValidationError("connector operation input is invalid")
+    return value
+
+
+def _provider_mapping(response: ConnectorResponse, label: str) -> Mapping[str, object]:
+    value = response.json()
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=response.status,
+            code=f"invalid_{label.casefold().replace(' ', '_')}",
+        )
+    return value
+
+
+def _required_provider_text(
+    data: Mapping[str, object],
+    name: str,
+    label: str,
+    *,
+    max_length: int = 2_048,
+) -> str:
+    value = data.get(name)
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > max_length
+        or any(character in value for character in ("\x00", "\r", "\n"))
+    ):
+        raise ValidationError(f"Outlook {label} is invalid")
+    return value
+
+
+def _required_provider_body(data: Mapping[str, object], name: str) -> str:
+    value = data.get(name)
+    if not isinstance(value, str) or "\x00" in value:
+        raise ValidationError("Outlook online-meeting body is invalid")
     return value
 
 

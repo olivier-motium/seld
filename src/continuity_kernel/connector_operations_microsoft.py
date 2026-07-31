@@ -62,6 +62,11 @@ def _operation(
 
 _ID = _string(1_024, min_length=1)
 _CHANGE_KEY = _string(2_048, min_length=1)
+_RESTORE_HANDLE = _string(
+    96,
+    min_length=47,
+    pattern=r"^rst-[A-Za-z0-9_-]{43}$",
+)
 _SHORT_TEXT = _string(1_024)
 _NAME = _string(256, min_length=1)
 _BODY_TEXT = _string(200_000)
@@ -121,47 +126,109 @@ _EVENT_TIME = _object(
     },
     required=("date_time", "time_zone"),
 )
-_RECURRENCE = _object(
-    {
-        "pattern": _object(
-            {
-                "day_of_month": {"maximum": 31, "minimum": 1, "type": "integer"},
-                "days_of_week": _array(
-                    _enum(
-                        "monday",
-                        "tuesday",
-                        "wednesday",
-                        "thursday",
-                        "friday",
-                        "saturday",
-                        "sunday",
-                    ),
-                    max_items=7,
-                ),
-                "index": _enum("first", "second", "third", "fourth", "last"),
-                "interval": {"maximum": 365, "minimum": 1, "type": "integer"},
-                "month": {"maximum": 12, "minimum": 1, "type": "integer"},
-                "type": _enum(
-                    "daily",
-                    "weekly",
-                    "absolute_monthly",
-                    "relative_monthly",
-                    "absolute_yearly",
-                    "relative_yearly",
-                ),
-            },
+_DAY_OF_WEEK = _enum(
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+_DAYS_OF_WEEK = _array(_DAY_OF_WEEK, max_items=7, min_items=1)
+_INTERVAL = {"maximum": 365, "minimum": 1, "type": "integer"}
+_DAY_OF_MONTH = {"maximum": 31, "minimum": 1, "type": "integer"}
+_MONTH = {"maximum": 12, "minimum": 1, "type": "integer"}
+_INDEX = _enum("first", "second", "third", "fourth", "last")
+_RECURRENCE_PATTERN = {
+    "oneOf": [
+        _object(
+            {"interval": _INTERVAL, "type": {"const": "daily"}},
             required=("type", "interval"),
         ),
-        "range": _object(
+        _object(
             {
-                "end_date": _DATE,
-                "number_of_occurrences": {"maximum": 999, "minimum": 1, "type": "integer"},
+                "days_of_week": _DAYS_OF_WEEK,
+                "first_day_of_week": _DAY_OF_WEEK,
+                "interval": _INTERVAL,
+                "type": {"const": "weekly"},
+            },
+            required=("type", "interval", "days_of_week", "first_day_of_week"),
+        ),
+        _object(
+            {
+                "day_of_month": _DAY_OF_MONTH,
+                "interval": _INTERVAL,
+                "type": {"const": "absolute_monthly"},
+            },
+            required=("type", "interval", "day_of_month"),
+        ),
+        _object(
+            {
+                "days_of_week": _DAYS_OF_WEEK,
+                "index": _INDEX,
+                "interval": _INTERVAL,
+                "type": {"const": "relative_monthly"},
+            },
+            required=("type", "interval", "days_of_week", "index"),
+        ),
+        _object(
+            {
+                "day_of_month": _DAY_OF_MONTH,
+                "interval": _INTERVAL,
+                "month": _MONTH,
+                "type": {"const": "absolute_yearly"},
+            },
+            required=("type", "interval", "day_of_month", "month"),
+        ),
+        _object(
+            {
+                "days_of_week": _DAYS_OF_WEEK,
+                "index": _INDEX,
+                "interval": _INTERVAL,
+                "month": _MONTH,
+                "type": {"const": "relative_yearly"},
+            },
+            required=("type", "interval", "days_of_week", "index", "month"),
+        ),
+    ]
+}
+_RECURRENCE_RANGE = {
+    "oneOf": [
+        _object(
+            {
+                "recurrence_time_zone": _TIME_ZONE,
                 "start_date": _DATE,
-                "type": _enum("no_end", "end_date", "numbered"),
+                "type": {"const": "no_end"},
             },
             required=("type", "start_date"),
         ),
-    },
+        _object(
+            {
+                "end_date": _DATE,
+                "recurrence_time_zone": _TIME_ZONE,
+                "start_date": _DATE,
+                "type": {"const": "end_date"},
+            },
+            required=("type", "start_date", "end_date"),
+        ),
+        _object(
+            {
+                "number_of_occurrences": {
+                    "maximum": 999,
+                    "minimum": 1,
+                    "type": "integer",
+                },
+                "recurrence_time_zone": _TIME_ZONE,
+                "start_date": _DATE,
+                "type": {"const": "numbered"},
+            },
+            required=("type", "start_date", "number_of_occurrences"),
+        ),
+    ]
+}
+_RECURRENCE = _object(
+    {"pattern": _RECURRENCE_PATTERN, "range": _RECURRENCE_RANGE},
     required=("pattern", "range"),
 )
 
@@ -497,8 +564,12 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         ConnectorEffect.SAFE_MUTATION,
         _MAIL_WRITE_SCOPES,
         _object(
-            {"change_key": _CHANGE_KEY, "message_id": _ID, "parent_folder_id": _ID},
-            required=("message_id",),
+            {
+                "change_key": _CHANGE_KEY,
+                "message_id": _ID,
+                "restore_handle": _RESTORE_HANDLE,
+            },
+            required=("message_id", "restore_handle"),
         ),
     ),
     _operation(
@@ -731,7 +802,7 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
                 "start": _EVENT_TIME,
                 "subject": _string(4_096),
             },
-            required=("calendar_id", "event_id"),
+            required=("calendar_id", "event_id", "change_key"),
         ),
     ),
     _operation(
@@ -839,7 +910,7 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
                 "change_key": _CHANGE_KEY,
                 "event_id": _ID,
             },
-            required=("calendar_id", "event_id", "attachment"),
+            required=("calendar_id", "event_id", "attachment", "change_key"),
         ),
     ),
     _operation(
