@@ -25,6 +25,7 @@ MAX_HEADER_ITEMS: Final = 24
 
 _PATH = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$")
 _HEADER_VALUE = re.compile(r"^[^\x00-\x1f\x7f]{0,8192}$")
+_RANGE = re.compile(r"^bytes=([0-9]+)-([0-9]+)$")
 _ALLOWED_HEADERS: Final = frozenset(
     {
         "accept",
@@ -32,6 +33,7 @@ _ALLOWED_HEADERS: Final = frozenset(
         "if-match",
         "if-none-match",
         "prefer",
+        "range",
         "x-goog-if-generation-match",
         "x-goog-if-metageneration-match",
     }
@@ -56,6 +58,7 @@ _SAFE_RESPONSE_HEADERS: Final = frozenset(
 class ConnectorOrigin(StrEnum):
     GMAIL = "gmail"
     GOOGLE = "google"
+    GOOGLE_OIDC = "google_oidc"
     MICROSOFT_GRAPH = "microsoft_graph"
     SLACK = "slack"
     DISCORD = "discord"
@@ -78,6 +81,7 @@ _ORIGIN_BASES: Final[Mapping[ConnectorOrigin, str]] = MappingProxyType(
     {
         ConnectorOrigin.GMAIL: "https://gmail.googleapis.com",
         ConnectorOrigin.GOOGLE: "https://www.googleapis.com",
+        ConnectorOrigin.GOOGLE_OIDC: "https://openidconnect.googleapis.com",
         ConnectorOrigin.MICROSOFT_GRAPH: "https://graph.microsoft.com",
         ConnectorOrigin.SLACK: "https://slack.com",
         ConnectorOrigin.DISCORD: "https://discord.com",
@@ -87,6 +91,7 @@ _DYNAMIC_HOSTS: Final[Mapping[ConnectorOrigin, frozenset[str]]] = MappingProxyTy
     {
         ConnectorOrigin.GMAIL: frozenset({"gmail.googleapis.com"}),
         ConnectorOrigin.GOOGLE: frozenset({"www.googleapis.com", "content.googleapis.com"}),
+        ConnectorOrigin.GOOGLE_OIDC: frozenset({"openidconnect.googleapis.com"}),
         ConnectorOrigin.MICROSOFT_GRAPH: frozenset({"graph.microsoft.com"}),
         ConnectorOrigin.SLACK: frozenset({"files.slack.com", "slack.com"}),
         ConnectorOrigin.DISCORD: frozenset({"cdn.discordapp.com", "discord.com"}),
@@ -165,7 +170,7 @@ class ConnectorResponse:
                 object_pairs_hook=_object_without_duplicates,
                 parse_constant=_reject_json_constant,
             )
-        except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        except (RecursionError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             raise ConnectorProviderError(
                 origin=self.origin,
                 status=self.status,
@@ -475,11 +480,18 @@ def _headers(values: Mapping[str, str]) -> dict[str, str]:
         raise ValidationError("connector headers exceed their item bound")
     result: dict[str, str] = {}
     for name, value in values.items():
-        if not isinstance(name, str) or name.casefold() not in _ALLOWED_HEADERS:
+        if not isinstance(name, str):
+            raise ValidationError("connector header is not allowed")
+        normalized_name = name.casefold()
+        if normalized_name not in _ALLOWED_HEADERS:
             raise ValidationError("connector header is not allowed")
         if not isinstance(value, str):
             raise ValidationError("connector header value is invalid")
         _header_value(value)
+        if normalized_name == "range":
+            match = _RANGE.fullmatch(value)
+            if match is None or int(match.group(1)) > int(match.group(2)):
+                raise ValidationError("connector range header is invalid")
         canonical = "-".join(part.capitalize() for part in name.split("-"))
         result[canonical] = value
     return result

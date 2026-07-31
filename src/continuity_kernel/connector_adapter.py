@@ -83,6 +83,7 @@ class ConnectorAdapter(Protocol):
         continuation: object | None,
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
+        write_idempotency_key: str | None = None,
     ) -> ConnectorAdapterResult: ...
 
 

@@ -38,7 +38,7 @@ class _Adapter:
     providers = frozenset({"gmail"})
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, object, object | None]] = []
+        self.calls: list[tuple[str, object, object | None, str | None]] = []
         self.effect: ConnectorEffect | None = None
         self.continuation: object | None = None
         self.after_execute: Callable[[], None] | None = None
@@ -55,9 +55,10 @@ class _Adapter:
         continuation: object | None,
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
+        write_idempotency_key: str | None = None,
     ) -> ConnectorAdapterResult:
         del credential, transport
-        self.calls.append((operation.name, input_value, continuation))
+        self.calls.append((operation.name, input_value, continuation, write_idempotency_key))
         if self.after_execute is not None:
             self.after_execute()
         return ConnectorAdapterResult(
@@ -225,6 +226,8 @@ def test_safe_mutation_executes_once_but_outward_effect_requires_bound_confirmat
     )
     assert confirmed["status"] == "ok"
     assert [call[0] for call in adapter.calls] == ["drafts.create", "drafts.send"]
+    assert adapter.calls[-1][3] is not None
+    assert len(adapter.calls[-1][3] or "") == 22
     with pytest.raises(ConflictError, match="already been consumed"):
         runtime.call_tool(
             "gsv_gmail_write",

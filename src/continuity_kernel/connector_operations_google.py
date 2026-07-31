@@ -21,6 +21,7 @@ _DRIVE_METADATA_READONLY: Final = "https://www.googleapis.com/auth/drive.metadat
 _DRIVE_READONLY: Final = "https://www.googleapis.com/auth/drive.readonly"
 _DRIVE_FILE: Final = "https://www.googleapis.com/auth/drive.file"
 _DRIVE: Final = "https://www.googleapis.com/auth/drive"
+_MAX_DRIVE_BYTE_OFFSET: Final = 5 * 1024**4
 
 
 def _object(properties: dict[str, object], *, required: tuple[str, ...] = ()) -> dict[str, object]:
@@ -101,7 +102,7 @@ def _mail_list() -> dict[str, object]:
         {
             "include_spam_trash": {"type": "boolean"},
             "label_ids": _array(_id(), maximum=64),
-            "page_size": {"maximum": 100, "minimum": 1, "type": "integer"},
+            "page_size": {"maximum": 500, "minimum": 1, "type": "integer"},
             "query": _text(8_192, minimum=0),
         }
     )
@@ -122,14 +123,62 @@ def _event_time() -> dict[str, object]:
     }
 
 
+def _event_attendee() -> dict[str, object]:
+    return _object(
+        {
+            "display_name": _text(1_024, minimum=0),
+            "email": _text(512),
+            "optional": {"type": "boolean"},
+            "response_status": {
+                "enum": ["accepted", "declined", "needsAction", "tentative"],
+                "type": "string",
+            },
+        },
+        required=("email",),
+    )
+
+
+def _event_reminder() -> dict[str, object]:
+    return _object(
+        {
+            "delivery": {"enum": ["email", "popup"], "type": "string"},
+            "minutes": {"maximum": 40_320, "minimum": 0, "type": "integer"},
+        },
+        required=("delivery", "minutes"),
+    )
+
+
+def _event_reminders() -> dict[str, object]:
+    return {
+        "oneOf": [
+            _object(
+                {"use_default": {"const": True, "type": "boolean"}},
+                required=("use_default",),
+            ),
+            _object(
+                {
+                    "overrides": _array(_event_reminder(), maximum=5),
+                    "use_default": {"const": False, "type": "boolean"},
+                },
+                required=("use_default",),
+            ),
+        ]
+    }
+
+
 def _event_fields() -> dict[str, object]:
     return {
         "attendee_emails": _email_addresses(),
+        "attendees": _array(_event_attendee(), maximum=64),
         "description": _text(200_000, minimum=0),
         "end": _event_time(),
         "event_id": _id(),
+        "guests_can_invite_others": {"type": "boolean"},
+        "guests_can_modify": {"type": "boolean"},
+        "guests_can_see_other_guests": {"type": "boolean"},
         "location": _text(4_096, minimum=0),
         "recurrence": _array(_text(2_048), maximum=32),
+        "reminders": _event_reminders(),
         "send_updates": {
             "enum": ["all", "externalOnly", "none"],
             "type": "string",
@@ -152,6 +201,77 @@ def _calendar_fields() -> dict[str, object]:
     }
 
 
+def _calendar_list() -> dict[str, object]:
+    return _object(
+        {
+            "min_access_role": {
+                "enum": [
+                    "freeBusyReader",
+                    "owner",
+                    "reader",
+                    "writer",
+                    "writerWithoutPrivateAccess",
+                ],
+                "type": "string",
+            },
+            "page_size": {"maximum": 250, "minimum": 1, "type": "integer"},
+            "show_deleted": {"type": "boolean"},
+            "show_hidden": {"type": "boolean"},
+            "show_own_organization_only": {"type": "boolean"},
+        }
+    )
+
+
+def _calendar_event_list() -> dict[str, object]:
+    return _object(
+        {
+            "calendar_id": _id(),
+            "event_types": _array(
+                {
+                    "enum": [
+                        "birthday",
+                        "default",
+                        "focusTime",
+                        "fromGmail",
+                        "outOfOffice",
+                        "workingLocation",
+                    ],
+                    "type": "string",
+                },
+                maximum=6,
+                minimum=1,
+            ),
+            "i_cal_uid": _text(1_024),
+            "max_attendees": {"maximum": 1_000, "minimum": 1, "type": "integer"},
+            "order_by": {"enum": ["startTime", "updated"], "type": "string"},
+            "page_size": {"maximum": 2_500, "minimum": 1, "type": "integer"},
+            "query": _text(8_192, minimum=0),
+            "show_deleted": {"type": "boolean"},
+            "single_events": {"type": "boolean"},
+            "time_max": _text(64),
+            "time_min": _text(64),
+            "time_zone": _text(128),
+            "updated_min": _text(64),
+        },
+        required=("calendar_id",),
+    )
+
+
+def _calendar_instance_list() -> dict[str, object]:
+    return _object(
+        {
+            "calendar_id": _id(),
+            "event_id": _id(),
+            "max_attendees": {"maximum": 1_000, "minimum": 1, "type": "integer"},
+            "page_size": {"maximum": 2_500, "minimum": 1, "type": "integer"},
+            "time_max": _text(64),
+            "time_min": _text(64),
+            "time_zone": _text(128),
+        },
+        required=("calendar_id", "event_id"),
+    )
+
+
 def _app_property() -> dict[str, object]:
     return _object({"key": _text(124), "value": _text(4_096)}, required=("key", "value"))
 
@@ -164,16 +284,66 @@ def _file_fields() -> dict[str, object]:
         "mime_type": _text(256),
         "name": _text(1_024),
         "parent_ids": _array(_id(), maximum=32),
+        "supports_all_drives": {"type": "boolean"},
     }
 
 
 def _drive_list() -> dict[str, object]:
     return _object(
         {
+            "corpora": {"enum": ["allDrives", "domain", "drive", "user"], "type": "string"},
+            "drive_id": _id(),
+            "include_items_from_all_drives": {"type": "boolean"},
             "include_trashed": {"type": "boolean"},
             "mime_type": _text(256),
-            "page_size": {"maximum": 100, "minimum": 1, "type": "integer"},
+            "order_by": _array(
+                {
+                    "enum": [
+                        "createdTime",
+                        "createdTime desc",
+                        "folder",
+                        "folder desc",
+                        "modifiedByMeTime",
+                        "modifiedByMeTime desc",
+                        "modifiedTime",
+                        "modifiedTime desc",
+                        "name",
+                        "name desc",
+                        "name_natural",
+                        "name_natural desc",
+                        "quotaBytesUsed",
+                        "quotaBytesUsed desc",
+                        "recency",
+                        "recency desc",
+                        "sharedWithMeTime",
+                        "sharedWithMeTime desc",
+                        "starred",
+                        "starred desc",
+                        "viewedByMeTime",
+                        "viewedByMeTime desc",
+                    ],
+                    "type": "string",
+                },
+                maximum=10,
+                minimum=1,
+            ),
+            "page_size": {"maximum": 1_000, "minimum": 1, "type": "integer"},
             "parent_id": _id(),
+            "query": _text(8_192, minimum=0),
+            "spaces": _array(
+                {"enum": ["appDataFolder", "drive"], "type": "string"},
+                maximum=2,
+                minimum=1,
+            ),
+            "supports_all_drives": {"type": "boolean"},
+        }
+    )
+
+
+def _shared_drive_list() -> dict[str, object]:
+    return _object(
+        {
+            "page_size": {"maximum": 100, "minimum": 1, "type": "integer"},
             "query": _text(8_192, minimum=0),
         }
     )
@@ -449,7 +619,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "calendars.list",
         ConnectorEffect.READ,
         _CALENDAR_LIST_SCOPES,
-        _object({"page_size": {"maximum": 100, "minimum": 1, "type": "integer"}}),
+        _calendar_list(),
     ),
     _operation(
         "google_calendar",
@@ -465,17 +635,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "events.list",
         ConnectorEffect.READ,
         _CALENDAR_EVENT_READ_SCOPES,
-        _object(
-            {
-                "calendar_id": _id(),
-                "page_size": {"maximum": 100, "minimum": 1, "type": "integer"},
-                "query": _text(8_192, minimum=0),
-                "single_events": {"type": "boolean"},
-                "time_max": _text(64),
-                "time_min": _text(64),
-            },
-            required=("calendar_id",),
-        ),
+        _calendar_event_list(),
     ),
     _operation(
         "google_calendar",
@@ -491,16 +651,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "events.instances",
         ConnectorEffect.READ,
         _CALENDAR_EVENT_READ_SCOPES,
-        _object(
-            {
-                "calendar_id": _id(),
-                "event_id": _id(),
-                "page_size": {"maximum": 100, "minimum": 1, "type": "integer"},
-                "time_max": _text(64),
-                "time_min": _text(64),
-            },
-            required=("calendar_id", "event_id"),
-        ),
+        _calendar_instance_list(),
     ),
     _operation(
         "google_calendar",
@@ -622,6 +773,14 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
     _operation(
         "google_drive",
         ConnectorMode.READ,
+        "drives.list",
+        ConnectorEffect.READ,
+        _DRIVE_METADATA_SCOPES,
+        _shared_drive_list(),
+    ),
+    _operation(
+        "google_drive",
+        ConnectorMode.READ,
         "files.list",
         ConnectorEffect.READ,
         _DRIVE_METADATA_SCOPES,
@@ -633,7 +792,10 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.get",
         ConnectorEffect.READ,
         _DRIVE_METADATA_SCOPES,
-        _object({"file_id": _id()}, required=("file_id",)),
+        _object(
+            {"file_id": _id(), "supports_all_drives": {"type": "boolean"}},
+            required=("file_id",),
+        ),
     ),
     _operation(
         "google_drive",
@@ -643,9 +805,10 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _DRIVE_CONTENT_SCOPES,
         _object(
             {
-                "byte_offset": {"maximum": 2_147_483_647, "minimum": 0, "type": "integer"},
+                "byte_offset": {"maximum": _MAX_DRIVE_BYTE_OFFSET, "minimum": 0, "type": "integer"},
                 "file_id": _id(),
                 "max_chunk_size": {"maximum": 240_000, "minimum": 1, "type": "integer"},
+                "supports_all_drives": {"type": "boolean"},
             },
             required=("file_id",),
         ),
@@ -671,6 +834,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
             {
                 "file_id": _id(),
                 "page_size": {"maximum": 100, "minimum": 1, "type": "integer"},
+                "supports_all_drives": {"type": "boolean"},
             },
             required=("file_id",),
         ),
@@ -713,7 +877,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _object(
             {
                 "file_id": _id(),
-                "page_size": {"maximum": 100, "minimum": 1, "type": "integer"},
+                "page_size": {"maximum": 1_000, "minimum": 1, "type": "integer"},
             },
             required=("file_id",),
         ),
@@ -726,7 +890,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _DRIVE_CONTENT_SCOPES,
         _object(
             {
-                "byte_offset": {"maximum": 2_147_483_647, "minimum": 0, "type": "integer"},
+                "byte_offset": {"maximum": _MAX_DRIVE_BYTE_OFFSET, "minimum": 0, "type": "integer"},
                 "file_id": _id(),
                 "max_chunk_size": {"maximum": 240_000, "minimum": 1, "type": "integer"},
                 "revision_id": _id(),
@@ -772,6 +936,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
                 "etag": _text(1_024),
                 "file_id": _id(),
                 "remove_parent_ids": _array(_id(), maximum=32),
+                "supports_all_drives": {"type": "boolean"},
             },
             required=("file_id",),
         ),
@@ -782,7 +947,14 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.trash",
         ConnectorEffect.DESTRUCTIVE,
         _DRIVE_WRITE_SCOPES,
-        _object({"etag": _text(1_024), "file_id": _id()}, required=("etag", "file_id")),
+        _object(
+            {
+                "etag": _text(1_024),
+                "file_id": _id(),
+                "supports_all_drives": {"type": "boolean"},
+            },
+            required=("etag", "file_id"),
+        ),
     ),
     _operation(
         "google_drive",
@@ -790,7 +962,14 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.restore",
         ConnectorEffect.SAFE_MUTATION,
         _DRIVE_WRITE_SCOPES,
-        _object({"etag": _text(1_024), "file_id": _id()}, required=("etag", "file_id")),
+        _object(
+            {
+                "etag": _text(1_024),
+                "file_id": _id(),
+                "supports_all_drives": {"type": "boolean"},
+            },
+            required=("etag", "file_id"),
+        ),
     ),
     _operation(
         "google_drive",
@@ -798,7 +977,14 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.purge",
         ConnectorEffect.PERMANENT,
         _DRIVE_WRITE_SCOPES,
-        _object({"etag": _text(1_024), "file_id": _id()}, required=("etag", "file_id")),
+        _object(
+            {
+                "etag": _text(1_024),
+                "file_id": _id(),
+                "supports_all_drives": {"type": "boolean"},
+            },
+            required=("etag", "file_id"),
+        ),
     ),
     _operation(
         "google_drive",
@@ -816,8 +1002,12 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
                     "enum": ["user", "group", "domain", "anyone"],
                     "type": "string",
                 },
-                "role": {"enum": ["reader", "commenter", "writer"], "type": "string"},
+                "role": {
+                    "enum": ["reader", "commenter", "writer", "fileOrganizer", "organizer"],
+                    "type": "string",
+                },
                 "send_notification_email": {"type": "boolean"},
+                "supports_all_drives": {"type": "boolean"},
             },
             required=("file_id", "permission_type", "role"),
         ),
@@ -833,7 +1023,11 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
                 "etag": _text(1_024),
                 "file_id": _id(),
                 "permission_id": _id(),
-                "role": {"enum": ["reader", "commenter", "writer"], "type": "string"},
+                "role": {
+                    "enum": ["reader", "commenter", "writer", "fileOrganizer", "organizer"],
+                    "type": "string",
+                },
+                "supports_all_drives": {"type": "boolean"},
             },
             required=("etag", "file_id", "permission_id", "role"),
         ),
@@ -845,7 +1039,12 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.DESTRUCTIVE,
         _DRIVE_WRITE_SCOPES,
         _object(
-            {"etag": _text(1_024), "file_id": _id(), "permission_id": _id()},
+            {
+                "etag": _text(1_024),
+                "file_id": _id(),
+                "permission_id": _id(),
+                "supports_all_drives": {"type": "boolean"},
+            },
             required=("etag", "file_id", "permission_id"),
         ),
     ),

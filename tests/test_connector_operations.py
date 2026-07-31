@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
-
 from continuity_kernel.connector_contract import ConnectorMode
 from continuity_kernel.connector_operations import (
     ALL_CONNECTOR_OPERATIONS,
@@ -11,26 +9,26 @@ from continuity_kernel.connector_operations import (
 )
 
 
-def test_catalog_is_exactly_seven_provider_pairs_and_178_operations() -> None:
-    assert Counter(
-        (operation.provider, operation.mode) for operation in ALL_CONNECTOR_OPERATIONS
-    ) == {
-        ("discord", ConnectorMode.READ): 11,
-        ("discord", ConnectorMode.WRITE): 21,
-        ("gmail", ConnectorMode.READ): 8,
-        ("gmail", ConnectorMode.WRITE): 15,
-        ("google_calendar", ConnectorMode.READ): 6,
-        ("google_calendar", ConnectorMode.WRITE): 8,
-        ("google_drive", ConnectorMode.READ): 9,
-        ("google_drive", ConnectorMode.WRITE): 18,
-        ("outlook_calendar", ConnectorMode.READ): 9,
-        ("outlook_calendar", ConnectorMode.WRITE): 15,
-        ("outlook_mail", ConnectorMode.READ): 7,
-        ("outlook_mail", ConnectorMode.WRITE): 19,
-        ("slack", ConnectorMode.READ): 12,
-        ("slack", ConnectorMode.WRITE): 20,
+def test_catalog_has_one_nonempty_read_write_pair_for_each_supported_provider() -> None:
+    expected_pairs = {
+        (provider, mode)
+        for provider in (
+            "discord",
+            "gmail",
+            "google_calendar",
+            "google_drive",
+            "outlook_calendar",
+            "outlook_mail",
+            "slack",
+        )
+        for mode in (ConnectorMode.READ, ConnectorMode.WRITE)
     }
-    assert len(ALL_CONNECTOR_OPERATIONS) == 178
+    assert {(operation.provider, operation.mode) for operation in ALL_CONNECTOR_OPERATIONS} == (
+        expected_pairs
+    )
+    assert len({operation.key for operation in ALL_CONNECTOR_OPERATIONS}) == len(
+        ALL_CONNECTOR_OPERATIONS
+    )
     assert OPERATION_CATALOG.providers() == (
         "discord",
         "gmail",

@@ -186,8 +186,8 @@ class ConnectorSession:
         mutation: object,
         connection_version: int,
         credential_version: int,
-    ) -> None:
-        """Validate and spend the nonce before the caller performs a mutation."""
+    ) -> str:
+        """Validate and spend the nonce, returning its bounded provider idempotency key."""
 
         payload = self._decode(token, kind="confirmation")
         now, expires_at = self._validate_times(payload, kind="confirmation")
@@ -211,6 +211,7 @@ class ConnectorSession:
             if len(self._spent_nonces) >= self._max_spent_nonces:
                 raise ConflictError("confirmation capacity is full; wait for an approval to expire")
             self._spent_nonces[nonce] = expires_at
+        return nonce
 
     def _now(self) -> float:
         try:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 from collections.abc import Mapping
 from typing import Final, cast
@@ -26,7 +27,7 @@ from continuity_kernel.connector_operations import (
     OPERATION_CATALOG,
 )
 from continuity_kernel.connector_profiles import ConnectorAccessTier, get_profile_for_connection
-from continuity_kernel.connector_session import ConnectorSession
+from continuity_kernel.connector_session import DEFAULT_TTL_SECONDS, ConnectorSession
 from continuity_kernel.connector_transport import (
     AuthorizationScheme,
     ConnectorCredential,
@@ -129,6 +130,7 @@ class ConnectorRuntime:
             adapter.classify_effect(operation, input_value),
         )
         continuation: object | None = None
+        write_idempotency_key: str | None = None
         if mode is ConnectorMode.READ:
             cursor = envelope.get("cursor")
             if cursor is not None:
@@ -160,7 +162,7 @@ class ConnectorRuntime:
                     credential_version=credential.version,
                 )
             else:
-                self.session.consume_confirmation(
+                write_idempotency_key = self.session.consume_confirmation(
                     confirmation,
                     provider=provider,
                     operation=operation_name,
@@ -179,6 +181,7 @@ class ConnectorRuntime:
             continuation=continuation,
             credential=credential,
             transport=self.transport,
+            write_idempotency_key=write_idempotency_key,
         )
         if not isinstance(result, ConnectorAdapterResult):
             raise ValidationError("connector adapter returned an invalid result")
@@ -282,7 +285,7 @@ class ConnectorRuntime:
             "account": account_label or "Verified account",
             "confirmation_token": token,
             "effect": effect.value,
-            "expires_in_seconds": 600,
+            "expires_in_seconds": DEFAULT_TTL_SECONDS,
             "mutation_digest": canonical_json_digest(input_value),
             "operation": operation,
             "preview": _preview_value(input_value),
@@ -374,7 +377,7 @@ def _preview_field(name: str, value: object) -> object:
     if name == "content_base64" and isinstance(value, str):
         try:
             decoded = base64.b64decode(value, validate=True)
-        except ValueError:
+        except (binascii.Error, ValueError):
             decoded = value.encode("utf-8")
         return {
             "bytes": len(decoded),

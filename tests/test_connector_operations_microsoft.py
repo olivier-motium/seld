@@ -35,6 +35,7 @@ MAIL_NAMES = frozenset(
         "attachments.add",
         "attachments.delete",
         "drafts.send",
+        "messages.update",
         "messages.copy",
         "messages.move",
         "messages.trash",
@@ -105,8 +106,8 @@ def test_microsoft_catalog_has_the_exact_mail_and_calendar_operation_sets() -> N
         operation for operation in MICROSOFT_OPERATIONS if operation.provider == "outlook_calendar"
     )
 
-    assert len(MICROSOFT_OPERATIONS) == 50
-    assert len(mail) == 26
+    assert len(MICROSOFT_OPERATIONS) == 51
+    assert len(mail) == 27
     assert len(calendar) == 24
     assert {operation.name for operation in mail} == MAIL_NAMES
     assert {operation.name for operation in calendar} == CALENDAR_NAMES
@@ -164,12 +165,56 @@ def test_representative_message_event_and_attachment_inputs_are_exact(
         "outlook_calendar",
         ConnectorMode.WRITE,
         "events.create",
-        _event(),
+        {
+            **_event(),
+            "importance": "high",
+            "is_all_day": False,
+            "response_requested": False,
+            "sensitivity": "private",
+            "show_as": "working_elsewhere",
+        },
+    )
+    message_update = catalog.validate_input(
+        "outlook_mail",
+        ConnectorMode.WRITE,
+        "messages.update",
+        {
+            "categories": ["Follow up"],
+            "follow_up": "flagged",
+            "importance": "high",
+            "is_read": True,
+            "message_id": "message-1",
+        },
     )
 
     assert draft["body"] == {"content": "Hello", "content_type": "text"}
     assert attachment["attachment"]["name"] == "hello.txt"
     assert event["start"]["time_zone"] == "Europe/Brussels"
+    assert event["show_as"] == "working_elsewhere"
+    assert message_update["follow_up"] == "flagged"
+
+
+def test_message_page_size_and_follow_up_status_are_bounded(catalog: OperationCatalog) -> None:
+    assert catalog.validate_input(
+        "outlook_mail",
+        ConnectorMode.READ,
+        "messages.list",
+        {"page_size": 1_000},
+    ) == {"page_size": 1_000}
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "outlook_mail",
+            ConnectorMode.READ,
+            "messages.list",
+            {"page_size": 1_001},
+        )
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "outlook_mail",
+            ConnectorMode.WRITE,
+            "messages.update",
+            {"follow_up": "later", "message_id": "message-1"},
+        )
 
 
 def test_unknown_and_proxy_like_input_fields_fail(catalog: OperationCatalog) -> None:

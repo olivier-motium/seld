@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import cast
 
 import pytest
 
-from continuity_kernel.connector_contract import ConnectorEffect, ConnectorMode, OperationCatalog
+from continuity_kernel.connector_contract import (
+    ConnectorEffect,
+    ConnectorMode,
+    OperationCatalog,
+    OperationSpec,
+)
 from continuity_kernel.connector_operations_google import GOOGLE_OPERATIONS
 from continuity_kernel.errors import ValidationError
 
@@ -51,6 +57,7 @@ _EXPECTED_NAMES = {
         "events.delete",
     },
     "google_drive": {
+        "drives.list",
         "files.list",
         "files.get",
         "files.download",
@@ -86,7 +93,7 @@ def _catalog() -> OperationCatalog:
     return OperationCatalog(GOOGLE_OPERATIONS)
 
 
-def _operation(provider: str, mode: ConnectorMode, name: str):
+def _operation(provider: str, mode: ConnectorMode, name: str) -> OperationSpec:
     return _catalog().lookup(provider, mode, name)
 
 
@@ -110,13 +117,13 @@ def test_google_provider_mode_partitions_and_exact_operation_surface() -> None:
         for provider in _EXPECTED_NAMES
     }
     assert names == _EXPECTED_NAMES
-    assert len(GOOGLE_OPERATIONS) == 64
+    assert len(GOOGLE_OPERATIONS) == 65
     assert {
         provider: sum(item.provider == provider for item in GOOGLE_OPERATIONS) for provider in names
     } == {
         "gmail": 23,
         "google_calendar": 14,
-        "google_drive": 27,
+        "google_drive": 28,
     }
     assert all(item.endpoint == item.name for item in GOOGLE_OPERATIONS)
 
@@ -205,13 +212,27 @@ def test_google_catalog_validates_representative_rich_inputs() -> None:
     assert catalog.validate_input("gmail", ConnectorMode.WRITE, "drafts.create", gmail) == gmail
 
     event = {
-        "attendee_emails": ["guest@example.test"],
+        "attendees": [
+            {
+                "display_name": "Guest",
+                "email": "guest@example.test",
+                "optional": True,
+                "response_status": "needsAction",
+            }
+        ],
         "calendar_id": "primary",
         "description": "Planning meeting",
         "end": {"date_time": "2026-08-01T10:00:00+02:00", "time_zone": "Europe/Brussels"},
         "event_id": "client-event-01",
+        "guests_can_invite_others": False,
+        "guests_can_modify": False,
+        "guests_can_see_other_guests": True,
         "location": "Studio",
         "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=3"],
+        "reminders": {
+            "overrides": [{"delivery": "popup", "minutes": 10}],
+            "use_default": False,
+        },
         "send_updates": "externalOnly",
         "start": {"date_time": "2026-08-01T09:00:00+02:00", "time_zone": "Europe/Brussels"},
         "summary": "Weekly plan",
@@ -298,8 +319,11 @@ def test_google_schemas_and_tool_envelopes_keep_transport_sealed() -> None:
         schema = catalog.tool_input_schema(provider, mode)
         expected = {"connection_id", "input", "operation"}
         expected.add("cursor" if mode is ConnectorMode.READ else "confirmation_token")
-        for variant in schema["oneOf"]:
-            assert set(variant["properties"]) == expected
+        variants = cast(list[Mapping[str, object]], schema["oneOf"])
+        for variant in variants:
+            properties = variant["properties"]
+            assert isinstance(properties, Mapping)
+            assert set(properties) == expected
 
 
 def test_drive_metadata_scope_does_not_satisfy_content_or_write_operations() -> None:
@@ -313,6 +337,98 @@ def test_drive_metadata_scope_does_not_satisfy_content_or_write_operations() -> 
     assert not _operation(
         "google_drive", ConnectorMode.WRITE, "files.create"
     ).scope_grant_satisfies(metadata_scope)
+
+
+def test_google_catalog_uses_provider_page_limits_and_drive_capacity() -> None:
+    limits = {
+        ("gmail", "messages.list"): 500,
+        ("gmail", "threads.list"): 500,
+        ("gmail", "drafts.list"): 500,
+        ("google_calendar", "calendars.list"): 250,
+        ("google_calendar", "events.list"): 2_500,
+        ("google_calendar", "events.instances"): 2_500,
+        ("google_drive", "drives.list"): 100,
+        ("google_drive", "files.list"): 1_000,
+        ("google_drive", "permissions.list"): 100,
+        ("google_drive", "comments.list"): 100,
+        ("google_drive", "replies.list"): 100,
+        ("google_drive", "revisions.list"): 1_000,
+    }
+    for (provider, name), limit in limits.items():
+        schema = _operation(provider, ConnectorMode.READ, name).input_schema
+        properties = schema["properties"]
+        assert isinstance(properties, Mapping)
+        page_size = properties["page_size"]
+        assert isinstance(page_size, Mapping)
+        assert page_size["maximum"] == limit
+
+    for name in ("files.download", "revisions.download"):
+        schema = _operation("google_drive", ConnectorMode.READ, name).input_schema
+        properties = schema["properties"]
+        assert isinstance(properties, Mapping)
+        byte_offset = properties["byte_offset"]
+        assert isinstance(byte_offset, Mapping)
+        assert byte_offset["maximum"] == 5 * 1024**4
+        required = {"file_id": "file", "byte_offset": 5 * 1024**4}
+        if name == "revisions.download":
+            required["revision_id"] = "revision"
+        operation = _operation("google_drive", ConnectorMode.READ, name)
+        assert operation.validate_input(required) == required
+        with pytest.raises(ValidationError):
+            operation.validate_input({**required, "byte_offset": 5 * 1024**4 + 1})
+
+
+def test_drive_shared_drive_inputs_are_finite_without_admin_or_ownership_transfer() -> None:
+    catalog = _catalog()
+    file_list = {
+        "corpora": "drive",
+        "drive_id": "shared-drive",
+        "include_items_from_all_drives": True,
+        "order_by": ["modifiedTime desc", "name"],
+        "page_size": 1_000,
+        "spaces": ["drive"],
+        "supports_all_drives": True,
+    }
+    assert (
+        catalog.validate_input("google_drive", ConnectorMode.READ, "files.list", file_list)
+        == file_list
+    )
+    assert catalog.validate_input(
+        "google_drive",
+        ConnectorMode.WRITE,
+        "permissions.create",
+        {
+            "file_id": "shared-drive",
+            "permission_type": "user",
+            "role": "organizer",
+            "supports_all_drives": True,
+        },
+    ) == {
+        "file_id": "shared-drive",
+        "permission_type": "user",
+        "role": "organizer",
+        "supports_all_drives": True,
+    }
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "google_drive",
+            ConnectorMode.WRITE,
+            "permissions.create",
+            {"file_id": "file", "permission_type": "user", "role": "owner"},
+        )
+    for field in ("transfer_ownership", "use_domain_admin_access"):
+        with pytest.raises(ValidationError):
+            catalog.validate_input(
+                "google_drive",
+                ConnectorMode.WRITE,
+                "permissions.create",
+                {
+                    "file_id": "file",
+                    "permission_type": "user",
+                    "role": "reader",
+                    field: True,
+                },
+            )
 
 
 def test_gmail_normal_message_bodies_allow_the_documented_bound() -> None:

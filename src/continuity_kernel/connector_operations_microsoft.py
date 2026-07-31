@@ -70,7 +70,11 @@ _DATE = _string(32, min_length=1)
 _TIME_ZONE = _string(128, min_length=1)
 _EMAIL = _string(320, min_length=3, pattern=r"^[^@\s]+@[^@\s]+$")
 _PAGE_SIZE = {"maximum": 100, "minimum": 1, "type": "integer"}
+_MESSAGES_PAGE_SIZE = {"maximum": 1_000, "minimum": 1, "type": "integer"}
 _IMPORTANCE = _enum("low", "normal", "high")
+_FOLLOW_UP = _enum("not_flagged", "flagged", "complete")
+_SENSITIVITY = _enum("normal", "personal", "private", "confidential")
+_SHOW_AS = _enum("free", "tentative", "busy", "oof", "working_elsewhere", "unknown")
 _BODY = _object(
     {
         "content": _BODY_TEXT,
@@ -180,7 +184,7 @@ _MESSAGES_LIST = _object(
         "folder_id": _ID,
         "is_read": {"type": "boolean"},
         "order_by": _enum("received_at", "sent_at", "subject", "last_modified_at"),
-        "page_size": _PAGE_SIZE,
+        "page_size": _MESSAGES_PAGE_SIZE,
         "search": _string(4_096),
         "sort_direction": _enum("ascending", "descending"),
     }
@@ -433,6 +437,24 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
     _operation(
         "outlook_mail",
         ConnectorMode.WRITE,
+        "messages.update",
+        ConnectorEffect.SAFE_MUTATION,
+        _MAIL_WRITE_SCOPES,
+        _object(
+            {
+                "categories": _CATEGORIES,
+                "change_key": _CHANGE_KEY,
+                "follow_up": _FOLLOW_UP,
+                "importance": _IMPORTANCE,
+                "is_read": {"type": "boolean"},
+                "message_id": _ID,
+            },
+            required=("message_id",),
+        ),
+    ),
+    _operation(
+        "outlook_mail",
+        ConnectorMode.WRITE,
         "messages.copy",
         ConnectorEffect.SAFE_MUTATION,
         _MAIL_WRITE_SCOPES,
@@ -658,6 +680,8 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
                 "calendar_id": _ID,
                 "categories": _CATEGORIES,
                 "end": _EVENT_TIME,
+                "importance": _IMPORTANCE,
+                "is_all_day": {"type": "boolean"},
                 "is_reminder_on": {"type": "boolean"},
                 "location": _SHORT_TEXT,
                 "recurrence": _RECURRENCE,
@@ -666,6 +690,9 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
                     "minimum": 0,
                     "type": "integer",
                 },
+                "response_requested": {"type": "boolean"},
+                "sensitivity": _SENSITIVITY,
+                "show_as": _SHOW_AS,
                 "start": _EVENT_TIME,
                 "subject": _string(4_096),
                 "transaction_id": _string(256, min_length=1),
@@ -688,6 +715,8 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
                 "change_key": _CHANGE_KEY,
                 "end": _EVENT_TIME,
                 "event_id": _ID,
+                "importance": _IMPORTANCE,
+                "is_all_day": {"type": "boolean"},
                 "is_reminder_on": {"type": "boolean"},
                 "location": _SHORT_TEXT,
                 "recurrence": _RECURRENCE,
@@ -696,6 +725,9 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
                     "minimum": 0,
                     "type": "integer",
                 },
+                "response_requested": {"type": "boolean"},
+                "sensitivity": _SENSITIVITY,
+                "show_as": _SHOW_AS,
                 "start": _EVENT_TIME,
                 "subject": _string(4_096),
             },

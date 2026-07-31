@@ -174,7 +174,7 @@ _DISCORD_EMBED = _object(
     }
 )
 _DISCORD_MESSAGE_FIELDS: Final = {
-    "content": _text(4_000, minimum=1),
+    "content": _text(2_000, minimum=1),
     "embeds": _array(_DISCORD_EMBED, 10, minimum=1),
     "message_reference": _object(
         {
@@ -185,7 +185,6 @@ _DISCORD_MESSAGE_FIELDS: Final = {
         },
         ("message_id",),
     ),
-    "nonce": _text(128, minimum=1),
 }
 
 
@@ -199,7 +198,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "users.list",
         ConnectorEffect.READ,
         _SLACK_USERS,
-        _object({"limit": _LIMIT, "query": _text(256, minimum=1)}),
+        _object({"limit": _LIMIT}),
     ),
     _operation(
         "slack",
@@ -223,7 +222,6 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
                     minimum=1,
                 ),
                 "limit": _LIMIT,
-                "query": _text(256, minimum=1),
             }
         ),
     ),
@@ -247,7 +245,6 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
                 "latest": _SLACK_TIMESTAMP,
                 "limit": _LIMIT,
                 "oldest": _SLACK_TIMESTAMP,
-                "query": _text(256, minimum=1),
             },
             ("channel",),
         ),
@@ -288,7 +285,6 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
                 "latest": _SLACK_TIMESTAMP,
                 "limit": _LIMIT,
                 "oldest": _SLACK_TIMESTAMP,
-                "query": _text(256, minimum=1),
             }
         ),
     ),
@@ -535,10 +531,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "channels.list",
         ConnectorEffect.READ,
         _DISCORD_BOT,
-        _object(
-            {"after": _SNOWFLAKE, "before": _SNOWFLAKE, "guild_id": _SNOWFLAKE, "limit": _LIMIT},
-            ("guild_id",),
-        ),
+        _object({"guild_id": _SNOWFLAKE}, ("guild_id",)),
     ),
     _operation(
         "discord",
@@ -554,7 +547,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "threads.active",
         ConnectorEffect.READ,
         _DISCORD_BOT,
-        _object({"guild_id": _SNOWFLAKE, "limit": _LIMIT}, ("guild_id",)),
+        _object({"guild_id": _SNOWFLAKE}, ("guild_id",)),
     ),
     _operation(
         "discord",
@@ -787,7 +780,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _DISCORD_BOT,
         _object(
             {"channel_id": _SNOWFLAKE, **_DISCORD_MESSAGE_FIELDS},
-            ("channel_id", "content", "nonce"),
+            ("channel_id", "content"),
         ),
     ),
     _operation(

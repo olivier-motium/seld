@@ -32,9 +32,10 @@ class _Response:
         headers: dict[str, str] | None = None,
     ) -> None:
         self.status = status
-        self.headers = Message()
+        headers_value = Message()
         for name, value in (headers or {}).items():
-            self.headers[name] = value
+            headers_value[name] = value
+        self.headers: object = headers_value
         self._body = io.BytesIO(body)
 
     def read(self, amount: int = -1) -> bytes:
@@ -86,6 +87,26 @@ def test_fixed_origin_request_builds_authorization_internally_and_filters_header
     assert "top-secret-provider-token" not in repr(response)
 
 
+def test_google_oidc_origin_is_pinned_for_userinfo_requests() -> None:
+    captured: list[Request] = []
+
+    def open_request(request: Request, timeout: float) -> ResponseLike:
+        del timeout
+        captured.append(request)
+        return _Response(b'{"sub":"subject"}')
+
+    response = ConnectorTransport(opener=open_request).request(
+        origin=ConnectorOrigin.GOOGLE_OIDC,
+        method=ConnectorMethod.GET,
+        path="/v1/userinfo",
+        credential=_credential(),
+    )
+
+    assert response.json() == {"sub": "subject"}
+    assert captured[0].full_url == "https://openidconnect.googleapis.com/v1/userinfo"
+    assert captured[0].get_header("Authorization") == "Bearer top-secret-provider-token"
+
+
 def test_transport_rejects_caller_transport_escape_and_wrong_auth_scheme() -> None:
     transport = ConnectorTransport(opener=lambda request, timeout: _Response(b"{}"))
     with pytest.raises(ValidationError, match="path"):
@@ -108,6 +129,44 @@ def test_transport_rejects_caller_transport_escape_and_wrong_auth_scheme() -> No
             method=ConnectorMethod.GET,
             path="/api/auth.test",
             credential=_credential(AuthorizationScheme.BOT),
+        )
+
+
+def test_transport_allows_only_well_formed_byte_range_headers() -> None:
+    captured: list[Request] = []
+
+    def open_request(request: Request, timeout: float) -> ResponseLike:
+        del timeout
+        captured.append(request)
+        return _Response(b"partial", status=206, headers={"Content-Range": "bytes 5-11/12"})
+
+    transport = ConnectorTransport(opener=open_request)
+    response = transport.request(
+        origin=ConnectorOrigin.GOOGLE,
+        method=ConnectorMethod.GET,
+        path="/drive/v3/files/file",
+        credential=_credential(),
+        headers={"Range": "bytes=5-11"},
+        expected_statuses=frozenset({206}),
+    )
+    assert captured[0].get_header("Range") == "bytes=5-11"
+    assert response.headers["content-range"] == "bytes 5-11/12"
+
+    with pytest.raises(ValidationError, match="range"):
+        transport.request(
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path="/drive/v3/files/file",
+            credential=_credential(),
+            headers={"Range": "bytes=11-5"},
+        )
+    with pytest.raises(ValidationError, match="header"):
+        transport.request(
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path="/drive/v3/files/file",
+            credential=_credential(),
+            headers={"X-Forwarded-Host": "attacker.invalid"},
         )
 
 

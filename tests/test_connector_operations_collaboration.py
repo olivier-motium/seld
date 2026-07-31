@@ -8,6 +8,7 @@ from continuity_kernel.connector_contract import (
     ConnectorEffect,
     ConnectorMode,
     OperationCatalog,
+    OperationSpec,
     validate_json,
 )
 from continuity_kernel.connector_operations_collaboration import COLLABORATION_OPERATIONS
@@ -18,8 +19,14 @@ CONNECTION_ID = "con-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 SEALED = "v1.payload.mac"
 
 
-def _operation(provider: str, mode: ConnectorMode, name: str):
+def _operation(provider: str, mode: ConnectorMode, name: str) -> OperationSpec:
     return CATALOG.lookup(provider, mode, name)
+
+
+def _validated_input(operation: OperationSpec, value: object) -> dict[str, object]:
+    validated = operation.validate_input(value)
+    assert isinstance(validated, dict)
+    return validated
 
 
 def _schema_fields(schema: object) -> set[str]:
@@ -109,7 +116,8 @@ def test_discord_is_bot_only_and_never_exposes_permission_overwrites() -> None:
 def test_representative_message_thread_and_file_inputs_are_exactly_validated() -> None:
     slack_message = _operation("slack", ConnectorMode.WRITE, "messages.create")
     assert (
-        slack_message.validate_input(
+        _validated_input(
+            slack_message,
             {
                 "blocks": [
                     {"type": "section", "text": {"type": "mrkdwn", "text": "Hello *team*"}},
@@ -123,30 +131,33 @@ def test_representative_message_thread_and_file_inputs_are_exactly_validated() -
                 "client_msg_id": "client-123",
                 "text": "Hello team",
                 "unfurl_links": False,
-            }
+            },
         )["text"]
         == "Hello team"
     )
     assert (
-        _operation("slack", ConnectorMode.WRITE, "threads.reply").validate_input(
-            {"channel": "C123", "text": "A thread reply", "thread_ts": "1712345678.000001"}
+        _validated_input(
+            _operation("slack", ConnectorMode.WRITE, "threads.reply"),
+            {"channel": "C123", "text": "A thread reply", "thread_ts": "1712345678.000001"},
         )["thread_ts"]
         == "1712345678.000001"
     )
     assert (
-        _operation("slack", ConnectorMode.WRITE, "files.upload").validate_input(
+        _validated_input(
+            _operation("slack", ConnectorMode.WRITE, "files.upload"),
             {
                 "channel": "C123",
                 "content_base64": "aGVsbG8=",
                 "filename": "hello.txt",
                 "thread_ts": "1712345678.000001",
                 "title": "Hello",
-            }
+            },
         )["filename"]
         == "hello.txt"
     )
     assert (
-        _operation("discord", ConnectorMode.WRITE, "messages.create").validate_input(
+        _validated_input(
+            _operation("discord", ConnectorMode.WRITE, "messages.create"),
             {
                 "channel_id": "123456789012345678",
                 "content": "Hello Discord",
@@ -154,30 +165,31 @@ def test_representative_message_thread_and_file_inputs_are_exactly_validated() -
                     {"title": "A bounded embed", "fields": [{"name": "One", "value": "Two"}]}
                 ],
                 "message_reference": {"message_id": "223456789012345678"},
-                "nonce": "client-123",
-            }
-        )["nonce"]
-        == "client-123"
+            },
+        )["content"]
+        == "Hello Discord"
     )
     assert (
-        _operation("discord", ConnectorMode.WRITE, "threads.create").validate_input(
+        _validated_input(
+            _operation("discord", ConnectorMode.WRITE, "threads.create"),
             {
                 "archive_duration": 1_440,
                 "channel_id": "123456789012345678",
                 "name": "Design discussion",
                 "type": "public",
-            }
+            },
         )["type"]
         == "public"
     )
     assert (
-        _operation("discord", ConnectorMode.WRITE, "attachments.add").validate_input(
+        _validated_input(
+            _operation("discord", ConnectorMode.WRITE, "attachments.add"),
             {
                 "channel_id": "123456789012345678",
                 "content_base64": "aGVsbG8=",
                 "filename": "hello.txt",
                 "message_id": "223456789012345678",
-            }
+            },
         )["content_base64"]
         == "aGVsbG8="
     )
@@ -222,6 +234,26 @@ def test_proxy_and_unknown_fields_fail(
         _operation(provider, mode, name).validate_input(value)
 
 
+@pytest.mark.parametrize(
+    ("provider", "name", "value"),
+    [
+        ("slack", "users.list", {"query": "staff"}),
+        ("slack", "conversations.list", {"query": "project"}),
+        ("slack", "messages.list", {"channel": "C123", "query": "hello"}),
+        ("slack", "files.list", {"query": "report"}),
+        ("discord", "channels.list", {"guild_id": "123", "limit": 10}),
+        ("discord", "threads.active", {"guild_id": "123", "limit": 10}),
+    ],
+)
+def test_catalog_rejects_unsupported_list_search_and_pagination_inputs(
+    provider: str,
+    name: str,
+    value: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        _operation(provider, ConnectorMode.READ, name).validate_input(value)
+
+
 def test_tool_envelopes_expose_only_sealed_boundary_fields() -> None:
     read_schema = CATALOG.tool_input_schema("slack", ConnectorMode.READ)
     write_schema = CATALOG.tool_input_schema("discord", ConnectorMode.WRITE)
@@ -234,7 +266,7 @@ def test_tool_envelopes_expose_only_sealed_boundary_fields() -> None:
     write_call = {
         "confirmation_token": SEALED,
         "connection_id": CONNECTION_ID,
-        "input": {"channel_id": "123", "content": "Hello", "nonce": "client-1"},
+        "input": {"channel_id": "123", "content": "Hello"},
         "operation": "messages.create",
     }
 
@@ -262,6 +294,6 @@ def test_rich_slack_message_text_fits_the_explicit_bound() -> None:
     text = "x" * 40_000
     operation = _operation("slack", ConnectorMode.WRITE, "messages.create")
 
-    assert operation.validate_input({"channel": "C123", "text": text})["text"] == text
+    assert _validated_input(operation, {"channel": "C123", "text": text})["text"] == text
     with pytest.raises(ValidationError):
         operation.validate_input({"channel": "C123", "text": text + "x"})
