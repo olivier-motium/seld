@@ -425,9 +425,7 @@ def test_reconnecting_same_account_refreshes_equal_grant_but_never_downgrades_br
     assert manager.resolve_oauth_access_token(existing.connection_id) == "replacement-access-token"
 
     broader = _existing_oauth(manager, "gmail", access=ConnectorAccessTier.FULL)
-    gmail_read = _credential(
-        get_connector_profile("gmail").scopes_for(ConnectorAccessTier.READ)
-    )
+    gmail_read = _credential(get_connector_profile("gmail").scopes_for(ConnectorAccessTier.READ))
     monkeypatch.setattr(
         manager,
         "acquire_oauth_credential",

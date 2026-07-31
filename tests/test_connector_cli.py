@@ -20,6 +20,13 @@ class _Onboarding:
     def list(self) -> dict[str, object]:
         return {"connections": [], "revision": "absent"}
 
+    def registration_readiness(self) -> dict[str, dict[str, str]]:
+        return {
+            "google": {"sign_in": "available", "status": "ready"},
+            "microsoft": {"sign_in": "available", "status": "ready"},
+            "slack": {"sign_in": "available", "status": "ready"},
+        }
+
     def status(self, target: str | None) -> dict[str, object]:
         return {"connections": [], "target": target}
 
@@ -65,6 +72,14 @@ def test_connector_list_and_status_are_first_class_json_commands(
     assert cli.main(["--json", "--vault", str(vault), "connectors", "status", "google_drive"]) == 0
     status = json.loads(capsys.readouterr().out)
     assert status["result"]["target"] == "google_drive"
+
+    assert cli.main(["--json", "--vault", str(vault), "connectors", "readiness"]) == 0
+    readiness = json.loads(capsys.readouterr().out)["result"]
+    assert readiness == {
+        "oauth_registration_ready": True,
+        "registration_readiness": fake.registration_readiness(),
+        "vault_healthy_independent": True,
+    }
 
 
 def test_oauth_connect_passes_firefox_and_manual_url_fallback_without_credentials_in_args(

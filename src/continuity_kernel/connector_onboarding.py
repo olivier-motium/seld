@@ -108,9 +108,7 @@ class ConnectorOnboarding:
         if include_permanent_delete and (
             profile.name != "gmail" or tier is not ConnectorAccessTier.FULL
         ):
-            raise ValidationError(
-                "--with-permanent-delete is available only for Gmail Full access"
-            )
+            raise ValidationError("--with-permanent-delete is available only for Gmail Full access")
         registration = self.registration_loader(profile.provider)
         pending = _pending_oauth_metadata(
             profile,
@@ -224,7 +222,7 @@ class ConnectorOnboarding:
                     else "legacy_provider_bundle",
                 }
             )
-        readiness = self._registration_readiness()
+        readiness = self.registration_readiness()
         catalog: list[dict[str, object]] = []
         for connector, profile in sorted(CONNECTOR_PROFILES.items()):
             connected = sum(1 for row in projected if row.get("connector") == connector)
@@ -269,9 +267,7 @@ class ConnectorOnboarding:
                 profile = get_connector_profile(connector_or_connection_id)
                 readiness = status.get("registration_readiness")
                 registration = (
-                    readiness.get(profile.provider)
-                    if isinstance(readiness, dict)
-                    else None
+                    readiness.get(profile.provider) if isinstance(readiness, dict) else None
                 )
                 return {
                     **status,
@@ -384,9 +380,7 @@ class ConnectorOnboarding:
                 "nothing_saved": True,
                 "status": "identity_binding_missing_reconnect_required",
             }
-        if (
-            connection.account.fingerprint != identity.fingerprint
-        ):
+        if connection.account.fingerprint != identity.fingerprint:
             return {
                 "account": identity.display_label,
                 "connection_id": str(clean_id),
@@ -413,7 +407,9 @@ class ConnectorOnboarding:
             "status": "connected",
         }
 
-    def _registration_readiness(self) -> dict[str, dict[str, str]]:
+    def registration_readiness(self) -> dict[str, dict[str, str]]:
+        """Report packaged OAuth registration readiness without exposing client IDs."""
+
         readiness: dict[str, dict[str, str]] = {}
         providers = sorted(
             {
@@ -729,9 +725,7 @@ def provider_revocation_guidance(provider: str) -> str:
     guidance = {
         "discord": "Reset or delete the bot token in the Discord Developer Portal.",
         "google": "Remove Seld from your Google Account third-party access page.",
-        "microsoft": (
-            "Remove Seld from your Microsoft account or organization app-consent page."
-        ),
+        "microsoft": ("Remove Seld from your Microsoft account or organization app-consent page."),
         "slack": "Remove Seld from the workspace's installed apps.",
     }
     try:

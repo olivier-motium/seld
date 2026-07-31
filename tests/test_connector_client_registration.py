@@ -9,6 +9,7 @@ from continuity_kernel.connector_client_registration import (
     CLIENT_REGISTRATION_SCHEMA_VERSION,
     load_public_client_registration,
     load_public_client_registrations,
+    require_public_client_registrations,
 )
 from continuity_kernel.errors import SetupError, ValidationError
 
@@ -55,6 +56,32 @@ def test_loader_accepts_an_explicit_injected_path(tmp_path: Path) -> None:
     registration = load_public_client_registration("google", source_path=source)
 
     assert registration.client_id == "google-public.apps.example"
+
+
+def test_release_gate_requires_all_registrations_without_returning_client_ids() -> None:
+    assert require_public_client_registrations(source_bytes=_encoded(_all_providers())) == (
+        "google",
+        "microsoft",
+        "slack",
+    )
+
+    with pytest.raises(
+        SetupError,
+        match=r"release is blocked.*microsoft, slack",
+    ):
+        require_public_client_registrations(
+            source_bytes=_encoded({"google": _all_providers()["google"]})
+        )
+
+
+def test_release_gate_preserves_strict_secret_rejection() -> None:
+    providers = _all_providers()
+    google = dict(providers["google"])
+    google["client_secret"] = "must-not-be-accepted"
+    providers["google"] = google
+
+    with pytest.raises(ValidationError, match="client secrets"):
+        require_public_client_registrations(source_bytes=_encoded(providers))
 
 
 def test_missing_provider_is_a_friendly_setup_error_without_writing_anything(

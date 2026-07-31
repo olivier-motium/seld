@@ -104,6 +104,30 @@ def load_public_client_registration(
     return registration
 
 
+def require_public_client_registrations(
+    *,
+    source_path: str | Path | None = None,
+    source_bytes: bytes | None = None,
+) -> tuple[str, ...]:
+    """Fail a release unless every supported OAuth provider is registered.
+
+    The return value deliberately contains provider names only. Client IDs are
+    public, but release logs and readiness output do not need to expose them.
+    """
+
+    registrations = load_public_client_registrations(
+        source_path=source_path,
+        source_bytes=source_bytes,
+    )
+    missing = sorted(_PROVIDERS.difference(registrations))
+    if missing:
+        raise SetupError(
+            "release is blocked because public OAuth client registrations are missing for: "
+            + ", ".join(missing)
+        )
+    return tuple(sorted(registrations))
+
+
 def load_client_registration(
     provider: str,
     *,

@@ -160,10 +160,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
         vault = Vault(vault_path)
         initialized = vault.initialize(name=args.name, command="gsv")
         doctor = doctor_dict(vault.doctor())
+        connector_registration = _connector_registration_status(vault)
         if not doctor["healthy"]:
             return {
                 "bridge": None,
                 "codex": None,
+                "connectors": connector_registration,
                 "doctor": doctor,
                 "next": _doctor_next(vault_path, doctor),
                 "setup_complete": False,
@@ -217,6 +219,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return {
             "bridge": bridge,
             "codex": integration,
+            "connectors": connector_registration,
             "doctor": doctor,
             "next": _setup_next(
                 no_codex=args.no_codex,
@@ -359,6 +362,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             result["codex"] = {"available": True, **codex_status(codex_home=codex_home())}
         except ContinuityError as exc:
             result["codex"] = {"available": False, "error": str(exc)}
+        result["connectors"] = _connector_registration_status(vault)
         return result
     if args.command == "context":
         context = vault.context_pack(max_characters=args.max_characters)
@@ -589,17 +593,15 @@ def _dispatch(args: argparse.Namespace) -> Any:
 
 def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
     onboarding = ConnectorOnboarding(ConnectorAuthManager(vault))
+    if args.connectors_command == "readiness":
+        return _connector_registration_status(vault, onboarding=onboarding)
     if args.connectors_command == "list":
         return onboarding.list()
     if args.connectors_command == "status":
         return onboarding.status(args.target)
     if args.connectors_command == "connect":
-        if args.with_permanent_delete and (
-            args.connector != "gmail" or args.access != "full"
-        ):
-            raise ValidationError(
-                "--with-permanent-delete is available only for Gmail Full access"
-            )
+        if args.with_permanent_delete and (args.connector != "gmail" or args.access != "full"):
+            raise ValidationError("--with-permanent-delete is available only for Gmail Full access")
         print(
             f"Connecting {args.connector.replace('_', ' ').title()} with {args.access.title()} "
             "access…",
@@ -672,6 +674,21 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
             "status": "instructions_only",
         }
     raise AssertionError("unreachable connectors command")
+
+
+def _connector_registration_status(
+    vault: Vault,
+    *,
+    onboarding: ConnectorOnboarding | None = None,
+) -> dict[str, object]:
+    current = onboarding or ConnectorOnboarding(ConnectorAuthManager(vault))
+    readiness = current.registration_readiness()
+    ready = all(row.get("status") == "ready" for row in readiness.values())
+    return {
+        "oauth_registration_ready": ready,
+        "registration_readiness": readiness,
+        "vault_healthy_independent": True,
+    }
 
 
 _USE_DEFAULT_BROWSER = object()
@@ -1412,6 +1429,10 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
     )
     connector_commands.add_parser("list", help="List redacted connector status.")
+    connector_commands.add_parser(
+        "readiness",
+        help="Show whether this build contains every public OAuth client registration.",
+    )
     connector_status = connector_commands.add_parser(
         "status",
         help="Show all connections for one logical connector or one exact connection ID.",
@@ -1427,8 +1448,7 @@ def _parser() -> argparse.ArgumentParser:
     connector_connect.add_argument(
         "--alias",
         help=(
-            "Optional privacy-safe local account label; provider email is never stored by "
-            "default."
+            "Optional privacy-safe local account label; provider email is never stored by default."
         ),
     )
     connector_connect.add_argument(
@@ -1447,8 +1467,7 @@ def _parser() -> argparse.ArgumentParser:
     connector_resume.add_argument(
         "--alias",
         help=(
-            "Optional privacy-safe local account label; provider email is never stored by "
-            "default."
+            "Optional privacy-safe local account label; provider email is never stored by default."
         ),
     )
     connector_disconnect = connector_commands.add_parser(
