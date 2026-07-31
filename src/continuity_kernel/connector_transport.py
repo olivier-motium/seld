@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -13,13 +15,17 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import SplitResult, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from continuity_kernel.connector_transfer import ArtifactReceipt, PreparedUpload
 from continuity_kernel.errors import ContinuityError, ValidationError
+from continuity_kernel.local_files import MAX_FILE_TRANSFER_BYTES
 
 DEFAULT_TIMEOUT_SECONDS: Final = 30.0
 MAX_TIMEOUT_SECONDS: Final = 120.0
 MAX_REQUEST_BODY_BYTES: Final = 16 * 1024 * 1024
 MAX_RESPONSE_BODY_BYTES: Final = 16 * 1024 * 1024
 MAX_ERROR_BODY_BYTES: Final = 64 * 1024
+MAX_STREAM_BODY_BYTES: Final = MAX_FILE_TRANSFER_BYTES
+MAX_STREAM_CHUNK_BYTES: Final = 1024 * 1024
 MAX_QUERY_ITEMS: Final = 128
 MAX_HEADER_ITEMS: Final = 24
 
@@ -34,6 +40,8 @@ _ALLOWED_HEADERS: Final = frozenset(
         "if-none-match",
         "prefer",
         "range",
+        "x-upload-content-length",
+        "x-upload-content-type",
         "x-goog-if-generation-match",
         "x-goog-if-metageneration-match",
     }
@@ -46,6 +54,7 @@ _SAFE_RESPONSE_HEADERS: Final = frozenset(
         "etag",
         "location",
         "preference-applied",
+        "range",
         "retry-after",
         "x-ratelimit-limit",
         "x-ratelimit-remaining",
@@ -92,9 +101,19 @@ _DYNAMIC_HOSTS: Final[Mapping[ConnectorOrigin, frozenset[str]]] = MappingProxyTy
         ConnectorOrigin.GMAIL: frozenset({"gmail.googleapis.com"}),
         ConnectorOrigin.GOOGLE: frozenset({"www.googleapis.com", "content.googleapis.com"}),
         ConnectorOrigin.GOOGLE_OIDC: frozenset({"openidconnect.googleapis.com"}),
-        ConnectorOrigin.MICROSOFT_GRAPH: frozenset({"graph.microsoft.com"}),
+        ConnectorOrigin.MICROSOFT_GRAPH: frozenset({"graph.microsoft.com", "outlook.office.com"}),
         ConnectorOrigin.SLACK: frozenset({"files.slack.com", "slack.com"}),
         ConnectorOrigin.DISCORD: frozenset({"cdn.discordapp.com", "discord.com"}),
+    }
+)
+_DYNAMIC_HOST_SUFFIXES: Final[Mapping[ConnectorOrigin, tuple[str, ...]]] = MappingProxyType(
+    {
+        ConnectorOrigin.GMAIL: (),
+        ConnectorOrigin.GOOGLE: (".googleusercontent.com",),
+        ConnectorOrigin.GOOGLE_OIDC: (),
+        ConnectorOrigin.MICROSOFT_GRAPH: (),
+        ConnectorOrigin.SLACK: (),
+        ConnectorOrigin.DISCORD: (".discordapp.com",),
     }
 )
 
@@ -156,9 +175,13 @@ class ConnectorResponse:
     body: bytes
 
     def __repr__(self) -> str:
+        safe_headers = {
+            name: ("<redacted>" if name.casefold() == "location" else value)
+            for name, value in self.headers.items()
+        }
         return (
             f"ConnectorResponse(origin={self.origin!r}, status={self.status!r}, "
-            f"headers={dict(self.headers)!r}, body=<{len(self.body)} bytes>)"
+            f"headers={safe_headers!r}, body=<{len(self.body)} bytes>)"
         )
 
     def json(self) -> object:
@@ -176,6 +199,63 @@ class ConnectorResponse:
                 status=self.status,
                 code="invalid_json_response",
             ) from exc
+
+
+@dataclass(frozen=True, repr=False)
+class ConnectorStreamResponse:
+    """Response metadata for a transfer whose body was never materialized."""
+
+    origin: ConnectorOrigin
+    status: int
+    headers: Mapping[str, str]
+    bytes_transferred: int
+    sha256: str | None
+    next_offset: int | None = None
+    control_body: bytes = b""
+    artifact: ArtifactReceipt | None = None
+
+    @property
+    def body(self) -> bytes:
+        """Return only the bounded provider control response, never transferred bytes."""
+
+        return self.control_body
+
+    def json(self) -> object:
+        if not self.control_body:
+            return None
+        try:
+            return json.loads(
+                self.control_body.decode("utf-8"),
+                object_pairs_hook=_object_without_duplicates,
+                parse_constant=_reject_json_constant,
+            )
+        except (RecursionError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise ConnectorProviderError(
+                origin=self.origin,
+                status=self.status,
+                code="invalid_json_response",
+            ) from exc
+
+    @property
+    def bytes_sent(self) -> int:
+        return self.bytes_transferred
+
+    @property
+    def bytes_received(self) -> int:
+        return self.bytes_transferred
+
+    def __repr__(self) -> str:
+        safe_headers = {
+            name: ("<redacted>" if name.casefold() == "location" else value)
+            for name, value in self.headers.items()
+        }
+        return (
+            f"ConnectorStreamResponse(origin={self.origin!r}, status={self.status!r}, "
+            f"headers={safe_headers!r}, bytes_transferred={self.bytes_transferred!r}, "
+            f"next_offset={self.next_offset!r}, "
+            f"control_body=<{len(self.control_body)} bytes>, artifact={self.artifact!r}, "
+            "sha256=<redacted>)"
+        )
 
 
 class ResponseLike(Protocol):
@@ -271,6 +351,267 @@ class ConnectorTransport:
             response_bound=response_bound,
         )
 
+    def request_stream(
+        self,
+        *,
+        origin: ConnectorOrigin,
+        method: ConnectorMethod,
+        source: Iterable[bytes] | PreparedUpload | None = None,
+        content_length: int | None = None,
+        path: str | None = None,
+        location: str | None = None,
+        query: Sequence[tuple[str, str]] = (),
+        credential: ConnectorCredential | None = None,
+        content_type: str | None = None,
+        byte_offset: int = 0,
+        total_length: int | None = None,
+        expected_statuses: frozenset[int] = frozenset({200, 201, 202, 204, 308}),
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> ConnectorStreamResponse:
+        """Upload an adapter-owned stream with an exact generated byte length.
+
+        The destination is either a validated relative provider path or a
+        response-derived provider location. No caller headers, raw URL, or
+        token are accepted by this boundary.
+        """
+
+        target = _stream_target(origin, path=path, location=location)
+        target = _stream_query(target, query=query, location=location)
+        _validate_upload_stream_credential(path=path, location=location, credential=credential)
+        _validate_request_policy(origin, method, credential)
+        if source is None:
+            raise ValidationError("stream source is required")
+        if isinstance(source, PreparedUpload):
+            length = _prepared_upload_length(
+                source,
+                content_length=content_length,
+                byte_offset=byte_offset,
+                total_length=total_length,
+            )
+        else:
+            if byte_offset != 0:
+                raise ValidationError("resumed uploads require an immutable prepared upload")
+            length = _stream_length(source, content_length)
+        headers = _stream_upload_headers(
+            length=length,
+            content_type=content_type,
+            byte_offset=byte_offset,
+            total_length=total_length,
+        )
+        expected = _expected_statuses(expected_statuses)
+        timeout = _timeout(timeout_seconds)
+        body = _ExactBody(source, expected_length=length, byte_offset=byte_offset)
+        if credential is not None:
+            headers["Authorization"] = f"{credential.scheme.value} {credential.secret}"
+        request = Request(target, data=body, headers=headers, method=method.value)
+        response_headers: dict[str, str] = {}
+        control_body = b""
+        status = 0
+        try:
+            with self._opener(request, timeout) as response:
+                status = _response_status(response)
+                response_headers = _safe_headers(response.headers)
+                if status not in expected:
+                    error_body = _bounded_stream_error_read(response)
+                    raise ConnectorProviderError(
+                        origin=origin,
+                        status=status,
+                        code=_provider_error_code(error_body),
+                        retry_after=response_headers.get("retry-after"),
+                    )
+                control_body = _bounded_read(response, MAX_RESPONSE_BODY_BYTES)
+            body.verify_complete()
+        except HTTPError as exc:
+            if exc.code in expected:
+                status = exc.code
+                response_headers = _safe_headers(exc.headers)
+                control_body = _bounded_read(cast(ResponseLike, exc), MAX_RESPONSE_BODY_BYTES)
+                try:
+                    body.verify_complete()
+                except ValidationError as verification_error:
+                    raise ConnectorOutcomeUnknown(
+                        "provider responded before the complete upload; outcome is unknown"
+                    ) from verification_error
+            else:
+                raise ConnectorProviderError(
+                    origin=origin,
+                    status=exc.code,
+                    code=_provider_error_code(_bounded_error_read(exc)),
+                    retry_after=_header(exc.headers, "Retry-After"),
+                ) from exc
+        except ValidationError as exc:
+            if body.total:
+                raise ConnectorOutcomeUnknown(
+                    "provider stream source failed after dispatch; outcome is unknown"
+                ) from exc
+            raise
+        except (OSError, TimeoutError, URLError) as exc:
+            raise ConnectorOutcomeUnknown(
+                "provider stream transport failed; outcome is unknown and was not retried"
+            ) from exc
+        next_offset = _resume_next_offset(
+            status=status,
+            headers=response_headers,
+            byte_offset=byte_offset,
+            content_length=length,
+        )
+        return ConnectorStreamResponse(
+            origin=origin,
+            status=status,
+            headers=MappingProxyType(response_headers),
+            bytes_transferred=body.total,
+            sha256=body.hexdigest,
+            next_offset=next_offset,
+            control_body=control_body,
+        )
+
+    def download_stream(
+        self,
+        *,
+        origin: ConnectorOrigin,
+        sink: object,
+        path: str | None = None,
+        location: str | None = None,
+        query: Sequence[tuple[str, str]] = (),
+        credential: ConnectorCredential | None = None,
+        range_start: int | None = None,
+        range_end: int | None = None,
+        expected_length: int | None = None,
+        expected_statuses: frozenset[int] = frozenset({200, 206}),
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        max_bytes: int = MAX_STREAM_BODY_BYTES,
+    ) -> ConnectorStreamResponse:
+        """Stream a provider response into an adapter-owned sink.
+
+        The sink is aborted on every failure when it exposes ``abort``. A
+        sink exposing ``finish`` is completed only after status, length, range,
+        and byte-count checks have passed.
+        """
+
+        target = _stream_target(origin, path=path, location=location)
+        target = _stream_query(target, query=query, location=location)
+        _validate_download_stream_credential(
+            origin=origin,
+            path=path,
+            location=location,
+            credential=credential,
+        )
+        _validate_request_policy(origin, ConnectorMethod.GET, credential)
+        _stream_bound(max_bytes)
+        expected = _expected_statuses(expected_statuses)
+        request_headers: dict[str, str] = {"Accept": "application/octet-stream"}
+        expected_from_range = _download_range_header(
+            request_headers,
+            range_start=range_start,
+            range_end=range_end,
+        )
+        expected_count = expected_length
+        if expected_count is None:
+            expected_count = expected_from_range
+        if expected_count is not None:
+            _stream_length_value(expected_count, label="expected download length")
+            if expected_count > max_bytes:
+                raise ValidationError("expected download length exceeds its operation bound")
+        if credential is not None:
+            request_headers["Authorization"] = f"{credential.scheme.value} {credential.secret}"
+        timeout = _timeout(timeout_seconds)
+        response_headers: dict[str, str] = {}
+        status = 0
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            redirected = False
+            while True:
+                request = Request(target, headers=request_headers, method="GET")
+                try:
+                    response = self._opener(request, timeout)
+                except HTTPError as exc:
+                    redirect_headers = _safe_headers(exc.headers)
+                    redirected_target = _credentialless_download_redirect(
+                        origin,
+                        from_fixed_path=path is not None,
+                        already_redirected=redirected,
+                        status=exc.code,
+                        headers=redirect_headers,
+                    )
+                    if redirected_target is None:
+                        raise
+                    with suppress(Exception):
+                        exc.close()
+                    target = redirected_target
+                    request_headers.pop("Authorization", None)
+                    redirected = True
+                    continue
+                break
+            with response:
+                status = _response_status(response)
+                response_headers = _safe_headers(response.headers)
+                if status not in expected:
+                    error_body = _bounded_stream_error_read(response)
+                    raise ConnectorProviderError(
+                        origin=origin,
+                        status=status,
+                        code=_provider_error_code(error_body),
+                        retry_after=response_headers.get("retry-after"),
+                    )
+                _validate_download_status(
+                    status,
+                    range_requested=range_start is not None,
+                )
+                declared = _declared_content_length(response_headers)
+                if declared is not None:
+                    if declared > max_bytes:
+                        raise ValidationError(
+                            "provider download Content-Length exceeds its operation bound"
+                        )
+                    if expected_count is not None and declared != expected_count:
+                        raise ValidationError("provider download Content-Length is unexpected")
+                    expected_count = declared
+                _validate_download_content_range(
+                    response_headers,
+                    range_start=range_start,
+                    range_end=range_end,
+                    expected_count=expected_count,
+                )
+                while True:
+                    block = response.read(MAX_STREAM_CHUNK_BYTES)
+                    if not isinstance(block, bytes):
+                        raise ValidationError("provider download returned a non-binary chunk")
+                    if len(block) > MAX_STREAM_CHUNK_BYTES:
+                        raise ValidationError("provider download chunk exceeds its size bound")
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > max_bytes:
+                        raise ValidationError("provider download exceeds its size bound")
+                    _write_sink(sink, block)
+                    digest.update(block)
+                if expected_count is not None and total != expected_count:
+                    raise ValidationError("provider download byte count does not match its length")
+            artifact = _finish_sink(sink)
+        except HTTPError as exc:
+            _abort_sink(sink)
+            raise ConnectorProviderError(
+                origin=origin,
+                status=exc.code,
+                code=_provider_error_code(_bounded_error_read(exc)),
+                retry_after=_header(exc.headers, "Retry-After"),
+            ) from exc
+        except (OSError, TimeoutError, URLError) as exc:
+            _abort_sink(sink)
+            raise ContinuityError(f"provider {origin.value} download transport failed") from exc
+        except Exception:
+            _abort_sink(sink)
+            raise
+        return ConnectorStreamResponse(
+            origin=origin,
+            status=status,
+            headers=MappingProxyType(response_headers),
+            bytes_transferred=total,
+            sha256=digest.hexdigest(),
+            artifact=artifact,
+        )
+
     def _send(
         self,
         *,
@@ -357,6 +698,332 @@ def _open_without_redirects(request: Request, timeout: float) -> ResponseLike:
     return cast(ResponseLike, build_opener(_RejectRedirects()).open(request, timeout=timeout))
 
 
+class _ExactBody:
+    """File-like adapter that counts an iterable without buffering the payload."""
+
+    def __init__(
+        self,
+        source: Iterable[bytes] | PreparedUpload,
+        *,
+        expected_length: int,
+        byte_offset: int = 0,
+    ) -> None:
+        self._source = (
+            source.iter_chunks(offset=byte_offset, length=expected_length)
+            if isinstance(source, PreparedUpload)
+            else iter(source)
+        )
+        self._expected_length = expected_length
+        self._buffer = bytearray()
+        self._exhausted = False
+        self._accepted = 0
+        self.total = 0
+        self._digest = hashlib.sha256()
+
+    @property
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+    def read(self, amount: int = -1) -> bytes:
+        if amount == 0:
+            return b""
+        if self._exhausted and not self._buffer:
+            return b""
+        requested = MAX_STREAM_CHUNK_BYTES if amount <= 0 else min(amount, MAX_STREAM_CHUNK_BYTES)
+        while len(self._buffer) < requested and not self._exhausted:
+            if self._accepted == self._expected_length:
+                self._exhausted = True
+                break
+            try:
+                chunk = next(self._source)
+            except StopIteration:
+                self._exhausted = True
+                raise ValidationError(
+                    "stream source ended before its declared Content-Length"
+                ) from None
+            if not isinstance(chunk, bytes):
+                raise ValidationError("stream source returned a non-binary chunk")
+            if not chunk:
+                raise ValidationError("stream source returned an empty chunk")
+            if len(chunk) > MAX_STREAM_CHUNK_BYTES:
+                raise ValidationError("stream source chunk exceeds its size bound")
+            if self._accepted + len(chunk) > self._expected_length:
+                raise ValidationError("stream source exceeds its declared Content-Length")
+            self._accepted += len(chunk)
+            self._buffer.extend(chunk)
+        if not self._buffer:
+            return b""
+        block = bytes(self._buffer[:requested])
+        del self._buffer[: len(block)]
+        self.total += len(block)
+        self._digest.update(block)
+        return block
+
+    def verify_complete(self) -> None:
+        if (
+            self._buffer
+            or self._accepted != self._expected_length
+            or self.total != self._expected_length
+        ):
+            raise ValidationError("stream source byte count does not match Content-Length")
+
+
+def _stream_target(
+    origin: ConnectorOrigin,
+    *,
+    path: str | None,
+    location: str | None,
+) -> str:
+    if (path is None) == (location is None):
+        raise ValidationError("stream target must be one provider path or location")
+    if location is not None:
+        return _provider_location(origin, location)
+    assert path is not None
+    return _ORIGIN_BASES[_origin(origin)] + _relative_path(path)
+
+
+def _stream_query(
+    target: str,
+    *,
+    query: Sequence[tuple[str, str]],
+    location: str | None,
+) -> str:
+    if location is not None and query:
+        raise ValidationError("response-derived stream locations do not accept extra query items")
+    encoded = _query(query)
+    return f"{target}?{encoded}" if encoded else target
+
+
+def _validate_upload_stream_credential(
+    *,
+    path: str | None,
+    location: str | None,
+    credential: ConnectorCredential | None,
+) -> None:
+    if path is not None and credential is None:
+        raise ValidationError("fixed provider upload paths require a credential")
+    if location is not None and credential is not None:
+        raise ValidationError("response-derived transfer locations do not accept credentials")
+
+
+def _validate_download_stream_credential(
+    *,
+    origin: ConnectorOrigin,
+    path: str | None,
+    location: str | None,
+    credential: ConnectorCredential | None,
+) -> None:
+    if path is not None and credential is None:
+        raise ValidationError("fixed provider download paths require a credential")
+    if location is None:
+        return
+    if origin is ConnectorOrigin.SLACK:
+        if credential is None:
+            raise ValidationError("Slack private file downloads require a credential")
+        return
+    if credential is not None:
+        raise ValidationError("signed provider download locations do not accept credentials")
+
+
+def _stream_length(
+    source: Iterable[bytes] | PreparedUpload,
+    value: int | None,
+) -> int:
+    if value is None and isinstance(source, PreparedUpload):
+        value = source.size
+    if value is None:
+        raise ValidationError("stream Content-Length is required")
+    return _stream_length_value(value, label="stream Content-Length")
+
+
+def _prepared_upload_length(
+    source: PreparedUpload,
+    *,
+    content_length: int | None,
+    byte_offset: int,
+    total_length: int | None,
+) -> int:
+    if type(byte_offset) is not int or not 0 <= byte_offset <= source.size:
+        raise ValidationError("prepared upload byte offset is invalid")
+    if total_length is not None and total_length != source.size:
+        raise ValidationError("prepared upload total length does not match its snapshot")
+    length = source.size - byte_offset if content_length is None else _stream_length_value(
+        content_length,
+        label="stream Content-Length",
+    )
+    if byte_offset + length > source.size:
+        raise ValidationError("prepared upload range exceeds its snapshot")
+    return length
+
+
+def _resume_next_offset(
+    *,
+    status: int,
+    headers: Mapping[str, str],
+    byte_offset: int,
+    content_length: int,
+) -> int | None:
+    if status != 308:
+        return None
+    acknowledged = headers.get("range")
+    match = _RANGE.fullmatch(acknowledged) if acknowledged is not None else None
+    expected_end = byte_offset + content_length - 1
+    if (
+        content_length == 0
+        or match is None
+        or int(match.group(1)) != 0
+        or int(match.group(2)) != expected_end
+    ):
+        raise ValidationError("provider resumable acknowledgement does not match the sent range")
+    return expected_end + 1
+
+
+def _stream_length_value(value: object, *, label: str) -> int:
+    if type(value) is not int or not 0 <= value <= MAX_STREAM_BODY_BYTES:
+        raise ValidationError(f"{label} is invalid")
+    return value
+
+
+def _stream_bound(value: object) -> int:
+    return _stream_length_value(value, label="stream size bound")
+
+
+def _stream_upload_headers(
+    *,
+    length: int,
+    content_type: str | None,
+    byte_offset: int,
+    total_length: int | None,
+) -> dict[str, str]:
+    if type(byte_offset) is not int or byte_offset < 0:
+        raise ValidationError("stream byte offset is invalid")
+    headers = {
+        "Accept": "application/json",
+        "Content-Length": str(length),
+    }
+    if content_type is not None:
+        _header_value(content_type)
+        headers["Content-Type"] = content_type
+    if total_length is not None:
+        _stream_length_value(total_length, label="upload total length")
+        if total_length < byte_offset + length:
+            raise ValidationError("upload range exceeds its total length")
+        if length == 0:
+            raise ValidationError("upload range cannot contain an empty chunk")
+        headers["Content-Range"] = f"bytes {byte_offset}-{byte_offset + length - 1}/{total_length}"
+    elif byte_offset != 0:
+        raise ValidationError("non-zero upload offset requires a total length")
+    return headers
+
+
+def _validate_download_status(status: int, *, range_requested: bool) -> None:
+    if range_requested and status != 206:
+        raise ValidationError("provider ignored the requested download range")
+    if not range_requested and status == 206:
+        raise ValidationError("provider returned an unsolicited partial download")
+
+
+def _download_range_header(
+    headers: dict[str, str],
+    *,
+    range_start: int | None,
+    range_end: int | None,
+) -> int | None:
+    if (range_start is None) != (range_end is None):
+        raise ValidationError("download range requires both endpoints")
+    if range_start is None or range_end is None:
+        return None
+    if (
+        type(range_start) is not int
+        or type(range_end) is not int
+        or range_start < 0
+        or range_end < range_start
+        or range_end - range_start + 1 > MAX_STREAM_BODY_BYTES
+    ):
+        raise ValidationError("download range is invalid")
+    headers["Range"] = f"bytes={range_start}-{range_end}"
+    return range_end - range_start + 1
+
+
+def _declared_content_length(headers: Mapping[str, str]) -> int | None:
+    value = headers.get("content-length")
+    if value is None:
+        return None
+    if not re.fullmatch(r"[0-9]+", value):
+        raise ValidationError("provider download Content-Length is invalid")
+    return _stream_length_value(int(value), label="provider download Content-Length")
+
+
+def _validate_download_content_range(
+    headers: Mapping[str, str],
+    *,
+    range_start: int | None,
+    range_end: int | None,
+    expected_count: int | None,
+) -> None:
+    value = headers.get("content-range")
+    if range_start is None or range_end is None:
+        return
+    if value is None:
+        raise ValidationError("provider ranged download has no Content-Range")
+    match = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", value)
+    if match is None:
+        raise ValidationError("provider Content-Range is invalid")
+    start, end, total = match.groups()
+    start_value = int(start)
+    end_value = int(end)
+    if (
+        start_value != range_start
+        or end_value != range_end
+        or end_value < start_value
+        or (expected_count is not None and end_value - start_value + 1 != expected_count)
+        or (total != "*" and int(total) <= end_value)
+    ):
+        raise ValidationError("provider Content-Range does not match the requested range")
+
+
+def _response_status(response: ResponseLike) -> int:
+    status = response.status
+    if type(status) is not int or not 100 <= status <= 599:
+        raise ContinuityError("provider response status is invalid")
+    return status
+
+
+def _bounded_stream_error_read(response: ResponseLike) -> bytes:
+    try:
+        return response.read(MAX_ERROR_BODY_BYTES + 1)[:MAX_ERROR_BODY_BYTES]
+    except OSError:
+        return b""
+
+
+def _write_sink(sink: object, block: bytes) -> None:
+    writer = getattr(sink, "write", None)
+    if not callable(writer):
+        raise ValidationError("download sink is not writable")
+    result = writer(block)
+    if result is not None and result != len(block):
+        raise ValidationError("download sink wrote an unexpected byte count")
+
+
+def _finish_sink(sink: object) -> ArtifactReceipt | None:
+    finish = getattr(sink, "finish", None)
+    if finish is None:
+        return None
+    if not callable(finish):
+        raise ValidationError("download sink completion is invalid")
+    result = finish()
+    if result is None or isinstance(result, ArtifactReceipt):
+        return result
+    raise ValidationError("download sink returned an invalid completion receipt")
+
+
+def _abort_sink(sink: object) -> None:
+    abort = getattr(sink, "abort", None)
+    if callable(abort):
+        with suppress(Exception):
+            abort()
+
+
 def _origin(value: object) -> ConnectorOrigin:
     if not isinstance(value, ConnectorOrigin):
         raise ValidationError("connector origin is invalid")
@@ -380,13 +1047,21 @@ def _provider_location(origin: ConnectorOrigin, value: object) -> str:
         raise ValidationError("connector provider location is invalid")
     parsed = urlsplit(value)
     host = parsed.hostname.casefold() if parsed.hostname is not None else None
+    clean_origin = _origin(origin)
+    host_allowed = host in _DYNAMIC_HOSTS[clean_origin] or (
+        host is not None
+        and any(
+            host.endswith(suffix) and host != suffix[1:]
+            for suffix in _DYNAMIC_HOST_SUFFIXES[clean_origin]
+        )
+    )
     try:
         port = parsed.port
     except ValueError as exc:
         raise ValidationError("connector provider location is invalid") from exc
     if (
         parsed.scheme != "https"
-        or host not in _DYNAMIC_HOSTS[_origin(origin)]
+        or not host_allowed
         or parsed.username is not None
         or parsed.password is not None
         or port not in {None, 443}
@@ -394,8 +1069,30 @@ def _provider_location(origin: ConnectorOrigin, value: object) -> str:
         or not parsed.path.startswith("/")
     ):
         raise ValidationError("connector provider location is outside its pinned origin")
+    assert host is not None
     canonical = SplitResult("https", host, parsed.path, parsed.query, "")
     return urlunsplit(canonical)
+
+
+def _credentialless_download_redirect(
+    origin: ConnectorOrigin,
+    *,
+    from_fixed_path: bool,
+    already_redirected: bool,
+    status: int,
+    headers: Mapping[str, str],
+) -> str | None:
+    if (
+        not from_fixed_path
+        or already_redirected
+        or status not in {302, 303, 307, 308}
+        or origin not in {ConnectorOrigin.GOOGLE, ConnectorOrigin.MICROSOFT_GRAPH}
+    ):
+        return None
+    location = headers.get("location")
+    if location is None:
+        raise ValidationError("provider download redirect has no safe Location")
+    return _provider_location(origin, location)
 
 
 def _validate_request_policy(
@@ -548,12 +1245,16 @@ def _safe_headers(values: object) -> dict[str, str]:
         return {}
     result: dict[str, str] = {}
     for name, value in cast(HeadersLike, values).items():
+        normalized = name.casefold() if isinstance(name, str) else None
         if (
             isinstance(name, str)
             and isinstance(value, str)
-            and name.casefold() in _SAFE_RESPONSE_HEADERS
+            and normalized in _SAFE_RESPONSE_HEADERS
         ):
-            result[name.casefold()] = value[:8_192]
+            assert normalized is not None
+            if normalized in result:
+                raise ValidationError("provider response contains a duplicate safety header")
+            result[normalized] = value[:8_192]
     return result
 
 

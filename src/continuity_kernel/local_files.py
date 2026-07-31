@@ -7,10 +7,13 @@ to the Seld vault or the grant record.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +39,19 @@ _LEGACY_LOCAL_FILE_GRANT_FORMAT_VERSION: Final = 1
 MAX_LOCAL_PATH_BYTES: Final = 16 * 1024
 MAX_LOCAL_GRANTS: Final = 128
 MAX_LOCAL_GRANT_STORE_BYTES: Final = 512 * 1024
+# Google Drive is the largest supported provider surface at 5 TiB.  Keep this
+# independent from the 16 MiB JSON/control-plane limits: this lane is streamed
+# from a descriptor-pinned file and is never materialized in a request object.
+MAX_FILE_TRANSFER_BYTES: Final = 5 * 1024**4
+FILE_TRANSFER_CHUNK_BYTES: Final = 1024 * 1024
+_PINNED_FILE_TRANSFER_SUPPORTED: Final = (
+    os.name != "nt"
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.stat in os.supports_follow_symlinks
+)
 _GRANT_KEYS: Final = frozenset(
     {
         "created_at",
@@ -75,6 +91,47 @@ class LocalFileGrant:
         if current is not None:
             value["current"] = current
         return value
+
+
+@dataclass(frozen=True, repr=False)
+class LocalFileRef:
+    """An internal, revalidatable reference to one granted regular file."""
+
+    grant_id: str
+    relative_path: str
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    sha256: str
+    _store: LocalFileGrantStore
+    _root: str
+    _relative: Path
+
+    def __repr__(self) -> str:
+        return (
+            "LocalFileRef(grant_id=<redacted>, relative_path=<redacted>, "
+            f"device={self.device!r}, inode={self.inode!r}, size={self.size!r}, "
+            f"modified_ns={self.modified_ns!r}, sha256=<redacted>)"
+        )
+
+    def revalidate(self) -> None:
+        """Prove that the grant and the captured file identity still hold."""
+
+        self._store.revalidate_file_ref(self)
+
+    def iter_chunks(self, *, chunk_size: int = FILE_TRANSFER_CHUNK_BYTES) -> Iterator[bytes]:
+        """Yield bounded chunks while holding the grant lock and rechecking the file."""
+
+        yield from self._store.iter_file_ref(self, chunk_size=chunk_size)
+
+    @property
+    def mtime_ns(self) -> int:
+        return self.modified_ns
+
+    @property
+    def content_length(self) -> int:
+        return self.size
 
 
 class LocalFileGrantStore:
@@ -217,6 +274,123 @@ class LocalFileGrantStore:
                 )
             return _read_granted_file(grant=grant, relative=relative)
 
+    def resolve_file_ref(
+        self,
+        grant_id: str,
+        relative_path: str,
+        *,
+        max_bytes: int = MAX_FILE_TRANSFER_BYTES,
+    ) -> LocalFileRef:
+        """Resolve one internal binary reference through the current grant set."""
+
+        clean_id = _grant_id(grant_id)
+        relative = _relative_path(relative_path)
+        _file_transfer_bound(max_bytes)
+        with self._locked():
+            grant = self._grant_for_file_ref(clean_id)
+            with _open_granted_file(grant, relative) as descriptor:
+                metadata = _stable_file_metadata(os.fstat(descriptor))
+                if metadata[2] > max_bytes:
+                    raise ValidationError("local file exceeds its transfer size bound")
+                digest = _hash_descriptor(
+                    descriptor,
+                    label="local file",
+                    max_bytes=max_bytes,
+                )
+                current = _stable_file_metadata(os.fstat(descriptor))
+                if current != metadata:
+                    raise ValidationError("local file changed while its reference was created")
+            return LocalFileRef(
+                grant_id=clean_id,
+                relative_path=relative.as_posix(),
+                device=metadata[0],
+                inode=metadata[1],
+                size=metadata[2],
+                modified_ns=metadata[3],
+                sha256=digest,
+                _store=self,
+                _root=grant.root,
+                _relative=relative,
+            )
+
+    def assert_transfer_authorized(self, grant_id: str, relative_path: str) -> None:
+        """Recheck grant authority without reopening or replacing a prepared snapshot."""
+
+        clean_id = _grant_id(grant_id)
+        _relative_path(relative_path)
+        with self._locked():
+            self._grant_for_file_ref(clean_id)
+
+    def revalidate_file_ref(self, reference: LocalFileRef) -> None:
+        """Recheck grant, path, identity, size, timestamp, and content digest."""
+
+        if not isinstance(reference, LocalFileRef) or reference._store is not self:
+            raise ValidationError("local file reference belongs to another grant store")
+        relative = _relative_path(reference.relative_path)
+        if relative != reference._relative or reference._root == "":
+            raise ValidationError("local file reference is invalid")
+        with self._locked():
+            grant = self._grant_for_file_ref(reference.grant_id)
+            if grant.root != reference._root:
+                raise ValidationError("local file reference grant root changed")
+            with _open_granted_file(grant, relative) as descriptor:
+                metadata = _stable_file_metadata(os.fstat(descriptor))
+                _match_file_ref(reference, metadata)
+                digest = _hash_descriptor(
+                    descriptor,
+                    label="local file",
+                    max_bytes=reference.size,
+                )
+                if digest != reference.sha256:
+                    raise ValidationError("local file reference content changed")
+
+    def iter_file_ref(
+        self,
+        reference: LocalFileRef,
+        *,
+        chunk_size: int = FILE_TRANSFER_CHUNK_BYTES,
+    ) -> Iterator[bytes]:
+        """Stream a reference without materializing its content in memory."""
+
+        if not isinstance(reference, LocalFileRef) or reference._store is not self:
+            raise ValidationError("local file reference belongs to another grant store")
+        if type(chunk_size) is not int or not 1 <= chunk_size <= FILE_TRANSFER_CHUNK_BYTES:
+            raise ValidationError("local file transfer chunk size is invalid")
+        relative = _relative_path(reference.relative_path)
+        with self._locked():
+            grant = self._grant_for_file_ref(reference.grant_id)
+            if grant.root != reference._root:
+                raise ValidationError("local file reference grant root changed")
+            with _open_granted_file(grant, relative) as descriptor:
+                metadata = _stable_file_metadata(os.fstat(descriptor))
+                _match_file_ref(reference, metadata)
+                digest = hashlib.sha256()
+                total = 0
+                while True:
+                    block = os.read(descriptor, chunk_size)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > reference.size:
+                        raise ValidationError("local file grew beyond its captured identity")
+                    digest.update(block)
+                    yield block
+                if total != reference.size or digest.hexdigest() != reference.sha256:
+                    raise ValidationError("local file reference content changed while streamed")
+
+    def _grant_for_file_ref(self, grant_id: str) -> LocalFileGrant:
+        grant = next(
+            (item for item in self._load() if item.grant_id == grant_id and self._belongs(item)),
+            None,
+        )
+        if grant is None:
+            raise NotFoundError("local-file grant not found for this vault")
+        if not _root_matches(grant):
+            raise ValidationError(
+                "local-file grant root changed; revoke it and grant the root again"
+            )
+        return grant
+
     def _belongs(self, grant: LocalFileGrant) -> bool:
         return (
             grant.vault_id == self.vault_id
@@ -299,6 +473,166 @@ def validate_local_file_tool_binding(
         raise ValidationError(
             f"{LOCAL_FILE_SOURCE_ID} observations require tool_binding {LOCAL_FILE_READER_TOOL!r}"
         )
+
+
+def _file_transfer_bound(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= MAX_FILE_TRANSFER_BYTES:
+        raise ValidationError("local file transfer size bound is invalid")
+    return value
+
+
+def _stable_file_metadata(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _match_file_ref(
+    reference: LocalFileRef,
+    metadata: tuple[int, int, int, int],
+) -> None:
+    if metadata != (
+        reference.device,
+        reference.inode,
+        reference.size,
+        reference.modified_ns,
+    ):
+        raise ValidationError("local file reference identity changed")
+
+
+@contextmanager
+def _open_granted_file(grant: LocalFileGrant, relative: Path) -> Iterator[int]:
+    """Open a granted file through no-follow descriptors and verify its ancestry."""
+
+    if not _PINNED_FILE_TRANSFER_SUPPORTED:
+        raise ValidationError("secure local file transfer is unavailable on this platform")
+    parts = relative.parts
+    if relative.is_absolute() or not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValidationError("local file transfer path is not safely relative")
+    root = Path(grant.root)
+    assessment = assess_local_path(relative, selected_root=root, content_requested=True)
+    if assessment.relative_path != relative.as_posix():
+        raise ValidationError("local file transfer path has symbolic-link ancestry")
+    if (
+        assessment.decision
+        in {
+            AwarenessDecision.EXCLUDE,
+            AwarenessDecision.PLACEHOLDER,
+        }
+        or assessment.reason == "cloud-residency-unverified"
+    ):
+        raise ValidationError("local file is not eligible for binary transfer")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_descriptor = -1
+    directory_descriptors: list[int] = []
+    directory_links: list[tuple[int, str, tuple[int, int]]] = []
+    file_descriptor = -1
+    try:
+        try:
+            root_descriptor = os.open(root, directory_flags)
+        except OSError as exc:
+            raise ValidationError("granted local file root changed before transfer") from exc
+        opened_root = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(opened_root.st_mode) or _identity(opened_root) != (
+            grant.device,
+            grant.inode,
+        ):
+            raise ValidationError("granted local file root changed before transfer")
+
+        parent = root_descriptor
+        for component in parts[:-1]:
+            try:
+                child = os.open(component, directory_flags, dir_fd=parent)
+            except OSError as exc:
+                raise ValidationError("local file transfer ancestry is unavailable") from exc
+            child_metadata = os.fstat(child)
+            if not stat.S_ISDIR(child_metadata.st_mode):
+                os.close(child)
+                raise ValidationError("local file transfer ancestry is not a directory")
+            directory_links.append((parent, component, _identity(child_metadata)))
+            directory_descriptors.append(child)
+            parent = child
+
+        name = parts[-1]
+        try:
+            listed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError as exc:
+            raise ValidationError("granted local file is unavailable") from exc
+        if _is_cloud_placeholder_metadata(name, listed):
+            raise ValidationError("local file is a cloud placeholder")
+        if stat.S_ISLNK(listed.st_mode) or not stat.S_ISREG(listed.st_mode):
+            raise ValidationError("local file transfer requires a regular file, not a link")
+
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        try:
+            file_descriptor = os.open(name, file_flags, dir_fd=parent)
+        except OSError as exc:
+            raise ValidationError("local file changed before transfer") from exc
+        opened = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _identity(listed) != _identity(opened)
+            or _is_cloud_placeholder_metadata(name, opened)
+        ):
+            raise ValidationError("local file changed before transfer")
+        yield file_descriptor
+
+        finished = os.fstat(file_descriptor)
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(finished.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or _stable_file_metadata(finished) != _stable_file_metadata(opened)
+            or _identity(current) != _identity(opened)
+            or _is_cloud_placeholder_metadata(name, finished)
+            or _is_cloud_placeholder_metadata(name, current)
+        ):
+            raise ValidationError("local file changed while it was transferred")
+        for link_parent, component, identity in directory_links:
+            linked = os.stat(component, dir_fd=link_parent, follow_symlinks=False)
+            if not stat.S_ISDIR(linked.st_mode) or _identity(linked) != identity:
+                raise ValidationError("local file transfer ancestry changed while it ran")
+        current_root = os.stat(root, follow_symlinks=False)
+        if not stat.S_ISDIR(current_root.st_mode) or _identity(current_root) != (
+            grant.device,
+            grant.inode,
+        ):
+            raise ValidationError("granted local file root changed while it was transferred")
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError("local file transfer could not verify its stable path") from exc
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        for descriptor in reversed(directory_descriptors):
+            os.close(descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+
+
+def _hash_descriptor(descriptor: int, *, label: str, max_bytes: int) -> str:
+    digest = hashlib.sha256()
+    total = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while block := os.read(descriptor, FILE_TRANSFER_CHUNK_BYTES):
+        total += len(block)
+        if total > max_bytes:
+            raise ValidationError(f"{label} exceeds its transfer size bound")
+        digest.update(block)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def _is_cloud_placeholder_metadata(name: str, metadata: os.stat_result) -> bool:
+    if name.endswith(".icloud"):
+        return True
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    return bool(attributes & (0x1000 | 0x400000))
 
 
 def _read_granted_file(*, grant: LocalFileGrant, relative: Path) -> dict[str, Any]:
