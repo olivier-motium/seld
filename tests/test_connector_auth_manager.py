@@ -24,7 +24,11 @@ from continuity_kernel.connector_auth import (
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_credentials import OAuthCredential
 from continuity_kernel.connector_identifiers import parse_connection_id
-from continuity_kernel.connector_oauth import OAuthTokenEndpointError, OAuthTokenType
+from continuity_kernel.connector_oauth import (
+    OAuthTokenEndpointError,
+    OAuthTokenSet,
+    OAuthTokenType,
+)
 from continuity_kernel.connector_profiles import get_profile
 from continuity_kernel.connector_secrets import InMemorySecretStore
 from continuity_kernel.errors import ConflictError, SetupError, ValidationError
@@ -266,7 +270,7 @@ def test_native_loopback_flow_ignores_host_header_and_persists_result(
         assert fields["code"] == "one-time-code"
         assert len(fields["code_verifier"]) >= 43
         assert fields["redirect_uri"].startswith("http://127.0.0.1:")
-        assert timeout_seconds == 30.0
+        assert 0 < timeout_seconds <= 30.0
         return 200, (
             b'{"access_token":"loopback-access","token_type":"Bearer",'
             b'"refresh_token":"loopback-refresh","expires_in":3600}'
@@ -283,6 +287,140 @@ def test_native_loopback_flow_ignores_host_header_and_persists_result(
     assert isinstance(status, list)
     assert status[0]["host_credential"] == "available"
     assert status[0]["health"] == "unverified"
+
+
+def test_oauth_acquisition_survives_browser_failure_without_persisting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    metadata = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert metadata is not None
+    presented: list[tuple[str, bool]] = []
+
+    class Listener:
+        redirect_uri = "http://127.0.0.1:48123"
+
+        def configure(self, config: object, attempt: object) -> None:
+            del config, attempt
+
+        def wait_for_code(self, *, timeout_seconds: float) -> str:
+            assert timeout_seconds > 0
+            return "one-time-code"
+
+        def close(self) -> None:
+            return None
+
+    listener = Listener()
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.BoundLoopbackCallback.bind",
+        lambda **_values: listener,
+    )
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.exchange_authorization_code",
+        lambda *_args, **_values: OAuthTokenSet(
+            access_token="transient-access",
+            token_type=OAuthTokenType.BEARER,
+            refresh_token="transient-refresh",
+            expires_in_seconds=3600,
+            scopes=(GOOGLE_SCOPE,),
+        ),
+    )
+
+    credential = manager.acquire_oauth_credential(
+        metadata,
+        timeout_seconds=30,
+        browser_opener=lambda _url: False,
+        present_authorization_url=lambda url, opened: presented.append((url, opened)),
+    )
+
+    assert credential.access_token == "transient-access"
+    assert len(presented) == 1
+    assert presented[0][0].startswith("https://accounts.google.com/")
+    assert presented[0][1] is False
+    assert manager.tokens.state(CONNECTION_ID) is None
+    unchanged = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert unchanged is not None
+    assert unchanged.health is ConnectionHealth.UNKNOWN
+
+
+def test_fresh_verified_connection_is_unusable_until_token_and_identity_publish(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    template = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert template is not None
+    now = datetime.now(UTC)
+    new_id = parse_connection_id("con-" + "n" * 32)
+    metadata = replace(
+        template,
+        connection_id=new_id,
+        account=AccountMetadata(
+            fingerprint="sha256:" + "a" * 64,
+            label="Google account - aaaaaaaa",
+        ),
+        health=ConnectionHealth.UNVERIFIED,
+        created_at=now,
+        updated_at=now,
+        version=1,
+        last_verified_at=None,
+    )
+    credential = OAuthCredential(
+        access_token="fresh-access",
+        refresh_token="fresh-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=(GOOGLE_SCOPE,),
+        issued_at=now,
+        expires_at=None,
+    )
+
+    result = manager.publish_new_oauth_connection(metadata, credential)
+
+    published = manager.vault.get_connection_snapshot().connection(new_id)
+    assert published is not None
+    assert published.health is ConnectionHealth.READY
+    assert published.last_verified_at is not None
+    assert manager.tokens.read(new_id).value == credential.to_bytes()
+    assert "fresh-access" not in json.dumps(result, sort_keys=True)
+
+
+def test_fresh_connection_rolls_back_metadata_when_secret_never_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    template = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert template is not None
+    now = datetime.now(UTC)
+    new_id = parse_connection_id("con-" + "p" * 32)
+    metadata = replace(
+        template,
+        connection_id=new_id,
+        account=AccountMetadata(fingerprint="sha256:" + "b" * 64),
+        health=ConnectionHealth.UNVERIFIED,
+        created_at=now,
+        updated_at=now,
+        version=1,
+        last_verified_at=None,
+    )
+    credential = OAuthCredential(
+        access_token="never-published",
+        refresh_token="never-published-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=(GOOGLE_SCOPE,),
+        issued_at=now,
+        expires_at=None,
+    )
+
+    def fail_update(*_args: object, **_values: object) -> object:
+        raise SetupError("synthetic keyring failure")
+
+    monkeypatch.setattr(manager.tokens, "update", fail_update)
+    with pytest.raises(SetupError, match="synthetic keyring failure"):
+        manager.publish_new_oauth_connection(metadata, credential)
+
+    assert manager.vault.get_connection_snapshot().connection(new_id) is None
+    assert manager.tokens.state(new_id) is None
 
 
 def test_oauth_credential_rejects_provider_grants_outside_the_profile(

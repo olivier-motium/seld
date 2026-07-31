@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shlex
 import subprocess
 import sys
+import webbrowser
+from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import continuity_kernel.update as self_update
 from continuity_kernel import __version__, resident_import, whatsapp
@@ -42,7 +45,11 @@ from continuity_kernel.config import (
     restore_config,
     save_config,
 )
+from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_identifiers import parse_connection_id
+from continuity_kernel.connector_onboarding import ConnectorIdentityReview, ConnectorOnboarding
+from continuity_kernel.connector_operations import CONNECTOR_PROFILE
+from continuity_kernel.connector_profiles import CONNECTOR_PROFILES
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
 from continuity_kernel.direction import direction_aim, direction_dict
@@ -54,7 +61,7 @@ from continuity_kernel.local_source_delivery import (
     VERIFIED_PREFIX_ADOPTION,
     LocalSourceDelivery,
 )
-from continuity_kernel.mcp_server import CONNECTOR_PROFILE, GUIDED_REVIEW_PROFILE, serve
+from continuity_kernel.mcp_server import GUIDED_REVIEW_PROFILE, serve
 from continuity_kernel.operations import OperationLedger, capture_operation_binding
 from continuity_kernel.portfolio import (
     portfolio_dict,
@@ -120,6 +127,12 @@ def main(arguments: list[str] | None = None) -> int:
         else:
             print(f"Error: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        print(
+            "Cancelled. Run `gsv connectors list` before retrying if sign-in had already finished.",
+            file=sys.stderr,
+        )
+        return 130
 
 
 def _dispatch(args: argparse.Namespace) -> Any:
@@ -341,6 +354,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         raise AssertionError("unreachable resident-context command")
     if args.command == "execution-bindings":
         return execution_bindings(vault)
+    if args.command == "connectors":
+        return _connectors(vault, args)
     if args.command == "source":
         if args.source_command == "list":
             return {"catalog": list_recipes(), "state": vault.source_status()}
@@ -552,6 +567,158 @@ def _dispatch(args: argparse.Namespace) -> Any:
             return vault.create_backup(Path(args.output) if args.output else None)
         raise AssertionError("unreachable backup command")
     raise AssertionError("unreachable command")
+
+
+def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
+    onboarding = ConnectorOnboarding(ConnectorAuthManager(vault))
+    if args.connectors_command == "list":
+        return onboarding.list()
+    if args.connectors_command == "status":
+        return onboarding.status(args.target)
+    if args.connectors_command == "connect":
+        print(
+            f"Connecting {args.connector.replace('_', ' ').title()} with {args.access.title()} "
+            "access…",
+            file=sys.stderr,
+        )
+        if args.connector == "discord":
+            if not sys.stdin.isatty():
+                raise SetupError(
+                    "Discord bot onboarding needs an interactive terminal so the token stays "
+                    "hidden; it is never accepted on the command line"
+                )
+            token = getpass.getpass("Discord bot token (input hidden): ").encode("utf-8")
+            return onboarding.connect_discord(
+                token,
+                access=args.access,
+                confirm_identity=_confirm_connector_identity,
+                new_account=args.new_account,
+            )
+        opener = _connector_browser_opener(args)
+        if opener is _USE_DEFAULT_BROWSER:
+            return onboarding.connect_oauth(
+                args.connector,
+                access=args.access,
+                confirm_identity=_confirm_connector_identity,
+                new_account=args.new_account,
+                present_authorization_url=_present_authorization_url,
+                timeout_seconds=args.timeout,
+            )
+        return onboarding.connect_oauth(
+            args.connector,
+            access=args.access,
+            confirm_identity=_confirm_connector_identity,
+            new_account=args.new_account,
+            browser_opener=cast(Callable[[str], bool] | None, opener),
+            present_authorization_url=_present_authorization_url,
+            timeout_seconds=args.timeout,
+        )
+    if args.connectors_command == "disconnect":
+        if not args.yes and not _confirm(
+            "Forget this local connection? Provider access will remain authorized. [y/N] "
+        ):
+            return {
+                "connection_id": args.connection_id,
+                "nothing_changed": True,
+                "status": "cancelled",
+            }
+        return onboarding.disconnect(args.connection_id)
+    if args.connectors_command == "revocation-help":
+        status = onboarding.status(args.connection_id)
+        rows = cast(list[dict[str, object]], status["connections"])
+        provider = rows[0].get("provider")
+        if not isinstance(provider, str):
+            raise SetupError("connector provider is unavailable")
+        return {
+            "connection_id": args.connection_id,
+            "next": _revocation_guidance(provider),
+            "provider": provider,
+            "provider_access_revoked": False,
+            "status": "instructions_only",
+        }
+    raise AssertionError("unreachable connectors command")
+
+
+_USE_DEFAULT_BROWSER = object()
+
+
+def _connector_browser_opener(args: argparse.Namespace) -> object:
+    if args.no_browser:
+        return None
+    if args.browser == "default":
+        return _USE_DEFAULT_BROWSER
+    try:
+        controller = webbrowser.get("firefox")
+    except webbrowser.Error:
+        if sys.platform != "darwin":
+            return lambda url: False
+
+        def open_firefox(url: str) -> bool:
+            try:
+                completed = subprocess.run(
+                    ["open", "-a", "Firefox", url],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            except OSError:
+                return False
+            return completed.returncode == 0
+
+        return open_firefox
+    return controller.open
+
+
+def _present_authorization_url(url: str, browser_opened: bool) -> None:
+    if browser_opened:
+        print("Your browser is open. Finish sign-in there; Seld is waiting…", file=sys.stderr)
+        return
+    print("Open this sign-in URL in a browser, then finish there:", file=sys.stderr)
+    print(url, file=sys.stderr)
+
+
+def _confirm_connector_identity(review: ConnectorIdentityReview) -> bool:
+    print(
+        f"Provider account: {review.display_label}\n"
+        f"Connector: {review.connector.replace('_', ' ').title()}\n"
+        f"Access: {review.access.value.title()}",
+        file=sys.stderr,
+    )
+    return _confirm("Use this account? [y/N] ")
+
+
+def _confirm(prompt: str) -> bool:
+    try:
+        response = input(prompt)
+    except EOFError:
+        return False
+    return response.strip().casefold() in {"y", "yes"}
+
+
+def _revocation_guidance(provider: str) -> str:
+    guidance = {
+        "discord": (
+            "Reset or delete the bot token in the Discord Developer Portal, then run `gsv "
+            "connectors disconnect <connection-id>` locally."
+        ),
+        "google": (
+            "Remove Seld from your Google Account third-party access page, then run `gsv "
+            "connectors disconnect <connection-id>` locally."
+        ),
+        "microsoft": (
+            "Remove Seld from your Microsoft account or organization app-consent page, then run "
+            "`gsv connectors disconnect <connection-id>` locally."
+        ),
+        "slack": (
+            "Remove Seld from the workspace's installed apps, then run `gsv connectors "
+            "disconnect <connection-id>` locally."
+        ),
+    }
+    try:
+        return guidance[provider]
+    except KeyError as exc:
+        raise ValidationError("connector provider has no revocation guidance") from exc
 
 
 def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | None:
@@ -1217,6 +1384,42 @@ def _parser() -> argparse.ArgumentParser:
         "execution-bindings",
         help="Read every explicit active ChatGPT hand and focused WorkThread binding.",
     )
+
+    connectors = commands.add_parser(
+        "connectors",
+        help="Connect and inspect full-feature provider accounts without exposing credentials.",
+    )
+    connector_commands = connectors.add_subparsers(
+        dest="connectors_command",
+        required=True,
+    )
+    connector_commands.add_parser("list", help="List redacted connector status.")
+    connector_status = connector_commands.add_parser(
+        "status",
+        help="Show all connections for one logical connector or one exact connection ID.",
+    )
+    connector_status.add_argument("target", nargs="?")
+    connector_connect = connector_commands.add_parser(
+        "connect",
+        help="Sign in, verify the exact account, confirm it, and publish only when ready.",
+    )
+    connector_connect.add_argument("connector", choices=tuple(sorted(CONNECTOR_PROFILES)))
+    connector_connect.add_argument("--access", choices=("read", "full"), required=True)
+    connector_connect.add_argument("--new-account", action="store_true")
+    connector_connect.add_argument("--timeout", type=float, default=180.0)
+    connector_connect.add_argument("--browser", choices=("default", "firefox"), default="default")
+    connector_connect.add_argument("--no-browser", action="store_true")
+    connector_disconnect = connector_commands.add_parser(
+        "disconnect",
+        help="Forget one local connection without claiming provider-side revocation.",
+    )
+    connector_disconnect.add_argument("connection_id")
+    connector_disconnect.add_argument("--yes", action="store_true")
+    connector_revoke = connector_commands.add_parser(
+        "revocation-help",
+        help="Show honest provider-side revocation steps without taking remote action.",
+    )
+    connector_revoke.add_argument("connection_id")
 
     source = commands.add_parser(
         "source",

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 import webbrowser
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
-from typing import Any, Final
+from typing import Any, Final, cast
 from urllib.parse import urlsplit
 
 from continuity_kernel.config import connector_auth_dir
@@ -31,7 +32,10 @@ from continuity_kernel.connector_oauth import (
     refresh_access_token,
 )
 from continuity_kernel.connector_oauth_loopback import BoundLoopbackCallback, begin_authorization
-from continuity_kernel.connector_profiles import ConnectorAccessTier, get_profile
+from continuity_kernel.connector_profiles import (
+    ConnectorAccessTier,
+    get_profile_for_connection,
+)
 from continuity_kernel.connector_secrets import KeyringSecretStore
 from continuity_kernel.connector_token_store import AtomicTokenStore, ResolvedToken, TokenState
 from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
@@ -51,6 +55,7 @@ _PINNED_OAUTH_ENDPOINTS: Final = {
         "https://slack.com/api/oauth.v2.user.access",
     ),
 }
+_DEFAULT_BROWSER_OPENER: Final = object()
 
 
 @dataclass(frozen=True, repr=False)
@@ -261,17 +266,74 @@ class ConnectorAuthManager:
         """Read the exact locally selected tier without resolving a credential."""
 
         metadata = self._metadata(connection_id)
-        return get_profile(metadata.provider).access_for_scopes(metadata.scopes)
+        return get_profile_for_connection(
+            metadata.provider,
+            metadata.source_ids,
+            metadata.scopes,
+        ).access_for_scopes(metadata.scopes)
 
     def authorize_oauth(
         self,
         connection_id: ConnectionId | str,
         *,
         timeout_seconds: float = 180.0,
+        browser_opener: Callable[[str], bool] | None | object = _DEFAULT_BROWSER_OPENER,
+        present_authorization_url: Callable[[str, bool], None] | None = None,
     ) -> None:
         """Run one interactive native authorization and persist its secret result."""
 
         metadata = self._oauth_metadata(connection_id)
+        credential = self.acquire_oauth_credential(
+            metadata,
+            timeout_seconds=timeout_seconds,
+            browser_opener=browser_opener,
+            present_authorization_url=present_authorization_url,
+        )
+        current = self.tokens.state(metadata.connection_id)
+        self.store_oauth_credential(
+            metadata.connection_id,
+            credential,
+            expected_token_version=current.version if current else 0,
+        )
+        self._mark_health(
+            metadata.connection_id,
+            ConnectionHealth.UNVERIFIED,
+            observed_at=credential.issued_at,
+        )
+
+    def acquire_oauth_credential(
+        self,
+        metadata: ConnectionMetadata,
+        *,
+        timeout_seconds: float = 180.0,
+        browser_opener: Callable[[str], bool] | None | object = _DEFAULT_BROWSER_OPENER,
+        present_authorization_url: Callable[[str, bool], None] | None = None,
+    ) -> OAuthCredential:
+        """Acquire and validate one OAuth grant in memory without publishing it."""
+
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValidationError("OAuth timeout must be a positive finite number")
+        if metadata.credential_kind is not CredentialKind.OAUTH2:
+            raise ValidationError("connection does not use OAuth")
+        self._assert_not_revoked(metadata)
+        deadline = monotonic() + timeout_seconds
+        resolved_browser_opener = (
+            webbrowser.open
+            if browser_opener is _DEFAULT_BROWSER_OPENER
+            else cast(Callable[[str], bool] | None, browser_opener)
+        )
+
+        def remaining() -> float:
+            seconds = deadline - monotonic()
+            if seconds <= 0:
+                raise OAuthTransportError("OAuth authorization timed out")
+            return seconds
+
         template = urlsplit(metadata.client.redirect_uris[0])
         host = template.hostname
         if host not in {"127.0.0.1", "::1", "localhost"}:
@@ -285,14 +347,25 @@ class ConnectorAuthManager:
             config = self._oauth_config(metadata, redirect_uri=listener.redirect_uri)
             attempt = begin_authorization(config)
             listener.configure(config, attempt)
-            if not webbrowser.open(attempt.authorization_url):
-                raise SetupError("the OAuth authorization page could not be opened")
-            code = listener.wait_for_code(timeout_seconds=timeout_seconds)
+            browser_opened = False
+            if resolved_browser_opener is not None:
+                try:
+                    browser_opened = bool(resolved_browser_opener(attempt.authorization_url))
+                except (OSError, RuntimeError, webbrowser.Error):
+                    browser_opened = False
+            if present_authorization_url is not None:
+                present_authorization_url(attempt.authorization_url, browser_opened)
+            elif not browser_opened:
+                raise SetupError(
+                    "the OAuth authorization page could not be opened; rerun with a manual "
+                    "authorization URL presenter"
+                )
+            code = listener.wait_for_code(timeout_seconds=remaining())
             token_set = exchange_authorization_code(
                 config,
                 authorization_code=code,
                 code_verifier=attempt.code_verifier,
-                timeout_seconds=min(timeout_seconds, 30.0),
+                timeout_seconds=min(remaining(), 30.0),
             )
         finally:
             listener.close()
@@ -307,17 +380,101 @@ class ConnectorAuthManager:
                 issued_at=credential.issued_at,
                 expires_at=credential.expires_at,
             )
-        current = self.tokens.state(metadata.connection_id)
-        self.store_oauth_credential(
-            metadata.connection_id,
-            credential,
-            expected_token_version=current.version if current else 0,
-        )
-        self._mark_health(
-            metadata.connection_id,
-            ConnectionHealth.UNVERIFIED,
-            observed_at=issued_at,
-        )
+        self._validate_oauth_credential(metadata, credential)
+        return credential
+
+    def publish_new_oauth_connection(
+        self,
+        metadata: ConnectionMetadata,
+        credential: OAuthCredential,
+    ) -> dict[str, Any]:
+        """Publish a verified fresh-ID OAuth connection without exposing its token early."""
+
+        if metadata.credential_kind is not CredentialKind.OAUTH2:
+            raise ValidationError("connection does not use OAuth")
+        self._validate_publishable_identity(metadata)
+        self._validate_oauth_credential(metadata, credential)
+        return self._publish_new_connection(metadata, credential.to_bytes())
+
+    def publish_new_bearer_connection(
+        self,
+        metadata: ConnectionMetadata,
+        credential: bytes,
+    ) -> dict[str, Any]:
+        """Publish a verified fresh-ID bot connection from one transient credential."""
+
+        if metadata.credential_kind is not CredentialKind.BEARER:
+            raise ValidationError("connection does not use a bearer credential")
+        self._validate_publishable_identity(metadata)
+        if not credential:
+            raise ValidationError("credential is empty")
+        return self._publish_new_connection(metadata, credential)
+
+    def _publish_new_connection(
+        self,
+        metadata: ConnectionMetadata,
+        credential: bytes,
+    ) -> dict[str, Any]:
+        clean_id = metadata.connection_id
+        with self.tokens.exclusive_lifecycle(clean_id):
+            snapshot = self.vault.get_connection_snapshot()
+            if snapshot.connection(clean_id) is not None or self.tokens.occupied(clean_id):
+                raise ConflictError("fresh connector identity is already occupied")
+            published_at = max(datetime.now(UTC), metadata.updated_at)
+            self.vault.put_connection(
+                expected_revision=snapshot.revision,
+                connection=metadata,
+                observed_at=published_at,
+            )
+            try:
+                self.tokens.update(
+                    clean_id,
+                    expected_version=0,
+                    value=credential,
+                    updated_at=metadata.updated_at,
+                )
+            except Exception:
+                self._remove_empty_published_connection(metadata)
+                raise
+            return self._mark_health(
+                clean_id,
+                ConnectionHealth.READY,
+                observed_at=max(
+                    datetime.now(UTC),
+                    metadata.updated_at + timedelta(microseconds=1),
+                ),
+                verified=True,
+            )
+
+    def _remove_empty_published_connection(self, metadata: ConnectionMetadata) -> None:
+        """Roll back metadata only when no credential material was published."""
+
+        try:
+            if self.tokens.occupied(metadata.connection_id):
+                return
+            snapshot = self.vault.get_connection_snapshot()
+            current = snapshot.connection(metadata.connection_id)
+            if current != metadata:
+                return
+            self.vault.remove_connection(
+                expected_revision=snapshot.revision,
+                connection_id=metadata.connection_id,
+                observed_at=max(
+                    datetime.now(UTC),
+                    metadata.updated_at + timedelta(microseconds=1),
+                ),
+            )
+        except Exception:
+            # The UNVERIFIED record is safe and repairable; never turn cleanup
+            # uncertainty into deletion of potentially committed secret state.
+            return
+
+    @staticmethod
+    def _validate_publishable_identity(metadata: ConnectionMetadata) -> None:
+        if metadata.version != 1 or metadata.health is not ConnectionHealth.UNVERIFIED:
+            raise ValidationError("new verified connections must start as unverified version 1")
+        if metadata.account.fingerprint is None:
+            raise ValidationError("new verified connections require an account fingerprint")
 
     def mark_verified(self, connection_id: ConnectionId | str) -> dict[str, Any]:
         clean_id = parse_connection_id(connection_id)
@@ -457,7 +614,11 @@ class ConnectorAuthManager:
 
     @staticmethod
     def _oauth_allowed_scopes(metadata: ConnectionMetadata) -> frozenset[str]:
-        profile = get_profile(metadata.provider)
+        profile = get_profile_for_connection(
+            metadata.provider,
+            metadata.source_ids,
+            metadata.scopes,
+        )
         if profile.credential_kind is not CredentialKind.OAUTH2:
             raise ValidationError("connection provider does not have a built-in OAuth profile")
         allowed = profile.allowed_scopes

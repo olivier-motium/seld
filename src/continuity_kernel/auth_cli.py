@@ -6,6 +6,7 @@ import argparse
 import getpass
 import json
 import sys
+import webbrowser
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,8 @@ def _dispatch(args: argparse.Namespace, manager: ConnectorAuthManager) -> dict[s
         manager.authorize_oauth(
             parse_connection_id(args.connection_id),
             timeout_seconds=args.timeout,
+            browser_opener=_oauth_browser(args),
+            present_authorization_url=_present_authorization_url,
         )
         return _connection_result(manager, args.connection_id)
     if args.command == "remove":
@@ -288,6 +291,8 @@ def _parser() -> argparse.ArgumentParser:
     oauth = commands.add_parser("oauth", help="Run one native OAuth authorization-code flow.")
     oauth.add_argument("connection_id")
     oauth.add_argument("--timeout", type=float, default=180.0)
+    oauth.add_argument("--browser", choices=("default", "firefox"), default="default")
+    oauth.add_argument("--no-browser", action="store_true")
 
     remove = commands.add_parser(
         "remove",
@@ -316,3 +321,22 @@ def _print(value: Any, *, json_output: bool) -> None:
         print(json.dumps({"ok": True, "result": value}, separators=(",", ":")))
     else:
         print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _oauth_browser(args: argparse.Namespace) -> Any:
+    if args.no_browser:
+        return None
+    if args.browser == "default":
+        return webbrowser.open
+    try:
+        return webbrowser.get("firefox").open
+    except webbrowser.Error:
+        return lambda url: False
+
+
+def _present_authorization_url(url: str, browser_opened: bool) -> None:
+    if browser_opened:
+        print("Your browser is open. Finish sign-in there; Seld is waiting…", file=sys.stderr)
+        return
+    print("Open this sign-in URL in a browser, then finish there:", file=sys.stderr)
+    print(url, file=sys.stderr)
