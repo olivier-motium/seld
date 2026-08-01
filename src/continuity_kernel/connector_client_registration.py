@@ -14,7 +14,6 @@ from continuity_kernel.errors import SetupError, ValidationError
 
 CLIENT_REGISTRATION_SCHEMA_VERSION: Final = 1
 MAX_CLIENT_REGISTRATION_BYTES: Final = 64 * 1024
-MAX_REGISTRATION_BYTES: Final = MAX_CLIENT_REGISTRATION_BYTES
 
 _RESOURCE_NAME: Final = "resources/connector_clients.json"
 _PROVIDERS: Final = frozenset({"google", "microsoft", "slack"})
@@ -36,21 +35,6 @@ class PublicClientRegistration:
         _client_id(self.client_id)
         _redirect_template(provider, self.redirect_template)
         object.__setattr__(self, "provider", provider)
-
-    @property
-    def identifier(self) -> str:
-        return self.client_id
-
-    @property
-    def redirect_uri_template(self) -> str:
-        return self.redirect_template
-
-    @property
-    def redirect_uri(self) -> str:
-        return self.redirect_template
-
-
-ConnectorClientRegistration = PublicClientRegistration
 
 
 def load_public_client_registrations(
@@ -126,17 +110,6 @@ def require_public_client_registrations(
             + ", ".join(missing)
         )
     return tuple(sorted(registrations))
-
-
-def load_client_registration(
-    provider: str,
-    *,
-    path: str | Path | None = None,
-    data: bytes | None = None,
-) -> PublicClientRegistration:
-    """Short compatibility wrapper for the explicit path/bytes test seam."""
-
-    return load_public_client_registration(provider, source_path=path, source_bytes=data)
 
 
 def _read_source(

@@ -61,7 +61,7 @@ def _prepared(
         assert provider == "slack"
         authorization_endpoint = "https://slack.com/oauth/v2_user/authorize"
         default_token_endpoint = "https://slack.com/api/oauth.v2.user.access"
-    scopes = get_profile(provider).scopes
+    scopes = get_profile(provider).read_scopes
     metadata = ConnectionMetadata(
         connection_id=connection_id,
         provider=provider,
@@ -106,7 +106,7 @@ def _prepared(
         connection_id,
         OAuthCredential(
             access_token=TOKEN,
-            refresh_token=None,
+            refresh_token=None if provider == "slack" else f"{provider}-refresh-token",
             token_type=OAuthTokenType.BEARER,
             scopes=scopes,
             issued_at=BASE_TIME,
@@ -912,12 +912,7 @@ def test_slack_history_error_and_credential_rotation_fail_closed(
                 access_token="rotated-access-token",
                 refresh_token=None,
                 token_type=OAuthTokenType.BEARER,
-                scopes=(
-                    "channels:history",
-                    "groups:history",
-                    "im:history",
-                    "mpim:history",
-                ),
+                scopes=get_profile("slack").read_scopes,
                 issued_at=BASE_TIME,
                 expires_at=None,
             ),

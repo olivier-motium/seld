@@ -105,7 +105,7 @@ def _add(args: argparse.Namespace, manager: ConnectorAuthManager) -> dict[str, o
         provider = profile.provider
         source_ids = profile.source_ids
         kind = profile.credential_kind
-        scopes = profile.scopes
+        scopes = profile.read_scopes
         authorization_endpoint = profile.authorization_endpoint
         token_endpoint = profile.token_endpoint
     else:
@@ -124,6 +124,8 @@ def _add(args: argparse.Namespace, manager: ConnectorAuthManager) -> dict[str, o
             raise ValidationError("OAuth connections require --client-id and --redirect-uri")
         if args.profile == "google":
             _validate_google_redirect(args.redirect_uri)
+        elif args.profile == "microsoft":
+            _validate_microsoft_redirect(args.redirect_uri)
         elif args.profile == "slack":
             _validate_slack_redirect(args.redirect_uri)
         client = ClientMetadata(
@@ -254,6 +256,27 @@ def _validate_google_redirect(redirect_uri: str) -> None:
     ):
         raise ValidationError(
             "Google profile requires http://127.0.0.1:<port> or http://[::1]:<port>"
+        )
+
+
+def _validate_microsoft_redirect(redirect_uri: str) -> None:
+    try:
+        parsed = urlsplit(redirect_uri)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValidationError("Microsoft profile redirect URI is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "localhost"
+        or port is None
+        or parsed.path != "/oauth/callback"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValidationError(
+            "Microsoft profile requires an exact http://localhost:<port>/oauth/callback"
         )
 
 

@@ -34,12 +34,6 @@ class ConnectorProfile:
     token_endpoint: str | None = None
 
     @property
-    def scopes(self) -> tuple[str, ...]:
-        """Compatibility alias for the default, least-authority tier."""
-
-        return self.read_scopes
-
-    @property
     def allowed_scopes(self) -> frozenset[str]:
         return frozenset((*self.read_scopes, *self.full_scopes, *self.supplemental_scopes))
 

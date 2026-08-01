@@ -436,7 +436,12 @@ class ConnectorOnboarding:
         connection: ConnectionMetadata,
         credential: OAuthCredential,
     ) -> Mapping[str, object]:
-        if not set(connection.scopes).issubset(credential.scopes):
+        configured_scopes = connection.scopes
+        if connection.provider == "microsoft":
+            configured_scopes = tuple(
+                scope for scope in configured_scopes if scope.casefold() != "offline_access"
+            )
+        if not set(configured_scopes).issubset(credential.scopes):
             return {
                 "credential": "existing_broader_grant_retained",
                 "warning": (

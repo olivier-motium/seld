@@ -236,3 +236,77 @@ def test_profile_owned_fields_cannot_be_overridden(tmp_path: Path) -> None:
             ),
             manager,
         )
+
+
+def test_microsoft_profile_accepts_dynamic_and_concrete_loopback_ports(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Microsoft redirects")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+
+    for port in (0, 49152):
+        auth_cli._dispatch(
+            parser.parse_args(
+                [
+                    "add",
+                    "--profile",
+                    "microsoft",
+                    "--client-id",
+                    f"microsoft-client-{port}",
+                    "--redirect-uri",
+                    f"http://localhost:{port}/oauth/callback",
+                ]
+            ),
+            manager,
+        )
+
+    assert len(vault.get_connection_snapshot().connections) == 2
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "http://127.0.0.1:49152/oauth/callback",
+        "http://localhost/oauth/callback",
+        "http://localhost:not-a-port/oauth/callback",
+        "http://localhost:65536/oauth/callback",
+        "http://localhost:49152/callback",
+        "http://user@localhost:49152/oauth/callback",
+        "http://localhost:49152/oauth/callback?code=leak",
+        "http://localhost:49152/oauth/callback#fragment",
+    ],
+)
+def test_microsoft_profile_rejects_noncontract_loopback_redirects(
+    tmp_path: Path,
+    redirect_uri: str,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Microsoft redirect validation")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+
+    with pytest.raises(ValidationError, match="Microsoft profile"):
+        auth_cli._dispatch(
+            parser.parse_args(
+                [
+                    "add",
+                    "--profile",
+                    "microsoft",
+                    "--client-id",
+                    "microsoft-client",
+                    "--redirect-uri",
+                    redirect_uri,
+                ]
+            ),
+            manager,
+        )
+
+    assert vault.get_connection_snapshot().connections == ()

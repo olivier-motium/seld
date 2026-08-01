@@ -3,7 +3,8 @@ from __future__ import annotations
 import base64
 import shutil
 import subprocess
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -21,11 +22,11 @@ from continuity_kernel.connector_auth import (
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_auth_transfer import export_auth_archive, import_auth_archive
 from continuity_kernel.connector_credentials import OAuthCredential
-from continuity_kernel.connector_identifiers import parse_connection_id
+from continuity_kernel.connector_identifiers import ConnectionId, parse_connection_id
 from continuity_kernel.connector_oauth import OAuthTokenType
 from continuity_kernel.connector_profiles import get_profile
 from continuity_kernel.connector_secrets import InMemorySecretStore
-from continuity_kernel.errors import MutationCommittedError, ValidationError
+from continuity_kernel.errors import ConflictError, MutationCommittedError, ValidationError
 from continuity_kernel.vault import Vault
 
 SENTINEL = b"synthetic-portable-secret-never-in-vault"
@@ -211,6 +212,75 @@ def test_import_resumes_after_metadata_was_committed_but_reported_as_failed(
     assert target_manager.resolve_credential(CONNECTION_ID) == SENTINEL
 
 
+def test_export_rejects_connection_drift_before_encrypting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_vault, source_manager = _source_manager(tmp_path)
+    original_read = source_manager.tokens.read
+
+    def read_then_drift(connection_id: ConnectionId):
+        resolved = original_read(connection_id)
+        snapshot = source_vault.get_connection_snapshot()
+        metadata = snapshot.connection(CONNECTION_ID)
+        assert metadata is not None
+        observed_at = max(datetime.now(UTC), metadata.updated_at + timedelta(microseconds=1))
+        source_vault.put_connection(
+            expected_revision=snapshot.revision,
+            connection=replace(
+                metadata,
+                health=ConnectionHealth.DEGRADED,
+                updated_at=observed_at,
+                version=metadata.version + 1,
+            ),
+            observed_at=observed_at,
+        )
+        return resolved
+
+    monkeypatch.setattr(source_manager.tokens, "read", read_then_drift)
+    monkeypatch.setattr(
+        connector_auth_transfer,
+        "_run_age",
+        lambda *_args, **_kwargs: pytest.fail("encryption must not start after snapshot drift"),
+    )
+    destination = tmp_path / "connector-auth.age"
+
+    with pytest.raises(ConflictError, match="changed during auth export"):
+        export_auth_archive(
+            source_manager,
+            destination,
+            recipient="synthetic-recipient",
+        )
+
+    assert not destination.exists()
+
+
+def test_export_reports_missing_host_credential_before_encryption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _source_vault, manager = _source_manager(tmp_path)
+    manager.tokens.delete(CONNECTION_ID)
+    destination = tmp_path / "connector-auth.age"
+    monkeypatch.setattr(
+        connector_auth_transfer,
+        "_run_age",
+        lambda *_args, **_kwargs: pytest.fail("encryption must not start without custody"),
+    )
+
+    with pytest.raises(ValidationError) as failure:
+        export_auth_archive(
+            manager,
+            destination,
+            recipient="synthetic-recipient",
+        )
+
+    message = str(failure.value)
+    assert str(CONNECTION_ID) in message
+    assert "authorize or remove it" in message
+    assert not destination.exists()
+
+
 def test_import_rejects_an_overbroad_oauth_grant_before_mutating_custody(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -225,7 +295,7 @@ def test_import_rejects_an_overbroad_oauth_grant_before_mutating_custody(
         source_ids=profile.source_ids,
         credential_kind=profile.credential_kind,
         account=AccountMetadata(label="Synthetic Slack"),
-        scopes=profile.scopes,
+        scopes=profile.read_scopes,
         client=ClientMetadata(
             kind=ClientKind.PUBLIC,
             identifier="public-slack-client",
@@ -253,7 +323,7 @@ def test_import_rejects_an_overbroad_oauth_grant_before_mutating_custody(
         access_token="overbroad-slack-token",
         refresh_token=None,
         token_type=OAuthTokenType.BEARER,
-        scopes=(*profile.scopes, "chat:write"),
+        scopes=(*profile.read_scopes, "chat:write"),
         issued_at=now,
         expires_at=None,
     ).to_bytes()

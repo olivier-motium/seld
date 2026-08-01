@@ -29,6 +29,9 @@ from continuity_kernel.connector_oauth import (
     OAuthDialect,
     OAuthTokenEndpointError,
     OAuthTransportError,
+    canonicalize_google_scopes,
+    canonicalize_microsoft_access_scopes,
+    canonicalize_microsoft_scopes,
     exchange_authorization_code,
     refresh_access_token,
 )
@@ -39,7 +42,13 @@ from continuity_kernel.connector_profiles import (
 )
 from continuity_kernel.connector_secrets import KeyringSecretStore
 from continuity_kernel.connector_token_store import AtomicTokenStore, ResolvedToken, TokenState
-from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
+from continuity_kernel.errors import (
+    ConflictError,
+    MutationCommittedError,
+    NotFoundError,
+    SetupError,
+    ValidationError,
+)
 from continuity_kernel.vault import Vault
 
 _PINNED_OAUTH_ENDPOINTS: Final = {
@@ -136,6 +145,7 @@ class ConnectorAuthManager:
         clean_id = parse_connection_id(connection_id)
         with self.tokens.exclusive_lifecycle(clean_id):
             metadata = self._oauth_metadata(clean_id)
+            credential = self._canonicalize_oauth_credential(metadata, credential)
             self._validate_oauth_credential(metadata, credential)
             return self.tokens.update(
                 metadata.connection_id,
@@ -218,13 +228,15 @@ class ConnectorAuthManager:
 
             def refresh_if_needed(resolved: ResolvedToken) -> bytes | None:
                 previous = OAuthCredential.from_bytes(resolved.value)
+                previous = self._canonicalize_oauth_credential(metadata, previous)
                 self._validate_oauth_credential(metadata, previous)
                 if previous.usable_at(
                     now,
                     minimum_validity_seconds=minimum_validity_seconds,
                 ):
-                    return None
-                if previous.refresh_token is None:
+                    canonical = previous.to_bytes()
+                    return None if canonical == resolved.value else canonical
+                if not previous.refresh_token:
                     raise ValidationError("OAuth connection requires reauthorization")
                 token_set = refresh_access_token(
                     config,
@@ -237,6 +249,7 @@ class ConnectorAuthManager:
                     issued_at=now,
                     previous=previous,
                 )
+                refreshed = self._canonicalize_oauth_credential(metadata, refreshed)
                 self._validate_oauth_credential(metadata, refreshed)
                 return refreshed.to_bytes()
 
@@ -253,9 +266,17 @@ class ConnectorAuthManager:
                     if exc.error in {"invalid_grant", "invalid_refresh_token"}
                     else ConnectionHealth.DEGRADED
                 )
-                self._mark_health(metadata.connection_id, health, observed_at=now)
+                self._mark_health(
+                    metadata.connection_id,
+                    health,
+                    observed_at=max(
+                        now,
+                        metadata.updated_at + timedelta(microseconds=1),
+                    ),
+                )
                 raise
             credential = OAuthCredential.from_bytes(resolved.value)
+            credential = self._canonicalize_oauth_credential(metadata, credential)
             self._validate_oauth_credential(metadata, credential)
             return ResolvedOAuthAccessToken(
                 access_token=credential.access_token,
@@ -283,24 +304,124 @@ class ConnectorAuthManager:
     ) -> None:
         """Run one interactive native authorization and persist its secret result."""
 
-        metadata = self._oauth_metadata(connection_id)
+        clean_id = parse_connection_id(connection_id)
+        metadata = self._oauth_metadata(clean_id)
         credential = self.acquire_oauth_credential(
             metadata,
             timeout_seconds=timeout_seconds,
             browser_opener=browser_opener,
             present_authorization_url=present_authorization_url,
         )
-        current = self.tokens.state(metadata.connection_id)
-        self.store_oauth_credential(
-            metadata.connection_id,
-            credential,
-            expected_token_version=current.version if current else 0,
-        )
-        self._mark_health(
-            metadata.connection_id,
-            ConnectionHealth.UNVERIFIED,
-            observed_at=credential.issued_at,
-        )
+        acquired_binding = self._credential_binding(metadata)
+        with self.tokens.exclusive_lifecycle(clean_id):
+            snapshot = self.vault.get_connection_snapshot()
+            current = snapshot.connection(clean_id)
+            if current is None:
+                raise NotFoundError("connection was not found")
+            if self._credential_binding(current) != acquired_binding:
+                raise ConflictError("connection changed during OAuth authorization")
+            self._assert_not_revoked(current)
+            credential = self._canonicalize_oauth_credential(current, credential)
+            self._validate_oauth_credential(current, credential)
+            token_state = self.tokens.state(clean_id)
+            expected_token_version = token_state.version if token_state else 0
+            observed_at = max(
+                datetime.now(UTC),
+                current.updated_at + timedelta(microseconds=1),
+            )
+            self.vault.mark_connection_health(
+                expected_revision=snapshot.revision,
+                connection_id=clean_id,
+                health=ConnectionHealth.UNVERIFIED,
+                observed_at=observed_at,
+            )
+
+            transitioned_snapshot = self.vault.get_connection_snapshot()
+            transitioned = transitioned_snapshot.connection(clean_id)
+            if transitioned is None:
+                raise NotFoundError("connection was not found")
+            if (
+                self._credential_binding(transitioned) != acquired_binding
+                or transitioned.health is not ConnectionHealth.UNVERIFIED
+            ):
+                raise ConflictError("connection changed during OAuth authorization")
+            self._validate_oauth_credential(transitioned, credential)
+            self.tokens.update(
+                clean_id,
+                expected_version=expected_token_version,
+                value=credential.to_bytes(),
+                updated_at=credential.issued_at,
+            )
+
+    def rotate_verified_oauth_credential(
+        self,
+        connection_id: ConnectionId | str,
+        *,
+        expected_revision: str,
+        expected_account_fingerprint: str,
+        expected_token_version: int,
+        replacement: OAuthCredential,
+    ) -> dict[str, Any]:
+        """Atomically replace one verified connection's OAuth credential."""
+
+        clean_id = parse_connection_id(connection_id)
+        with self.tokens.exclusive_lifecycle(clean_id):
+            snapshot = self.vault.get_connection_snapshot()
+            if snapshot.revision != expected_revision:
+                raise ConflictError("connection changed; reload before rotating credential")
+            metadata = snapshot.connection(clean_id)
+            if metadata is None:
+                raise NotFoundError("connection was not found")
+            if metadata.credential_kind is not CredentialKind.OAUTH2:
+                raise ValidationError("connection does not use OAuth")
+            if metadata.account.fingerprint != expected_account_fingerprint:
+                raise ConflictError("account binding changed; reload before rotating credential")
+            if metadata.health not in {
+                ConnectionHealth.READY,
+                ConnectionHealth.DEGRADED,
+                ConnectionHealth.REAUTHORIZATION_REQUIRED,
+            }:
+                raise ValidationError("credential rotation requires a verified connection")
+
+            self._oauth_config(metadata)
+            replacement = self._canonicalize_oauth_credential(metadata, replacement)
+            self._validate_oauth_credential(metadata, replacement)
+            current = self.tokens.state(clean_id)
+            current_version = current.version if current is not None else 0
+            if current_version != expected_token_version:
+                raise ConflictError(
+                    "connector credential changed; reload before rotating credential"
+                )
+
+            try:
+                self.tokens.update(
+                    clean_id,
+                    expected_version=expected_token_version,
+                    value=replacement.to_bytes(),
+                    updated_at=replacement.issued_at,
+                )
+            except MutationCommittedError as exc:
+                raise MutationCommittedError(
+                    "credential rotation committed; metadata repair is required"
+                ) from exc
+
+            observed_at = max(
+                datetime.now(UTC),
+                metadata.updated_at + timedelta(microseconds=1),
+                replacement.issued_at,
+            )
+            try:
+                return self.vault.mark_connection_health(
+                    expected_revision=expected_revision,
+                    connection_id=clean_id,
+                    health=ConnectionHealth.READY,
+                    verified=True,
+                    observed_at=observed_at,
+                )
+            except Exception as exc:
+                raise MutationCommittedError(
+                    "credential rotation committed; metadata repair is required"
+                ) from exc
 
     def acquire_oauth_credential(
         self,
@@ -372,15 +493,7 @@ class ConnectorAuthManager:
             listener.close()
         issued_at = datetime.now(UTC)
         credential = credential_from_token_set(token_set, issued_at=issued_at)
-        if not credential.scopes:
-            credential = OAuthCredential(
-                access_token=credential.access_token,
-                refresh_token=credential.refresh_token,
-                token_type=credential.token_type,
-                scopes=metadata.scopes,
-                issued_at=credential.issued_at,
-                expires_at=credential.expires_at,
-            )
+        credential = self._canonicalize_oauth_credential(metadata, credential)
         self._validate_oauth_credential(metadata, credential)
         return credential
 
@@ -394,6 +507,7 @@ class ConnectorAuthManager:
         if metadata.credential_kind is not CredentialKind.OAUTH2:
             raise ValidationError("connection does not use OAuth")
         self._validate_publishable_identity(metadata)
+        credential = self._canonicalize_oauth_credential(metadata, credential)
         self._validate_oauth_credential(metadata, credential)
         return self._publish_new_connection(metadata, credential.to_bytes())
 
@@ -479,10 +593,17 @@ class ConnectorAuthManager:
 
     def mark_verified(self, connection_id: ConnectionId | str) -> dict[str, Any]:
         clean_id = parse_connection_id(connection_id)
+        snapshot = self.vault.get_connection_snapshot()
+        current = snapshot.connection(clean_id)
+        if current is None:
+            raise NotFoundError("connection was not found")
         return self._mark_health(
             clean_id,
             ConnectionHealth.READY,
-            observed_at=datetime.now(UTC),
+            observed_at=max(
+                datetime.now(UTC),
+                current.updated_at + timedelta(microseconds=1),
+            ),
             verified=True,
         )
 
@@ -573,15 +694,18 @@ class ConnectorAuthManager:
         self,
         metadata: ConnectionMetadata,
         value: bytes,
-    ) -> None:
+    ) -> bytes:
         """Validate one decrypted credential before it enters host custody."""
 
         self._assert_not_revoked(metadata)
-        if metadata.credential_kind is CredentialKind.OAUTH2:
-            self._validate_oauth_credential(
-                metadata,
-                OAuthCredential.from_bytes(value),
-            )
+        if metadata.credential_kind is not CredentialKind.OAUTH2:
+            return value
+        credential = self._canonicalize_oauth_credential(
+            metadata,
+            OAuthCredential.from_bytes(value),
+        )
+        self._validate_oauth_credential(metadata, credential)
+        return credential.to_bytes()
 
     def ensure_imported_credential(
         self,
@@ -596,7 +720,7 @@ class ConnectorAuthManager:
             self._assert_not_revoked(current)
             if self._credential_binding(current) != self._credential_binding(metadata):
                 raise ConflictError("portable connection changed during credential import")
-            self.validate_import_credential(current, value)
+            value = self.validate_import_credential(current, value)
             return self.tokens.ensure_imported(clean_id, value)
 
     def _metadata(
@@ -655,6 +779,7 @@ class ConnectorAuthManager:
             scopes=metadata.scopes,
             dialect={
                 "google": OAuthDialect.GOOGLE,
+                "microsoft": OAuthDialect.MICROSOFT,
                 "slack": OAuthDialect.SLACK_USER,
             }.get(metadata.provider, OAuthDialect.STANDARD),
         )
@@ -680,11 +805,72 @@ class ConnectorAuthManager:
         metadata: ConnectionMetadata,
         credential: OAuthCredential,
     ) -> None:
+        requires_refresh = metadata.provider == "google" or (
+            metadata.provider == "microsoft"
+            and any(
+                scope.casefold() == "offline_access"
+                for scope in canonicalize_microsoft_scopes(metadata.scopes)
+            )
+        )
+        if requires_refresh and not credential.refresh_token:
+            raise ValidationError("OAuth credential requires a non-empty refresh token")
         allowed = ConnectorAuthManager._oauth_allowed_scopes(metadata)
-        granted = frozenset(credential.scopes)
-        configured = frozenset(metadata.scopes)
-        if not granted or not granted.issubset(configured) or not granted.issubset(allowed):
+        canonical_scopes = (
+            canonicalize_google_scopes(credential.scopes)
+            if metadata.provider == "google"
+            else (
+                canonicalize_microsoft_scopes(credential.scopes)
+                if metadata.provider == "microsoft"
+                else credential.scopes
+            )
+        )
+        granted = frozenset(canonical_scopes)
+        configured = frozenset(
+            canonicalize_microsoft_scopes(metadata.scopes)
+            if metadata.provider == "microsoft"
+            else metadata.scopes
+        )
+        configured_access = frozenset(
+            scope for scope in configured if scope.casefold() != "offline_access"
+        )
+        granted_access = frozenset(
+            scope for scope in granted if scope.casefold() != "offline_access"
+        )
+        if not configured_access.issubset(granted_access) or not granted.issubset(allowed):
             raise ValidationError("OAuth credential grants scopes outside its selected access")
+        profile = get_profile_for_connection(
+            metadata.provider,
+            metadata.source_ids,
+            metadata.scopes,
+        )
+        configured_tier = profile.access_for_scopes(metadata.scopes)
+        if profile.exact_read_scopes:
+            try:
+                granted_tier = profile.access_for_scopes(tuple(canonical_scopes))
+            except ValidationError as exc:
+                raise ValidationError(
+                    "OAuth credential grants scopes outside its selected access"
+                ) from exc
+            if (
+                configured_tier is ConnectorAccessTier.READ
+                and granted_tier is ConnectorAccessTier.FULL
+            ):
+                raise ValidationError("OAuth credential grants scopes outside its selected access")
+
+    @staticmethod
+    def _canonicalize_oauth_credential(
+        metadata: ConnectionMetadata,
+        credential: OAuthCredential,
+    ) -> OAuthCredential:
+        if metadata.provider == "google":
+            scopes = canonicalize_google_scopes(credential.scopes)
+        elif metadata.provider == "microsoft":
+            scopes = canonicalize_microsoft_access_scopes(credential.scopes)
+        else:
+            return credential
+        if scopes == credential.scopes:
+            return credential
+        return replace(credential, scopes=scopes)
 
     @staticmethod
     def _credential_binding(metadata: ConnectionMetadata) -> tuple[object, ...]:

@@ -47,16 +47,6 @@ class ConnectorIdentity:
             raise ValidationError("connector identity portable label is invalid")
         object.__setattr__(self, "provider", provider)
 
-    @property
-    def label(self) -> str:
-        """Compatibility spelling for callers that use a generic label field."""
-
-        return self.display_label
-
-    @property
-    def identity_fingerprint(self) -> str:
-        return self.fingerprint
-
     def __repr__(self) -> str:
         return (
             "ConnectorIdentity("
@@ -206,14 +196,6 @@ def verify_identity(
     """Verify one provider identity without storing or logging its response."""
 
     return ConnectorIdentityVerifier(transport).verify(provider, credential)
-
-
-def verify_connector_identity(
-    provider: str,
-    credential: ConnectorCredential,
-    transport: ConnectorTransport | None = None,
-) -> ConnectorIdentity:
-    return verify_identity(provider, credential, transport)
 
 
 def _identity(

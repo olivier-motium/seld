@@ -8,7 +8,7 @@ import hmac
 import json
 import math
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Final, Protocol, cast
 from urllib.error import HTTPError, URLError
@@ -22,6 +22,7 @@ _PKCE_ALLOWED: Final = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 )
 _MAX_RESPONSE_BYTES: Final = 1_048_576
+_SLACK_REFRESH_ENDPOINT: Final = "https://slack.com/api/oauth.v2.access"
 _RESERVED_AUTH_PARAMETERS: Final = frozenset(
     "client_id code_challenge code_challenge_method redirect_uri response_type scope state".split()  # noqa: SIM905
 )
@@ -34,6 +35,7 @@ class OAuthTokenType(StrEnum):
 class OAuthDialect(StrEnum):
     STANDARD = "standard"
     GOOGLE = "google"
+    MICROSOFT = "microsoft"
     SLACK_USER = "slack_user"
 
 
@@ -44,6 +46,9 @@ class OAuthConfigurationError(ConnectorOAuthError): ...
 
 
 class OAuthCallbackError(ConnectorOAuthError): ...
+
+
+class OAuthStateMismatchError(OAuthCallbackError): ...
 
 
 class OAuthTransportError(ConnectorOAuthError): ...
@@ -164,7 +169,18 @@ def build_authorization_url(config: OAuthClientConfig, *, state: str, pkce: PKCE
             raise OAuthConfigurationError(
                 "Google authorization endpoint contains reserved provider parameters"
             )
-        parameters.extend((("access_type", "offline"), ("prompt", "consent")))
+        parameters.extend(
+            (
+                ("access_type", "offline"),
+                ("prompt", "consent select_account"),
+            )
+        )
+    elif config.dialect is OAuthDialect.MICROSOFT:
+        if any(name == "prompt" for name, _value in existing):
+            raise OAuthConfigurationError(
+                "Microsoft authorization endpoint contains reserved provider parameters"
+            )
+        parameters.append(("prompt", "select_account"))
     return urlunsplit(endpoint._replace(query=urlencode(parameters)))
 
 
@@ -182,10 +198,14 @@ def validate_authorization_callback(
     if received_target != expected_target:
         raise OAuthCallbackError("OAuth callback target does not match the redirect URI")
 
+    state_values = [
+        value
+        for name, value in parse_qsl(received.query, keep_blank_values=True)
+        if name == "state"
+    ]
+    if len(state_values) != 1 or not hmac.compare_digest(state_values[0], expected_state):
+        raise OAuthStateMismatchError("OAuth callback state does not match")
     parameters = _singular_parameters(received.query)
-    state = parameters.get("state")
-    if state is None or not hmac.compare_digest(state, expected_state):
-        raise OAuthCallbackError("OAuth callback state does not match")
     error = parameters.get("error")
     if error is not None:
         if not error:
@@ -208,7 +228,7 @@ def exchange_authorization_code(
     if not authorization_code:
         raise OAuthConfigurationError("authorization code must not be empty")
     _validate_code_verifier(code_verifier)
-    return _request_token(
+    token_set = _request_token(
         config,
         {
             "grant_type": "authorization_code",
@@ -220,7 +240,15 @@ def exchange_authorization_code(
         timeout_seconds=timeout_seconds,
         post_form=post_form,
         preserved_refresh_token=None,
+        allow_slack_authed_user_scope=True,
     )
+    if config.dialect is OAuthDialect.SLACK_USER and (
+        (token_set.refresh_token is None) != (token_set.expires_in_seconds is None)
+    ):
+        raise OAuthTransportError(
+            "Slack OAuth token response must pair refresh_token with expires_in"
+        )
+    return token_set
 
 
 def refresh_access_token(
@@ -242,13 +270,29 @@ def refresh_access_token(
         _validate_scopes(scopes)
         if scopes:
             fields["scope"] = " ".join(scopes)
-    return _request_token(
-        config,
+    request_config = config
+    preserved_refresh_token: str | None = refresh_token
+    if config.dialect is OAuthDialect.SLACK_USER:
+        request_config = replace(config, token_endpoint=_SLACK_REFRESH_ENDPOINT)
+        preserved_refresh_token = None
+    token_set = _request_token(
+        request_config,
         fields,
         timeout_seconds=timeout_seconds,
         post_form=post_form,
-        preserved_refresh_token=refresh_token,
+        preserved_refresh_token=preserved_refresh_token,
+        allow_slack_authed_user_scope=False,
     )
+    if config.dialect is OAuthDialect.SLACK_USER:
+        if token_set.refresh_token is None or token_set.refresh_token == refresh_token:
+            raise OAuthTransportError(
+                "Slack OAuth refresh response has no new replacement refresh_token"
+            )
+        if token_set.expires_in_seconds is None or token_set.expires_in_seconds <= 0:
+            raise OAuthTransportError("Slack OAuth refresh response has no usable expires_in")
+        if not token_set.scopes:
+            raise OAuthTransportError("Slack OAuth refresh response has no usable scope")
+    return token_set
 
 
 def _request_token(
@@ -258,6 +302,7 @@ def _request_token(
     timeout_seconds: float,
     post_form: FormPoster | None,
     preserved_refresh_token: str | None,
+    allow_slack_authed_user_scope: bool,
 ) -> OAuthTokenSet:
     if timeout_seconds <= 0 or not math.isfinite(timeout_seconds):
         raise OAuthConfigurationError("OAuth timeout must be a positive finite number")
@@ -281,7 +326,13 @@ def _request_token(
             description=description if isinstance(description, str) else None,
             status_code=status,
         )
-    return _parse_token_set(payload, preserved_refresh_token, config.dialect)
+    return _parse_token_set(
+        payload,
+        preserved_refresh_token,
+        config.dialect,
+        configured_scopes=config.scopes,
+        allow_slack_authed_user_scope=allow_slack_authed_user_scope,
+    )
 
 
 def _post_form(
@@ -309,6 +360,9 @@ def _parse_token_set(
     payload: dict[str, object],
     preserved_refresh_token: str | None,
     dialect: OAuthDialect,
+    *,
+    configured_scopes: tuple[str, ...],
+    allow_slack_authed_user_scope: bool,
 ) -> OAuthTokenSet:
     access_token = payload.get("access_token")
     if not isinstance(access_token, str) or not access_token:
@@ -327,6 +381,13 @@ def _parse_token_set(
         refresh_token = refresh_value
     if dialect is OAuthDialect.GOOGLE and refresh_token is None:
         raise OAuthTransportError("Google OAuth response has no usable refresh_token")
+    if (
+        dialect is OAuthDialect.MICROSOFT
+        and preserved_refresh_token is None
+        and _has_scope(configured_scopes, "offline_access")
+        and refresh_token is None
+    ):
+        raise OAuthTransportError("Microsoft OAuth response has no usable refresh_token")
 
     expires_value = payload.get("expires_in")
     if expires_value is None:
@@ -336,20 +397,41 @@ def _parse_token_set(
     else:
         expires_in = expires_value
     scope_value = payload.get("scope")
-    if scope_value is None and dialect is OAuthDialect.SLACK_USER:
+    if scope_value is None and dialect is OAuthDialect.SLACK_USER and allow_slack_authed_user_scope:
         authed_user = payload.get("authed_user")
         if isinstance(authed_user, dict):
             scope_value = authed_user.get("scope")
     if scope_value is None:
-        if dialect is OAuthDialect.SLACK_USER and preserved_refresh_token is None:
+        if preserved_refresh_token is None and dialect is OAuthDialect.GOOGLE:
+            raise OAuthTransportError("Google OAuth token response has no usable scope")
+        if preserved_refresh_token is None and dialect is OAuthDialect.SLACK_USER:
             raise OAuthTransportError("Slack OAuth token response has no usable user scope")
-        scopes = None
+        if preserved_refresh_token is None and dialect is OAuthDialect.MICROSOFT:
+            scopes = canonicalize_microsoft_access_scopes(
+                tuple(scope for scope in configured_scopes if scope.casefold() != "offline_access")
+            )
+        else:
+            scopes = None
     elif isinstance(scope_value, str):
         if dialect is OAuthDialect.SLACK_USER:
             scopes = tuple(item.strip() for item in scope_value.split(","))
         else:
             scopes = tuple(scope_value.split())
         _validate_scopes(scopes)
+        if (
+            not scopes
+            and preserved_refresh_token is None
+            and dialect
+            in {
+                OAuthDialect.GOOGLE,
+                OAuthDialect.SLACK_USER,
+            }
+        ):
+            raise OAuthTransportError("OAuth token response has no usable scope")
+        if dialect is OAuthDialect.GOOGLE:
+            scopes = canonicalize_google_scopes(scopes)
+        if dialect is OAuthDialect.MICROSOFT:
+            scopes = canonicalize_microsoft_access_scopes(scopes)
     else:
         raise OAuthTransportError("OAuth token response has an invalid scope")
     return OAuthTokenSet(
@@ -423,7 +505,8 @@ def _singular_parameters(query: str) -> dict[str, str]:
     values: dict[str, str] = {}
     for name, value in parse_qsl(query, keep_blank_values=True):
         if name in values:
-            raise OAuthCallbackError(f"OAuth callback contains duplicate {name}")
+            error_type = OAuthStateMismatchError if name == "state" else OAuthCallbackError
+            raise error_type(f"OAuth callback contains duplicate {name}")
         values[name] = value
     return values
 
@@ -440,3 +523,54 @@ def _validate_scopes(scopes: tuple[str, ...]) -> None:
         raise OAuthConfigurationError("OAuth scopes must be non-empty strings without whitespace")
     if len(set(scopes)) != len(scopes):
         raise OAuthConfigurationError("OAuth scopes must not contain duplicates")
+
+
+_GOOGLE_USERINFO_EMAIL_SCOPE: Final = "https://www.googleapis.com/auth/userinfo.email"
+
+
+def canonicalize_google_scopes(scopes: tuple[str, ...]) -> tuple[str, ...]:
+    """Return Google grants in the built-in profile's canonical spelling."""
+
+    _validate_scopes(scopes)
+    result = tuple("email" if scope == _GOOGLE_USERINFO_EMAIL_SCOPE else scope for scope in scopes)
+    _validate_scopes(result)
+    return result
+
+
+_MICROSOFT_SCOPE_PREFIX: Final = "https://graph.microsoft.com/"
+_MICROSOFT_CANONICAL_SCOPES: Final = {
+    "offline_access": "offline_access",
+    "user.read": "User.Read",
+    "mail.read": "Mail.Read",
+    "mail.readwrite": "Mail.ReadWrite",
+    "mail.send": "Mail.Send",
+    "calendars.read": "Calendars.Read",
+    "calendars.readwrite": "Calendars.ReadWrite",
+}
+
+
+def canonicalize_microsoft_scopes(scopes: tuple[str, ...]) -> tuple[str, ...]:
+    """Return Microsoft grants in the built-in profile's canonical spelling."""
+
+    canonical: list[str] = []
+    prefix = _MICROSOFT_SCOPE_PREFIX.casefold()
+    for scope in scopes:
+        candidate = scope
+        if candidate.casefold().startswith(prefix):
+            candidate = candidate[len(_MICROSOFT_SCOPE_PREFIX) :]
+        canonical.append(_MICROSOFT_CANONICAL_SCOPES.get(candidate.casefold(), candidate))
+    result = tuple(canonical)
+    _validate_scopes(result)
+    return result
+
+
+def canonicalize_microsoft_access_scopes(scopes: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        scope
+        for scope in canonicalize_microsoft_scopes(scopes)
+        if scope.casefold() != "offline_access"
+    )
+
+
+def _has_scope(scopes: tuple[str, ...], expected: str) -> bool:
+    return any(scope.casefold() == expected.casefold() for scope in scopes)

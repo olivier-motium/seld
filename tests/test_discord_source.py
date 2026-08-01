@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -790,10 +791,10 @@ def test_poll_discards_provider_result_if_credential_rotates_during_read(
         nonlocal rotated
         if not rotated:
             rotated = True
-            bridge.auth_manager.store_credential(
+            bridge.auth_manager.tokens.update(
                 CONNECTION_ID,
-                b"rotated-discord-bot-token",
-                expected_token_version=current.version,
+                expected_version=current.version,
+                value=b"rotated-discord-bot-token",
             )
         return original_state(connection_id)
 
@@ -810,26 +811,26 @@ def test_acknowledgement_cannot_cross_credential_rotation(
     _provider(monkeypatch)
     delivery = bridge.poll()
     receipt_revision = _record(vault, delivery)
-    original_resolve = bridge.auth_manager.resolve_credential_state
+    original_read = bridge.auth_manager.tokens.read
     calls = 0
 
-    def resolve_with_rotation(connection_id: ConnectionId | str) -> ResolvedToken:
+    def read_with_rotation(connection_id: ConnectionId) -> ResolvedToken:
         nonlocal calls
         calls += 1
         if calls == 2:
             current = bridge.auth_manager.tokens.state(CONNECTION_ID)
             assert current is not None
-            bridge.auth_manager.store_credential(
+            bridge.auth_manager.tokens.update(
                 CONNECTION_ID,
-                b"rotated-before-acknowledgement",
-                expected_token_version=current.version,
+                expected_version=current.version,
+                value=b"rotated-before-acknowledgement",
             )
-        return original_resolve(connection_id)
+        return original_read(connection_id)
 
     monkeypatch.setattr(
-        bridge.auth_manager,
-        "resolve_credential_state",
-        resolve_with_rotation,
+        bridge.auth_manager.tokens,
+        "read",
+        read_with_rotation,
     )
     with pytest.raises(ConflictError, match="credential changed before acknowledgement"):
         bridge.acknowledge(
@@ -837,6 +838,56 @@ def test_acknowledgement_cannot_cross_credential_rotation(
             expected_source_revision=receipt_revision,
         )
     assert bridge.status()["checkpoint"]["pending"] is True
+
+
+def test_discord_poll_lock_order_releases_binding_snapshot_before_lifecycle(
+    prepared: tuple[Vault, DiscordSourceBridge, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, bridge, _runtime_path = prepared
+    _provider(monkeypatch)
+    events: list[tuple[str, str, bool]] = []
+    lifecycle_held = False
+    global_path = bridge.vault.state / "locks/global.lock"
+
+    @contextmanager
+    def observed_lock(path: Path):
+        label = "global" if path == global_path else "binding"
+        events.append((label, "acquire", lifecycle_held))
+        try:
+            yield
+        finally:
+            events.append((label, "release", lifecycle_held))
+
+    @contextmanager
+    def observed_lifecycle(_connection_id: ConnectionId):
+        nonlocal lifecycle_held
+        events.append(("lifecycle", "acquire", lifecycle_held))
+        lifecycle_held = True
+        try:
+            yield
+        finally:
+            lifecycle_held = False
+            events.append(("lifecycle", "release", lifecycle_held))
+
+    monkeypatch.setattr(discord_source_module, "exclusive_lock", observed_lock)
+    monkeypatch.setattr(
+        bridge.auth_manager.tokens,
+        "exclusive_lifecycle",
+        observed_lifecycle,
+    )
+
+    assert bridge.poll()["result"] == "explicit_empty"
+    assert events == [
+        ("binding", "acquire", False),
+        ("binding", "release", False),
+        ("lifecycle", "acquire", False),
+        ("global", "acquire", True),
+        ("binding", "acquire", True),
+        ("binding", "release", True),
+        ("global", "release", True),
+        ("lifecycle", "release", False),
+    ]
 
 
 def test_binding_rejects_extra_tools_and_malformed_protocol(

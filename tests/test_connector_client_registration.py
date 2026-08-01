@@ -41,8 +41,8 @@ def test_loader_reads_public_ids_from_injected_bytes_and_never_needs_user_id_inp
     registrations = load_public_client_registrations(source_bytes=_encoded(_all_providers()))
 
     assert registrations["google"].client_id == "google-public.apps.example"
-    assert registrations["microsoft"].redirect_uri_template.endswith("/oauth/callback")
-    assert registrations["slack"].redirect_uri == "http://localhost:43127/oauth/callback"
+    assert registrations["microsoft"].redirect_template.endswith("/oauth/callback")
+    assert registrations["slack"].redirect_template == "http://localhost:43127/oauth/callback"
     assert (
         load_public_client_registration("google", source_bytes=_encoded(_all_providers()))
         == (registrations["google"])

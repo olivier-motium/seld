@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 
+import continuity_kernel.connector_adapter_collaboration as collaboration_module
 from continuity_kernel.connector_adapter import ConnectorRuntimeCredential
 from continuity_kernel.connector_adapter_collaboration import (
     CollaborationConnectorAdapter,
@@ -1115,3 +1116,61 @@ def test_discord_attachment_multipart_and_raw_transport_fields_are_rejected() ->
             credential=_credential(message),
             transport=cast(ConnectorTransport, transport),
         )
+
+
+def test_discord_multipart_boundary_retries_after_payload_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidates = iter(("collision", "safe"))
+    monkeypatch.setattr(
+        collaboration_module.secrets,
+        "token_hex",
+        lambda _length: next(candidates),
+    )
+
+    body, content_type = collaboration_module._multipart_body(
+        {"content": "seld-discord-attachment-collision"},
+        "é.txt",
+        b"attachment:seld-discord-attachment-collision",
+    )
+
+    assert content_type.endswith("seld-discord-attachment-safe")
+    assert b"seld-discord-attachment-collision" in body
+    assert b"seld-discord-attachment-safe" in body
+    assert 'filename="é.txt"'.encode() in body
+
+
+def test_discord_multipart_boundary_fails_closed_after_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = "seld-discord-attachment-collision"
+    attempts = 0
+
+    def collision(_length: int) -> str:
+        nonlocal attempts
+        attempts += 1
+        return "collision"
+
+    monkeypatch.setattr(collaboration_module.secrets, "token_hex", collision)
+    with pytest.raises(ValidationError, match="boundary could not be made safe"):
+        collaboration_module._multipart_body({"content": candidate}, "hello.txt", b"attachment")
+    assert attempts == collaboration_module._MULTIPART_BOUNDARY_ATTEMPTS
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        'bad"name.txt',
+        "bad\\name.txt",
+        "bad\rname.txt",
+        "bad\nname.txt",
+        "bad\x00name.txt",
+        "bad\x1fname.txt",
+        "bad\x7fname.txt",
+    ],
+)
+def test_discord_multipart_rejects_filename_header_injection_and_controls(
+    filename: str,
+) -> None:
+    with pytest.raises(ValidationError, match="filename is invalid"):
+        collaboration_module._multipart_body({"attachments": []}, filename, b"attachment")

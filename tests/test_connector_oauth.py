@@ -16,12 +16,14 @@ from continuity_kernel.connector_oauth import (
     OAuthClientConfig,
     OAuthConfigurationError,
     OAuthDialect,
+    OAuthStateMismatchError,
     OAuthTokenEndpointError,
     OAuthTokenSet,
     OAuthTokenType,
     OAuthTransportError,
     PKCEPair,
     build_authorization_url,
+    canonicalize_google_scopes,
     exchange_authorization_code,
     generate_pkce_pair,
     generate_state,
@@ -221,6 +223,87 @@ def test_localhost_redirect_listens_on_both_loopback_families(callback_host: str
     assert not thread.is_alive()
 
 
+@pytest.mark.parametrize(
+    "invalid_query",
+    [
+        "code=rejected-one&code=rejected-two&state=wrong-state",
+        "code=rejected-one&code=rejected-two",
+        "code=rejected-one&code=rejected-two&state=wrong-state&state=expected",
+    ],
+)
+def test_state_mismatch_does_not_latch_listener_before_valid_callback(
+    invalid_query: str,
+) -> None:
+    listener = BoundLoopbackCallback.bind(host="127.0.0.1", port=0, path="/oauth/callback")
+    config = OAuthClientConfig(
+        authorization_endpoint="https://accounts.example/authorize",
+        token_endpoint="https://accounts.example/token",
+        client_id="seld-public-client",
+        redirect_uri=listener.redirect_uri,
+    )
+    attempt = begin_authorization(config)
+    listener.configure(config, attempt)
+    redirect = urlsplit(listener.redirect_uri)
+    assert redirect.port is not None
+    responses: list[int] = []
+
+    def callback() -> None:
+        for query in (invalid_query, f"code=valid-code&state={attempt.state}"):
+            connection = http.client.HTTPConnection("127.0.0.1", redirect.port, timeout=5)
+            connection.request("GET", f"{redirect.path}?{query}")
+            response = connection.getresponse()
+            responses.append(response.status)
+            response.read()
+            connection.close()
+
+    thread = threading.Thread(target=callback)
+    thread.start()
+    try:
+        assert listener.wait_for_code(timeout_seconds=5) == "valid-code"
+    finally:
+        listener.close()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert responses == [400, 200]
+
+
+def test_valid_state_duplicate_code_latches_listener_as_terminal() -> None:
+    listener = BoundLoopbackCallback.bind(host="127.0.0.1", port=0, path="/oauth/callback")
+    config = OAuthClientConfig(
+        authorization_endpoint="https://accounts.example/authorize",
+        token_endpoint="https://accounts.example/token",
+        client_id="seld-public-client",
+        redirect_uri=listener.redirect_uri,
+    )
+    attempt = begin_authorization(config)
+    listener.configure(config, attempt)
+    redirect = urlsplit(listener.redirect_uri)
+    assert redirect.port is not None
+    responses: list[int] = []
+
+    def callback() -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", redirect.port, timeout=5)
+        connection.request(
+            "GET",
+            f"{redirect.path}?code=one&code=two&state={attempt.state}",
+        )
+        response = connection.getresponse()
+        responses.append(response.status)
+        response.read()
+        connection.close()
+
+    thread = threading.Thread(target=callback)
+    thread.start()
+    try:
+        with pytest.raises(OAuthCallbackError, match="duplicate code"):
+            listener.wait_for_code(timeout_seconds=5)
+    finally:
+        listener.close()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert responses == [400]
+
+
 def test_fixed_oauth_callback_port_collision_fails_cleanly() -> None:
     occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     occupied.bind(("127.0.0.1", 0))
@@ -247,6 +330,25 @@ def test_callback_returns_code_only_after_exact_target_and_state_validation(
     )
 
     assert result == "one-time-code"
+
+
+def test_missing_or_mismatched_state_uses_a_specific_callback_error(
+    oauth_config: OAuthClientConfig,
+) -> None:
+    for callback_url in (
+        "http://127.0.0.1:49152/oauth/callback?code=code",
+        "http://127.0.0.1:49152/oauth/callback?code=code&state=wrong",
+        "http://127.0.0.1:49152/oauth/callback?code=code&state=wrong&state=expected",
+        "http://127.0.0.1:49152/oauth/callback?code=one&code=two",
+        "http://127.0.0.1:49152/oauth/callback?code=one&code=two&state=wrong",
+        ("http://127.0.0.1:49152/oauth/callback?code=one&code=two&state=wrong&state=expected"),
+    ):
+        with pytest.raises(OAuthStateMismatchError):
+            validate_authorization_callback(
+                oauth_config,
+                callback_url=callback_url,
+                expected_state="expected",
+            )
 
 
 @pytest.mark.parametrize(
@@ -317,6 +419,27 @@ def test_authorization_code_exchange_posts_the_exact_public_client_form(
     assert result.scopes == ("messages.read", "profile")
 
 
+def test_initial_scope_omission_is_not_globally_replaced() -> None:
+    config = OAuthClientConfig(
+        authorization_endpoint="https://accounts.example/authorize",
+        token_endpoint="https://accounts.example/token",
+        client_id="seld-public-client",
+        redirect_uri="http://127.0.0.1:49152/oauth/callback",
+        scopes=("messages.read",),
+    )
+
+    result = exchange_authorization_code(
+        config,
+        authorization_code="one-time-code",
+        code_verifier="v" * 64,
+        post_form=RecordingTransport(
+            (200, b'{"access_token":"new-access-token","token_type":"Bearer"}')
+        ),
+    )
+
+    assert result.scopes is None
+
+
 def test_google_authorization_requires_a_refreshable_offline_grant() -> None:
     config = OAuthClientConfig(
         authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
@@ -330,14 +453,193 @@ def test_google_authorization_requires_a_refreshable_offline_grant() -> None:
     query = parse_qs(urlsplit(build_authorization_url(config, state="expected", pkce=pkce)).query)
 
     assert query["access_type"] == ["offline"]
-    assert query["prompt"] == ["consent"]
+    assert query["prompt"] == ["consent select_account"]
     with pytest.raises(OAuthTransportError, match="refresh_token"):
         exchange_authorization_code(
             config,
             authorization_code="one-time-code",
             code_verifier=pkce.code_verifier,
             post_form=RecordingTransport(
-                (200, b'{"access_token":"temporary","token_type":"Bearer","expires_in":3600}')
+                (
+                    200,
+                    b'{"access_token":"temporary","token_type":"Bearer",'
+                    b'"scope":"https://www.googleapis.com/auth/gmail.readonly",'
+                    b'"expires_in":3600}',
+                )
+            ),
+        )
+
+
+def test_google_userinfo_email_scope_is_canonicalized_during_token_parsing() -> None:
+    config = OAuthClientConfig(
+        authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+        token_endpoint="https://oauth2.googleapis.com/token",
+        client_id="public-google-client",
+        redirect_uri="http://127.0.0.1:49152",
+        scopes=("openid", "email", "https://www.googleapis.com/auth/gmail.readonly"),
+        dialect=OAuthDialect.GOOGLE,
+    )
+    token_set = exchange_authorization_code(
+        config,
+        authorization_code="one-time-code",
+        code_verifier="v" * 64,
+        post_form=RecordingTransport(
+            (
+                200,
+                json.dumps(
+                    {
+                        "access_token": "google-access",
+                        "refresh_token": "google-refresh",
+                        "token_type": "Bearer",
+                        "scope": (
+                            "openid https://www.googleapis.com/auth/userinfo.email "
+                            "https://www.googleapis.com/auth/gmail.readonly"
+                        ),
+                    }
+                ).encode(),
+            )
+        ),
+    )
+    credential = credential_from_token_set(
+        token_set,
+        issued_at=datetime(2026, 7, 30, 9, 0, tzinfo=UTC),
+    )
+
+    assert token_set.scopes == (
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/gmail.readonly",
+    )
+    assert credential.scopes == token_set.scopes
+    assert canonicalize_google_scopes(("userinfo.email",)) == ("userinfo.email",)
+
+
+def test_microsoft_authorization_uses_only_select_account() -> None:
+    config = OAuthClientConfig(
+        authorization_endpoint=("https://login.microsoftonline.com/common/oauth2/v2.0/authorize"),
+        token_endpoint="https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        client_id="public-microsoft-client",
+        redirect_uri="http://127.0.0.1:49152/oauth/callback",
+        scopes=("offline_access", "User.Read", "Mail.Read"),
+        dialect=OAuthDialect.MICROSOFT,
+    )
+    query = parse_qs(
+        urlsplit(
+            build_authorization_url(
+                config,
+                state="expected",
+                pkce=pkce_pair_from_verifier("v" * 64),
+            )
+        ).query
+    )
+
+    assert query["prompt"] == ["select_account"]
+    assert "consent select_account" not in query["prompt"]
+
+    response = RecordingTransport(
+        (
+            200,
+            json.dumps(
+                {
+                    "access_token": "microsoft-access",
+                    "refresh_token": "microsoft-refresh",
+                    "token_type": "Bearer",
+                    "scope": (
+                        "HTTPS://GRAPH.MICROSOFT.COM/user.read "
+                        "https://graph.microsoft.com/MAIL.READ offline_access"
+                    ),
+                }
+            ).encode(),
+        )
+    )
+    result = exchange_authorization_code(
+        config,
+        authorization_code="one-time-code",
+        code_verifier="v" * 64,
+        post_form=response,
+    )
+
+    assert result.scopes == ("User.Read", "Mail.Read")
+
+
+def test_microsoft_initial_scope_and_refresh_rules_are_provider_exact() -> None:
+    config = OAuthClientConfig(
+        authorization_endpoint=("https://login.microsoftonline.com/common/oauth2/v2.0/authorize"),
+        token_endpoint="https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        client_id="public-microsoft-client",
+        redirect_uri="http://127.0.0.1:49152/oauth/callback",
+        scopes=("offline_access", "User.Read", "Mail.Read"),
+        dialect=OAuthDialect.MICROSOFT,
+    )
+    token_response_without_scope = RecordingTransport(
+        (
+            200,
+            b'{"access_token":"microsoft-access","token_type":"Bearer",'
+            b'"refresh_token":"microsoft-refresh"}',
+        )
+    )
+
+    result = exchange_authorization_code(
+        config,
+        authorization_code="one-time-code",
+        code_verifier="v" * 64,
+        post_form=token_response_without_scope,
+    )
+
+    assert result.scopes == ("User.Read", "Mail.Read")
+    assert result.refresh_token == "microsoft-refresh"
+
+    without_offline_access = OAuthClientConfig(
+        authorization_endpoint=config.authorization_endpoint,
+        token_endpoint=config.token_endpoint,
+        client_id=config.client_id,
+        redirect_uri=config.redirect_uri,
+        scopes=("User.Read", "Mail.Read"),
+        dialect=OAuthDialect.MICROSOFT,
+    )
+    result_without_refresh = exchange_authorization_code(
+        without_offline_access,
+        authorization_code="one-time-code",
+        code_verifier="v" * 64,
+        post_form=RecordingTransport(
+            (200, b'{"access_token":"microsoft-access","token_type":"Bearer"}')
+        ),
+    )
+    assert result_without_refresh.scopes == ("User.Read", "Mail.Read")
+    assert result_without_refresh.refresh_token is None
+
+    with pytest.raises(OAuthTransportError, match="refresh_token"):
+        exchange_authorization_code(
+            config,
+            authorization_code="one-time-code",
+            code_verifier="v" * 64,
+            post_form=RecordingTransport(
+                (200, b'{"access_token":"microsoft-access","token_type":"Bearer"}')
+            ),
+        )
+
+
+def test_google_initial_grant_requires_a_returned_scope() -> None:
+    config = OAuthClientConfig(
+        authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+        token_endpoint="https://oauth2.googleapis.com/token",
+        client_id="public-google-client",
+        redirect_uri="http://127.0.0.1:49152",
+        scopes=("https://www.googleapis.com/auth/gmail.readonly",),
+        dialect=OAuthDialect.GOOGLE,
+    )
+
+    with pytest.raises(OAuthTransportError, match="usable scope"):
+        exchange_authorization_code(
+            config,
+            authorization_code="one-time-code",
+            code_verifier="v" * 64,
+            post_form=RecordingTransport(
+                (
+                    200,
+                    b'{"access_token":"temporary","token_type":"Bearer",'
+                    b'"refresh_token":"refresh","expires_in":3600}',
+                )
             ),
         )
 
@@ -381,6 +683,20 @@ def test_slack_user_authorization_and_token_response_use_the_official_dialect() 
     assert result.scopes == ("channels:history", "groups:history")
     assert result.refresh_token == "xoxe-portable-refresh"
 
+    for incomplete_rotation in (
+        b'{"ok":true,"access_token":"xoxp-user","token_type":"user",'
+        b'"refresh_token":"xoxe-refresh","authed_user":{"scope":"channels:history"}}',
+        b'{"ok":true,"access_token":"xoxp-user","token_type":"user",'
+        b'"expires_in":43200,"authed_user":{"scope":"channels:history"}}',
+    ):
+        with pytest.raises(OAuthTransportError, match="pair refresh_token with expires_in"):
+            exchange_authorization_code(
+                config,
+                authorization_code="one-time-code",
+                code_verifier=pkce.code_verifier,
+                post_form=RecordingTransport((200, incomplete_rotation)),
+            )
+
     with pytest.raises(OAuthTransportError, match="user scope"):
         exchange_authorization_code(
             config,
@@ -401,7 +717,7 @@ def test_slack_user_authorization_and_token_response_use_the_official_dialect() 
         )
 
 
-def test_slack_user_refresh_omits_scopes_and_rejects_ok_false() -> None:
+def test_slack_user_refresh_uses_rotation_endpoint_and_exact_rotating_shape() -> None:
     config = OAuthClientConfig(
         authorization_endpoint="https://slack.com/oauth/v2_user/authorize",
         token_endpoint="https://slack.com/api/oauth.v2.user.access",
@@ -413,20 +729,26 @@ def test_slack_user_refresh_omits_scopes_and_rejects_ok_false() -> None:
     successful = RecordingTransport(
         (
             200,
-            b'{"ok":true,"access_token":"fresh","token_type":"user"}',
+            b'{"ok":true,"access_token":"fresh","token_type":"user",'
+            b'"refresh_token":"xoxe-next","expires_in":43200,'
+            b'"scope":"channels:history"}',
         )
     )
-    refresh_access_token(
+    refreshed = refresh_access_token(
         config,
         refresh_token="xoxe-refresh",
         scopes=("channels:history",),
         post_form=successful,
     )
+    assert successful.endpoint == "https://slack.com/api/oauth.v2.access"
     assert successful.fields == {
         "client_id": "123.456",
         "grant_type": "refresh_token",
         "refresh_token": "xoxe-refresh",
     }
+    assert refreshed.refresh_token == "xoxe-next"
+    assert refreshed.expires_in_seconds == 43200
+    assert refreshed.scopes == ("channels:history",)
 
     with pytest.raises(OAuthTokenEndpointError) as failure:
         refresh_access_token(
@@ -435,6 +757,80 @@ def test_slack_user_refresh_omits_scopes_and_rejects_ok_false() -> None:
             post_form=RecordingTransport((200, b'{"ok":false,"error":"invalid_refresh_token"}')),
         )
     assert failure.value.error == "invalid_refresh_token"
+
+
+def test_slack_user_refresh_rejects_authed_user_scope_without_top_level_scope() -> None:
+    config = OAuthClientConfig(
+        authorization_endpoint="https://slack.com/oauth/v2_user/authorize",
+        token_endpoint="https://slack.com/api/oauth.v2.user.access",
+        client_id="123.456",
+        redirect_uri="http://localhost:49152/oauth/callback",
+        scopes=("channels:history",),
+        dialect=OAuthDialect.SLACK_USER,
+    )
+
+    with pytest.raises(OAuthTransportError, match="user scope"):
+        refresh_access_token(
+            config,
+            refresh_token="xoxe-refresh",
+            scopes=("channels:history",),
+            post_form=RecordingTransport(
+                (
+                    200,
+                    b'{"ok":true,"access_token":"fresh","token_type":"user",'
+                    b'"refresh_token":"xoxe-next","expires_in":43200,'
+                    b'"authed_user":{"scope":"channels:history"}}',
+                )
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (
+            b'{"ok":true,"access_token":"fresh","token_type":"user",'
+            b'"expires_in":43200,"scope":"channels:history"}',
+            "replacement refresh_token",
+        ),
+        (
+            b'{"ok":true,"access_token":"fresh","token_type":"user",'
+            b'"refresh_token":"xoxe-consumed","expires_in":43200,'
+            b'"scope":"channels:history"}',
+            "replacement refresh_token",
+        ),
+        (
+            b'{"ok":true,"access_token":"fresh","token_type":"user",'
+            b'"refresh_token":"xoxe-next","scope":"channels:history"}',
+            "expires_in",
+        ),
+        (
+            b'{"ok":true,"access_token":"fresh","token_type":"user",'
+            b'"refresh_token":"xoxe-next","expires_in":43200}',
+            "scope",
+        ),
+    ],
+)
+def test_slack_user_refresh_rejects_incomplete_rotating_response(
+    response: bytes,
+    message: str,
+) -> None:
+    config = OAuthClientConfig(
+        authorization_endpoint="https://slack.com/oauth/v2_user/authorize",
+        token_endpoint="https://slack.com/api/oauth.v2.user.access",
+        client_id="123.456",
+        redirect_uri="http://localhost:49152/oauth/callback",
+        scopes=("channels:history",),
+        dialect=OAuthDialect.SLACK_USER,
+    )
+
+    with pytest.raises(OAuthTransportError, match=message):
+        refresh_access_token(
+            config,
+            refresh_token="xoxe-consumed",
+            scopes=("channels:history",),
+            post_form=RecordingTransport((200, response)),
+        )
 
 
 def test_refresh_preserves_old_refresh_token_only_when_provider_omits_it(

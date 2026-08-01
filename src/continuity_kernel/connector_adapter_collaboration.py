@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import secrets
 from collections.abc import Mapping, Sequence
 from typing import Final, cast
 from urllib.parse import quote
@@ -29,6 +30,8 @@ __all__ = ["CollaborationConnectorAdapter", "SlackUploadOutcomeUnknown"]
 _PROVIDERS: Final = frozenset({"discord", "slack"})
 OPERATION_CATALOG: Final = OperationCatalog(COLLABORATION_OPERATIONS)
 _MAX_BINARY_BYTES: Final = 180_000
+_MULTIPART_BOUNDARY_ATTEMPTS: Final = 8
+_MULTIPART_BOUNDARY_BYTES: Final = 16
 _SLACK_CHANNEL_TYPES: Final = {
     "channel": "public_channel",
     "group": "private_channel",
@@ -1465,10 +1468,25 @@ def _existing_attachments(message: Mapping[str, object]) -> list[dict[str, objec
 
 
 def _multipart_body(payload: object, filename: object, content: bytes) -> tuple[bytes, str]:
-    if not isinstance(filename, str) or not filename or "\r" in filename or "\n" in filename:
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or any(
+            character in {'"', "\\"} or ord(character) < 0x20 or ord(character) == 0x7F
+            for character in filename
+        )
+    ):
         raise ValidationError("Discord attachment filename is invalid")
-    boundary = "seld-discord-attachment-v1"
     payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    boundary: str | None = None
+    for _ in range(_MULTIPART_BOUNDARY_ATTEMPTS):
+        candidate = f"seld-discord-attachment-{secrets.token_hex(_MULTIPART_BOUNDARY_BYTES)}"
+        candidate_bytes = candidate.encode("ascii")
+        if candidate_bytes not in payload_json and candidate_bytes not in content:
+            boundary = candidate
+            break
+    if boundary is None:
+        raise ValidationError("Discord attachment multipart boundary could not be made safe")
     parts = (
         (
             f"--{boundary}\r\n"

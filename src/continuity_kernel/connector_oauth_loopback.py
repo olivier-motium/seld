@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from continuity_kernel.connector_oauth import (
     OAuthCallbackError,
     OAuthClientConfig,
+    OAuthStateMismatchError,
     build_authorization_url,
     generate_pkce_pair,
     generate_state,
@@ -68,7 +69,8 @@ class _CallbackHandler(BaseHTTPRequestHandler):
                 expected_state=self.server.attempt.state,
             )
         except OAuthCallbackError as exc:
-            self.server.callback_error = exc
+            if not isinstance(exc, OAuthStateMismatchError):
+                self.server.callback_error = exc
             self._reply(400, _REJECTED)
             return
         self._reply(200, _SUCCESS)

@@ -440,6 +440,59 @@ def test_reconnecting_same_account_refreshes_equal_grant_but_never_downgrades_br
     assert manager.resolve_oauth_access_token(broader.connection_id) == "transient-provider-token"
 
 
+def test_microsoft_same_tier_reconnect_replaces_credential_without_offline_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    existing = _existing_oauth(manager, "outlook_mail", access=ConnectorAccessTier.READ)
+    before = manager.vault.get_connection_snapshot().connection(existing.connection_id)
+    assert before is not None
+    profile = get_connector_profile("outlook_mail")
+    access_scopes = tuple(
+        scope
+        for scope in profile.scopes_for(ConnectorAccessTier.READ)
+        if scope.casefold() != "offline_access"
+    )
+    refreshed = _credential(access_scopes)
+    refreshed = OAuthCredential(
+        access_token="outlook-replacement-access",
+        refresh_token="outlook-replacement-refresh",
+        token_type=refreshed.token_type,
+        scopes=refreshed.scopes,
+        issued_at=refreshed.issued_at,
+        expires_at=refreshed.expires_at,
+    )
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: refreshed,
+    )
+
+    result = onboarding.connect_oauth(
+        "outlook_mail",
+        access="read",
+        confirm_identity=lambda review: True,
+    )
+
+    assert result["status"] == "already_connected"
+    assert result["credential"] == "refreshed"
+    assert result["connection_id"] == str(existing.connection_id)
+    assert manager.resolve_oauth_access_token(existing.connection_id) == (
+        "outlook-replacement-access"
+    )
+    after = manager.vault.get_connection_snapshot().connection(existing.connection_id)
+    assert after is not None
+    assert after.health is ConnectionHealth.READY
+    assert after.updated_at > before.updated_at
+    assert after.last_verified_at == after.updated_at
+
+
 def test_resume_verifies_exact_identity_supports_alias_and_cleans_missing_credential(
     tmp_path: Path,
 ) -> None:

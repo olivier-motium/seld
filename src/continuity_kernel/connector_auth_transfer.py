@@ -8,6 +8,7 @@ import os
 import secrets
 import stat
 import subprocess
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,6 +28,7 @@ from continuity_kernel.errors import (
     ConflictError,
     DegradedIntegrityError,
     MutationCommittedError,
+    NotFoundError,
     SetupError,
     ValidationError,
 )
@@ -61,15 +63,30 @@ def export_auth_archive(
     if not snapshot.connections:
         raise ValidationError("there are no connector credentials to export")
     records: list[dict[str, object]] = []
-    for metadata in snapshot.connections:
-        credential = manager.tokens.read(metadata.connection_id).value
-        manager.validate_import_credential(metadata, credential)
-        records.append(
-            {
-                "credential": base64.b64encode(credential).decode("ascii"),
-                "metadata": metadata.to_dict(),
-            }
-        )
+    connection_ids = sorted(item.connection_id for item in snapshot.connections)
+    with ExitStack() as locks:
+        for connection_id in connection_ids:
+            locks.enter_context(manager.tokens.exclusive_lifecycle(connection_id))
+        locked_snapshot = manager.vault.get_connection_snapshot()
+        if locked_snapshot != snapshot:
+            raise ConflictError("portable connection records changed during auth export")
+        for metadata in locked_snapshot.connections:
+            try:
+                credential = manager.tokens.read(metadata.connection_id).value
+            except NotFoundError as exc:
+                raise ValidationError(
+                    f"connection {metadata.connection_id} has no credential in host custody; "
+                    "authorize or remove it"
+                ) from exc
+            canonical = manager.validate_import_credential(metadata, credential)
+            records.append(
+                {
+                    "credential": base64.b64encode(canonical).decode("ascii"),
+                    "metadata": metadata.to_dict(),
+                }
+            )
+        if manager.vault.get_connection_snapshot() != locked_snapshot:
+            raise ConflictError("portable connection records changed during auth export")
     plaintext = _encode_archive(
         {
             "connection_revision": snapshot.revision,
@@ -128,9 +145,11 @@ def import_auth_archive(
     if not initial_snapshot and not resumed_snapshot:
         raise ConflictError("portable connection records differ from the auth archive")
 
+    validated: list[tuple[ConnectionMetadata, bytes]] = []
     for item, credential in records:
-        manager.validate_import_credential(item, credential)
-        manager.tokens.validate_import(item.connection_id, credential)
+        canonical = manager.validate_import_credential(item, credential)
+        manager.tokens.validate_import(item.connection_id, canonical)
+        validated.append((item, canonical))
 
     if initial_snapshot:
         replacement = _unverified_snapshot(current)
@@ -157,7 +176,7 @@ def import_auth_archive(
             raise
 
     imported: list[ConnectionMetadata] = []
-    for item, credential in records:
+    for item, credential in validated:
         try:
             manager.ensure_imported_credential(item, credential)
         except Exception as import_error:
