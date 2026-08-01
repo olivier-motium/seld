@@ -135,25 +135,6 @@ class ConnectorAuthManager:
                 value=value,
             )
 
-    def store_oauth_credential(
-        self,
-        connection_id: ConnectionId | str,
-        credential: OAuthCredential,
-        *,
-        expected_token_version: int,
-    ) -> TokenState:
-        clean_id = parse_connection_id(connection_id)
-        with self.tokens.exclusive_lifecycle(clean_id):
-            metadata = self._oauth_metadata(clean_id)
-            credential = self._canonicalize_oauth_credential(metadata, credential)
-            self._validate_oauth_credential(metadata, credential)
-            return self.tokens.update(
-                metadata.connection_id,
-                expected_version=expected_token_version,
-                value=credential.to_bytes(),
-                updated_at=credential.issued_at,
-            )
-
     def resolve_credential(self, connection_id: ConnectionId | str) -> bytes:
         """Resolve only inside a connector runtime; never expose through MCP or status."""
 
@@ -361,9 +342,63 @@ class ConnectorAuthManager:
         expected_account_fingerprint: str,
         expected_token_version: int,
         replacement: OAuthCredential,
+        account_label: str | None = None,
     ) -> dict[str, Any]:
         """Atomically replace one verified connection's OAuth credential."""
 
+        def prepare(metadata: ConnectionMetadata) -> tuple[bytes, datetime]:
+            if metadata.credential_kind is not CredentialKind.OAUTH2:
+                raise ValidationError("connection does not use OAuth")
+            self._oauth_config(metadata)
+            prepared = self._canonicalize_oauth_credential(metadata, replacement)
+            self._validate_oauth_credential(metadata, prepared)
+            return prepared.to_bytes(), prepared.issued_at
+
+        return self._rotate_verified_credential(
+            connection_id,
+            expected_revision=expected_revision,
+            expected_account_fingerprint=expected_account_fingerprint,
+            expected_token_version=expected_token_version,
+            prepare=prepare,
+            account_label=account_label,
+        )
+
+    def rotate_verified_bearer_credential(
+        self,
+        connection_id: ConnectionId | str,
+        *,
+        expected_revision: str,
+        expected_account_fingerprint: str,
+        expected_token_version: int,
+        replacement: bytes,
+        account_label: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically replace one verified bot connection's bearer credential."""
+
+        def prepare(metadata: ConnectionMetadata) -> tuple[bytes, None]:
+            if metadata.credential_kind is not CredentialKind.BEARER:
+                raise ValidationError("connection does not use a bearer credential")
+            return replacement, None
+
+        return self._rotate_verified_credential(
+            connection_id,
+            expected_revision=expected_revision,
+            expected_account_fingerprint=expected_account_fingerprint,
+            expected_token_version=expected_token_version,
+            prepare=prepare,
+            account_label=account_label,
+        )
+
+    def _rotate_verified_credential(
+        self,
+        connection_id: ConnectionId | str,
+        *,
+        expected_revision: str,
+        expected_account_fingerprint: str,
+        expected_token_version: int,
+        prepare: Callable[[ConnectionMetadata], tuple[bytes, datetime | None]],
+        account_label: str | None,
+    ) -> dict[str, Any]:
         clean_id = parse_connection_id(connection_id)
         with self.tokens.exclusive_lifecycle(clean_id):
             snapshot = self.vault.get_connection_snapshot()
@@ -372,8 +407,6 @@ class ConnectorAuthManager:
             metadata = snapshot.connection(clean_id)
             if metadata is None:
                 raise NotFoundError("connection was not found")
-            if metadata.credential_kind is not CredentialKind.OAUTH2:
-                raise ValidationError("connection does not use OAuth")
             if metadata.account.fingerprint != expected_account_fingerprint:
                 raise ConflictError("account binding changed; reload before rotating credential")
             if metadata.health not in {
@@ -382,10 +415,11 @@ class ConnectorAuthManager:
                 ConnectionHealth.REAUTHORIZATION_REQUIRED,
             }:
                 raise ValidationError("credential rotation requires a verified connection")
-
-            self._oauth_config(metadata)
-            replacement = self._canonicalize_oauth_credential(metadata, replacement)
-            self._validate_oauth_credential(metadata, replacement)
+            updated_account = AccountMetadata(
+                fingerprint=metadata.account.fingerprint,
+                label=(metadata.account.label if account_label is None else account_label),
+            )
+            replacement, replacement_time = prepare(metadata)
             current = self.tokens.state(clean_id)
             current_version = current.version if current is not None else 0
             if current_version != expected_token_version:
@@ -397,25 +431,33 @@ class ConnectorAuthManager:
                 self.tokens.update(
                     clean_id,
                     expected_version=expected_token_version,
-                    value=replacement.to_bytes(),
-                    updated_at=replacement.issued_at,
+                    value=replacement,
+                    updated_at=replacement_time,
                 )
             except MutationCommittedError as exc:
                 raise MutationCommittedError(
                     "credential rotation committed; metadata repair is required"
                 ) from exc
 
-            observed_at = max(
+            observed_candidates = [
                 datetime.now(UTC),
                 metadata.updated_at + timedelta(microseconds=1),
-                replacement.issued_at,
+            ]
+            if replacement_time is not None:
+                observed_candidates.append(replacement_time)
+            observed_at = max(observed_candidates)
+            updated = replace(
+                metadata,
+                account=updated_account,
+                health=ConnectionHealth.READY,
+                last_verified_at=observed_at,
+                updated_at=observed_at,
+                version=metadata.version + 1,
             )
             try:
-                return self.vault.mark_connection_health(
+                return self.vault.put_connection(
                     expected_revision=expected_revision,
-                    connection_id=clean_id,
-                    health=ConnectionHealth.READY,
-                    verified=True,
+                    connection=updated,
                     observed_at=observed_at,
                 )
             except Exception as exc:
@@ -590,22 +632,6 @@ class ConnectorAuthManager:
             raise ValidationError("new verified connections must start as unverified version 1")
         if metadata.account.fingerprint is None:
             raise ValidationError("new verified connections require an account fingerprint")
-
-    def mark_verified(self, connection_id: ConnectionId | str) -> dict[str, Any]:
-        clean_id = parse_connection_id(connection_id)
-        snapshot = self.vault.get_connection_snapshot()
-        current = snapshot.connection(clean_id)
-        if current is None:
-            raise NotFoundError("connection was not found")
-        return self._mark_health(
-            clean_id,
-            ConnectionHealth.READY,
-            observed_at=max(
-                datetime.now(UTC),
-                current.updated_at + timedelta(microseconds=1),
-            ),
-            verified=True,
-        )
 
     def verify_existing_connection_identity(
         self,
@@ -874,6 +900,8 @@ class ConnectorAuthManager:
 
     @staticmethod
     def _credential_binding(metadata: ConnectionMetadata) -> tuple[object, ...]:
+        # Interactive acquisition/import pins the whole account record so a concurrent
+        # alias edit restarts the operation instead of being overwritten at commit.
         return (
             metadata.provider,
             metadata.source_ids,

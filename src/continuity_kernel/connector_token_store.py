@@ -30,6 +30,7 @@ from continuity_kernel.errors import (
     DegradedIntegrityError,
     MutationCommittedError,
     NotFoundError,
+    SetupError,
     ValidationError,
 )
 
@@ -245,13 +246,18 @@ class AtomicTokenStore:
         clean_id = parse_connection_id(connection_id)
         self._prepare()
         with exclusive_lock(self._lock_path(clean_id)):
-            current = self._load_unlocked(clean_id)
-            removed = current is not None
+            path = self._state_path(clean_id)
+            try:
+                current = self._load_unlocked(clean_id)
+            except ValidationError:
+                # The two secret slots are fixed and connection-bound, so an unreadable
+                # pointer must not prevent local revocation and recovery.
+                current = None
+            removed = current is not None or os.path.lexists(path)
             for name in (SecretName("token-slot-a"), SecretName("token-slot-b")):
-                if self.secrets.get_secret(clean_id, name) is not None:
+                if self._slot_requires_deletion(clean_id, name):
                     self.secrets.delete_secret(clean_id, name)
                     removed = True
-            path = self._state_path(clean_id)
             if os.path.lexists(path):
                 durable_unlink(path)
             return removed
@@ -350,14 +356,26 @@ class AtomicTokenStore:
         if previous is None:
             return
         try:
-            self.secrets.delete_secret(
+            if self._slot_requires_deletion(
                 previous.connection_id,
                 previous.secret_reference.name,
-            )
+            ):
+                self.secrets.delete_secret(
+                    previous.connection_id,
+                    previous.secret_reference.name,
+                )
         except Exception as cleanup_error:
             raise MutationCommittedError(
                 "token update committed, but the prior secret could not be removed; reload"
             ) from cleanup_error
+
+    def _slot_requires_deletion(self, connection_id: ConnectionId, name: SecretName) -> bool:
+        try:
+            return self.secrets.get_secret(connection_id, name) is not None
+        except ValidationError:
+            # A corrupt-but-present keyring value is still safely deletable by its
+            # fixed connection-bound name.
+            return True
 
     def _load_unlocked(self, connection_id: ConnectionId) -> TokenState | None:
         path = self._state_path(connection_id)
@@ -471,7 +489,7 @@ def _private_directory(path: Path) -> None:
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         metadata = os.lstat(path)
     except OSError as exc:
-        raise ValidationError(f"connector token storage is unavailable: {path}") from exc
+        raise SetupError(f"connector token storage is unavailable: {path}") from exc
     file_attributes = int(getattr(metadata, "st_file_attributes", 0))
     reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
     if (
@@ -479,6 +497,6 @@ def _private_directory(path: Path) -> None:
         or bool(file_attributes & reparse_flag)
         or not stat.S_ISDIR(metadata.st_mode)
     ):
-        raise ValidationError("connector token storage must use real directories")
+        raise SetupError("connector token storage must use real directories")
     if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise ValidationError("connector token storage permissions are too broad")
+        raise SetupError("connector token storage permissions are too broad")

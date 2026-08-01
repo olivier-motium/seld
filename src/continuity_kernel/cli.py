@@ -126,16 +126,30 @@ def main(arguments: list[str] | None = None) -> int:
             return failure[0]
         return 0
     except ContinuityError as exc:
+        oauth_guidance = _connector_oauth_failure_guidance(args)
         if getattr(args, "json", False):
-            print(json.dumps({"error": str(exc), "ok": False}, ensure_ascii=False), file=sys.stderr)
+            payload: dict[str, object] = {"error": str(exc), "ok": False}
+            if oauth_guidance is not None:
+                payload.update(
+                    {
+                        "provider_access_may_remain": True,
+                        "revocation_help": oauth_guidance,
+                    }
+                )
+            print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
         else:
             print(f"Error: {exc}", file=sys.stderr)
+            if oauth_guidance is not None:
+                print(
+                    "If provider sign-in completed, provider access may remain. "
+                    f"{oauth_guidance} Run `gsv connectors list` before retrying.",
+                    file=sys.stderr,
+                )
         return 2
     except KeyboardInterrupt:
-        if (
-            getattr(args, "command", None) == "connectors"
-            and getattr(args, "connectors_command", None) == "connect"
-        ):
+        if getattr(args, "command", None) == "connectors" and getattr(
+            args, "connectors_command", None
+        ) in {"connect", "reauthorize"}:
             connector = getattr(args, "connector", None)
             profile = CONNECTOR_PROFILES.get(connector) if isinstance(connector, str) else None
             guidance = (
@@ -145,12 +159,26 @@ def main(arguments: list[str] | None = None) -> int:
             )
             print(
                 "Cancelled locally. If provider sign-in had completed, provider access may "
-                f"remain. {guidance} Run `gsv connectors list` before retrying.",
+                f"remain. {guidance} Run `gsv connectors list` before retrying or reauthorizing.",
                 file=sys.stderr,
             )
         else:
             print("Cancelled.", file=sys.stderr)
         return 130
+
+
+def _connector_oauth_failure_guidance(args: argparse.Namespace) -> str | None:
+    if getattr(args, "command", None) != "connectors" or getattr(
+        args, "connectors_command", None
+    ) not in {"connect", "reauthorize"}:
+        return None
+    connector = getattr(args, "connector", None)
+    if connector == "discord":
+        return None
+    profile = CONNECTOR_PROFILES.get(connector) if isinstance(connector, str) else None
+    if profile is not None:
+        return provider_revocation_guidance(profile.provider)
+    return "Review the provider's connected-app settings."
 
 
 def _dispatch(args: argparse.Namespace) -> Any:
@@ -602,6 +630,12 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
     if args.connectors_command == "connect":
         if args.with_permanent_delete and (args.connector != "gmail" or args.access != "full"):
             raise ValidationError("--with-permanent-delete is available only for Gmail Full access")
+        if args.connector == "discord" and args.connection_id is not None:
+            raise ValidationError("--connection-id is unavailable for Discord bot onboarding")
+        if args.connector == "discord" and (args.browser is not None or args.no_browser):
+            raise ValidationError("browser options are unavailable for Discord bot onboarding")
+        if args.connector == "discord" and args.timeout is not None:
+            raise ValidationError("--timeout is unavailable for Discord bot onboarding")
         print(
             f"Connecting {args.connector.replace('_', ' ').title()} with {args.access.title()} "
             "access…",
@@ -622,33 +656,34 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
                 alias=args.alias,
             )
         opener = _connector_browser_opener(args)
-        if opener is _USE_DEFAULT_BROWSER:
-            return onboarding.connect_oauth(
-                args.connector,
-                access=args.access,
-                confirm_identity=_confirm_connector_identity,
-                new_account=args.new_account,
-                alias=args.alias,
-                include_permanent_delete=args.with_permanent_delete,
-                present_authorization_url=_present_authorization_url,
-                timeout_seconds=args.timeout,
-            )
+        timeout_seconds = args.timeout if args.timeout is not None else 180.0
         return onboarding.connect_oauth(
             args.connector,
             access=args.access,
             confirm_identity=_confirm_connector_identity,
             new_account=args.new_account,
+            connection_id=args.connection_id,
             alias=args.alias,
             include_permanent_delete=args.with_permanent_delete,
-            browser_opener=cast(Callable[[str], bool] | None, opener),
+            browser_opener=opener,
             present_authorization_url=_present_authorization_url,
-            timeout_seconds=args.timeout,
+            timeout_seconds=timeout_seconds,
         )
     if args.connectors_command == "resume":
         return onboarding.resume(
             args.connection_id,
             confirm_identity=_confirm_connector_identity,
             alias=args.alias,
+        )
+    if args.connectors_command == "reauthorize":
+        opener = _connector_browser_opener(args)
+        return onboarding.reauthorize_oauth(
+            args.connection_id,
+            confirm_identity=_confirm_connector_identity,
+            alias=args.alias,
+            browser_opener=opener,
+            present_authorization_url=_present_authorization_url,
+            timeout_seconds=args.timeout,
         )
     if args.connectors_command == "disconnect":
         if not args.yes and not _confirm(
@@ -691,42 +726,49 @@ def _connector_registration_status(
     }
 
 
-_USE_DEFAULT_BROWSER = object()
-
-
-def _connector_browser_opener(args: argparse.Namespace) -> object:
+def _connector_browser_opener(args: argparse.Namespace) -> Callable[[str], bool] | None:
     if args.no_browser:
         return None
-    if args.browser == "default":
-        return _USE_DEFAULT_BROWSER
-    try:
-        controller = webbrowser.get("firefox")
-    except webbrowser.Error:
-        if sys.platform != "darwin":
-            return lambda url: False
+    if args.browser in {None, "default"}:
+        return webbrowser.open
 
-        def open_firefox(url: str) -> bool:
+    def open_firefox(url: str) -> bool:
+        try:
+            controller = webbrowser.get("firefox")
             try:
-                completed = subprocess.run(
-                    ["open", "-a", "Firefox", url],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            except OSError:
-                return False
-            return completed.returncode == 0
+                if bool(controller.open(url)):
+                    return True
+            except (OSError, RuntimeError, webbrowser.Error):
+                pass
+        except (OSError, RuntimeError, webbrowser.Error):
+            pass
+        if sys.platform != "darwin":
+            return False
+        try:
+            completed = subprocess.run(
+                ["open", "-b", "org.mozilla.firefox", "-u", url],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return completed.returncode == 0
 
-        return open_firefox
-    return controller.open
+    return open_firefox
 
 
 def _present_authorization_url(url: str, browser_opened: bool) -> None:
     if browser_opened:
         print("Your browser is open. Finish sign-in there; Seld is waiting…", file=sys.stderr)
     else:
-        print("Open this sign-in URL in a browser, then finish there:", file=sys.stderr)
+        print(
+            "Manual mode: open this sign-in URL on this computer while this command keeps "
+            "running, then finish sign-in there:",
+            file=sys.stderr,
+        )
     print("Sign-in URL (safe to copy into your browser):", file=sys.stderr)
     print(url, file=sys.stderr)
 
@@ -1444,7 +1486,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     connector_connect.add_argument("connector", choices=tuple(sorted(CONNECTOR_PROFILES)))
     connector_connect.add_argument("--access", choices=("read", "full"), required=True)
-    connector_connect.add_argument("--new-account", action="store_true")
+    connector_selector = connector_connect.add_mutually_exclusive_group()
+    connector_selector.add_argument("--connection-id")
+    connector_selector.add_argument("--new-account", action="store_true")
     connector_connect.add_argument(
         "--alias",
         help=(
@@ -1456,9 +1500,30 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Gmail Full only: request the separate irreversible-delete permission.",
     )
-    connector_connect.add_argument("--timeout", type=float, default=180.0)
-    connector_connect.add_argument("--browser", choices=("default", "firefox"), default="default")
-    connector_connect.add_argument("--no-browser", action="store_true")
+    connector_connect.add_argument("--timeout", type=float)
+    connector_browser = connector_connect.add_mutually_exclusive_group()
+    connector_browser.add_argument("--browser", choices=("default", "firefox"), default=None)
+    connector_browser.add_argument("--no-browser", action="store_true")
+    connector_reauthorize = connector_commands.add_parser(
+        "reauthorize",
+        help="Run OAuth again for one existing verified connection without changing its ID.",
+    )
+    connector_reauthorize.add_argument("connection_id")
+    connector_reauthorize.add_argument(
+        "--alias",
+        help=(
+            "Optional privacy-safe local account label; replaces the stored label for this "
+            "connection."
+        ),
+    )
+    connector_reauthorize.add_argument("--timeout", type=float, default=180.0)
+    reauthorize_browser = connector_reauthorize.add_mutually_exclusive_group()
+    reauthorize_browser.add_argument(
+        "--browser",
+        choices=("default", "firefox"),
+        default=None,
+    )
+    reauthorize_browser.add_argument("--no-browser", action="store_true")
     connector_resume = connector_commands.add_parser(
         "resume",
         help="Finish identity confirmation for one retained unverified connection.",

@@ -105,18 +105,15 @@ def _runtime(
         secret_store=InMemorySecretStore(),
         state_root=tmp_path / "host-state",
     )
-    manager.store_oauth_credential(
-        _CONNECTION_ID,
-        OAuthCredential(
-            access_token="runtime-access-token",
-            refresh_token="runtime-refresh-token",
-            token_type=OAuthTokenType.BEARER,
-            scopes=full_scopes,
-            issued_at=now,
-            expires_at=None,
-        ),
-        expected_token_version=0,
+    credential = OAuthCredential(
+        access_token="runtime-access-token",
+        refresh_token="runtime-refresh-token",
+        token_type=OAuthTokenType.BEARER,
+        scopes=full_scopes,
+        issued_at=now,
+        expires_at=None,
     )
+    manager.ensure_imported_credential(connection, credential.to_bytes())
     transport = _NoProviderHttp()
     runtime = ConnectorRuntime(
         vault,

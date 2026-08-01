@@ -102,18 +102,15 @@ def _prepared(
         secret_store=InMemorySecretStore(),
         state_root=tmp_path / f"tokens-{marker}",
     )
-    manager.store_oauth_credential(
-        connection_id,
-        OAuthCredential(
-            access_token=TOKEN,
-            refresh_token=None if provider == "slack" else f"{provider}-refresh-token",
-            token_type=OAuthTokenType.BEARER,
-            scopes=scopes,
-            issued_at=BASE_TIME,
-            expires_at=None,
-        ),
-        expected_token_version=0,
+    credential = OAuthCredential(
+        access_token=TOKEN,
+        refresh_token=None if provider == "slack" else f"{provider}-refresh-token",
+        token_type=OAuthTokenType.BEARER,
+        scopes=scopes,
+        issued_at=BASE_TIME,
+        expires_at=None,
     )
+    manager.ensure_imported_credential(metadata, credential.to_bytes())
     return vault, manager, connection_id
 
 
@@ -906,17 +903,19 @@ def test_slack_history_error_and_credential_rotation_fail_closed(
             return {"ok": True, "team_id": "T123456789", "user_id": "U123456789"}
         current = manager.tokens.state(connection_id)
         assert current is not None
-        manager.store_oauth_credential(
+        replacement = OAuthCredential(
+            access_token="rotated-access-token",
+            refresh_token=None,
+            token_type=OAuthTokenType.BEARER,
+            scopes=get_profile("slack").read_scopes,
+            issued_at=BASE_TIME,
+            expires_at=None,
+        )
+        manager.tokens.update(
             connection_id,
-            OAuthCredential(
-                access_token="rotated-access-token",
-                refresh_token=None,
-                token_type=OAuthTokenType.BEARER,
-                scopes=get_profile("slack").read_scopes,
-                issued_at=BASE_TIME,
-                expires_at=None,
-            ),
-            expected_token_version=current.version,
+            expected_version=current.version,
+            value=replacement.to_bytes(),
+            updated_at=replacement.issued_at,
         )
         return {"ok": False, "error": "missing_scope"}
 

@@ -11,7 +11,6 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-import continuity_kernel.connector_auth_manager as connector_auth_manager
 import continuity_kernel.connector_oauth as connector_oauth
 from continuity_kernel.connections import render_connection_snapshot
 from continuity_kernel.connector_auth import (
@@ -32,6 +31,7 @@ from continuity_kernel.connector_oauth import (
 )
 from continuity_kernel.connector_profiles import get_profile
 from continuity_kernel.connector_secrets import InMemorySecretStore
+from continuity_kernel.connector_token_store import TokenState
 from continuity_kernel.errors import (
     ConflictError,
     MutationCommittedError,
@@ -175,6 +175,15 @@ def _expired_credential() -> OAuthCredential:
     )
 
 
+def _import_oauth_credential(
+    manager: ConnectorAuthManager,
+    credential: OAuthCredential,
+) -> TokenState:
+    metadata = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert metadata is not None
+    return manager.ensure_imported_credential(metadata, credential.to_bytes())
+
+
 def _rotation_manager(
     tmp_path: Path,
     *,
@@ -194,11 +203,7 @@ def _rotation_manager(
         issued_at=BASE_TIME,
         expires_at=None,
     )
-    manager.store_oauth_credential(
-        CONNECTION_ID,
-        original,
-        expected_token_version=0,
-    )
+    _import_oauth_credential(manager, original)
     return manager, original
 
 
@@ -218,11 +223,7 @@ def test_concurrent_refresh_uses_a_rotating_provider_token_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _manager(tmp_path)
-    manager.store_oauth_credential(
-        CONNECTION_ID,
-        _expired_credential(),
-        expected_token_version=0,
-    )
+    _import_oauth_credential(manager, _expired_credential())
     calls = 0
     calls_lock = threading.Lock()
 
@@ -275,11 +276,7 @@ def test_invalid_refresh_preserves_secret_and_marks_reauthorization(
     provider_error: str,
 ) -> None:
     manager = _manager(tmp_path)
-    original = manager.store_oauth_credential(
-        CONNECTION_ID,
-        _expired_credential(),
-        expected_token_version=0,
-    )
+    original = _import_oauth_credential(manager, _expired_credential())
 
     def invalid_grant(
         endpoint: str,
@@ -313,7 +310,7 @@ def test_refresh_error_downgrade_advances_a_stale_observation(
 ) -> None:
     manager = _manager(tmp_path)
     credential = replace(_expired_credential(), expires_at=BASE_TIME + timedelta(seconds=30))
-    manager.store_oauth_credential(CONNECTION_ID, credential, expected_token_version=0)
+    _import_oauth_credential(manager, credential)
     before = manager.vault.get_connection_snapshot()
     before_metadata = before.connection(CONNECTION_ID)
     assert before_metadata is not None
@@ -343,46 +340,12 @@ def test_refresh_error_downgrade_advances_a_stale_observation(
     assert manager.tokens.read(CONNECTION_ID).value == credential.to_bytes()
 
 
-def test_mark_verified_advances_updated_at_when_clock_regresses(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _manager(
-        tmp_path,
-        fingerprint=GOOGLE_ACCOUNT_FINGERPRINT,
-        health=ConnectionHealth.UNVERIFIED,
-    )
-    before = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
-    assert before is not None
-
-    class RegressedClock(datetime):
-        @classmethod
-        def now(cls, tz: object | None = None) -> datetime:
-            del cls, tz
-            return before.updated_at
-
-    monkeypatch.setattr(connector_auth_manager, "datetime", RegressedClock)
-
-    manager.mark_verified(CONNECTION_ID)
-
-    after = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
-    assert after is not None
-    assert after.health is ConnectionHealth.READY
-    assert after.updated_at == before.updated_at + timedelta(microseconds=1)
-    assert after.updated_at > before.updated_at
-    assert after.last_verified_at == after.updated_at
-
-
 def test_refresh_sink_rejects_a_connection_swap_and_unpinned_endpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _manager(tmp_path)
-    manager.store_oauth_credential(
-        CONNECTION_ID,
-        _expired_credential(),
-        expected_token_version=0,
-    )
+    _import_oauth_credential(manager, _expired_credential())
     safe_snapshot = manager.vault.get_connection_snapshot()
     safe_metadata = safe_snapshot.connection(CONNECTION_ID)
     assert safe_metadata is not None
@@ -690,34 +653,6 @@ def test_fresh_verified_connection_is_unusable_until_token_and_identity_publish(
 
 
 @pytest.mark.parametrize("provider", ["google", "microsoft"])
-def test_oauth_store_requires_refresh_token_without_mutation(
-    tmp_path: Path,
-    provider: str,
-) -> None:
-    manager = _manager(tmp_path) if provider == "google" else _microsoft_manager(tmp_path)
-    scopes = (GOOGLE_SCOPE,) if provider == "google" else ("User.Read", "Mail.Read")
-    credential = OAuthCredential(
-        access_token=f"{provider}-access",
-        refresh_token=None,
-        token_type=OAuthTokenType.BEARER,
-        scopes=scopes,
-        issued_at=BASE_TIME,
-        expires_at=None,
-    )
-    before = manager.vault.get_connection_snapshot()
-
-    with pytest.raises(ValidationError, match="refresh token"):
-        manager.store_oauth_credential(
-            CONNECTION_ID,
-            credential,
-            expected_token_version=0,
-        )
-
-    assert manager.tokens.state(CONNECTION_ID) is None
-    assert manager.vault.get_connection_snapshot() == before
-
-
-@pytest.mark.parametrize("provider", ["google", "microsoft"])
 def test_oauth_import_requires_refresh_token_without_mutation(
     tmp_path: Path,
     provider: str,
@@ -794,11 +729,7 @@ def test_verified_oauth_rotation_requires_refresh_token_without_mutation(
             issued_at=BASE_TIME,
             expires_at=None,
         )
-        manager.store_oauth_credential(
-            CONNECTION_ID,
-            original,
-            expected_token_version=0,
-        )
+        _import_oauth_credential(manager, original)
         fingerprint = MICROSOFT_ACCOUNT_FINGERPRINT
     replacement = replace(
         original,
@@ -874,11 +805,7 @@ def test_oauth_credential_rejects_provider_grants_outside_the_profile(
     )
 
     with pytest.raises(ValidationError, match="outside its selected access"):
-        manager.store_oauth_credential(
-            CONNECTION_ID,
-            overbroad,
-            expected_token_version=0,
-        )
+        _import_oauth_credential(manager, overbroad)
     assert manager.tokens.state(CONNECTION_ID) is None
 
 
@@ -895,11 +822,7 @@ def test_google_identity_url_scope_is_canonicalized_on_persistence_and_resolutio
         expires_at=None,
     )
 
-    manager.store_oauth_credential(
-        CONNECTION_ID,
-        raw,
-        expected_token_version=0,
-    )
+    _import_oauth_credential(manager, raw)
     canonical = OAuthCredential.from_bytes(manager.tokens.read(CONNECTION_ID).value)
     assert canonical.scopes == GOOGLE_IDENTITY_SCOPES
 
@@ -936,11 +859,7 @@ def test_google_identity_alias_outside_the_canonical_profile_is_rejected(
     before = manager.vault.get_connection_snapshot()
 
     with pytest.raises(ValidationError, match="outside its selected access"):
-        manager.store_oauth_credential(
-            CONNECTION_ID,
-            credential,
-            expected_token_version=0,
-        )
+        _import_oauth_credential(manager, credential)
 
     assert manager.tokens.state(CONNECTION_ID) is None
     assert manager.vault.get_connection_snapshot() == before
@@ -994,11 +913,7 @@ def test_microsoft_accepts_canonical_short_grants_without_offline_access(
         expires_at=None,
     )
 
-    stored = manager.store_oauth_credential(
-        CONNECTION_ID,
-        credential,
-        expected_token_version=0,
-    )
+    stored = _import_oauth_credential(manager, credential)
 
     assert stored.version == 1
     assert OAuthCredential.from_bytes(manager.tokens.read(CONNECTION_ID).value).scopes == (
@@ -1092,6 +1007,7 @@ def test_verified_same_id_oauth_rotation_accepts_recoverable_health(
         expected_account_fingerprint=GOOGLE_ACCOUNT_FINGERPRINT,
         expected_token_version=1,
         replacement=replacement,
+        account_label="Recovered account",
     )
 
     after = manager.vault.get_connection_snapshot()
@@ -1099,6 +1015,7 @@ def test_verified_same_id_oauth_rotation_accepts_recoverable_health(
     assert connection is not None
     assert connection.health is ConnectionHealth.READY
     assert connection.account.fingerprint == GOOGLE_ACCOUNT_FINGERPRINT
+    assert connection.account.label == "Recovered account"
     assert after.revision != before.revision
     assert result["connections"][0]["health"] == "ready"
     assert manager.tokens.read(CONNECTION_ID).state.version == 2
@@ -1106,6 +1023,24 @@ def test_verified_same_id_oauth_rotation_accepts_recoverable_health(
     assert original.to_bytes() != replacement.to_bytes()
     assert GOOGLE_ACCOUNT_FINGERPRINT not in json.dumps(result, sort_keys=True)
     assert "rotation-new-access" not in json.dumps(result, sort_keys=True)
+
+
+def test_same_id_rotation_rejects_invalid_label_before_token_commit(tmp_path: Path) -> None:
+    manager, original = _rotation_manager(tmp_path)
+    before = manager.vault.get_connection_snapshot()
+
+    with pytest.raises(ValidationError, match="account label"):
+        manager.rotate_verified_oauth_credential(
+            CONNECTION_ID,
+            expected_revision=before.revision,
+            expected_account_fingerprint=GOOGLE_ACCOUNT_FINGERPRINT,
+            expected_token_version=1,
+            replacement=_rotation_replacement(),
+            account_label="x" * 513,
+        )
+
+    assert manager.tokens.read(CONNECTION_ID).value == original.to_bytes()
+    assert manager.vault.get_connection_snapshot() == before
 
 
 def test_same_id_rotation_repairs_corrupt_old_credential_bytes(tmp_path: Path) -> None:
@@ -1285,7 +1220,11 @@ def test_same_id_rotation_rejects_stale_token_version_without_mutation(tmp_path:
 def test_same_id_rotation_rejects_revision_drift_without_mutation(tmp_path: Path) -> None:
     manager, original = _rotation_manager(tmp_path)
     before = manager.vault.get_connection_snapshot()
-    manager.mark_verified(CONNECTION_ID)
+    manager.vault.mark_connection_health(
+        expected_revision=before.revision,
+        connection_id=CONNECTION_ID,
+        health=ConnectionHealth.DEGRADED,
+    )
     drifted = manager.vault.get_connection_snapshot()
 
     with pytest.raises(ConflictError, match="connection changed"):
@@ -1318,7 +1257,7 @@ def test_same_id_rotation_rejects_fingerprint_mismatch_without_mutation(tmp_path
     assert manager.vault.get_connection_snapshot() == before
 
 
-def test_same_id_rotation_reports_committed_token_when_health_write_fails(
+def test_same_id_rotation_reports_committed_token_when_metadata_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1326,10 +1265,10 @@ def test_same_id_rotation_reports_committed_token_when_health_write_fails(
     before = manager.vault.get_connection_snapshot()
     replacement = _rotation_replacement()
 
-    def fail_health_write(**_kwargs: object) -> dict[str, object]:
-        raise SetupError("synthetic health write failure")
+    def fail_metadata_write(**_kwargs: object) -> dict[str, object]:
+        raise SetupError("synthetic metadata write failure")
 
-    monkeypatch.setattr(manager.vault, "mark_connection_health", fail_health_write)
+    monkeypatch.setattr(manager.vault, "put_connection", fail_metadata_write)
     with pytest.raises(
         MutationCommittedError,
         match="credential rotation committed; metadata repair is required",
@@ -1353,13 +1292,13 @@ def test_stale_removal_preserves_credential_before_retryable_revocation(
     tmp_path: Path,
 ) -> None:
     manager = _manager(tmp_path)
-    manager.store_oauth_credential(
-        CONNECTION_ID,
-        _expired_credential(),
-        expected_token_version=0,
-    )
+    _import_oauth_credential(manager, _expired_credential())
     stale_revision = manager.vault.get_connection_snapshot().revision
-    manager.mark_verified(CONNECTION_ID)
+    manager.vault.mark_connection_health(
+        expected_revision=stale_revision,
+        connection_id=CONNECTION_ID,
+        health=ConnectionHealth.DEGRADED,
+    )
 
     with pytest.raises(ConflictError, match="reload before removing"):
         manager.remove(CONNECTION_ID, expected_revision=stale_revision)
@@ -1376,11 +1315,7 @@ def test_interrupted_removal_leaves_a_terminal_retryable_revocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _manager(tmp_path)
-    manager.store_oauth_credential(
-        CONNECTION_ID,
-        _expired_credential(),
-        expected_token_version=0,
-    )
+    _import_oauth_credential(manager, _expired_credential())
     actual_delete = manager.tokens.delete
     fail_once = True
 
@@ -1403,8 +1338,6 @@ def test_interrupted_removal_leaves_a_terminal_retryable_revocation(
     assert manager.tokens.read(CONNECTION_ID).value == _expired_credential().to_bytes()
     with pytest.raises(ValidationError, match="revoked"):
         manager.resolve_oauth_access_token(CONNECTION_ID)
-    with pytest.raises(ValidationError, match="cannot be restored"):
-        manager.mark_verified(CONNECTION_ID)
 
     removed = manager.remove(CONNECTION_ID, expected_revision=interrupted.revision)
     assert removed["connections"] == []

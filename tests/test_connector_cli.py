@@ -4,12 +4,14 @@ import json
 import webbrowser
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from continuity_kernel import cli
 from continuity_kernel.connector_onboarding import ConnectorIdentityReview
 from continuity_kernel.connector_profiles import ConnectorAccessTier
+from continuity_kernel.errors import SetupError
 from continuity_kernel.vault import Vault
 
 
@@ -44,6 +46,10 @@ class _Onboarding:
 
     def resume(self, connection_id: str, **kwargs: object) -> dict[str, object]:
         self.calls.append(("resume", {"connection_id": connection_id, **kwargs}))
+        return {"connection_id": connection_id, "status": "connected"}
+
+    def reauthorize_oauth(self, connection_id: str, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("reauthorize", {"connection_id": connection_id, **kwargs}))
         return {"connection_id": connection_id, "status": "connected"}
 
 
@@ -261,3 +267,308 @@ def test_connector_resume_and_gmail_purge_step_up_are_explicit(
         == 0
     )
     assert fake.calls[-1][1]["include_permanent_delete"] is True
+
+
+def test_connect_parser_routes_connection_selector_and_rejects_conflicting_flags() -> None:
+    parser = cli._parser()
+    connection_id = "con-" + "a" * 32
+    parsed = parser.parse_args(
+        [
+            "connectors",
+            "connect",
+            "gmail",
+            "--access",
+            "read",
+            "--connection-id",
+            connection_id,
+        ]
+    )
+    assert parsed.connection_id == connection_id
+    assert parsed.new_account is False
+    assert parsed.browser is None
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "connectors",
+                "connect",
+                "gmail",
+                "--access",
+                "read",
+                "--connection-id",
+                connection_id,
+                "--new-account",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "connectors",
+                "connect",
+                "gmail",
+                "--access",
+                "read",
+                "--browser",
+                "firefox",
+                "--no-browser",
+            ]
+        )
+
+
+def test_connect_selector_and_reauthorize_route_through_same_seams(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = tmp_path / "vault"
+    Vault(vault).initialize(name="Connector CLI")
+    fake = _Onboarding()
+    _install_fake_onboarding(monkeypatch, fake)
+    connection_id = "con-" + "b" * 32
+
+    assert (
+        cli.main(
+            [
+                "--vault",
+                str(vault),
+                "connectors",
+                "connect",
+                "gmail",
+                "--access",
+                "read",
+                "--connection-id",
+                connection_id,
+                "--no-browser",
+            ]
+        )
+        == 0
+    )
+    assert fake.calls[-1][1]["connection_id"] == connection_id
+
+    assert (
+        cli.main(
+            [
+                "--vault",
+                str(vault),
+                "connectors",
+                "reauthorize",
+                connection_id,
+                "--alias",
+                "Work Mail",
+                "--no-browser",
+            ]
+        )
+        == 0
+    )
+    assert fake.calls[-1][0] == "reauthorize"
+    assert fake.calls[-1][1]["connection_id"] == connection_id
+    assert fake.calls[-1][1]["alias"] == "Work Mail"
+    assert callable(fake.calls[-1][1]["confirm_identity"])
+
+
+def test_discord_rejects_browser_flags_instead_of_ignoring_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = tmp_path / "vault"
+    Vault(vault).initialize(name="Connector CLI")
+    fake = _Onboarding()
+    _install_fake_onboarding(monkeypatch, fake)
+
+    result = cli.main(
+        [
+            "--vault",
+            str(vault),
+            "connectors",
+            "connect",
+            "discord",
+            "--access",
+            "full",
+            "--no-browser",
+        ]
+    )
+
+    assert result == 2
+    assert fake.calls == []
+    assert "browser options" in capsys.readouterr().err
+
+    result = cli.main(
+        [
+            "--vault",
+            str(vault),
+            "connectors",
+            "connect",
+            "discord",
+            "--access",
+            "full",
+            "--connection-id",
+            "con-" + "d" * 32,
+        ]
+    )
+
+    assert result == 2
+    assert fake.calls == []
+    assert "--connection-id" in capsys.readouterr().err
+
+
+def test_discord_rejects_oauth_timeout_instead_of_ignoring_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = tmp_path / "vault"
+    Vault(vault).initialize(name="Connector CLI")
+    fake = _Onboarding()
+    _install_fake_onboarding(monkeypatch, fake)
+
+    result = cli.main(
+        [
+            "--vault",
+            str(vault),
+            "connectors",
+            "connect",
+            "discord",
+            "--access",
+            "full",
+            "--timeout",
+            "30",
+        ]
+    )
+
+    assert result == 2
+    assert fake.calls == []
+    assert "--timeout is unavailable" in capsys.readouterr().err
+
+
+def test_firefox_opener_is_lazy_and_uses_bounded_macos_bundle_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = Namespace(browser="firefox", no_browser=False)
+    looked_up: list[str] = []
+    subprocess_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def unavailable(name: str) -> object:
+        looked_up.append(name)
+        raise webbrowser.Error("Firefox is unavailable")
+
+    def run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        subprocess_calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.webbrowser, "get", unavailable)
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+
+    opener = cli._connector_browser_opener(args)
+    assert looked_up == []
+    assert callable(opener)
+    assert opener("https://accounts.example/authorize") is True
+    assert looked_up == ["firefox"]
+    assert subprocess_calls == [
+        (
+            [
+                "open",
+                "-b",
+                "org.mozilla.firefox",
+                "-u",
+                "https://accounts.example/authorize",
+            ],
+            {
+                "stdin": cli.subprocess.DEVNULL,
+                "stdout": cli.subprocess.DEVNULL,
+                "stderr": cli.subprocess.DEVNULL,
+                "check": False,
+                "timeout": 5,
+            },
+        )
+    ]
+
+
+def test_firefox_opener_returns_manual_fallback_when_non_macos_browser_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = Namespace(browser="firefox", no_browser=False)
+    monkeypatch.setattr(
+        cli.webbrowser, "get", lambda name: (_ for _ in ()).throw(webbrowser.Error())
+    )
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("macOS fallback reached"),
+    )
+
+    opener = cli._connector_browser_opener(args)
+    assert callable(opener)
+    assert opener("https://accounts.example/authorize") is False
+
+
+def test_manual_authorization_message_explains_same_computer_wait(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli._present_authorization_url("https://accounts.example/authorize", False)
+    stderr = capsys.readouterr().err
+    assert "on this computer" in stderr
+    assert "command keeps running" in stderr
+
+
+def test_connector_reauthorize_interrupt_has_recovery_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = tmp_path / "vault"
+    Vault(vault).initialize(name="Connector CLI")
+    fake = _Onboarding()
+
+    def interrupted(connection_id: str, **kwargs: object) -> dict[str, object]:
+        del connection_id, kwargs
+        raise KeyboardInterrupt
+
+    fake.reauthorize_oauth = interrupted  # type: ignore[method-assign]
+    _install_fake_onboarding(monkeypatch, fake)
+    connection_id = "con-" + "c" * 32
+
+    result = cli.main(
+        [
+            "--vault",
+            str(vault),
+            "connectors",
+            "reauthorize",
+            connection_id,
+            "--no-browser",
+        ]
+    )
+
+    assert result == 130
+    stderr = capsys.readouterr().err
+    assert "provider access may remain" in stderr
+    assert "connectors list" in stderr
+    assert "reauthorizing" in stderr
+
+
+def test_connector_oauth_failure_has_provider_cleanup_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail(_args: Namespace) -> object:
+        raise SetupError("synthetic post-consent failure")
+
+    monkeypatch.setattr(cli, "_dispatch", fail)
+
+    result = cli.main(
+        [
+            "--json",
+            "connectors",
+            "connect",
+            "gmail",
+            "--access",
+            "read",
+        ]
+    )
+
+    assert result == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["error"] == "synthetic post-consent failure"
+    assert payload["provider_access_may_remain"] is True
+    assert payload["revocation_help"]

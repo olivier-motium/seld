@@ -17,6 +17,8 @@ from continuity_kernel.connector_auth import (
     CredentialKind,
 )
 from continuity_kernel.connector_identifiers import (
+    ConnectionId,
+    SecretName,
     SecretReference,
     new_connection_id,
     parse_connection_id,
@@ -288,6 +290,82 @@ def test_token_delete_revokes_pointer_and_both_bounded_rotation_slots(tmp_path: 
     assert tokens.occupied(connection_id) is False
     with pytest.raises(NotFoundError):
         tokens.read(connection_id)
+
+
+def test_token_delete_revokes_fixed_slots_when_pointer_is_unreadable(tmp_path: Path) -> None:
+    connection_id = parse_connection_id(_connection_id())
+    secrets_store = InMemorySecretStore()
+    tokens = AtomicTokenStore(tmp_path / "connector-auth", secrets_store)
+    tokens.update(connection_id, expected_version=0, value=b"first-secret")
+    state_path = tmp_path / "connector-auth/state" / f"{connection_id}.json"
+    state_path.write_text("not-json", encoding="utf-8")
+
+    assert tokens.delete(connection_id) is True
+
+    assert tokens.state(connection_id) is None
+    assert tokens.occupied(connection_id) is False
+
+
+def test_token_rotation_repairs_a_pointer_whose_previous_keyring_slot_is_missing(
+    tmp_path: Path,
+) -> None:
+    class MissingDeleteRaisesSecretStore(InMemorySecretStore):
+        def delete_secret(self, connection_id: ConnectionId, name: SecretName) -> None:
+            if self.get_secret(connection_id, name) is None:
+                raise SetupError("synthetic keyring missing-entry deletion")
+            super().delete_secret(connection_id, name)
+
+    connection_id = parse_connection_id(_connection_id())
+    secrets_store = MissingDeleteRaisesSecretStore()
+    tokens = AtomicTokenStore(tmp_path / "connector-auth", secrets_store)
+    previous = tokens.update(connection_id, expected_version=0, value=b"old-secret")
+    InMemorySecretStore.delete_secret(
+        secrets_store,
+        connection_id,
+        previous.secret_reference.name,
+    )
+
+    repaired = tokens.update(connection_id, expected_version=1, value=b"replacement-secret")
+
+    assert repaired.version == 2
+    assert tokens.read(connection_id).value == b"replacement-secret"
+
+
+@pytest.mark.parametrize("action", ("delete", "rotate"))
+def test_corrupt_keyring_slot_can_be_deleted_or_replaced(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    class CorruptLookupSecretStore(InMemorySecretStore):
+        corrupt: set[tuple[ConnectionId, SecretName]]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.corrupt = set()
+
+        def get_secret(self, connection_id: ConnectionId, name: SecretName) -> bytes | None:
+            if (connection_id, name) in self.corrupt:
+                raise ValidationError("synthetic corrupt keyring value")
+            return super().get_secret(connection_id, name)
+
+        def delete_secret(self, connection_id: ConnectionId, name: SecretName) -> None:
+            self.corrupt.discard((connection_id, name))
+            super().delete_secret(connection_id, name)
+
+    connection_id = parse_connection_id(_connection_id())
+    secrets_store = CorruptLookupSecretStore()
+    tokens = AtomicTokenStore(tmp_path / "connector-auth", secrets_store)
+    previous = tokens.update(connection_id, expected_version=0, value=b"corrupt-me")
+    secrets_store.corrupt.add((connection_id, previous.secret_reference.name))
+
+    if action == "delete":
+        assert tokens.delete(connection_id) is True
+        assert tokens.state(connection_id) is None
+        assert tokens.occupied(connection_id) is False
+    else:
+        repaired = tokens.update(connection_id, expected_version=1, value=b"replacement-secret")
+        assert repaired.version == 2
+        assert tokens.read(connection_id).value == b"replacement-secret"
 
 
 def test_exact_credential_import_resumes_after_visible_pointer_failure(

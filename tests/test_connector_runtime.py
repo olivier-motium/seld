@@ -205,18 +205,15 @@ def _prepared(
     )
     stored = vault.get_connection_snapshot().connection(CONNECTION_ID)
     assert stored is not None
-    manager.store_oauth_credential(
-        CONNECTION_ID,
-        OAuthCredential(
-            access_token="runtime-access-token",
-            refresh_token="runtime-refresh-token",
-            token_type=OAuthTokenType.BEARER,
-            scopes=stored.scopes,
-            issued_at=now,
-            expires_at=None,
-        ),
-        expected_token_version=0,
+    credential = OAuthCredential(
+        access_token="runtime-access-token",
+        refresh_token="runtime-refresh-token",
+        token_type=OAuthTokenType.BEARER,
+        scopes=stored.scopes,
+        issued_at=now,
+        expires_at=None,
     )
+    manager.ensure_imported_credential(stored, credential.to_bytes())
     adapter = adapter or _Adapter()
     runtime = ConnectorRuntime(
         vault,
