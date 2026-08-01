@@ -78,6 +78,52 @@ _PAGE_SIZE = {"maximum": 100, "minimum": 1, "type": "integer"}
 _CALENDAR_WINDOW_PAGE_SIZE = {"maximum": 1_000, "minimum": 1, "type": "integer"}
 _MESSAGES_PAGE_SIZE = {"maximum": 1_000, "minimum": 1, "type": "integer"}
 _FREEBUSY_INTERVAL_MINUTES = {"maximum": 1_440, "minimum": 5, "type": "integer"}
+_MESSAGE_FIELD_NAMES = (
+    "bcc_recipients",
+    "body",
+    "body_preview",
+    "categories",
+    "cc_recipients",
+    "change_key",
+    "conversation_id",
+    "conversation_index",
+    "created_at",
+    "flag",
+    "from",
+    "has_attachments",
+    "id",
+    "importance",
+    "inference_classification",
+    "internet_message_headers",
+    "internet_message_id",
+    "is_delivery_receipt_requested",
+    "is_draft",
+    "is_read",
+    "is_read_receipt_requested",
+    "last_modified_at",
+    "parent_folder_id",
+    "received_at",
+    "reply_to",
+    "sender",
+    "sent_at",
+    "subject",
+    "to_recipients",
+    "unique_body",
+    "web_link",
+)
+_MESSAGE_LIST_FIELD_NAMES = tuple(
+    name for name in _MESSAGE_FIELD_NAMES if name != "internet_message_headers"
+)
+_MESSAGE_LIST_FIELDS = _array(
+    _enum(*_MESSAGE_LIST_FIELD_NAMES),
+    max_items=len(_MESSAGE_LIST_FIELD_NAMES),
+    min_items=1,
+)
+_MESSAGE_GET_FIELDS = _array(
+    _enum(*_MESSAGE_FIELD_NAMES),
+    max_items=len(_MESSAGE_FIELD_NAMES),
+    min_items=1,
+)
 _IMPORTANCE = _enum("low", "normal", "high")
 _FOLLOW_UP = _enum("not_flagged", "flagged", "complete")
 _SENSITIVITY = _enum("normal", "personal", "private", "confidential")
@@ -275,15 +321,44 @@ _FOLDERS_LIST = _object(
         "search": _string(4_096),
     }
 )
+_MESSAGES_LIST_COMMON_PROPERTIES = {
+    "fields": _MESSAGE_LIST_FIELDS,
+    "folder_id": _ID,
+    "page_size": _MESSAGES_PAGE_SIZE,
+}
 _MESSAGES_LIST = _object(
     {
-        "folder_id": _ID,
+        **_MESSAGES_LIST_COMMON_PROPERTIES,
         "is_read": {"type": "boolean"},
         "order_by": _enum("received_at", "sent_at", "subject", "last_modified_at"),
-        "page_size": _MESSAGES_PAGE_SIZE,
         "search": _string(4_096),
         "sort_direction": _enum("ascending", "descending"),
     }
+)
+_MESSAGES_LIST["oneOf"] = [
+    _object(
+        {**_MESSAGES_LIST_COMMON_PROPERTIES, "is_read": {"type": "boolean"}},
+    ),
+    _object(
+        {**_MESSAGES_LIST_COMMON_PROPERTIES, "search": _string(4_096)},
+        required=("search",),
+    ),
+    _object(
+        {
+            **_MESSAGES_LIST_COMMON_PROPERTIES,
+            "order_by": _enum("received_at", "sent_at", "subject", "last_modified_at"),
+            "sort_direction": _enum("ascending", "descending"),
+        },
+        required=("order_by",),
+    ),
+]
+_MESSAGES_GET = _object(
+    {
+        "body_format": _enum("text", "html"),
+        "fields": _MESSAGE_GET_FIELDS,
+        "message_id": _ID,
+    },
+    required=("message_id",),
 )
 _CALENDARS_LIST = _object(
     {
@@ -399,7 +474,7 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         "messages.get",
         ConnectorEffect.READ,
         _MAIL_READ_SCOPES,
-        _object({"message_id": _ID}, required=("message_id",)),
+        _MESSAGES_GET,
     ),
     _operation(
         "outlook_mail",
@@ -612,6 +687,9 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
                 "categories": _CATEGORIES,
                 "change_key": _CHANGE_KEY,
                 "follow_up": _FOLLOW_UP,
+                "follow_up_completed": _EVENT_TIME,
+                "follow_up_due": _EVENT_TIME,
+                "follow_up_start": _EVENT_TIME,
                 "importance": _IMPORTANCE,
                 "is_read": {"type": "boolean"},
                 "message_id": _ID,

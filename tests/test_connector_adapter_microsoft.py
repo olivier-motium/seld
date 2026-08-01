@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from types import MappingProxyType
 from typing import cast
+from urllib.parse import urlencode
 
 import pytest
 
@@ -20,6 +21,19 @@ from continuity_kernel.connector_transport import (
     ConnectorTransport,
 )
 from continuity_kernel.errors import ValidationError
+
+_MESSAGE_SUMMARY_SELECT = (
+    "bodyPreview,categories,changeKey,conversationId,from,hasAttachments,id,importance,"
+    "isDraft,isRead,lastModifiedDateTime,parentFolderId,receivedDateTime,sender,sentDateTime,"
+    "subject,toRecipients,webLink"
+)
+_MESSAGE_DETAIL_SELECT = (
+    "bccRecipients,body,bodyPreview,categories,ccRecipients,changeKey,conversationId,"
+    "createdDateTime,flag,from,hasAttachments,id,importance,inferenceClassification,"
+    "internetMessageId,isDeliveryReceiptRequested,isDraft,isRead,isReadReceiptRequested,"
+    "lastModifiedDateTime,parentFolderId,receivedDateTime,replyTo,sender,sentDateTime,subject,"
+    "toRecipients,uniqueBody,webLink"
+)
 
 
 class _FakeTransport:
@@ -354,7 +368,10 @@ def test_every_microsoft_operation_uses_its_fixed_final_graph_route() -> None:
 
 
 def test_immutable_ids_and_continuations_are_internal_and_stripped_from_payload() -> None:
-    next_link = "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=opaque&$top=10"
+    next_link = (
+        "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=opaque&$top=10"
+        f"&$select={_MESSAGE_SUMMARY_SELECT}"
+    )
     response = json.dumps({"@odata.nextLink": next_link, "value": [{"id": "message-1"}]}).encode()
     adapter = MicrosoftConnectorAdapter()
     transport = _FakeTransport(response)
@@ -380,12 +397,19 @@ def test_immutable_ids_and_continuations_are_internal_and_stripped_from_payload(
         transport=cast(ConnectorTransport, transport),
     )
     assert transport.calls[0]["headers"] == {"Prefer": 'IdType="ImmutableId"'}
-    assert transport.calls[1]["query"] == (("$skiptoken", "opaque"), ("$top", "10"))
+    assert transport.calls[1]["query"] == (
+        ("$select", _MESSAGE_SUMMARY_SELECT),
+        ("$skiptoken", "opaque"),
+        ("$top", "10"),
+    )
 
     numeric = _FakeTransport(
         json.dumps(
             {
-                "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=1",
+                "@odata.nextLink": (
+                    "https://graph.microsoft.com/v1.0/me/messages?$skip=1"
+                    f"&$select={_MESSAGE_SUMMARY_SELECT}"
+                ),
                 "value": [],
             }
         ).encode()
@@ -402,6 +426,40 @@ def test_immutable_ids_and_continuations_are_internal_and_stripped_from_payload(
         "query": [["$skip", "1"]],
     }
 
+    custom_transport = _FakeTransport(
+        json.dumps(
+            {
+                "@odata.nextLink": (
+                    "https://graph.microsoft.com/v1.0/me/messages?$skip=2&$select=id,subject"
+                ),
+                "value": [],
+            }
+        ).encode()
+    )
+    custom_input = {"fields": ["subject", "id"]}
+    custom_result = adapter.execute(
+        operation,
+        custom_input,
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, custom_transport),
+    )
+    assert custom_result.continuation == {
+        "path": "/v1.0/me/messages",
+        "query": [["$skip", "2"]],
+    }
+    adapter.execute(
+        operation,
+        custom_input,
+        continuation=custom_result.continuation,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, custom_transport),
+    )
+    assert custom_transport.calls[-1]["query"] == (
+        ("$select", "id,subject"),
+        ("$skip", "2"),
+    )
+
     for invalid_progress in (
         "$skiptoken=",
         "$skip=0",
@@ -411,7 +469,8 @@ def test_immutable_ids_and_continuations_are_internal_and_stripped_from_payload(
             json.dumps(
                 {
                     "@odata.nextLink": (
-                        "https://graph.microsoft.com/v1.0/me/messages?" + invalid_progress
+                        "https://graph.microsoft.com/v1.0/me/messages?"
+                        f"{invalid_progress}&$select={_MESSAGE_SUMMARY_SELECT}"
                     ),
                     "value": [],
                 }
@@ -424,6 +483,146 @@ def test_immutable_ids_and_continuations_are_internal_and_stripped_from_payload(
                 continuation=None,
                 credential=_credential(),
                 transport=cast(ConnectorTransport, invalid),
+            )
+        assert raised.value.code == "invalid_next_link"
+
+    for projection_query in (
+        "",
+        "&$select=id,subject",
+        f"&$select={_MESSAGE_SUMMARY_SELECT}&$select={_MESSAGE_SUMMARY_SELECT}",
+    ):
+        forged = _FakeTransport(
+            json.dumps(
+                {
+                    "@odata.nextLink": (
+                        "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=opaque"
+                        + projection_query
+                    ),
+                    "value": [],
+                }
+            ).encode()
+        )
+        with pytest.raises(ConnectorProviderError) as raised:
+            adapter.execute(
+                operation,
+                {},
+                continuation=None,
+                credential=_credential(),
+                transport=cast(ConnectorTransport, forged),
+            )
+        assert raised.value.code == "invalid_next_link"
+
+
+def test_message_continuation_binds_search_projection_and_page_limit() -> None:
+    operation = _operation("outlook_mail", ConnectorMode.READ, "messages.list")
+    input_value = {
+        "page_size": 50,
+        "search": 'subject:"Quarterly Financials"',
+    }
+    graph_search = '"subject:\\"Quarterly Financials\\""'
+    next_query = [
+        ("$skiptoken", "opaque-page-two"),
+        ("$top", "50"),
+        ("$search", graph_search),
+        ("$select", _MESSAGE_SUMMARY_SELECT),
+    ]
+    transport = _FakeTransport(
+        json.dumps(
+            {
+                "@odata.nextLink": (
+                    "https://graph.microsoft.com/v1.0/me/messages?" + urlencode(next_query)
+                ),
+                "value": [],
+            }
+        ).encode()
+    )
+    adapter = MicrosoftConnectorAdapter()
+
+    result = adapter.execute(
+        operation,
+        input_value,
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert transport.calls[0]["query"] == (
+        ("$select", _MESSAGE_SUMMARY_SELECT),
+        ("$top", "50"),
+        ("$search", graph_search),
+    )
+    assert result.continuation == {
+        "path": "/v1.0/me/messages",
+        "query": [["$skiptoken", "opaque-page-two"]],
+    }
+    adapter.execute(
+        operation,
+        input_value,
+        continuation=result.continuation,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.calls[1]["query"] == (
+        ("$select", _MESSAGE_SUMMARY_SELECT),
+        ("$top", "50"),
+        ("$search", graph_search),
+        ("$skiptoken", "opaque-page-two"),
+    )
+
+    forged_queries = (
+        [("$skiptoken", "opaque"), ("$top", "50"), ("$select", _MESSAGE_SUMMARY_SELECT)],
+        [
+            ("$skiptoken", "opaque"),
+            ("$top", "50"),
+            ("$search", '"subject:Changed"'),
+            ("$select", _MESSAGE_SUMMARY_SELECT),
+        ],
+        [
+            ("$skiptoken", "opaque"),
+            ("$top", "50"),
+            ("$search", graph_search),
+            ("$search", graph_search),
+            ("$select", _MESSAGE_SUMMARY_SELECT),
+        ],
+        [
+            ("$skiptoken", "opaque"),
+            ("$top", "1001"),
+            ("$search", graph_search),
+            ("$select", _MESSAGE_SUMMARY_SELECT),
+        ],
+        [
+            ("$skiptoken", "opaque"),
+            ("$top", "50"),
+            ("$top", "50"),
+            ("$search", graph_search),
+            ("$select", _MESSAGE_SUMMARY_SELECT),
+        ],
+        [
+            ("$skiptoken", "opaque"),
+            ("$top", "50"),
+            ("$search", graph_search),
+            ("$filter", "isRead eq true"),
+            ("$select", _MESSAGE_SUMMARY_SELECT),
+        ],
+    )
+    for query in forged_queries:
+        forged = _FakeTransport(
+            json.dumps(
+                {
+                    "@odata.nextLink": (
+                        "https://graph.microsoft.com/v1.0/me/messages?" + urlencode(query)
+                    ),
+                    "value": [],
+                }
+            ).encode()
+        )
+        with pytest.raises(ConnectorProviderError) as raised:
+            adapter.execute(
+                operation,
+                input_value,
+                continuation=None,
+                credential=_credential(),
+                transport=cast(ConnectorTransport, forged),
             )
         assert raised.value.code == "invalid_next_link"
 
@@ -450,6 +649,33 @@ def test_tampered_microsoft_continuation_replay_fails_before_transport() -> None
             messages,
             message_input,
             {"path": "/v1.0/me/messages", "query": [["$top", "10"]]},
+            "continuation is invalid",
+        ),
+        (
+            messages,
+            message_input,
+            {
+                "path": "/v1.0/me/messages",
+                "query": [["$filter", "isRead eq true"], ["$skiptoken", "opaque"]],
+            },
+            "continuation is invalid",
+        ),
+        (
+            messages,
+            message_input,
+            {
+                "path": "/v1.0/me/messages",
+                "query": [["$top", "1001"], ["$skiptoken", "opaque"]],
+            },
+            "continuation is invalid",
+        ),
+        (
+            messages,
+            message_input,
+            {
+                "path": "/v1.0/me/messages",
+                "query": [["$select", _MESSAGE_SUMMARY_SELECT], ["$skiptoken", "opaque"]],
+            },
             "continuation is invalid",
         ),
         (
@@ -717,7 +943,169 @@ def test_message_list_accepts_the_documented_bounded_1000_page_size() -> None:
         credential=_credential(),
         transport=cast(ConnectorTransport, transport),
     )
-    assert transport.calls[0]["query"] == (("$top", "1000"),)
+    assert transport.calls[0]["query"] == (
+        ("$select", _MESSAGE_SUMMARY_SELECT),
+        ("$top", "1000"),
+    )
+
+
+def test_message_queries_use_canonical_projections_and_get_body_format() -> None:
+    adapter = MicrosoftConnectorAdapter()
+    list_transport = _FakeTransport()
+    search_transport = _FakeTransport()
+    unread_transport = _FakeTransport()
+    get_transport = _FakeTransport()
+    custom_get_transport = _FakeTransport()
+
+    adapter.execute(
+        _operation("outlook_mail", ConnectorMode.READ, "messages.list"),
+        {"fields": ["subject", "id"], "order_by": "sent_at"},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, list_transport),
+    )
+    adapter.execute(
+        _operation("outlook_mail", ConnectorMode.READ, "messages.list"),
+        {"page_size": 50, "search": "from:ada@example.test"},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, search_transport),
+    )
+    adapter.execute(
+        _operation("outlook_mail", ConnectorMode.READ, "messages.list"),
+        {"is_read": False},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, unread_transport),
+    )
+    adapter.execute(
+        _operation("outlook_mail", ConnectorMode.READ, "messages.get"),
+        {"message_id": "message-1"},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, get_transport),
+    )
+    adapter.execute(
+        _operation("outlook_mail", ConnectorMode.READ, "messages.get"),
+        {
+            "body_format": "text",
+            "fields": ["unique_body", "internet_message_headers", "body", "id"],
+            "message_id": "message-1",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, custom_get_transport),
+    )
+
+    assert list_transport.calls[0]["query"] == (
+        ("$select", "id,subject"),
+        ("$orderby", "sentDateTime asc"),
+    )
+    assert search_transport.calls[0]["query"] == (
+        ("$select", _MESSAGE_SUMMARY_SELECT),
+        ("$top", "50"),
+        ("$search", '"from:ada@example.test"'),
+    )
+    assert unread_transport.calls[0]["query"] == (
+        ("$select", _MESSAGE_SUMMARY_SELECT),
+        ("$filter", "isRead eq false"),
+    )
+    assert get_transport.calls[0]["query"] == (("$select", _MESSAGE_DETAIL_SELECT),)
+    assert custom_get_transport.calls[0]["query"] == (
+        ("$select", "body,id,internetMessageHeaders,uniqueBody"),
+    )
+    assert custom_get_transport.calls[0]["headers"] == {
+        "Prefer": 'IdType="ImmutableId", outlook.body-content-type="text"'
+    }
+
+
+def test_invalid_message_query_combinations_and_duplicate_fields_fail_before_transport() -> None:
+    adapter = MicrosoftConnectorAdapter()
+    cases = (
+        ("messages.list", {"is_read": True, "order_by": "received_at"}),
+        ("messages.list", {"search": "subject:planning", "sort_direction": "descending"}),
+        ("messages.list", {"search": '"subject:planning'}),
+        ("messages.list", {"search": '"a"b"'}),
+        ("messages.list", {"search": '"planning\\"'}),
+        ("messages.list", {"fields": ["id", "id"]}),
+        ("messages.get", {"fields": ["subject", "subject"], "message_id": "message-1"}),
+    )
+    for name, value in cases:
+        transport = _FakeTransport()
+        with pytest.raises(ValidationError):
+            adapter.execute(
+                _operation("outlook_mail", ConnectorMode.READ, name),
+                value,
+                continuation=None,
+                credential=_credential(),
+                transport=cast(ConnectorTransport, transport),
+            )
+        assert transport.calls == []
+
+
+def test_message_follow_up_dates_map_and_invalid_combinations_fail_before_transport() -> None:
+    operation = _operation("outlook_mail", ConnectorMode.WRITE, "messages.update")
+    start = {"date_time": "2026-08-03T09:00:00", "time_zone": "Europe/Brussels"}
+    due = {"date_time": "2026-08-04T17:00:00", "time_zone": "Europe/Brussels"}
+    completed = {"date_time": "2026-08-04T12:00:00", "time_zone": "Europe/Brussels"}
+    transport = _FakeTransport()
+
+    MicrosoftConnectorAdapter().execute(
+        operation,
+        {
+            "follow_up": "complete",
+            "follow_up_completed": completed,
+            "follow_up_due": due,
+            "follow_up_start": start,
+            "message_id": "message-1",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.calls[0]["json_body"] == {
+        "flag": {
+            "completedDateTime": {
+                "dateTime": "2026-08-04T12:00:00",
+                "timeZone": "Europe/Brussels",
+            },
+            "dueDateTime": {
+                "dateTime": "2026-08-04T17:00:00",
+                "timeZone": "Europe/Brussels",
+            },
+            "flagStatus": "complete",
+            "startDateTime": {
+                "dateTime": "2026-08-03T09:00:00",
+                "timeZone": "Europe/Brussels",
+            },
+        }
+    }
+
+    invalid = (
+        {"follow_up_start": start, "message_id": "message-1"},
+        {"follow_up": "flagged", "follow_up_due": due, "message_id": "message-1"},
+        {
+            "follow_up": "not_flagged",
+            "follow_up_start": start,
+            "message_id": "message-1",
+        },
+        {
+            "follow_up": "flagged",
+            "follow_up_completed": completed,
+            "message_id": "message-1",
+        },
+    )
+    for value in invalid:
+        invalid_transport = _FakeTransport()
+        with pytest.raises(ValidationError):
+            MicrosoftConnectorAdapter().execute(
+                operation,
+                value,
+                continuation=None,
+                credential=_credential(),
+                transport=cast(ConnectorTransport, invalid_transport),
+            )
+        assert invalid_transport.calls == []
 
 
 def test_forged_or_unknown_operation_never_reaches_graph_transport() -> None:

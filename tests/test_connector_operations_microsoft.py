@@ -223,6 +223,46 @@ def test_message_page_size_and_follow_up_status_are_bounded(catalog: OperationCa
         )
 
 
+def test_message_list_schema_exposes_only_provider_valid_query_combinations(
+    catalog: OperationCatalog,
+) -> None:
+    valid = (
+        {},
+        {"fields": ["id", "subject"], "folder_id": "inbox", "page_size": 1_000},
+        {"is_read": False, "page_size": 25},
+        {"order_by": "received_at"},
+        {"order_by": "subject", "sort_direction": "descending"},
+        {"search": "from:ada@example.test", "page_size": 50},
+    )
+    for value in valid:
+        assert (
+            catalog.validate_input(
+                "outlook_mail",
+                ConnectorMode.READ,
+                "messages.list",
+                value,
+            )
+            == value
+        )
+
+    invalid = (
+        {"fields": ["internet_message_headers"]},
+        {"sort_direction": "ascending"},
+        {"is_read": True, "order_by": "received_at"},
+        {"is_read": True, "search": "subject:planning"},
+        {"order_by": "sent_at", "search": "subject:planning"},
+        {"search": "subject:planning", "sort_direction": "descending"},
+    )
+    for value in invalid:
+        with pytest.raises(ValidationError):
+            catalog.validate_input(
+                "outlook_mail",
+                ConnectorMode.READ,
+                "messages.list",
+                value,
+            )
+
+
 def test_calendar_read_schemas_expose_only_supported_query_fields(
     catalog: OperationCatalog,
 ) -> None:

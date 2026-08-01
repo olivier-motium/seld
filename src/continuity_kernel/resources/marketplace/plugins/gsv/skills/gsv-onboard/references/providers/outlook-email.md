@@ -12,12 +12,13 @@ gsv connectors connect outlook_mail --access full --browser firefox
 ```
 
 Read grants folder, message, MIME, and attachment reads. Full adds folder and
-draft CRUD, reply/reply-all/forward/send, message updates/copy/move,
-trash/restore/purge, and attachment mutations. The command opens Microsoft OAuth
-with PKCE and a loopback callback, verifies the Graph identity, shows the
-mailbox/account, and asks `Use this account? [y/N]` before publishing. The
-default is no. A Read connection remains ready during a same-account Full
-upgrade.
+draft CRUD, reply/reply-all/forward draft creation, a separately confirmed
+draft send, message updates/copy/move, trash/restore/purge, and attachment
+mutations. Message updates include read state, importance, categories, and full
+follow-up start/due/completed dates. The command opens Microsoft OAuth with PKCE
+and a loopback callback, verifies the Graph identity, shows the mailbox/account,
+and asks `Use this account? [y/N]` before publishing. The default is no. A Read
+connection remains ready during a same-account Full upgrade.
 
 The person owns account and tenant selection, consent, administrator approval,
 conditional access, and second factors. If the installed build lacks a public
@@ -32,14 +33,36 @@ successful empty result counts. The bound proves Pulse coverage; it does not
 limit the interactive connector.
 
 The isolated `gsv_connectors` server exposes `gsv_outlook_mail_read` and
-`gsv_outlook_mail_write`. Sends, replies, and forwards are outward; trash is
-recoverable; purge is separately permanent. The runtime binds each required
-confirmation to the exact account, operation, input, scopes, and credential
-version. A local-file `attachments.add` is snapshot-bound and promoted to an
-outward confirmation: preview reads the file into an immutable local snapshot
-and does not write to Outlook; a matching confirmation replay dispatches the
-upload once. Inline `content_base64` keeps the existing small compatibility
-path.
+`gsv_outlook_mail_write`. Message lists use a bounded summary projection by
+default; message gets use a detail projection that includes `body` and
+`uniqueBody`. Both accept a closed `fields` list. Custom field order is
+canonicalized, duplicate fields fail locally, and the exact Graph `$select` is
+kept through provider pagination. Pagination also binds the original search,
+filter, ordering, and page limit, so a provider continuation cannot change the
+requested mailbox slice. Internet message headers are a get-only
+field, matching Graph's documented operation. `messages.get` also accepts
+`body_format: "text" | "html"`; list bodies retain Graph's documented HTML
+behavior. Search uses Graph's provider-fixed sent-time order and therefore
+cannot be combined with unread filtering or custom ordering. Unread filtering
+and custom ordering are separate typed list modes. Supply the bounded KQL
+expression as `search`; the connector applies Graph's required outer quotes and
+transport encoding, including escaping an exact phrase such as
+`subject:"Quarterly Financials"`, while an already correctly quoted Graph
+expression is preserved.
+
+Reply, reply-all, and forward create reviewable drafts; only `drafts.send`
+dispatches mail and requires the outward confirmation. Message trash returns a
+24-hour process-local restore handle that also expires on process restart;
+folder restore is an explicit move, not a durable undo receipt. Purge is
+separately permanent. The runtime binds each required confirmation to the exact
+account, operation, input, scopes, and credential version. Current interactive
+routes are the signed-in user's `/me` mailbox only: this note does not claim
+shared or delegated mailbox access or send-as authority.
+
+A local-file `attachments.add` is snapshot-bound and promoted to an outward
+confirmation: preview reads the file into an immutable local snapshot and does
+not write to Outlook; a matching confirmation replay dispatches the upload
+once. Inline `content_base64` keeps the existing small compatibility path.
 
 Attachment uploads follow Microsoft's transfer contract. A file smaller than
 3 MB (3,000,000 bytes) uses one direct attachment POST, including zero-byte

@@ -55,6 +55,91 @@ _OUTLOOK_UPLOAD_HOST: Final = "outlook.office.com"
 _ATTACHMENT_METADATA_SELECT: Final = (
     "id,lastModifiedDateTime,name,contentType,size,isInline,contentId,contentLocation"
 )
+_MESSAGE_FIELD_MAP: Final = {
+    "bcc_recipients": "bccRecipients",
+    "body": "body",
+    "body_preview": "bodyPreview",
+    "categories": "categories",
+    "cc_recipients": "ccRecipients",
+    "change_key": "changeKey",
+    "conversation_id": "conversationId",
+    "conversation_index": "conversationIndex",
+    "created_at": "createdDateTime",
+    "flag": "flag",
+    "from": "from",
+    "has_attachments": "hasAttachments",
+    "id": "id",
+    "importance": "importance",
+    "inference_classification": "inferenceClassification",
+    "internet_message_headers": "internetMessageHeaders",
+    "internet_message_id": "internetMessageId",
+    "is_delivery_receipt_requested": "isDeliveryReceiptRequested",
+    "is_draft": "isDraft",
+    "is_read": "isRead",
+    "is_read_receipt_requested": "isReadReceiptRequested",
+    "last_modified_at": "lastModifiedDateTime",
+    "parent_folder_id": "parentFolderId",
+    "received_at": "receivedDateTime",
+    "reply_to": "replyTo",
+    "sender": "sender",
+    "sent_at": "sentDateTime",
+    "subject": "subject",
+    "to_recipients": "toRecipients",
+    "unique_body": "uniqueBody",
+    "web_link": "webLink",
+}
+_MESSAGE_FIELD_ORDER: Final = {name: index for index, name in enumerate(_MESSAGE_FIELD_MAP)}
+_MESSAGE_SUMMARY_FIELDS: Final = (
+    "body_preview",
+    "categories",
+    "change_key",
+    "conversation_id",
+    "from",
+    "has_attachments",
+    "id",
+    "importance",
+    "is_draft",
+    "is_read",
+    "last_modified_at",
+    "parent_folder_id",
+    "received_at",
+    "sender",
+    "sent_at",
+    "subject",
+    "to_recipients",
+    "web_link",
+)
+_MESSAGE_DETAIL_FIELDS: Final = (
+    "bcc_recipients",
+    "body",
+    "body_preview",
+    "categories",
+    "cc_recipients",
+    "change_key",
+    "conversation_id",
+    "created_at",
+    "flag",
+    "from",
+    "has_attachments",
+    "id",
+    "importance",
+    "inference_classification",
+    "internet_message_id",
+    "is_delivery_receipt_requested",
+    "is_draft",
+    "is_read",
+    "is_read_receipt_requested",
+    "last_modified_at",
+    "parent_folder_id",
+    "received_at",
+    "reply_to",
+    "sender",
+    "sent_at",
+    "subject",
+    "to_recipients",
+    "unique_body",
+    "web_link",
+)
 _ATTACHMENT_METADATA_RESPONSE_BOUND: Final = 256 * 1024
 _SESSION_RESPONSE_BOUND: Final = 64 * 1024
 _NEXT_EXPECTED_RANGE: Final = re.compile(r"^(0|[1-9][0-9]*)(-)?$")
@@ -68,9 +153,8 @@ _HTML_CLASS_ATTRIBUTE: Final = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _MEETING_BLOB_CLASS: Final = "me-email-text"
-_CONTINUATION_KEYS: Final = frozenset(
-    {"$filter", "$orderby", "$search", "$skip", "$skiptoken", "$top"}
-)
+_CONTINUATION_KEYS: Final = frozenset({"$skip", "$skiptoken", "$top"})
+_BOUND_CONTINUATION_KEYS: Final = frozenset({"$filter", "$orderby", "$search"})
 _WINDOW_CONTINUATION_KEYS: Final = frozenset({"endDateTime", "startDateTime"})
 _OPERATIONS: Final = {operation.key: operation for operation in MICROSOFT_OPERATIONS}
 _FOLLOW_UP_STATUS: Final = {
@@ -97,6 +181,8 @@ class _RequestShape:
     json_body: object | None = None
     expected_statuses: frozenset[int] = frozenset({200})
     time_zone: str | None = None
+    body_format: str | None = None
+    required_select: str | None = None
     continuation_window: tuple[tuple[str, str], tuple[str, str]] | None = None
     mime: bool = False
     metadata_only: bool = False
@@ -345,7 +431,8 @@ class MicrosoftConnectorAdapter:
             query = _continuation_query(
                 continuation,
                 path=shape.path,
-                required_select=_ATTACHMENT_METADATA_SELECT if shape.metadata_only else None,
+                initial_query=shape.query,
+                required_select=shape.required_select,
                 required_window=shape.continuation_window,
             )
         try:
@@ -356,7 +443,11 @@ class MicrosoftConnectorAdapter:
                 credential=credential.credential,
                 query=query,
                 json_body=shape.json_body,
-                headers=_headers(request_data, time_zone=shape.time_zone),
+                headers=_headers(
+                    request_data,
+                    time_zone=shape.time_zone,
+                    body_format=shape.body_format,
+                ),
                 expected_statuses=shape.expected_statuses,
                 response_bound=shape.response_bound,
             )
@@ -380,6 +471,8 @@ class MicrosoftConnectorAdapter:
             path=shape.path,
             mime=shape.mime,
             metadata_only=shape.metadata_only,
+            initial_query=shape.query,
+            required_select=shape.required_select,
             continuation_window=shape.continuation_window,
             delivery=delivery if shape.mime else None,
         )
@@ -470,7 +563,31 @@ def _known_operation(
     if not isinstance(validated, dict):
         raise ValidationError("connector operation input is invalid")
     _validate_transfer_bindings(operation, validated, transfer)
+    _validate_mail_input(operation, validated)
     return operation, validated
+
+
+def _validate_mail_input(operation: OperationSpec, data: dict[str, object]) -> None:
+    if operation.provider != "outlook_mail":
+        return
+    if operation.name in {"messages.list", "messages.get"} and "fields" in data:
+        _message_select(data, default=())
+    if operation.name == "messages.update":
+        _validate_follow_up(data)
+
+
+def _validate_follow_up(data: Mapping[str, object]) -> None:
+    date_fields = ("follow_up_start", "follow_up_due", "follow_up_completed")
+    present = {name for name in date_fields if name in data}
+    status = _optional_text(data, "follow_up")
+    if present and status is None:
+        raise ValidationError("Outlook follow-up dates require a follow-up status")
+    if "follow_up_due" in present and "follow_up_start" not in present:
+        raise ValidationError("Outlook follow-up due date requires a start date")
+    if status == "not_flagged" and present:
+        raise ValidationError("an Outlook message without a flag cannot have follow-up dates")
+    if status == "flagged" and "follow_up_completed" in present:
+        raise ValidationError("an active Outlook follow-up cannot have a completed date")
 
 
 def _prepared_validation_input(
@@ -567,9 +684,22 @@ def _mail_shape(name: str, data: dict[str, object]) -> _RequestShape:
     if name == "messages.list":
         folder = _optional_text(data, "folder_id")
         path = f"{_folder_path(folder)}/messages" if folder is not None else f"{_ROOT}/messages"
-        return _RequestShape(path, ConnectorMethod.GET, query=_message_query(data))
+        select = _message_select(data, default=_MESSAGE_SUMMARY_FIELDS)
+        return _RequestShape(
+            path,
+            ConnectorMethod.GET,
+            query=_message_query(data, select=select),
+            required_select=select,
+        )
     if name == "messages.get":
-        return _RequestShape(_message_path(_text(data, "message_id")), ConnectorMethod.GET)
+        select = _message_select(data, default=_MESSAGE_DETAIL_FIELDS)
+        return _RequestShape(
+            _message_path(_text(data, "message_id")),
+            ConnectorMethod.GET,
+            query=(("$select", select),),
+            body_format=_optional_text(data, "body_format"),
+            required_select=select,
+        )
     if name == "messages.mime":
         return _RequestShape(
             f"{_message_path(_text(data, 'message_id'))}/$value",
@@ -583,6 +713,7 @@ def _mail_shape(name: str, data: dict[str, object]) -> _RequestShape:
             ConnectorMethod.GET,
             query=(("$select", _ATTACHMENT_METADATA_SELECT),),
             metadata_only=True,
+            required_select=_ATTACHMENT_METADATA_SELECT,
             response_bound=_ATTACHMENT_METADATA_RESPONSE_BOUND,
         )
     if name == "attachments.get":
@@ -592,6 +723,7 @@ def _mail_shape(name: str, data: dict[str, object]) -> _RequestShape:
             ConnectorMethod.GET,
             query=(("$select", _ATTACHMENT_METADATA_SELECT),),
             metadata_only=True,
+            required_select=_ATTACHMENT_METADATA_SELECT,
             response_bound=_ATTACHMENT_METADATA_RESPONSE_BOUND,
         )
     if name == "folders.create":
@@ -749,6 +881,7 @@ def _calendar_shape(name: str, data: dict[str, object]) -> _RequestShape:
             ConnectorMethod.GET,
             query=(("$select", _ATTACHMENT_METADATA_SELECT),),
             metadata_only=True,
+            required_select=_ATTACHMENT_METADATA_SELECT,
             response_bound=_ATTACHMENT_METADATA_RESPONSE_BOUND,
         )
     if name == "attachments.get":
@@ -758,6 +891,7 @@ def _calendar_shape(name: str, data: dict[str, object]) -> _RequestShape:
             ConnectorMethod.GET,
             query=(("$select", _ATTACHMENT_METADATA_SELECT),),
             metadata_only=True,
+            required_select=_ATTACHMENT_METADATA_SELECT,
             response_bound=_ATTACHMENT_METADATA_RESPONSE_BOUND,
         )
     if name == "calendars.create":
@@ -1079,21 +1213,60 @@ def _folder_query(data: dict[str, object]) -> tuple[tuple[str, str], ...]:
     return _list_query(data, {"display_name": "displayName"})
 
 
-def _message_query(data: dict[str, object]) -> tuple[tuple[str, str], ...]:
-    query = list(
-        _list_query(
-            data,
-            {
-                "last_modified_at": "lastModifiedDateTime",
-                "received_at": "receivedDateTime",
-                "sent_at": "sentDateTime",
-                "subject": "subject",
-            },
-        )
-    )
+def _message_query(data: dict[str, object], *, select: str) -> tuple[tuple[str, str], ...]:
+    query: list[tuple[str, str]] = [("$select", select)]
+    if "page_size" in data:
+        query.append(("$top", str(_integer(data["page_size"]))))
+    if "search" in data:
+        query.append(("$search", _message_search(_text(data, "search"))))
+    if "order_by" in data:
+        order = {
+            "last_modified_at": "lastModifiedDateTime",
+            "received_at": "receivedDateTime",
+            "sent_at": "sentDateTime",
+            "subject": "subject",
+        }[_text(data, "order_by")]
+        direction = _optional_text(data, "sort_direction") or "ascending"
+        query.append(("$orderby", f"{order} {'asc' if direction == 'ascending' else 'desc'}"))
     if "is_read" in data:
         query.append(("$filter", f"isRead eq {str(data['is_read']).lower()}"))
     return tuple(query)
+
+
+def _message_search(value: str) -> str:
+    if not value.strip() or any(character in value for character in ("\x00", "\r", "\n")):
+        raise ValidationError("Outlook message search expression is invalid")
+    starts_quoted = value.startswith('"')
+    ends_quoted = value.endswith('"')
+    if starts_quoted and (not ends_quoted or len(value) < 3):
+        raise ValidationError("Outlook message search expression has invalid outer quotes")
+    if starts_quoted:
+        escape_pending = False
+        for character in value[1:-1]:
+            if escape_pending:
+                escape_pending = False
+            elif character == "\\":
+                escape_pending = True
+            elif character == '"':
+                raise ValidationError("Outlook message search expression has invalid outer quotes")
+        if escape_pending:
+            raise ValidationError("Outlook message search expression has invalid outer quotes")
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _message_select(data: Mapping[str, object], *, default: tuple[str, ...]) -> str:
+    requested = list(default) if "fields" not in data else _strings(data["fields"])
+    if not requested:
+        raise ValidationError("Outlook message fields cannot be empty")
+    if len(set(requested)) != len(requested):
+        raise ValidationError("Outlook message fields must be unique")
+    try:
+        selected = sorted(requested, key=_MESSAGE_FIELD_ORDER.__getitem__)
+        return ",".join(_MESSAGE_FIELD_MAP[name] for name in selected)
+    except (KeyError, ValueError) as exc:
+        raise ValidationError("Outlook message field is unsupported") from exc
 
 
 def _calendar_query(data: dict[str, object]) -> tuple[tuple[str, str], ...]:
@@ -1127,10 +1300,19 @@ def _list_query(
     return tuple(query)
 
 
-def _headers(data: dict[str, object], *, time_zone: str | None) -> dict[str, str]:
+def _headers(
+    data: dict[str, object],
+    *,
+    time_zone: str | None,
+    body_format: str | None = None,
+) -> dict[str, str]:
     prefer = 'IdType="ImmutableId"'
     if time_zone is not None:
         prefer += f', outlook.timezone="{_preference_time_zone(time_zone)}"'
+    if body_format is not None:
+        if body_format not in {"text", "html"}:
+            raise ValidationError("Outlook message body format is invalid")
+        prefer += f', outlook.body-content-type="{body_format}"'
     headers = {"Prefer": prefer}
     change_key = _optional_text(data, "change_key")
     if change_key is not None:
@@ -1174,7 +1356,15 @@ def _message_update_body(data: dict[str, object]) -> dict[str, object]:
     if "importance" in data:
         body["importance"] = _text(data, "importance")
     if "follow_up" in data:
-        body["flag"] = {"flagStatus": _FOLLOW_UP_STATUS[_text(data, "follow_up")]}
+        flag: dict[str, object] = {"flagStatus": _FOLLOW_UP_STATUS[_text(data, "follow_up")]}
+        for source, target in (
+            ("follow_up_start", "startDateTime"),
+            ("follow_up_due", "dueDateTime"),
+            ("follow_up_completed", "completedDateTime"),
+        ):
+            if source in data:
+                flag[target] = _graph_time(data[source])
+        body["flag"] = flag
     return body
 
 
@@ -1885,6 +2075,8 @@ def _result(
     path: str,
     mime: bool,
     metadata_only: bool = False,
+    initial_query: tuple[tuple[str, str], ...] = (),
+    required_select: str | None = None,
     continuation_window: tuple[tuple[str, str], tuple[str, str]] | None = None,
     delivery: str | None = None,
 ) -> ConnectorAdapterResult:
@@ -1917,7 +2109,12 @@ def _result(
         next_link,
         path=path,
         status=response.status,
-        required_select=_ATTACHMENT_METADATA_SELECT if metadata_only else None,
+        initial_query=initial_query,
+        required_select=(
+            _ATTACHMENT_METADATA_SELECT
+            if metadata_only and required_select is None
+            else required_select
+        ),
         required_window=continuation_window,
     )
     return ConnectorAdapterResult(payload, continuation=continuation)
@@ -1941,6 +2138,7 @@ def _next_link(
     *,
     path: str,
     status: int,
+    initial_query: tuple[tuple[str, str], ...] = (),
     required_select: str | None = None,
     required_window: tuple[tuple[str, str], tuple[str, str]] | None = None,
 ) -> object | None:
@@ -1982,6 +2180,10 @@ def _next_link(
         ) from exc
     continuation_pairs: list[tuple[str, str]] = []
     select_seen = False
+    top_seen = False
+    required_fixed = {key: item for key, item in initial_query if key in _BOUND_CONTINUATION_KEYS}
+    required_top = next((item for key, item in initial_query if key == "$top"), None)
+    fixed_seen: set[str] = set()
     allowed_keys = _CONTINUATION_KEYS
     if required_window is not None:
         allowed_keys = allowed_keys | _WINDOW_CONTINUATION_KEYS
@@ -1995,6 +2197,32 @@ def _next_link(
                 )
             select_seen = True
             continue
+        if key in _BOUND_CONTINUATION_KEYS:
+            if key in fixed_seen or required_fixed.get(key) != item:
+                raise ConnectorProviderError(
+                    origin=_ORIGIN,
+                    status=status,
+                    code="invalid_next_link",
+                )
+            fixed_seen.add(key)
+            continue
+        if key == "$top":
+            if top_seen or not _is_bounded_page_size(item):
+                raise ConnectorProviderError(
+                    origin=_ORIGIN,
+                    status=status,
+                    code="invalid_next_link",
+                )
+            if required_top is not None and item != required_top:
+                raise ConnectorProviderError(
+                    origin=_ORIGIN,
+                    status=status,
+                    code="invalid_next_link",
+                )
+            top_seen = True
+            if required_top is None:
+                continuation_pairs.append((key, item))
+            continue
         if key not in allowed_keys:
             raise ConnectorProviderError(
                 origin=_ORIGIN,
@@ -2002,6 +2230,18 @@ def _next_link(
                 code="invalid_next_link",
             )
         continuation_pairs.append((key, item))
+    if required_select is not None and not select_seen:
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=status,
+            code="invalid_next_link",
+        )
+    if fixed_seen != set(required_fixed) or (required_top is not None and not top_seen):
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=status,
+            code="invalid_next_link",
+        )
     if not _has_continuation_progress(continuation_pairs):
         raise ConnectorProviderError(
             origin=_ORIGIN,
@@ -2023,6 +2263,7 @@ def _continuation_query(
     value: object,
     *,
     path: str,
+    initial_query: tuple[tuple[str, str], ...] = (),
     required_select: str | None = None,
     required_window: tuple[tuple[str, str], tuple[str, str]] | None = None,
 ) -> tuple[tuple[str, str], ...]:
@@ -2033,6 +2274,7 @@ def _continuation_query(
     if not query or len(query) > 128:
         raise ValidationError("connector continuation is invalid")
     pairs: list[tuple[str, str]] = []
+    top_seen = False
     allowed_keys = _CONTINUATION_KEYS
     if required_window is not None:
         allowed_keys = allowed_keys | _WINDOW_CONTINUATION_KEYS
@@ -2042,14 +2284,30 @@ def _continuation_query(
             raise ValidationError("connector continuation is invalid")
         if pair[0] not in allowed_keys:
             raise ValidationError("connector continuation is invalid")
+        if pair[0] == "$top":
+            if top_seen or not _is_bounded_page_size(pair[1]):
+                raise ValidationError("connector continuation is invalid")
+            top_seen = True
         pairs.append((pair[0], pair[1]))
     if not _has_continuation_progress(pairs):
         raise ValidationError("connector continuation is invalid")
     if required_window is not None and not _has_exact_required_window(pairs, required_window):
         raise ValidationError("connector continuation is invalid")
-    if required_select is None:
-        return tuple(pairs)
-    return (("$select", required_select), *pairs)
+    fixed = tuple(
+        (key, item)
+        for key, item in initial_query
+        if key in _BOUND_CONTINUATION_KEYS or key == "$top"
+    )
+    if any(key == "$top" for key, _ in fixed) and top_seen:
+        raise ValidationError("connector continuation is invalid")
+    prefix = (("$select", required_select),) if required_select is not None else ()
+    return (*prefix, *fixed, *pairs)
+
+
+def _is_bounded_page_size(value: str) -> bool:
+    return (
+        value.isascii() and value.isdecimal() and not value.startswith("0") and int(value) <= 1_000
+    )
 
 
 def _has_continuation_progress(pairs: list[tuple[str, str]]) -> bool:
