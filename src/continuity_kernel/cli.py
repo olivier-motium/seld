@@ -48,6 +48,7 @@ from continuity_kernel.config import (
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_identifiers import parse_connection_id
 from continuity_kernel.connector_onboarding import (
+    BrowserMode,
     ConnectorIdentityReview,
     ConnectorOnboarding,
     provider_revocation_guidance,
@@ -674,8 +675,15 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
             alias=args.alias,
             include_permanent_delete=args.with_permanent_delete,
             browser_opener=opener,
+            browser_mode=_connector_browser_mode(args),
             present_authorization_url=_present_authorization_url,
             timeout_seconds=timeout_seconds,
+        )
+    if args.connectors_command == "alias":
+        return onboarding.alias(
+            args.connection_id,
+            args.alias,
+            expected_revision=args.expected_revision,
         )
     if args.connectors_command == "resume":
         return onboarding.resume(
@@ -690,6 +698,7 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
             confirm_identity=_confirm_connector_identity,
             alias=args.alias,
             browser_opener=opener,
+            browser_mode=_connector_browser_mode(args),
             present_authorization_url=_present_authorization_url,
             timeout_seconds=args.timeout,
         )
@@ -767,6 +776,12 @@ def _connector_browser_opener(args: argparse.Namespace) -> Callable[[str], bool]
         return completed.returncode == 0
 
     return open_firefox
+
+
+def _connector_browser_mode(args: argparse.Namespace) -> BrowserMode:
+    if args.no_browser:
+        return "manual"
+    return args.browser or "default"
 
 
 def _present_authorization_url(url: str, browser_opened: bool) -> None:
@@ -1563,6 +1578,16 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
     )
     reauthorize_browser.add_argument("--no-browser", action="store_true")
+    connector_alias = connector_commands.add_parser(
+        "alias",
+        help="Change only the local label of one connector connection.",
+    )
+    connector_alias.add_argument("connection_id")
+    connector_alias.add_argument("--alias", required=True, help="Privacy-safe local label.")
+    connector_alias.add_argument(
+        "--expected-revision",
+        help="Expected CONNECTIONS.md revision; defaults to the revision read for this command.",
+    )
     connector_resume = connector_commands.add_parser(
         "resume",
         help="Finish identity confirmation for one retained unverified connection.",

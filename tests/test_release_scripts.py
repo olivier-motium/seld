@@ -34,6 +34,32 @@ def test_standalone_smoke_does_not_discover_the_host_codex(tmp_path: Path) -> No
     assert not Path(environment["GSV_CODEX"]).exists()
 
 
+def test_artifact_readiness_parity_allows_local_missing_but_release_requires_ready() -> None:
+    missing = {
+        "oauth_registration_ready": False,
+        "registration_readiness": {"google": {"sign_in": "unavailable", "status": "missing"}},
+    }
+
+    assert build_standalone._require_connector_readiness_parity(missing, missing) == missing
+    assert e2e_clean_install._connector_readiness_receipt(missing, required=False) == missing
+    with pytest.raises(RuntimeError, match="missing one or more"):
+        e2e_clean_install._connector_readiness_receipt(missing, required=True)
+
+
+def test_artifact_readiness_parity_rejects_source_and_frozen_drift() -> None:
+    source = {
+        "oauth_registration_ready": True,
+        "registration_readiness": {"google": {"sign_in": "available", "status": "ready"}},
+    }
+    frozen = {
+        "oauth_registration_ready": False,
+        "registration_readiness": {"google": {"sign_in": "unavailable", "status": "missing"}},
+    }
+
+    with pytest.raises(RuntimeError, match="differs from the source build"):
+        build_standalone._require_connector_readiness_parity(source, frozen)
+
+
 @pytest.mark.parametrize("module", [build_standalone, e2e_clean_install])
 def test_release_bridge_http_disables_proxies_for_exact_loopback(
     module: Any, monkeypatch: pytest.MonkeyPatch

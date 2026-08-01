@@ -19,7 +19,11 @@ from continuity_kernel.connector_auth import (
 )
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_identifiers import new_connection_id
-from continuity_kernel.connector_profiles import ConnectorAccessTier, get_profile
+from continuity_kernel.connector_profiles import (
+    ConnectorAccessTier,
+    format_connector_command,
+    get_profile,
+)
 from continuity_kernel.connector_secrets import InMemorySecretStore
 from continuity_kernel.errors import ValidationError
 from continuity_kernel.vault import Vault
@@ -228,6 +232,88 @@ def test_manual_oauth_requires_a_built_in_profile(tmp_path: Path) -> None:
             ),
             manager,
         )
+
+
+def test_explicit_restored_vault_is_kept_in_status_and_import_recovery_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    restored = tmp_path / "gsv-auth restored vault"
+    vault = Vault(restored)
+    vault.initialize(name="Restored auth CLI")
+    now = datetime.now(UTC)
+    connection_id = new_connection_id()
+    profile = get_profile("google")
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=ConnectionMetadata(
+            connection_id=connection_id,
+            provider="google",
+            source_ids=("gmail",),
+            credential_kind=CredentialKind.OAUTH2,
+            account=AccountMetadata(
+                fingerprint="sha256:" + "a" * 64,
+                label="Restored Gmail",
+            ),
+            scopes=profile.read_scopes,
+            client=ClientMetadata(
+                kind=ClientKind.PUBLIC,
+                identifier="synthetic-client",
+                redirect_uris=("http://127.0.0.1:0",),
+                authorization_endpoint=profile.authorization_endpoint,
+                token_endpoint=profile.token_endpoint,
+            ),
+            health=ConnectionHealth.UNVERIFIED,
+            created_at=now,
+            updated_at=now,
+            version=1,
+        ),
+        observed_at=now,
+    )
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+    expected = format_connector_command(
+        ("gsv", "--vault", str(restored), "connectors", "resume", str(connection_id))
+    )
+
+    status = auth_cli._dispatch(
+        parser.parse_args(["--vault", str(restored), "status"]),
+        manager,
+    )
+    rows = status["connections"]
+    assert isinstance(rows, list) and isinstance(rows[0], dict)
+    assert rows[0]["next"] == expected
+
+    monkeypatch.setattr(
+        auth_cli,
+        "import_auth_archive",
+        lambda *_args, **_kwargs: {
+            "connection_count": 1,
+            "connection_ids": [str(connection_id)],
+            "imported": True,
+            "next_action": "resume_identity",
+            "requires_verification": True,
+            "vault_id": manager.vault_id,
+        },
+    )
+    imported = auth_cli._dispatch(
+        parser.parse_args(
+            [
+                "--vault",
+                str(restored),
+                "import",
+                str(tmp_path / "auth.age"),
+                "--identity",
+                str(tmp_path / "identity.txt"),
+            ]
+        ),
+        manager,
+    )
+    assert imported["resume_commands"] == [expected]
 
 
 def test_profile_owned_fields_cannot_be_overridden(tmp_path: Path) -> None:

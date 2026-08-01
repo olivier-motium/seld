@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from continuity_kernel import connector_auth_transfer
+from continuity_kernel import connector_auth_transfer, connector_sources
 from continuity_kernel.connections import ConnectionSnapshot
 from continuity_kernel.connector_auth import (
     AccountMetadata,
@@ -22,11 +22,20 @@ from continuity_kernel.connector_auth import (
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_auth_transfer import export_auth_archive, import_auth_archive
 from continuity_kernel.connector_credentials import OAuthCredential
-from continuity_kernel.connector_identifiers import ConnectionId, parse_connection_id
+from continuity_kernel.connector_identifiers import ConnectionId, SecretName, parse_connection_id
+from continuity_kernel.connector_identity import ConnectorIdentity
 from continuity_kernel.connector_oauth import OAuthTokenType
-from continuity_kernel.connector_profiles import get_profile
+from continuity_kernel.connector_onboarding import ConnectorOnboarding
+from continuity_kernel.connector_profiles import get_connector_profile, get_profile
 from continuity_kernel.connector_secrets import InMemorySecretStore
-from continuity_kernel.errors import ConflictError, MutationCommittedError, ValidationError
+from continuity_kernel.connector_sources import read_connector_source
+from continuity_kernel.connector_token_store import ResolvedToken
+from continuity_kernel.errors import (
+    ConflictError,
+    MutationCommittedError,
+    SetupError,
+    ValidationError,
+)
 from continuity_kernel.vault import Vault
 
 SENTINEL = b"synthetic-portable-secret-never-in-vault"
@@ -121,6 +130,9 @@ def test_age_export_restore_import_moves_credentials_without_plaintext_leakage(
     )
 
     assert imported["requires_verification"] is True
+    assert imported["next_action"] == "resume_identity"
+    assert imported["connection_ids"] == [str(CONNECTION_ID)]
+    assert str(restored_root) not in repr(imported)
     assert (
         target_manager.resolve_credential_state(
             CONNECTION_ID,
@@ -231,7 +243,7 @@ def test_export_rejects_connection_drift_before_encrypting(
     source_vault, source_manager = _source_manager(tmp_path)
     original_read = source_manager.tokens.read
 
-    def read_then_drift(connection_id: ConnectionId):
+    def read_then_drift(connection_id: ConnectionId) -> ResolvedToken:
         resolved = original_read(connection_id)
         snapshot = source_vault.get_connection_snapshot()
         metadata = snapshot.connection(CONNECTION_ID)
@@ -374,3 +386,191 @@ def test_import_rejects_an_overbroad_oauth_grant_before_mutating_custody(
 
     assert vault.get_connection_snapshot() == before
     assert manager.tokens.state(CONNECTION_ID) is None
+
+
+def test_import_proves_writable_custody_before_decrypting_or_mutating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_vault, _source_manager_value = _source_manager(tmp_path)
+    backup = Path(source_vault.create_backup(tmp_path / "vault.zip")["backup"])
+    restored_root = tmp_path / "restored-vault"
+    Vault.restore_backup(backup, restored_root)
+
+    class ReadOnlySecretStore(InMemorySecretStore):
+        def set_secret(
+            self,
+            connection_id: ConnectionId,
+            name: SecretName,
+            value: bytes,
+        ) -> None:
+            del connection_id, name, value
+            raise RuntimeError("synthetic keyring write refusal")
+
+    manager = ConnectorAuthManager(
+        Vault(restored_root),
+        secret_store=ReadOnlySecretStore(),
+        state_root=tmp_path / "target-host-state",
+    )
+    encrypted = tmp_path / "connector-auth.age"
+    encrypted.write_bytes(b"synthetic ciphertext")
+    identity = tmp_path / "identity.txt"
+    identity.write_text("synthetic identity", encoding="utf-8")
+    before = manager.vault.get_connection_snapshot()
+    before_token = manager.tokens.state(CONNECTION_ID)
+    monkeypatch.setattr(
+        connector_auth_transfer,
+        "_run_age",
+        lambda *_args, **_kwargs: pytest.fail("decryption must not start without writable custody"),
+    )
+
+    with pytest.raises(SetupError, match="custody readiness check failed"):
+        import_auth_archive(manager, encrypted, identity=identity)
+
+    assert manager.vault.get_connection_snapshot() == before
+    assert manager.tokens.state(CONNECTION_ID) == before_token
+
+
+def test_full_oauth_transfer_stays_blocked_until_identity_resume_then_reads_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = get_connector_profile("gmail")
+    scopes = profile.scopes_for("full")
+    fingerprint = "sha256:" + "b" * 64
+    observed_at = datetime.now(UTC)
+    source_vault = Vault(tmp_path / "oauth-source")
+    source_vault.initialize(name="OAuth Full transfer")
+    metadata = ConnectionMetadata(
+        connection_id=CONNECTION_ID,
+        provider=profile.provider,
+        source_ids=profile.source_ids,
+        credential_kind=profile.credential_kind,
+        account=AccountMetadata(fingerprint=fingerprint, label="Original Gmail"),
+        scopes=scopes,
+        client=ClientMetadata(
+            kind=ClientKind.PUBLIC,
+            identifier="synthetic-google-client",
+            redirect_uris=("http://127.0.0.1:49152",),
+            authorization_endpoint=profile.authorization_endpoint,
+            token_endpoint=profile.token_endpoint,
+        ),
+        health=ConnectionHealth.READY,
+        created_at=observed_at,
+        updated_at=observed_at,
+        version=1,
+        last_verified_at=observed_at,
+    )
+    source_vault.put_connection(
+        expected_revision=source_vault.get_connection_snapshot().revision,
+        connection=metadata,
+        observed_at=observed_at,
+    )
+    source_vault.select_sources(
+        expected_revision=source_vault.get_source_snapshot().revision,
+        sources=("gmail",),
+    )
+    source_manager = ConnectorAuthManager(
+        source_vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "oauth-source-state",
+    )
+    credential = OAuthCredential(
+        access_token="synthetic-transfer-access-token",
+        refresh_token="synthetic-transfer-refresh-token",
+        token_type=OAuthTokenType.BEARER,
+        scopes=scopes,
+        issued_at=observed_at,
+        expires_at=None,
+    )
+    source_manager.ensure_imported_credential(metadata, credential.to_bytes())
+    plaintext: bytes | None = None
+
+    def fake_age(
+        arguments: tuple[str, ...],
+        content: bytes,
+        *,
+        executable: Path | None,
+        output_bound: int,
+    ) -> bytes:
+        nonlocal plaintext
+        del executable, output_bound
+        if "--encrypt" in arguments:
+            plaintext = content
+            return b"synthetic-age-ciphertext"
+        assert plaintext is not None
+        return plaintext
+
+    monkeypatch.setattr(connector_auth_transfer, "_run_age", fake_age)
+    encrypted = tmp_path / "oauth-full.age"
+    export_auth_archive(source_manager, encrypted, recipient="synthetic-recipient")
+    backup = Path(source_vault.create_backup(tmp_path / "oauth-vault.zip")["backup"])
+    restored_root = tmp_path / "oauth-restored"
+    Vault.restore_backup(backup, restored_root)
+    restored_vault = Vault(restored_root)
+    restored_manager = ConnectorAuthManager(
+        restored_vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "oauth-restored-state",
+    )
+    identity = tmp_path / "synthetic-identity"
+    identity.write_text("synthetic identity", encoding="utf-8")
+
+    imported = import_auth_archive(restored_manager, encrypted, identity=identity)
+    assert imported["connection_ids"] == [str(CONNECTION_ID)]
+    imported_metadata = restored_vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert imported_metadata is not None
+    assert imported_metadata.health is ConnectionHealth.UNVERIFIED
+
+    provider_calls: list[str] = []
+
+    def manager_for_vault(observed_vault: Vault) -> ConnectorAuthManager:
+        assert observed_vault is restored_vault
+        return restored_manager
+
+    def get_json(url: str, headers: object, timeout: float) -> object:
+        del headers, timeout
+        provider_calls.append(url)
+        if url.endswith("/profile"):
+            return {"emailAddress": "restored@example.test"}
+        if url.endswith("/messages?maxResults=1"):
+            return {"messages": []}
+        raise AssertionError(f"unexpected Gmail URL: {url}")
+
+    monkeypatch.setattr(connector_sources, "ConnectorAuthManager", manager_for_vault)
+    monkeypatch.setattr(connector_sources, "http_get_json", get_json)
+    blocked = read_connector_source(
+        restored_vault,
+        connection_id=str(CONNECTION_ID),
+        source_id="gmail",
+        limit=1,
+    )
+    assert blocked["result"] == "failure"
+    assert blocked["errorCode"] == "auth_required"
+    assert provider_calls == []
+
+    resumed = ConnectorOnboarding(
+        restored_manager,
+        identity_verifier=lambda provider, runtime_credential: ConnectorIdentity(
+            provider=provider,
+            fingerprint=fingerprint,
+            display_label="Restored User <restored@example.test>",
+            portable_label=f"{provider}:{fingerprint[-12:]}",
+        ),
+    ).resume(
+        str(CONNECTION_ID),
+        alias="Restored Gmail",
+        confirm_identity=lambda review: True,
+    )
+    assert resumed["status"] == "connected"
+    restored = restored_vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert restored is not None and restored.health is ConnectionHealth.READY
+
+    delivered = read_connector_source(
+        restored_vault,
+        connection_id=str(CONNECTION_ID),
+        source_id="gmail",
+        limit=1,
+    )
+    assert delivered["result"] == "explicit_empty"
+    assert len(provider_calls) == 2

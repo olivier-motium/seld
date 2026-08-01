@@ -27,12 +27,13 @@ from continuity_kernel.connector_onboarding import (
 )
 from continuity_kernel.connector_profiles import (
     ConnectorAccessTier,
+    format_connector_command,
     get_connector_profile,
     get_profile,
 )
 from continuity_kernel.connector_secrets import InMemorySecretStore
 from continuity_kernel.connector_transport import AuthorizationScheme, ConnectorCredential
-from continuity_kernel.errors import ConflictError, SetupError, ValidationError
+from continuity_kernel.errors import ConflictError, ContinuityError, SetupError, ValidationError
 from continuity_kernel.vault import Vault
 
 FP_ONE = "sha256:" + "1" * 64
@@ -273,6 +274,46 @@ def test_missing_registration_fails_friendly_before_oauth_or_persistence(
     assert manager.vault.get_connection_snapshot().connections == ()
 
 
+def test_registration_readiness_distinguishes_missing_invalid_and_unrelated_failures(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+
+    def classified(provider: str) -> PublicClientRegistration:
+        if provider == "google":
+            raise SetupError("Google registration is missing")
+        if provider == "microsoft":
+            raise ValidationError("Microsoft registration is malformed")
+        return _registration(provider)
+
+    readiness = ConnectorOnboarding(
+        manager,
+        registration_loader=classified,
+    ).registration_readiness()
+    assert readiness == {
+        "google": {
+            "reason": "Google registration is missing",
+            "sign_in": "unavailable",
+            "status": "missing",
+        },
+        "microsoft": {
+            "reason": "Microsoft registration is malformed",
+            "sign_in": "unavailable",
+            "status": "invalid",
+        },
+        "slack": {"sign_in": "available", "status": "ready"},
+    }
+
+    def unrelated(provider: str) -> PublicClientRegistration:
+        raise ContinuityError(f"unexpected registration failure for {provider}")
+
+    with pytest.raises(ContinuityError, match="unexpected registration failure"):
+        ConnectorOnboarding(
+            manager,
+            registration_loader=unrelated,
+        ).registration_readiness()
+
+
 def test_browser_and_manual_url_callbacks_pass_through_without_becoming_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -353,6 +394,65 @@ def test_wrong_account_upgrade_aborts_and_explicit_new_account_keeps_both(
     new_connection = snapshot.connection(cast(str, connected["connection_id"]))
     assert new_connection is not None
     assert profile.access_for_scopes(new_connection.scopes) is ConnectorAccessTier.FULL
+
+
+@pytest.mark.parametrize(
+    ("browser_mode", "browser_flag"),
+    (("firefox", "--browser firefox"), ("manual", "--no-browser")),
+)
+def test_wrong_account_guidance_keeps_only_validated_alias_on_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    browser_mode: str,
+    browser_flag: str,
+) -> None:
+    manager = _manager(tmp_path)
+    _existing_oauth(manager, "outlook_calendar", access=ConnectorAccessTier.READ)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider, FP_TWO),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: _credential(metadata.scopes),
+    )
+    alias = "Finance; $(printf not-provider-identity)"
+
+    result = onboarding.connect_oauth(
+        "outlook_calendar",
+        access="full",
+        alias=alias,
+        browser_mode=browser_mode,  # type: ignore[arg-type]
+        confirm_identity=lambda review: True,
+    )
+
+    retry = cast(str, result["retry"])
+    new_account = cast(str, result["new_account"])
+    retry_arguments = [
+        "gsv",
+        "connectors",
+        "connect",
+        "outlook_calendar",
+        "--access",
+        "full",
+        f"--alias={alias}",
+    ]
+    new_account_arguments = [
+        "gsv",
+        "connectors",
+        "connect",
+        "outlook_calendar",
+        "--access",
+        "full",
+        "--new-account",
+    ]
+    option_arguments = browser_flag.split()
+    assert retry == format_connector_command((*retry_arguments, *option_arguments))
+    assert new_account == format_connector_command((*new_account_arguments, *option_arguments))
+    assert alias not in new_account
+    assert "Ada <ada@example.test>" not in repr(result)
 
 
 def test_same_account_upgrade_keeps_read_ready_until_full_is_published_then_removes_it(
@@ -557,6 +657,28 @@ def test_resume_verifies_exact_identity_supports_alias_and_cleans_missing_creden
     assert missing["next"] == "gsv connectors connect outlook_mail --access read"
     assert manager.vault.get_connection_snapshot().connection(stale.connection_id) is None
 
+    cancelled_pending = _unverified_oauth(
+        manager,
+        "gmail",
+        with_credential=True,
+        fingerprint=FP_ONE,
+    )
+    cancelled = onboarding.resume(
+        str(cancelled_pending.connection_id),
+        confirm_identity=lambda review: False,
+        alias="-Work",
+    )
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["next"] == format_connector_command(
+        (
+            "gsv",
+            "connectors",
+            "resume",
+            str(cancelled_pending.connection_id),
+            "--alias=-Work",
+        )
+    )
+
 
 def test_resume_shows_wrong_identity_before_returning_exact_retry(
     tmp_path: Path,
@@ -585,6 +707,33 @@ def test_resume_shows_wrong_identity_before_returning_exact_retry(
     assert "--new-account" in cast(str, result["new_account"])
     current = manager.vault.get_connection_snapshot().connection(pending.connection_id)
     assert current is not None and current.health is ConnectionHealth.UNVERIFIED
+
+
+def test_resume_wrong_identity_keeps_user_alias_only_on_retry(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    pending = _unverified_oauth(
+        manager,
+        "outlook_calendar",
+        with_credential=True,
+        fingerprint=FP_ONE,
+    )
+    onboarding = ConnectorOnboarding(
+        manager,
+        identity_verifier=lambda provider, credential: _identity(provider, FP_TWO),
+    )
+    alias = "Personal; $(printf provider-identity)"
+
+    result = onboarding.resume(
+        str(pending.connection_id),
+        alias=alias,
+        confirm_identity=lambda review: True,
+    )
+
+    assert result["retry"] == format_connector_command(
+        ("gsv", "connectors", "resume", str(pending.connection_id), f"--alias={alias}")
+    )
+    assert alias not in cast(str, result["new_account"])
+    assert "Ada <ada@example.test>" not in repr(result)
 
 
 def test_list_and_disconnected_status_include_registration_readiness(
@@ -1031,6 +1180,67 @@ def test_status_and_disconnect_are_redacted_and_do_not_claim_remote_revocation(
     assert result["status"] == "disconnected_locally"
     assert result["provider_access_revoked"] is False
     assert manager.vault.get_connection_snapshot().connections == ()
+
+
+def test_alias_is_label_only_cas_and_rejects_stale_or_revoked_connections(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    connection = _existing_oauth(manager, "gmail", access=ConnectorAccessTier.READ)
+    onboarding = ConnectorOnboarding(manager)
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = before_snapshot.connection(connection.connection_id)
+    assert before is not None
+    before_token = manager.tokens.state(connection.connection_id)
+    assert before_token is not None
+
+    result = onboarding.alias(
+        str(connection.connection_id),
+        "Work Mail",
+        expected_revision=before_snapshot.revision,
+    )
+
+    after_snapshot = manager.vault.get_connection_snapshot()
+    after = after_snapshot.connection(connection.connection_id)
+    assert after is not None
+    assert result["status"] == "alias_updated"
+    assert result["revision"] == after_snapshot.revision
+    assert after.account.label == "Work Mail"
+    assert after.version == before.version + 1
+    assert after.updated_at > before.updated_at
+    assert after.provider == before.provider
+    assert after.source_ids == before.source_ids
+    assert after.credential_kind is before.credential_kind
+    assert after.account.fingerprint == before.account.fingerprint
+    assert after.scopes == before.scopes
+    assert after.client == before.client
+    assert after.health is before.health
+    assert after.last_verified_at == before.last_verified_at
+    assert after.created_at == before.created_at
+    assert manager.tokens.state(connection.connection_id) == before_token
+
+    with pytest.raises(ConflictError, match="changed"):
+        onboarding.alias(
+            str(connection.connection_id),
+            "Stale Label",
+            expected_revision=before_snapshot.revision,
+        )
+
+    revoked_snapshot = manager.vault.get_connection_snapshot()
+    manager.vault.mark_connection_health(
+        expected_revision=revoked_snapshot.revision,
+        connection_id=connection.connection_id,
+        health=ConnectionHealth.REVOKED,
+    )
+    current_snapshot = manager.vault.get_connection_snapshot()
+    with pytest.raises(ValidationError, match="revoked"):
+        onboarding.alias(
+            str(connection.connection_id),
+            "Rejected Label",
+            expected_revision=current_snapshot.revision,
+        )
+    revoked = current_snapshot.connection(connection.connection_id)
+    assert revoked is not None and revoked.account.label == "Work Mail"
 
 
 def test_storage_permissions_failure_is_backend_unavailable_and_does_not_revoke(

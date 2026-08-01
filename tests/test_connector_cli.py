@@ -54,6 +54,15 @@ class _Onboarding:
         self.calls.append(("reauthorize", {"connection_id": connection_id, **kwargs}))
         return {"connection_id": connection_id, "status": "connected"}
 
+    def alias(
+        self,
+        connection_id: str,
+        alias: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        self.calls.append(("alias", {"connection_id": connection_id, "alias": alias, **kwargs}))
+        return {"connection_id": connection_id, "status": "alias_updated"}
+
 
 def _install_fake_onboarding(
     monkeypatch: pytest.MonkeyPatch,
@@ -193,6 +202,7 @@ def test_oauth_connect_passes_firefox_and_manual_url_fallback_without_credential
     connector, kwargs = fake.calls[0]
     assert connector == "gmail"
     assert kwargs["access"] == "full"
+    assert kwargs["browser_mode"] == "firefox"
     opener = kwargs["browser_opener"]
     assert callable(opener) and opener("https://accounts.example/authorize") is True
     assert opened == ["https://accounts.example/authorize"]
@@ -382,6 +392,57 @@ def test_connect_parser_routes_connection_selector_and_rejects_conflicting_flags
         )
 
 
+def test_alias_command_parser_and_route_carry_expected_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = cli._parser()
+    connection_id = "con-" + "e" * 32
+    parsed = parser.parse_args(
+        [
+            "connectors",
+            "alias",
+            connection_id,
+            "--alias",
+            "Work Mail",
+            "--expected-revision",
+            "revision-before",
+        ]
+    )
+    assert parsed.connection_id == connection_id
+    assert parsed.alias == "Work Mail"
+    assert parsed.expected_revision == "revision-before"
+
+    vault = tmp_path / "vault"
+    Vault(vault).initialize(name="Connector CLI")
+    fake = _Onboarding()
+    _install_fake_onboarding(monkeypatch, fake)
+    assert (
+        cli.main(
+            [
+                "--vault",
+                str(vault),
+                "connectors",
+                "alias",
+                connection_id,
+                "--alias",
+                "Work Mail",
+                "--expected-revision",
+                "revision-before",
+            ]
+        )
+        == 0
+    )
+    assert fake.calls[-1] == (
+        "alias",
+        {
+            "connection_id": connection_id,
+            "alias": "Work Mail",
+            "expected_revision": "revision-before",
+        },
+    )
+
+
 def test_connect_selector_and_reauthorize_route_through_same_seams(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -410,6 +471,7 @@ def test_connect_selector_and_reauthorize_route_through_same_seams(
         == 0
     )
     assert fake.calls[-1][1]["connection_id"] == connection_id
+    assert fake.calls[-1][1]["browser_mode"] == "manual"
 
     assert (
         cli.main(
@@ -429,6 +491,7 @@ def test_connect_selector_and_reauthorize_route_through_same_seams(
     assert fake.calls[-1][0] == "reauthorize"
     assert fake.calls[-1][1]["connection_id"] == connection_id
     assert fake.calls[-1][1]["alias"] == "Work Mail"
+    assert fake.calls[-1][1]["browser_mode"] == "manual"
     assert callable(fake.calls[-1][1]["confirm_identity"])
 
 

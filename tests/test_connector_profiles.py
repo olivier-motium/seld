@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
+import shlex
+
 import pytest
 
+import continuity_kernel.cli as cli_module
 from continuity_kernel.connector_profiles import (
     CONNECTOR_PROFILES,
     ConnectorAccessTier,
@@ -145,6 +149,38 @@ def test_connector_connect_command_preserves_selected_capability_and_account() -
         "gsv connectors connect gmail --access full --with-permanent-delete "
         "--new-account --connection-id con_0123456789ABCDEFGHJKMNPQRS"
     )
+
+
+def test_connector_connect_command_carries_explicit_browser_and_quotes_alias() -> None:
+    gmail = get_connector_profile("gmail")
+    alias = "Finance; $(touch /tmp/should-not-run) 'quoted'"
+
+    command = connector_connect_command(
+        gmail,
+        gmail.scopes_for("read"),
+        alias=alias,
+        browser_mode="manual",
+    )
+
+    if os.name == "nt":
+        assert "'--alias=Finance; $(touch /tmp/should-not-run) ''quoted'''" in command
+    else:
+        assert shlex.split(command)[-2:] == [f"--alias={alias}", "--no-browser"]
+    assert command.endswith("--no-browser")
+
+
+def test_leading_dash_alias_is_bound_with_equals_and_reparses() -> None:
+    gmail = get_connector_profile("gmail")
+    command = connector_connect_command(
+        gmail,
+        gmail.scopes_for("read"),
+        alias="-Work",
+        browser_mode="manual",
+    )
+
+    parsed = cli_module._parser().parse_args(shlex.split(command)[1:])
+    assert parsed.alias == "-Work"
+    assert parsed.no_browser is True
 
 
 def test_logical_connector_profiles_are_finite_single_source_least_authority_profiles() -> None:

@@ -36,6 +36,11 @@ jobs:
       - run: uv run python scripts/privacy_check.py --self-test
       - run: uv run python scripts/privacy_check.py .
       - run: uv build
+      - name: Require OAuth registrations from the built wheel
+        run: >-
+          uv run --isolated --no-project --with ./dist/gsv-*.whl python -c
+          "from continuity_kernel.connector_client_registration import require_public_client_registrations;
+          require_public_client_registrations()"
 
   build-native:
     name: ${{ matrix.asset }}
@@ -67,7 +72,7 @@ jobs:
       - run: uv run python scripts/build_standalone.py --output dist --asset-name "${{ matrix.asset }}"
       - run: uv run python scripts/write_checksum.py "dist/${{ matrix.asset }}"
       - run: uv run python scripts/privacy_check.py . --artifact "dist/${{ matrix.asset }}" --artifact "dist/${{ matrix.asset }}.sha256"
-      - run: uv run python scripts/e2e_clean_install.py --binary "dist/${{ matrix.asset }}" --report "dist/${{ matrix.asset }}.e2e.json"
+      - run: uv run python scripts/e2e_clean_install.py --binary "dist/${{ matrix.asset }}" --require-oauth-ready --report "dist/${{ matrix.asset }}.e2e.json"
       - run: uv run python scripts/privacy_check.py . --artifact "dist/${{ matrix.asset }}" --artifact "dist/${{ matrix.asset }}.sha256" --artifact "dist/${{ matrix.asset }}.e2e.json"
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:

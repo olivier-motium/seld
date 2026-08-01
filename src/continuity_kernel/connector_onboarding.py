@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final, cast
+from typing import Final, Literal, cast
 
 from continuity_kernel.connector_auth import (
     AccountMetadata,
@@ -32,8 +32,11 @@ from continuity_kernel.connector_profiles import (
     CONNECTOR_PROFILES,
     ConnectorAccessTier,
     ConnectorProfile,
+    connector_browser_options,
+    format_connector_command,
     get_connector_profile,
     get_profile_for_connection,
+    validate_connector_alias,
 )
 from continuity_kernel.connector_profiles import (
     connector_connect_command as _connect_command,
@@ -55,6 +58,7 @@ IdentityVerifier = Callable[[str, ConnectorCredential], ConnectorIdentity]
 RegistrationLoader = Callable[[str], PublicClientRegistration]
 BrowserOpener = Callable[[str], bool]
 AuthorizationPresenter = Callable[[str, bool], None]
+BrowserMode = Literal["default", "firefox", "manual"]
 
 _DEFAULT_BROWSER: Final = object()
 _CONNECTED_HEALTH: Final = frozenset({ConnectionHealth.READY, ConnectionHealth.DEGRADED})
@@ -114,6 +118,7 @@ class ConnectorOnboarding:
         include_permanent_delete: bool = False,
         timeout_seconds: float = 180.0,
         browser_opener: BrowserOpener | None | object = _DEFAULT_BROWSER,
+        browser_mode: BrowserMode | None = None,
         present_authorization_url: AuthorizationPresenter | None = None,
     ) -> dict[str, object]:
         """Connect one OAuth source, keeping every credential transient until confirmation."""
@@ -131,6 +136,7 @@ class ConnectorOnboarding:
         if connection_id is not None and new_account:
             raise ValidationError("--connection-id cannot be combined with --new-account")
         validated_alias = _alias(alias)
+        validated_browser_mode = _browser_mode(browser_mode)
         clean_connection_id = None if connection_id is None else parse_connection_id(connection_id)
 
         pinned_fingerprint: str | None = None
@@ -152,6 +158,7 @@ class ConnectorOnboarding:
                     alias=validated_alias,
                     timeout_seconds=timeout_seconds,
                     browser_opener=browser_opener,
+                    browser_mode=validated_browser_mode,
                     present_authorization_url=present_authorization_url,
                 )
             if candidate is not None:
@@ -200,9 +207,18 @@ class ConnectorOnboarding:
                 retry_command=_connect_command(
                     profile,
                     pending.scopes,
+                    new_account=new_account,
                     connection_id=(
                         str(clean_connection_id) if clean_connection_id is not None else None
                     ),
+                    alias=validated_alias,
+                    browser_mode=validated_browser_mode,
+                ),
+                new_account_command=_connect_command(
+                    profile,
+                    pending.scopes,
+                    new_account=True,
+                    browser_mode=validated_browser_mode,
                 ),
                 publish=lambda metadata: self.manager.publish_new_oauth_connection(
                     metadata,
@@ -224,6 +240,7 @@ class ConnectorOnboarding:
         alias: str | None = None,
         timeout_seconds: float = 180.0,
         browser_opener: BrowserOpener | None | object = _DEFAULT_BROWSER,
+        browser_mode: BrowserMode | None = None,
         present_authorization_url: AuthorizationPresenter | None = None,
     ) -> dict[str, object]:
         """Replace a verified OAuth credential while keeping its connection ID."""
@@ -232,6 +249,7 @@ class ConnectorOnboarding:
         if not callable(confirm_identity):
             raise ValidationError("connector identity confirmation is unavailable")
         validated_alias = _alias(alias)
+        validated_browser_mode = _browser_mode(browser_mode)
         snapshot = self.manager.vault.get_connection_snapshot()
         connection = snapshot.connection(clean_id)
         if connection is None:
@@ -271,7 +289,17 @@ class ConnectorOnboarding:
                     profile,
                     connection.scopes,
                     connection_id=str(clean_id),
-                    retry_command=f"gsv connectors reauthorize {clean_id}",
+                    retry_command=_reauthorize_command(
+                        clean_id,
+                        alias=validated_alias,
+                        browser_mode=validated_browser_mode,
+                    ),
+                    new_account_command=_connect_command(
+                        profile,
+                        connection.scopes,
+                        new_account=True,
+                        browser_mode=validated_browser_mode,
+                    ),
                     provider_authorization=True,
                     existing_connection_preserved=True,
                 )
@@ -285,8 +313,12 @@ class ConnectorOnboarding:
                 return _cancelled_identity_result(
                     profile,
                     connection_id=str(clean_id),
-                    next_command=f"gsv connectors status {clean_id}",
-                    retry_command=f"gsv connectors reauthorize {clean_id}",
+                    next_command=_status_command(clean_id),
+                    retry_command=_reauthorize_command(
+                        clean_id,
+                        alias=validated_alias,
+                        browser_mode=validated_browser_mode,
+                    ),
                     provider_authorization=True,
                     existing_connection_preserved=True,
                 )
@@ -295,7 +327,17 @@ class ConnectorOnboarding:
                     profile,
                     connection.scopes,
                     connection_id=str(clean_id),
-                    retry_command=f"gsv connectors reauthorize {clean_id}",
+                    retry_command=_reauthorize_command(
+                        clean_id,
+                        alias=validated_alias,
+                        browser_mode=validated_browser_mode,
+                    ),
+                    new_account_command=_connect_command(
+                        profile,
+                        connection.scopes,
+                        new_account=True,
+                        browser_mode=validated_browser_mode,
+                    ),
                     provider_authorization=True,
                     existing_connection_preserved=True,
                 )
@@ -540,6 +582,11 @@ class ConnectorOnboarding:
             preferred_label=None,
             force_fresh=False,
             retry_command=_connect_command(profile, pending.scopes),
+            new_account_command=_connect_command(
+                profile,
+                pending.scopes,
+                new_account=True,
+            ),
             publish=lambda metadata: self.manager.publish_new_bearer_connection(
                 metadata,
                 token,
@@ -707,6 +754,43 @@ class ConnectorOnboarding:
             "status": "disconnected_locally",
         }
 
+    def alias(
+        self,
+        connection_id: str,
+        alias: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> dict[str, object]:
+        """Repair only a local account label through an exact metadata CAS write."""
+
+        clean_id = parse_connection_id(connection_id)
+        validated_alias = _alias(alias)
+        if validated_alias is None:
+            raise ValidationError("connector alias is invalid")
+        snapshot = self.manager.vault.get_connection_snapshot()
+        connection = snapshot.connection(clean_id)
+        if connection is None:
+            raise ValidationError("connector connection was not found")
+        updated = self.manager.update_connection_alias(
+            clean_id,
+            validated_alias,
+            expected_revision=(
+                snapshot.revision if expected_revision is None else expected_revision
+            ),
+        )
+        revision = updated.get("revision")
+        if not isinstance(revision, str):
+            raise SetupError("connector alias update has no usable revision")
+        return {
+            "account_label": validated_alias,
+            "connection_id": str(clean_id),
+            "credential": "unchanged",
+            "metadata": "label_only",
+            "revision": revision,
+            "status": "alias_updated",
+            "token_custody": "unchanged",
+        }
+
     def resume(
         self,
         connection_id: str,
@@ -785,7 +869,7 @@ class ConnectorOnboarding:
             return _cancelled_identity_result(
                 profile,
                 connection_id=str(clean_id),
-                next_command=f"gsv connectors resume {clean_id}",
+                next_command=_resume_command(clean_id, alias=validated_alias),
                 provider_authorization=False,
             )
         if connection.account.fingerprint is None:
@@ -802,7 +886,12 @@ class ConnectorOnboarding:
                 profile,
                 connection.scopes,
                 connection_id=str(clean_id),
-                retry_command=f"gsv connectors resume {clean_id}",
+                retry_command=_resume_command(clean_id, alias=validated_alias),
+                new_account_command=_connect_command(
+                    profile,
+                    connection.scopes,
+                    new_account=True,
+                ),
                 provider_authorization=False,
                 existing_connection_preserved=True,
             )
@@ -836,11 +925,17 @@ class ConnectorOnboarding:
         for provider in providers:
             try:
                 self.registration_loader(provider)
-            except ContinuityError as exc:
+            except SetupError as exc:
                 readiness[provider] = {
                     "reason": str(exc),
                     "sign_in": "unavailable",
                     "status": "missing",
+                }
+            except ValidationError as exc:
+                readiness[provider] = {
+                    "reason": str(exc),
+                    "sign_in": "unavailable",
+                    "status": "invalid",
                 }
             else:
                 readiness[provider] = {"sign_in": "available", "status": "ready"}
@@ -920,6 +1015,7 @@ class ConnectorOnboarding:
         preferred_label: str | None,
         force_fresh: bool,
         retry_command: str | None,
+        new_account_command: str | None,
         publish: Callable[[ConnectionMetadata], Mapping[str, object]],
         reuse: Callable[[ConnectionMetadata, str], Mapping[str, object]],
     ) -> dict[str, object]:
@@ -975,6 +1071,7 @@ class ConnectorOnboarding:
                 profile,
                 pending.scopes,
                 retry_command=retry_command,
+                new_account_command=new_account_command,
                 provider_authorization=profile.credential_kind is CredentialKind.OAUTH2,
                 existing_connection_preserved=True,
             )
@@ -983,6 +1080,7 @@ class ConnectorOnboarding:
                 profile,
                 pending.scopes,
                 retry_command=retry_command,
+                new_account_command=new_account_command,
                 provider_authorization=profile.credential_kind is CredentialKind.OAUTH2,
                 existing_connection_preserved=True,
             )
@@ -1486,8 +1584,13 @@ def _different_account_result(
     retry_command: str | None = None,
     provider_authorization: bool,
     existing_connection_preserved: bool = False,
+    new_account_command: str | None = None,
 ) -> dict[str, object]:
-    new_account_command = _connect_command(profile, scopes, new_account=True)
+    new_account_command = new_account_command or _connect_command(
+        profile,
+        scopes,
+        new_account=True,
+    )
     result: dict[str, object] = {
         "connector": profile.name,
         "new_account": new_account_command,
@@ -1557,16 +1660,42 @@ def _same_credential_binding(
 
 
 def _alias(value: str | None) -> str | None:
+    return validate_connector_alias(value)
+
+
+def _browser_mode(value: BrowserMode | None) -> BrowserMode | None:
     if value is None:
         return None
-    if (
-        not isinstance(value, str)
-        or not value.strip()
-        or len(value.encode("utf-8")) > 256
-        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
-    ):
-        raise ValidationError("connector alias is invalid")
-    return value.strip()
+    connector_browser_options(value)
+    return value
+
+
+def _status_command(connection_id: ConnectionId | str) -> str:
+    return format_connector_command(("gsv", "connectors", "status", str(connection_id)))
+
+
+def _resume_command(
+    connection_id: ConnectionId | str,
+    *,
+    alias: str | None = None,
+) -> str:
+    arguments = ["gsv", "connectors", "resume", str(connection_id)]
+    if alias is not None:
+        arguments.append(f"--alias={alias}")
+    return format_connector_command(arguments)
+
+
+def _reauthorize_command(
+    connection_id: ConnectionId | str,
+    *,
+    alias: str | None = None,
+    browser_mode: BrowserMode | None = None,
+) -> str:
+    arguments = ["gsv", "connectors", "reauthorize", str(connection_id)]
+    if alias is not None:
+        arguments.append(f"--alias={alias}")
+    arguments.extend(connector_browser_options(browser_mode))
+    return format_connector_command(arguments)
 
 
 def provider_revocation_guidance(provider: str) -> str:

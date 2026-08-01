@@ -47,6 +47,7 @@ from continuity_kernel.connector_profiles import (
     ConnectorAccessTier,
     connector_connect_command,
     get_profile_for_connection,
+    validate_connector_alias,
 )
 from continuity_kernel.connector_secrets import KeyringSecretStore
 from continuity_kernel.connector_token_store import AtomicTokenStore, ResolvedToken, TokenState
@@ -138,6 +139,43 @@ class ConnectorAuthManager:
                 row["next"] = next_action
             projected.append(row)
         return {**portable, "connections": projected, "vault_id": self.vault_id}
+
+    def update_connection_alias(
+        self,
+        connection_id: ConnectionId | str,
+        alias: str,
+        *,
+        expected_revision: str,
+    ) -> dict[str, Any]:
+        """CAS-update only a user-owned connection label; custody is untouched."""
+
+        clean_alias = validate_connector_alias(alias)
+        if clean_alias is None:
+            raise ValidationError("connector alias is invalid")
+        clean_id = parse_connection_id(connection_id)
+        with self.tokens.exclusive_lifecycle(clean_id):
+            snapshot = self.vault.get_connection_snapshot()
+            if snapshot.revision != expected_revision:
+                raise ConflictError("connection changed; reload before repairing its alias")
+            metadata = snapshot.connection(clean_id)
+            if metadata is None:
+                raise NotFoundError("connection was not found")
+            self._assert_not_revoked(metadata)
+            observed_at = max(
+                datetime.now(UTC),
+                metadata.updated_at + timedelta(microseconds=1),
+            )
+            updated = replace(
+                metadata,
+                account=replace(metadata.account, label=clean_alias),
+                updated_at=observed_at,
+                version=metadata.version + 1,
+            )
+            return self.vault.put_connection(
+                expected_revision=expected_revision,
+                connection=updated,
+                observed_at=observed_at,
+            )
 
     def store_credential(
         self,

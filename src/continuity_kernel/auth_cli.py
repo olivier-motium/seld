@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import re
 import sys
 import webbrowser
 from datetime import UTC, datetime
@@ -24,7 +25,12 @@ from continuity_kernel.connector_auth import (
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_auth_transfer import export_auth_archive, import_auth_archive
 from continuity_kernel.connector_identifiers import new_connection_id, parse_connection_id
-from continuity_kernel.connector_profiles import PROFILES, get_profile, list_profiles
+from continuity_kernel.connector_profiles import (
+    PROFILES,
+    format_connector_command,
+    get_profile,
+    list_profiles,
+)
 from continuity_kernel.connector_secrets import MAX_SECRET_BYTES
 from continuity_kernel.errors import ContinuityError, ValidationError
 from continuity_kernel.vault import Vault
@@ -49,7 +55,10 @@ def main(arguments: list[str] | None = None) -> int:
 
 def _dispatch(args: argparse.Namespace, manager: ConnectorAuthManager) -> dict[str, object]:
     if args.command == "status":
-        return manager.status()
+        status = manager.status()
+        if args.vault is not None:
+            return _qualify_status_recovery(status, manager.vault.root)
+        return status
     if args.command == "profiles":
         return {"profiles": list_profiles()}
     if args.command == "add":
@@ -77,13 +86,64 @@ def _dispatch(args: argparse.Namespace, manager: ConnectorAuthManager) -> dict[s
             age_executable=Path(args.age_executable) if args.age_executable else None,
         )
     if args.command == "import":
-        return import_auth_archive(
+        result = import_auth_archive(
             manager,
             Path(args.archive),
             identity=Path(args.identity),
             age_executable=Path(args.age_executable) if args.age_executable else None,
         )
+        connection_ids = result.get("connection_ids")
+        if not isinstance(connection_ids, list) or not all(
+            isinstance(connection_id, str) for connection_id in connection_ids
+        ):
+            raise ValidationError("connector auth import omitted its connection IDs")
+        return {
+            **result,
+            "resume_commands": [
+                _resume_command(
+                    connection_id,
+                    vault=manager.vault.root if args.vault is not None else None,
+                )
+                for connection_id in connection_ids
+            ],
+        }
     raise ValidationError("unsupported connector auth command")
+
+
+def _qualify_status_recovery(
+    status: dict[str, object],
+    vault: Path,
+) -> dict[str, object]:
+    connections = status.get("connections")
+    if not isinstance(connections, list):
+        raise ValidationError("connector auth status is invalid")
+    projected: list[object] = []
+    connector_prefix = format_connector_command(("gsv", "--vault", str(vault), "connectors"))
+    auth_prefix = format_connector_command(("gsv-auth", "--vault", str(vault)))
+    for value in connections:
+        if not isinstance(value, dict):
+            projected.append(value)
+            continue
+        row = dict(value)
+        recovery = row.get("next")
+        if isinstance(recovery, str):
+            row["next"] = re.sub(
+                r"gsv connectors|gsv-auth",
+                lambda match: (
+                    connector_prefix if match.group() == "gsv connectors" else auth_prefix
+                ),
+                recovery,
+            )
+        projected.append(row)
+    return {**status, "connections": projected}
+
+
+def _resume_command(connection_id: str, *, vault: Path | None) -> str:
+    arguments = ["gsv"]
+    if vault is not None:
+        arguments.extend(("--vault", str(vault)))
+    arguments.extend(("connectors", "resume", connection_id))
+    return format_connector_command(arguments)
 
 
 def _add(args: argparse.Namespace, manager: ConnectorAuthManager) -> dict[str, object]:

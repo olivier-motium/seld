@@ -70,6 +70,7 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--native-codex", action="store_true")
+    parser.add_argument("--require-oauth-ready", action="store_true")
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
 
@@ -81,6 +82,7 @@ def main() -> int:
                 root,
                 args.binary.resolve(),
                 native_codex=args.native_codex,
+                require_oauth_ready=args.require_oauth_ready,
             )
         )
         encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
@@ -99,6 +101,7 @@ def run_e2e(
     binary: Path,
     *,
     native_codex: bool,
+    require_oauth_ready: bool = False,
 ) -> dict[str, Any]:
     root = root.resolve()
     if not binary.is_file():
@@ -161,6 +164,10 @@ def run_e2e(
     environment.pop("GSV_VAULT", None)
     installed_version = _run([str(installed), "--version"], environment).stdout.strip()
     binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+    connector_readiness = _connector_readiness_receipt(
+        _cli(installed, environment, ["connectors", "readiness"]),
+        required=require_oauth_ready,
+    )
 
     status = _cli(installed, environment, ["status"])
     bridge_status = _cli(installed, environment, ["bridge", "status"])
@@ -587,6 +594,7 @@ def run_e2e(
         "binary_version": installed_version,
         "codex_cli_contract": True,
         "codex_uninstall_without_config": True,
+        **connector_readiness,
         "crash_recovery": True,
         "frozen_manifest": True,
         "full_uninstall_removed_binary": True,
@@ -605,6 +613,23 @@ def run_e2e(
         "uninstall_preserved_config_and_vault": removed["user_data_preserved"],
         "updated_revision": updated["revision"],
         "vault_id": status["vault_id"],
+    }
+
+
+def _connector_readiness_receipt(
+    value: dict[str, Any],
+    *,
+    required: bool,
+) -> dict[str, object]:
+    ready = value.get("oauth_registration_ready")
+    registrations = value.get("registration_readiness")
+    if type(ready) is not bool or not isinstance(registrations, dict):
+        raise RuntimeError("installed connector readiness has an invalid contract")
+    if required and not ready:
+        raise RuntimeError("released artifact is missing one or more OAuth client registrations")
+    return {
+        "oauth_registration_ready": ready,
+        "registration_readiness": registrations,
     }
 
 

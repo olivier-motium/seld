@@ -126,6 +126,7 @@ def import_auth_archive(
         max_bytes=MAX_ENCRYPTED_ARCHIVE_BYTES,
     )
     identity_path = _regular_path(identity, "age identity")
+    manager.probe_credential_custody()
     plaintext = _run_age(
         ("--decrypt", "--identity", str(identity_path)),
         ciphertext,
@@ -185,8 +186,10 @@ def import_auth_archive(
             ) from import_error
         imported.append(item)
     return {
+        "connection_ids": sorted(str(item.connection_id) for item in imported),
         "connection_count": len(imported),
         "imported": True,
+        "next_action": "resume_identity",
         "requires_verification": True,
         "vault_id": manager.vault_id,
     }

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 from urllib.error import HTTPError
@@ -133,6 +134,20 @@ def main() -> int:
         text=True,
         timeout=30,
     ).stdout.strip()
+    with tempfile.TemporaryDirectory(prefix="gsv-frozen-connectors-") as raw:
+        readiness_root = Path(raw)
+        source_readiness = _connector_readiness(
+            (sys.executable, "-m", "continuity_kernel"),
+            readiness_root / "source",
+        )
+        frozen_readiness = _connector_readiness(
+            (str(target),),
+            readiness_root / "frozen",
+        )
+        connector_readiness = _require_connector_readiness_parity(
+            source_readiness,
+            frozen_readiness,
+        )
     handshake = _mcp_handshake(target)
     bridge_smoke = _bridge_static_smoke(target)
     result = handshake.get("result")
@@ -147,6 +162,7 @@ def main() -> int:
                 "artifact": str(target),
                 "artifact_privacy_scanned": privacy_report["scanned"],
                 **bridge_smoke,
+                **connector_readiness,
                 "mcp_server": server_info["name"],
                 "size": target.stat().st_size,
                 "version": version,
@@ -155,6 +171,66 @@ def main() -> int:
         )
     )
     return 0
+
+
+def _connector_readiness(command: Sequence[str], root: Path) -> dict[str, object]:
+    root.mkdir(parents=True, exist_ok=True)
+    vault = root / "vault"
+    environment = _isolated_environment(root, vault)
+    initialized = subprocess.run(
+        [*command, "--json", "--vault", str(vault), "init"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+        timeout=30,
+    )
+    if initialized.returncode != 0:
+        raise RuntimeError(f"connector readiness fixture setup failed: {initialized.stderr[:1000]}")
+    completed = subprocess.run(
+        [*command, "--json", "--vault", str(vault), "connectors", "readiness"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"connector readiness check failed: {completed.stderr[:1000]}")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("connector readiness check returned invalid JSON") from exc
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise RuntimeError("connector readiness check did not return a successful result")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("connector readiness check omitted its result")
+    return _connector_readiness_contract(result)
+
+
+def _connector_readiness_contract(value: dict[str, object]) -> dict[str, object]:
+    ready = value.get("oauth_registration_ready")
+    registrations = value.get("registration_readiness")
+    if type(ready) is not bool or not isinstance(registrations, dict):
+        raise RuntimeError("connector readiness result has an invalid contract")
+    return {
+        "oauth_registration_ready": ready,
+        "registration_readiness": registrations,
+    }
+
+
+def _require_connector_readiness_parity(
+    source: dict[str, object],
+    frozen: dict[str, object],
+) -> dict[str, object]:
+    source_contract = _connector_readiness_contract(source)
+    frozen_contract = _connector_readiness_contract(frozen)
+    if frozen_contract != source_contract:
+        raise RuntimeError("frozen connector registration readiness differs from the source build")
+    return frozen_contract
 
 
 def _mcp_handshake(binary: Path) -> dict[str, Any]:

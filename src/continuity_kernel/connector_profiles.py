@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import re
+import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -99,6 +102,8 @@ def connector_connect_command(
     connection_id: str | None = None,
     access: ConnectorAccessTier | None = None,
     include_permanent_delete: bool | None = None,
+    alias: str | None = None,
+    browser_mode: str | None = None,
 ) -> str:
     """Build the canonical guided-onboarding command for one profile."""
 
@@ -109,19 +114,77 @@ def connector_connect_command(
         if profile.name == "discord"
         else profile.access_for_scopes(tuple(scopes))
     )
-    command = f"gsv connectors connect {profile.name} --access {selected_access.value}"
+    arguments = [
+        "gsv",
+        "connectors",
+        "connect",
+        profile.name,
+        "--access",
+        selected_access.value,
+    ]
     has_permanent_delete_scope = any(scope in scopes for scope in profile.supplemental_scopes)
     if profile.name == "gmail" and (
         include_permanent_delete
         if include_permanent_delete is not None
         else has_permanent_delete_scope
     ):
-        command += " --with-permanent-delete"
+        arguments.append("--with-permanent-delete")
     if new_account:
-        command += " --new-account"
+        arguments.append("--new-account")
     if connection_id is not None:
-        command += f" --connection-id {connection_id}"
-    return command
+        arguments.extend(("--connection-id", connection_id))
+    if alias is not None:
+        arguments.append(f"--alias={alias}")
+    arguments.extend(connector_browser_options(browser_mode))
+    return format_connector_command(arguments)
+
+
+def connector_browser_options(browser_mode: str | None) -> tuple[str, ...]:
+    """Return the explicit CLI flags for one browser mode."""
+
+    if browser_mode is None:
+        return ()
+    if browser_mode == "manual":
+        return ("--no-browser",)
+    if browser_mode in {"default", "firefox"}:
+        return ("--browser", browser_mode)
+    raise ValidationError("connector browser mode is invalid")
+
+
+def format_connector_command(arguments: Sequence[str]) -> str:
+    """Format a copyable command for POSIX shells or Windows PowerShell."""
+
+    if not arguments or any(
+        not isinstance(argument, str) or not argument for argument in arguments
+    ):
+        raise ValidationError("connector command arguments are invalid")
+    if os.name == "nt":
+        return " ".join(_powershell_argument(argument) for argument in arguments)
+    return shlex.join(arguments)
+
+
+def _powershell_argument(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_./:\\-]+", value):
+        return value
+    return "'" + value.replace("'", "''") + "'"
+
+
+def validate_connector_alias(value: str | None) -> str | None:
+    """Validate and normalize a privacy-safe local connector label."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("connector alias is invalid")
+    try:
+        encoded_length = len(value.encode("utf-8"))
+    except UnicodeError as exc:
+        raise ValidationError("connector alias is invalid") from exc
+    if encoded_length > 256 or any(
+        ord(character) < 0x20 or ord(character) == 0x7F for character in value
+    ):
+        raise ValidationError("connector alias is invalid")
+    return value.strip()
 
 
 PROFILES: Final[Mapping[str, ConnectorProfile]] = MappingProxyType(
