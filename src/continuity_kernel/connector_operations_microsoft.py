@@ -107,18 +107,45 @@ _ATTENDEES = _array(
     max_items=100,
 )
 _CATEGORIES = _array(_string(128, min_length=1), max_items=32)
+_LOCAL_FILE = _object(
+    {
+        "grant_id": _string(128, min_length=1),
+        "relative_path": _string(16 * 1024, min_length=1),
+    },
+    required=("grant_id", "relative_path"),
+)
+_ATTACHMENT_METADATA = {
+    "content_type": _string(255, min_length=1),
+    "name": _NAME,
+}
 _ATTACHMENT = _object(
     {
+        **_ATTACHMENT_METADATA,
         "content_base64": _string(
             240_000,
             min_length=1,
             pattern=r"^[A-Za-z0-9+/]+={0,2}$",
         ),
-        "content_type": _string(255, min_length=1),
-        "name": _NAME,
-    },
-    required=("name", "content_type", "content_base64"),
+        "local_file": _LOCAL_FILE,
+    }
 )
+_ATTACHMENT["oneOf"] = [
+    _object(
+        {
+            **_ATTACHMENT_METADATA,
+            "content_base64": _string(
+                240_000,
+                min_length=1,
+                pattern=r"^[A-Za-z0-9+/]+={0,2}$",
+            ),
+        },
+        required=("name", "content_type", "content_base64"),
+    ),
+    _object(
+        {**_ATTACHMENT_METADATA, "local_file": _LOCAL_FILE},
+        required=("name", "content_type", "local_file"),
+    ),
+]
 _EVENT_TIME = _object(
     {
         "date_time": _DATE_TIME,
@@ -314,7 +341,10 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         "messages.mime",
         ConnectorEffect.READ,
         _MAIL_READ_SCOPES,
-        _object({"message_id": _ID}, required=("message_id",)),
+        _object(
+            {"delivery": _enum("inline", "artifact"), "message_id": _ID},
+            required=("message_id",),
+        ),
     ),
     _operation(
         "outlook_mail",
@@ -331,7 +361,11 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         ConnectorEffect.READ,
         _MAIL_READ_SCOPES,
         _object(
-            {"attachment_id": _ID, "message_id": _ID},
+            {
+                "attachment_id": _ID,
+                "delivery": _enum("metadata", "artifact"),
+                "message_id": _ID,
+            },
             required=("message_id", "attachment_id"),
         ),
     ),
@@ -682,7 +716,12 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         ConnectorEffect.READ,
         _CALENDAR_READ_SCOPES,
         _object(
-            {"attachment_id": _ID, "calendar_id": _ID, "event_id": _ID},
+            {
+                "attachment_id": _ID,
+                "calendar_id": _ID,
+                "delivery": _enum("metadata", "artifact"),
+                "event_id": _ID,
+            },
             required=("calendar_id", "event_id", "attachment_id"),
         ),
     ),

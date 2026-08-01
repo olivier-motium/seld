@@ -35,8 +35,29 @@ The isolated `gsv_connectors` server exposes `gsv_outlook_calendar_read` and
 `gsv_outlook_calendar_write`. Attendee-affecting events, responses,
 cancellations, and forwards are outward; destructive and permanent effects are
 separately classified. The runtime requires an exact preview and short-lived
-bound confirmation where the effect demands it. Large attachments use the
-local-file/artifact transfer lane and fixed Graph upload sessions.
+bound confirmation where the effect demands it. A local-file `attachments.add`
+is snapshot-bound and promoted to an outward confirmation: preview does not
+write to Outlook, and a matching replay dispatches the pinned immutable file
+once. Calendar/event preconditions and the safe-versus-outward classification
+are rechecked on replay.
+
+Attachment uploads follow Microsoft's full-transfer contract. A file smaller
+than 3 MB (3,000,000 bytes) uses one direct attachment POST, including
+zero-byte files. Files from 3 MB through 150 MiB use `createUploadSession` and
+sequential 3 MiB chunks to the exact preauthenticated
+`https://outlook.office.com` URL, without an Authorization header on those
+PUTs. 150 MiB is this connector's hard provider ceiling; tenant, mailbox,
+policy, and service limits can still reject a smaller upload. Shared or
+delegated large attachment sessions may also hit Microsoft's documented known
+issue; this connector does not hide or retry that failure.
+
+Attachment metadata reads select concrete fields without materializing
+`contentBytes`. Request `delivery: "artifact"` for an attachment read to
+stream `/$value` into the owner-only transient artifact store and receive a
+bounded artifact receipt. Outlook MIME and attachment artifact downloads stop
+at the connector's 150 MiB Outlook ceiling before they can consume unbounded
+local disk. Attachment reads are now metadata-only by default; callers that
+previously consumed inline `contentBytes` must request `delivery: "artifact"`.
 
 Return only the identity basis, bounded-read facts, covered interval, and
 stable references to `$gsv-onboard`. Do not persist event bodies, raw account
