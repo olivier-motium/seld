@@ -15,10 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 
 from continuity_kernel.atomic import sha256_bytes
-from continuity_kernel.connector_auth import (
-    ConnectionHealth,
-    CredentialKind,
-)
+from continuity_kernel.connector_auth import CredentialKind
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_http import (
     ConnectorHTTPError,
@@ -35,6 +32,7 @@ from continuity_kernel.connector_identifiers import ConnectionId, parse_connecti
 from continuity_kernel.connector_oauth import OAuthTokenEndpointError, OAuthTransportError
 from continuity_kernel.connector_profiles import get_profile_for_connection
 from continuity_kernel.connector_token_store import TokenState
+from continuity_kernel.connector_transport import SLACK_AUTH_FAILURE_CODES
 from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
 from continuity_kernel.records import format_time
 from continuity_kernel.source_state import SourceCompleteness
@@ -266,6 +264,13 @@ def read_connector_source(
             token_state=resolved_access.state,
             lock_timeout_seconds=budget.lock_timeout(),
         )
+        if error_code == "auth_expired":
+            auth_manager.mark_reauthorization_required(
+                clean_connection_id,
+                expected_connection_revision=connection_revision,
+                expected_token_version=resolved_access.state.version,
+                observed_at=observed,
+            )
         return _failure(
             source_id,
             source_revision,
@@ -359,11 +364,6 @@ def _preflight(
         raise ValidationError("connection provider does not match source")
     if source_id not in connection.source_ids:
         raise ValidationError("connection does not authorize source")
-    if connection.health in {
-        ConnectionHealth.REAUTHORIZATION_REQUIRED,
-        ConnectionHealth.REVOKED,
-    }:
-        raise ValidationError("connection health does not permit source reads")
     if connection.credential_kind is not CredentialKind.OAUTH2:
         raise ValidationError("connection credential kind is not OAuth")
     expected_endpoints = _OAUTH_ENDPOINTS[expected_provider]
@@ -1145,13 +1145,7 @@ def _token_error_code(error: OAuthTokenEndpointError) -> str:
 
 
 def _slack_error_code(error: str) -> str:
-    if error in {
-        "account_inactive",
-        "invalid_auth",
-        "not_authed",
-        "token_expired",
-        "token_revoked",
-    }:
+    if error in SLACK_AUTH_FAILURE_CODES:
         return "auth_expired"
     if error in {
         "channel_not_found",

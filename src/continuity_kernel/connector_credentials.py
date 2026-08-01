@@ -145,11 +145,18 @@ def credential_from_token_set(
     refresh_token = token_set.refresh_token
     if refresh_token is None and previous is not None:
         refresh_token = previous.refresh_token
-    expires_at = (
-        observed_at + timedelta(seconds=token_set.expires_in_seconds)
-        if token_set.expires_in_seconds is not None
-        else None
-    )
+    expires_in = token_set.expires_in_seconds
+    if expires_in is not None:
+        remaining = datetime.max.replace(tzinfo=UTC) - observed_at
+        maximum_seconds = remaining.days * 86_400 + remaining.seconds
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, int)
+            or expires_in < 0
+            or expires_in > maximum_seconds
+        ):
+            raise ValidationError("OAuth token expiry exceeds the supported time range")
+    expires_at = observed_at + timedelta(seconds=expires_in) if expires_in is not None else None
     return OAuthCredential(
         access_token=token_set.access_token,
         refresh_token=refresh_token,

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
+import secrets
 import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit
 
 from continuity_kernel.config import connector_auth_dir
@@ -23,7 +24,13 @@ from continuity_kernel.connector_credentials import (
     OAuthCredential,
     credential_from_token_set,
 )
-from continuity_kernel.connector_identifiers import ConnectionId, SecretStore, parse_connection_id
+from continuity_kernel.connector_identifiers import (
+    ConnectionId,
+    SecretStore,
+    new_connection_id,
+    parse_connection_id,
+    parse_secret_name,
+)
 from continuity_kernel.connector_oauth import (
     OAuthClientConfig,
     OAuthDialect,
@@ -38,16 +45,19 @@ from continuity_kernel.connector_oauth import (
 from continuity_kernel.connector_oauth_loopback import BoundLoopbackCallback, begin_authorization
 from continuity_kernel.connector_profiles import (
     ConnectorAccessTier,
+    connector_connect_command,
     get_profile_for_connection,
 )
 from continuity_kernel.connector_secrets import KeyringSecretStore
 from continuity_kernel.connector_token_store import AtomicTokenStore, ResolvedToken, TokenState
 from continuity_kernel.errors import (
     ConflictError,
+    ContinuityError,
     MutationCommittedError,
     NotFoundError,
     SetupError,
     ValidationError,
+    mark_provider_authorization_may_remain,
 )
 from continuity_kernel.vault import Vault
 
@@ -66,6 +76,9 @@ _PINNED_OAUTH_ENDPOINTS: Final = {
     ),
 }
 _DEFAULT_BROWSER_OPENER: Final = object()
+_VERIFIED_HEALTH: Final = frozenset({ConnectionHealth.READY, ConnectionHealth.DEGRADED})
+_CUSTODY_PROBE_NAME: Final = parse_secret_name("readiness-probe")
+CustodyStatus = Literal["valid", "missing", "invalid", "pointer_invalid"]
 
 
 @dataclass(frozen=True, repr=False)
@@ -108,11 +121,21 @@ class ConnectorAuthManager:
         rows = portable["connections"]
         assert isinstance(rows, list)
         projected: list[dict[str, object]] = []
+        snapshot = self.vault.get_connection_snapshot()
+        if portable.get("revision") != snapshot.revision:
+            raise ConflictError("connection status changed while it was being read")
         for raw in rows:
             assert isinstance(raw, dict)
             row = dict(raw)
             connection_id = parse_connection_id(row["connection_id"])
-            row["host_credential"] = self._host_availability(connection_id)
+            connection = snapshot.connection(connection_id)
+            if connection is None:
+                raise ConflictError("connection status changed while it was being read")
+            host_credential, custody = self._host_availability(connection)
+            row["host_credential"] = host_credential
+            next_action = self._recovery_action(connection, host_credential, custody)
+            if next_action is not None:
+                row["next"] = next_action
             projected.append(row)
         return {**portable, "connections": projected, "vault_id": self.vault_id}
 
@@ -129,20 +152,25 @@ class ConnectorAuthManager:
             self._assert_not_revoked(metadata)
             if metadata.credential_kind is CredentialKind.OAUTH2:
                 raise ValidationError("use the OAuth credential path for an OAuth connection")
+            if (
+                metadata.credential_kind is CredentialKind.BEARER
+                and metadata.account.fingerprint is not None
+            ):
+                raise ValidationError(
+                    "a bound bearer credential must be replaced through its verified connector "
+                    "onboarding flow"
+                )
             return self.tokens.update(
                 metadata.connection_id,
                 expected_version=expected_token_version,
                 value=value,
             )
 
-    def resolve_credential(self, connection_id: ConnectionId | str) -> bytes:
-        """Resolve only inside a connector runtime; never expose through MCP or status."""
-
-        return self.resolve_credential_state(connection_id).value
-
     def resolve_credential_state(
         self,
         connection_id: ConnectionId | str,
+        *,
+        require_verified_identity: bool = True,
     ) -> ResolvedToken:
         """Resolve runtime-only bytes with the pointer state needed for operation CAS."""
 
@@ -150,26 +178,13 @@ class ConnectorAuthManager:
         with self.tokens.exclusive_lifecycle(clean_id):
             metadata = self._metadata(clean_id)
             self._assert_not_revoked(metadata)
+            if require_verified_identity:
+                self._assert_verified_identity(metadata)
             if metadata.credential_kind is CredentialKind.OAUTH2:
-                raise ValidationError("use resolve_oauth_access_token for an OAuth connection")
+                raise ValidationError(
+                    "use resolve_oauth_access_token_state for an OAuth connection"
+                )
             return self.tokens.read(metadata.connection_id)
-
-    def resolve_oauth_access_token(
-        self,
-        connection_id: ConnectionId | str,
-        *,
-        expected_connection_revision: str | None = None,
-        minimum_validity_seconds: int = 60,
-        timeout_seconds: float = 15.0,
-        observed_at: datetime | None = None,
-    ) -> str:
-        return self.resolve_oauth_access_token_state(
-            connection_id,
-            expected_connection_revision=expected_connection_revision,
-            minimum_validity_seconds=minimum_validity_seconds,
-            timeout_seconds=timeout_seconds,
-            observed_at=observed_at,
-        ).access_token
 
     def resolve_oauth_access_token_state(
         self,
@@ -179,6 +194,7 @@ class ConnectorAuthManager:
         minimum_validity_seconds: int = 60,
         timeout_seconds: float = 15.0,
         observed_at: datetime | None = None,
+        require_verified_identity: bool = True,
     ) -> ResolvedOAuthAccessToken:
         if (
             isinstance(timeout_seconds, bool)
@@ -204,6 +220,8 @@ class ConnectorAuthManager:
                 clean_id,
                 expected_revision=expected_connection_revision,
             )
+            if require_verified_identity:
+                self._assert_verified_identity(metadata)
             config = self._oauth_config(metadata)
             now = (observed_at or datetime.now(UTC)).astimezone(UTC)
 
@@ -265,6 +283,106 @@ class ConnectorAuthManager:
                 scopes=credential.scopes,
             )
 
+    def inspect_custody(self, connection: ConnectionMetadata) -> CustodyStatus:
+        """Parse-validate one host credential without requiring verified identity."""
+
+        if not isinstance(connection, ConnectionMetadata):
+            raise ValidationError("connector connection metadata is invalid")
+        try:
+            state = self.tokens.state(connection.connection_id)
+        except ValidationError:
+            return "pointer_invalid"
+        except (OSError, ContinuityError) as exc:
+            raise SetupError("connector credential custody is unavailable") from exc
+        if state is None:
+            return "missing"
+        try:
+            resolved = self.tokens.read(connection.connection_id)
+        except (ValidationError, NotFoundError):
+            return "invalid"
+        except (OSError, ContinuityError) as exc:
+            raise SetupError("connector credential custody is unavailable") from exc
+        try:
+            if connection.credential_kind is CredentialKind.OAUTH2:
+                self.validate_import_credential(connection, resolved.value)
+            elif connection.credential_kind is CredentialKind.BEARER:
+                bearer = resolved.value.decode("utf-8")
+                if not bearer or any(character in bearer for character in "\x00\r\n"):
+                    return "invalid"
+        except (UnicodeError, ValidationError):
+            return "invalid"
+        return "valid"
+
+    def probe_credential_custody(self) -> None:
+        """Prove the configured secret store can round-trip and remove a sentinel."""
+
+        connection_id = new_connection_id()
+        marker = secrets.token_bytes(32)
+        failure: BaseException | None = None
+        try:
+            self.secret_store.set_secret(connection_id, _CUSTODY_PROBE_NAME, marker)
+            if self.secret_store.get_secret(connection_id, _CUSTODY_PROBE_NAME) != marker:
+                raise SetupError("connector credential custody readiness check failed")
+        except BaseException as exc:
+            failure = exc
+        cleanup_failure: BaseException | None = None
+        try:
+            self.secret_store.delete_secret(connection_id, _CUSTODY_PROBE_NAME)
+            if self.secret_store.get_secret(connection_id, _CUSTODY_PROBE_NAME) is not None:
+                raise SetupError("connector credential custody readiness cleanup failed")
+        except BaseException as exc:
+            cleanup_failure = exc
+        if failure is not None:
+            if cleanup_failure is not None:
+                failure.add_note("connector credential custody readiness cleanup is unconfirmed")
+            if not isinstance(failure, Exception):
+                raise failure
+            if isinstance(failure, SetupError):
+                raise failure
+            raise SetupError("connector credential custody readiness check failed") from failure
+        if cleanup_failure is not None:
+            if isinstance(cleanup_failure, SetupError):
+                raise cleanup_failure
+            if not isinstance(cleanup_failure, Exception):
+                raise cleanup_failure
+            raise SetupError(
+                "connector credential custody readiness cleanup failed"
+            ) from cleanup_failure
+
+    def mark_reauthorization_required(
+        self,
+        connection_id: ConnectionId | str,
+        *,
+        expected_connection_revision: str,
+        expected_token_version: int | None = None,
+        observed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """CAS-project a provider authentication rejection into portable health."""
+
+        clean_id = parse_connection_id(connection_id)
+        with self.tokens.exclusive_lifecycle(clean_id):
+            snapshot = self.vault.get_connection_snapshot()
+            if snapshot.revision != expected_connection_revision:
+                raise ConflictError("connection changed; discard the provider result and retry")
+            metadata = snapshot.connection(clean_id)
+            if metadata is None:
+                raise NotFoundError("connection was not found")
+            self._assert_not_revoked(metadata)
+            if expected_token_version is not None:
+                token_state = self.tokens.state(clean_id)
+                if token_state is None or token_state.version != expected_token_version:
+                    raise ConflictError("credential changed; discard the provider result and retry")
+            when = max(
+                (observed_at or datetime.now(UTC)).astimezone(UTC),
+                metadata.updated_at + timedelta(microseconds=1),
+            )
+            return self.vault.mark_connection_health(
+                expected_revision=expected_connection_revision,
+                connection_id=clean_id,
+                health=ConnectionHealth.REAUTHORIZATION_REQUIRED,
+                observed_at=when,
+            )
+
     def access_tier(self, connection_id: ConnectionId | str) -> ConnectorAccessTier:
         """Read the exact locally selected tier without resolving a credential."""
 
@@ -274,6 +392,22 @@ class ConnectorAuthManager:
             metadata.source_ids,
             metadata.scopes,
         ).access_for_scopes(metadata.scopes)
+
+    def verified_connection_metadata(
+        self,
+        connection_id: ConnectionId | str,
+        *,
+        expected_connection_revision: str | None = None,
+    ) -> ConnectionMetadata:
+        """Resolve metadata only when its provider identity is confirmed and usable."""
+
+        metadata = self._metadata(
+            connection_id,
+            expected_revision=expected_connection_revision,
+        )
+        self._assert_not_revoked(metadata)
+        self._assert_verified_identity(metadata)
+        return metadata
 
     def authorize_oauth(
         self,
@@ -507,17 +641,22 @@ class ConnectorAuthManager:
             port=template.port or 0,
             path=template.path,
         )
+        authorization_may_remain = False
         try:
             config = self._oauth_config(metadata, redirect_uri=listener.redirect_uri)
             attempt = begin_authorization(config)
             listener.configure(config, attempt)
             browser_opened = False
             if resolved_browser_opener is not None:
+                authorization_may_remain = True
                 try:
                     browser_opened = bool(resolved_browser_opener(attempt.authorization_url))
+                    authorization_may_remain = browser_opened
                 except (OSError, RuntimeError, webbrowser.Error):
+                    authorization_may_remain = True
                     browser_opened = False
             if present_authorization_url is not None:
+                authorization_may_remain = True
                 present_authorization_url(attempt.authorization_url, browser_opened)
             elif not browser_opened:
                 raise SetupError(
@@ -531,12 +670,16 @@ class ConnectorAuthManager:
                 code_verifier=attempt.code_verifier,
                 timeout_seconds=min(remaining(), 30.0),
             )
+            issued_at = datetime.now(UTC)
+            credential = credential_from_token_set(token_set, issued_at=issued_at)
+            credential = self._canonicalize_oauth_credential(metadata, credential)
+            self._validate_oauth_credential(metadata, credential)
+        except BaseException as exc:
+            if authorization_may_remain:
+                mark_provider_authorization_may_remain(exc)
+            raise
         finally:
             listener.close()
-        issued_at = datetime.now(UTC)
-        credential = credential_from_token_set(token_set, issued_at=issued_at)
-        credential = self._canonicalize_oauth_credential(metadata, credential)
-        self._validate_oauth_credential(metadata, credential)
         return credential
 
     def publish_new_oauth_connection(
@@ -916,16 +1059,127 @@ class ConnectorAuthManager:
         if metadata.health is ConnectionHealth.REVOKED:
             raise ValidationError("connection is revoked")
 
-    def _host_availability(self, connection_id: ConnectionId) -> str:
+    @staticmethod
+    def _assert_verified_identity(metadata: ConnectionMetadata) -> None:
+        if metadata.health in _VERIFIED_HEALTH and metadata.account.fingerprint is not None:
+            return
+        connection_id = metadata.connection_id
+        if (
+            metadata.health is ConnectionHealth.UNVERIFIED
+            and metadata.account.fingerprint is not None
+        ):
+            raise ValidationError(
+                f"connection identity is not confirmed; run `gsv connectors resume {connection_id}`"
+            )
+        if (
+            metadata.health is ConnectionHealth.REAUTHORIZATION_REQUIRED
+            and metadata.account.fingerprint is not None
+        ):
+            command = ConnectorAuthManager._reauthorization_command(metadata)
+            raise ValidationError(f"connection requires its credential again; run `{command}`")
+        reconnect = ConnectorAuthManager._new_account_command(metadata)
+        if reconnect is None:
+            raise ValidationError(
+                "connection identity is not usable; inspect it with `gsv-auth status`"
+            )
+        raise ValidationError(
+            "connection identity is not usable; run "
+            f"`gsv connectors disconnect {connection_id}`, then `{reconnect}`"
+        )
+
+    def _host_availability(
+        self,
+        connection: ConnectionMetadata,
+    ) -> tuple[str, CustodyStatus | None]:
         try:
-            self.tokens.read(connection_id)
-        except NotFoundError:
-            return "missing"
+            custody = self.inspect_custody(connection)
         except SetupError:
-            return "backend_unavailable"
-        except (OSError, ValidationError):
-            return "invalid"
-        return "available"
+            return "backend_unavailable", None
+        return (
+            {
+                "valid": "available",
+                "missing": "missing",
+                "invalid": "invalid",
+                "pointer_invalid": "invalid",
+            }[custody],
+            custody,
+        )
+
+    @staticmethod
+    def _connect_command(
+        metadata: ConnectionMetadata,
+        *,
+        new_account: bool,
+    ) -> str | None:
+        try:
+            profile = get_profile_for_connection(
+                metadata.provider,
+                metadata.source_ids,
+                metadata.scopes,
+            )
+        except ValidationError:
+            return None
+        return connector_connect_command(
+            profile,
+            metadata.scopes,
+            new_account=new_account,
+        )
+
+    @staticmethod
+    def _new_account_command(metadata: ConnectionMetadata) -> str | None:
+        return ConnectorAuthManager._connect_command(metadata, new_account=True)
+
+    @staticmethod
+    def _reauthorization_command(metadata: ConnectionMetadata) -> str:
+        if metadata.credential_kind is CredentialKind.OAUTH2:
+            return f"gsv connectors reauthorize {metadata.connection_id}"
+        command = ConnectorAuthManager._connect_command(metadata, new_account=False)
+        return command or "gsv-auth status"
+
+    @staticmethod
+    def _recovery_action(
+        metadata: ConnectionMetadata,
+        host_credential: str,
+        custody: CustodyStatus | None,
+    ) -> str | None:
+        connection_id = metadata.connection_id
+        if host_credential == "backend_unavailable":
+            return (
+                "Restore access to the approved OS keyring, then run "
+                f"`gsv connectors status {connection_id}`."
+            )
+        if (
+            metadata.health is ConnectionHealth.UNVERIFIED
+            and metadata.account.fingerprint is not None
+            and custody in {"valid", "missing"}
+        ):
+            return f"gsv connectors resume {connection_id}"
+        if custody == "pointer_invalid" or (
+            custody == "invalid" and metadata.health is ConnectionHealth.UNVERIFIED
+        ):
+            reconnect = ConnectorAuthManager._new_account_command(metadata)
+            if reconnect is None:
+                return "gsv-auth status"
+            return f"gsv connectors disconnect {connection_id}; {reconnect}"
+        if (
+            metadata.health is ConnectionHealth.REAUTHORIZATION_REQUIRED
+            and metadata.account.fingerprint is not None
+        ) or (
+            metadata.health in _VERIFIED_HEALTH
+            and metadata.account.fingerprint is not None
+            and host_credential != "available"
+        ):
+            return ConnectorAuthManager._reauthorization_command(metadata)
+        if (
+            metadata.health in _VERIFIED_HEALTH
+            and metadata.account.fingerprint is not None
+            and host_credential == "available"
+        ):
+            return None
+        reconnect = ConnectorAuthManager._new_account_command(metadata)
+        if reconnect is None:
+            return "gsv-auth status"
+        return f"gsv connectors disconnect {connection_id}; {reconnect}"
 
     def _mark_health(
         self,

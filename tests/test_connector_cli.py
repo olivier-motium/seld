@@ -9,9 +9,11 @@ from types import SimpleNamespace
 import pytest
 
 from continuity_kernel import cli
-from continuity_kernel.connector_onboarding import ConnectorIdentityReview
+from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_onboarding import ConnectorIdentityReview, ConnectorOnboarding
 from continuity_kernel.connector_profiles import ConnectorAccessTier
-from continuity_kernel.errors import SetupError
+from continuity_kernel.connector_secrets import InMemorySecretStore
+from continuity_kernel.errors import SetupError, mark_provider_authorization_may_remain
 from continuity_kernel.vault import Vault
 
 
@@ -86,6 +88,70 @@ def test_connector_list_and_status_are_first_class_json_commands(
         "registration_readiness": fake.registration_readiness(),
         "vault_healthy_independent": True,
     }
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        "account_selection_required",
+        "cancelled",
+        "credential_invalid_reconnect_required",
+        "credential_missing_reconnect_required",
+        "credential_pointer_invalid_reconnect_required",
+        "different_account",
+        "disconnect_cancelled",
+        "identity_binding_missing_reconnect_required",
+        "setup_incomplete",
+    ),
+)
+def test_incomplete_connector_outcomes_are_cli_failures(status: str) -> None:
+    failure = cli._result_failure(
+        Namespace(command="connectors"),
+        {"status": status},
+    )
+
+    assert failure is not None
+    assert failure[0] == 3
+
+
+def test_connector_failure_json_is_not_reported_as_ok(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = tmp_path / "vault"
+    Vault(vault).initialize(name="Connector CLI failure")
+    fake = _Onboarding()
+
+    def different_account(connector: str, **kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "connector": connector,
+            "next": "gsv connectors connect gmail --access read",
+            "status": "different_account",
+        }
+
+    fake.connect_oauth = different_account  # type: ignore[method-assign]
+    _install_fake_onboarding(monkeypatch, fake)
+
+    exit_code = cli.main(
+        [
+            "--json",
+            "--vault",
+            str(vault),
+            "connectors",
+            "connect",
+            "gmail",
+            "--access",
+            "read",
+            "--no-browser",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == 3
+    assert output["ok"] is False
+    assert output["result"]["status"] == "different_account"
 
 
 def test_oauth_connect_passes_firefox_and_manual_url_fallback_without_credentials_in_args(
@@ -179,7 +245,8 @@ def test_disconnect_requires_confirmation_and_explains_local_only_semantics(
     )
 
     result = cli._connectors(vault, args)
-    assert result["status"] == "cancelled"
+    assert result["status"] == "disconnect_cancelled"
+    assert result["next"] == f"gsv connectors status {args.connection_id}"
     assert fake.calls == []
 
     args.yes = True
@@ -188,7 +255,7 @@ def test_disconnect_requires_confirmation_and_explains_local_only_semantics(
     assert fake.calls[0][0] == "disconnect"
 
 
-def test_connector_interrupt_returns_130_with_safe_recovery_instruction(
+def test_preconsent_connector_interrupt_returns_130_without_provider_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -218,9 +285,9 @@ def test_connector_interrupt_returns_130_with_safe_recovery_instruction(
 
     assert result == 130
     stderr = capsys.readouterr().err
-    assert "provider access may remain" in stderr
-    assert "installed apps" in stderr
-    assert "connectors list" in stderr
+    assert "Cancelled." in stderr
+    assert "provider access" not in stderr
+    assert "installed apps" not in stderr
 
 
 def test_connector_resume_and_gmail_purge_step_up_are_explicit(
@@ -523,7 +590,9 @@ def test_connector_reauthorize_interrupt_has_recovery_guidance(
 
     def interrupted(connection_id: str, **kwargs: object) -> dict[str, object]:
         del connection_id, kwargs
-        raise KeyboardInterrupt
+        error = KeyboardInterrupt()
+        mark_provider_authorization_may_remain(error)
+        raise error
 
     fake.reauthorize_oauth = interrupted  # type: ignore[method-assign]
     _install_fake_onboarding(monkeypatch, fake)
@@ -542,17 +611,22 @@ def test_connector_reauthorize_interrupt_has_recovery_guidance(
 
     assert result == 130
     stderr = capsys.readouterr().err
-    assert "provider access may remain" in stderr
+    assert "provider sign-in may have started" in stderr
     assert "connectors list" in stderr
     assert "reauthorizing" in stderr
 
 
-def test_connector_oauth_failure_has_provider_cleanup_guidance(
+@pytest.mark.parametrize("post_consent", [False, True])
+def test_connector_oauth_failure_guidance_is_phase_aware(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    post_consent: bool,
 ) -> None:
     def fail(_args: Namespace) -> object:
-        raise SetupError("synthetic post-consent failure")
+        error = SetupError("synthetic connector failure")
+        if post_consent:
+            mark_provider_authorization_may_remain(error)
+        raise error
 
     monkeypatch.setattr(cli, "_dispatch", fail)
 
@@ -569,6 +643,96 @@ def test_connector_oauth_failure_has_provider_cleanup_guidance(
 
     assert result == 2
     payload = json.loads(capsys.readouterr().err)
-    assert payload["error"] == "synthetic post-consent failure"
-    assert payload["provider_access_may_remain"] is True
-    assert payload["revocation_help"]
+    assert payload["error"] == "synthetic connector failure"
+    if post_consent:
+        assert payload["provider_access_may_remain"] is True
+        assert payload["revocation_help"]
+    else:
+        assert "provider_access_may_remain" not in payload
+        assert "revocation_help" not in payload
+
+
+def test_preconsent_custody_failure_has_no_provider_cleanup_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault_path = tmp_path / "vault"
+    vault = Vault(vault_path)
+    vault.initialize(name="Pre-consent failure")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    monkeypatch.setattr(
+        manager,
+        "probe_credential_custody",
+        lambda: (_ for _ in ()).throw(SetupError("synthetic keyring failure")),
+    )
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=lambda provider: pytest.fail(f"registration reached for {provider}"),
+    )
+    monkeypatch.setattr(cli, "ConnectorAuthManager", lambda current_vault: manager)
+    monkeypatch.setattr(cli, "ConnectorOnboarding", lambda current_manager: onboarding)
+
+    result = cli.main(
+        [
+            "--json",
+            "--vault",
+            str(vault_path),
+            "connectors",
+            "connect",
+            "gmail",
+            "--access",
+            "read",
+        ]
+    )
+
+    assert result == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload == {"error": "synthetic keyring failure", "ok": False}
+
+
+def test_preconsent_custody_interrupt_is_json_safe_and_has_no_cleanup_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault_path = tmp_path / "vault"
+    vault = Vault(vault_path)
+    vault.initialize(name="Pre-consent interruption")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    monkeypatch.setattr(
+        manager,
+        "probe_credential_custody",
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=lambda provider: pytest.fail(f"registration reached for {provider}"),
+    )
+    monkeypatch.setattr(cli, "ConnectorAuthManager", lambda current_vault: manager)
+    monkeypatch.setattr(cli, "ConnectorOnboarding", lambda current_manager: onboarding)
+
+    result = cli.main(
+        [
+            "--json",
+            "--vault",
+            str(vault_path),
+            "connectors",
+            "connect",
+            "gmail",
+            "--access",
+            "read",
+        ]
+    )
+
+    assert result == 130
+    payload = json.loads(capsys.readouterr().err)
+    assert payload == {"error": "cancelled", "ok": False}

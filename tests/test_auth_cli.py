@@ -3,13 +3,22 @@ from __future__ import annotations
 import io
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from continuity_kernel import auth_cli
-from continuity_kernel.connector_auth import CredentialKind
+from continuity_kernel.connector_auth import (
+    AccountMetadata,
+    ClientKind,
+    ClientMetadata,
+    ConnectionHealth,
+    ConnectionMetadata,
+    CredentialKind,
+)
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_identifiers import new_connection_id
 from continuity_kernel.connector_profiles import ConnectorAccessTier, get_profile
 from continuity_kernel.connector_secrets import InMemorySecretStore
 from continuity_kernel.errors import ValidationError
@@ -140,6 +149,50 @@ def test_discord_profile_rejects_oauth_fields_and_keeps_external_custody(
     assert connection.source_ids == ("discord",)
     assert connection.credential_kind is CredentialKind.BEARER
     assert connection.client.identifier is None
+
+
+def test_raw_cli_cannot_replace_a_verified_bearer_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Verified Discord identity")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+    now = datetime.now(UTC)
+    connection_id = new_connection_id()
+    manager.publish_new_bearer_connection(
+        ConnectionMetadata(
+            connection_id=connection_id,
+            provider="discord",
+            source_ids=("discord",),
+            credential_kind=CredentialKind.BEARER,
+            account=AccountMetadata(
+                fingerprint="sha256:" + "a" * 64,
+                label="Verified Discord bot",
+            ),
+            scopes=("seld.discord.full",),
+            client=ClientMetadata(kind=ClientKind.EXTERNAL),
+            health=ConnectionHealth.UNVERIFIED,
+            created_at=now,
+            updated_at=now,
+            version=1,
+        ),
+        b"original-discord-bot-token",
+    )
+    monkeypatch.setattr(sys, "stdin", BinaryInput(b"different-discord-bot-token"))
+
+    with pytest.raises(ValidationError, match="verified connector onboarding"):
+        auth_cli._dispatch(
+            parser.parse_args(["credential", str(connection_id), "--replace"]),
+            manager,
+        )
+
+    assert manager.tokens.read(connection_id).value == b"original-discord-bot-token"
 
 
 def test_manual_oauth_requires_a_built_in_profile(tmp_path: Path) -> None:

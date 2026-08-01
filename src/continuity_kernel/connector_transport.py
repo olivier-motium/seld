@@ -28,6 +28,15 @@ MAX_STREAM_BODY_BYTES: Final = MAX_FILE_TRANSFER_BYTES
 MAX_STREAM_CHUNK_BYTES: Final = 1024 * 1024
 MAX_QUERY_ITEMS: Final = 128
 MAX_HEADER_ITEMS: Final = 24
+SLACK_AUTH_FAILURE_CODES: Final = frozenset(
+    {
+        "account_inactive",
+        "invalid_auth",
+        "not_authed",
+        "token_expired",
+        "token_revoked",
+    }
+)
 
 _PATH = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$")
 _HEADER_VALUE = re.compile(r"^[^\x00-\x1f\x7f]{0,8192}$")
@@ -847,9 +856,13 @@ def _prepared_upload_length(
         raise ValidationError("prepared upload byte offset is invalid")
     if total_length is not None and total_length != source.size:
         raise ValidationError("prepared upload total length does not match its snapshot")
-    length = source.size - byte_offset if content_length is None else _stream_length_value(
-        content_length,
-        label="stream Content-Length",
+    length = (
+        source.size - byte_offset
+        if content_length is None
+        else _stream_length_value(
+            content_length,
+            label="stream Content-Length",
+        )
     )
     if byte_offset + length > source.size:
         raise ValidationError("prepared upload range exceeds its snapshot")

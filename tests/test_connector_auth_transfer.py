@@ -121,7 +121,13 @@ def test_age_export_restore_import_moves_credentials_without_plaintext_leakage(
     )
 
     assert imported["requires_verification"] is True
-    assert target_manager.resolve_credential(CONNECTION_ID) == SENTINEL
+    assert (
+        target_manager.resolve_credential_state(
+            CONNECTION_ID,
+            require_verified_identity=False,
+        ).value
+        == SENTINEL
+    )
     restored = restored_vault.get_connection_snapshot().connection(CONNECTION_ID)
     assert restored is not None
     assert restored.health is ConnectionHealth.UNVERIFIED
@@ -209,7 +215,13 @@ def test_import_resumes_after_metadata_was_committed_but_reported_as_failed(
 
     resumed = import_auth_archive(target_manager, encrypted, identity=identity)
     assert resumed["imported"] is True
-    assert target_manager.resolve_credential(CONNECTION_ID) == SENTINEL
+    assert (
+        target_manager.resolve_credential_state(
+            CONNECTION_ID,
+            require_verified_identity=False,
+        ).value
+        == SENTINEL
+    )
 
 
 def test_export_rejects_connection_drift_before_encrypting(

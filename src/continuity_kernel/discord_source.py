@@ -34,7 +34,7 @@ from continuity_kernel.atomic import (
     sha256_regular_file,
 )
 from continuity_kernel.config import data_dir
-from continuity_kernel.connector_auth import ConnectionHealth, CredentialKind
+from continuity_kernel.connector_auth import CredentialKind
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_identifiers import ConnectionId, parse_connection_id
 from continuity_kernel.connector_token_store import TokenState
@@ -491,11 +491,10 @@ class DiscordSourceBridge:
             raise ValidationError("Discord connection does not authorize the Discord source")
         if metadata.credential_kind is not CredentialKind.BEARER:
             raise ValidationError("Discord connection must use a bearer bot token")
-        if metadata.health in {
-            ConnectionHealth.REAUTHORIZATION_REQUIRED,
-            ConnectionHealth.REVOKED,
-        }:
-            raise ValidationError("Discord connection requires reauthorization")
+        self.auth_manager.verified_connection_metadata(
+            connection_id,
+            expected_connection_revision=snapshot.revision,
+        )
         return snapshot.revision
 
     def _provider_environment(

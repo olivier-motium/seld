@@ -210,7 +210,10 @@ def _runtime(
         provider="slack",
         source_ids=profile.source_ids,
         credential_kind=profile.credential_kind,
-        account=AccountMetadata(label="Configured Slack Full"),
+        account=AccountMetadata(
+            fingerprint="sha256:" + "b" * 64,
+            label="Configured Slack Full",
+        ),
         scopes=scopes,
         client=ClientMetadata(
             kind=ClientKind.PUBLIC,

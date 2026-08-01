@@ -5,6 +5,7 @@ import pytest
 from continuity_kernel.connector_profiles import (
     CONNECTOR_PROFILES,
     ConnectorAccessTier,
+    connector_connect_command,
     get_connector_profile,
     get_profile,
     get_profile_for_connection,
@@ -129,6 +130,21 @@ def test_supplemental_grant_is_only_available_on_supported_full_profiles() -> No
         get_profile("google").scopes_for("read", include_supplemental=True)
     with pytest.raises(ValidationError, match="no supplemental"):
         get_profile("microsoft").scopes_for("full", include_supplemental=True)
+
+
+def test_connector_connect_command_preserves_selected_capability_and_account() -> None:
+    gmail = get_connector_profile("gmail")
+    scopes = gmail.scopes_for("full", include_supplemental=True)
+
+    assert connector_connect_command(
+        gmail,
+        scopes,
+        new_account=True,
+        connection_id="con_0123456789ABCDEFGHJKMNPQRS",
+    ) == (
+        "gsv connectors connect gmail --access full --with-permanent-delete "
+        "--new-account --connection-id con_0123456789ABCDEFGHJKMNPQRS"
+    )
 
 
 def test_logical_connector_profiles_are_finite_single_source_least_authority_profiles() -> None:

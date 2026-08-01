@@ -80,7 +80,10 @@ def _runtime(
         provider="google",
         source_ids=profile.source_ids,
         credential_kind=profile.credential_kind,
-        account=AccountMetadata(label="Configured Google Full"),
+        account=AccountMetadata(
+            fingerprint="sha256:" + "c" * 64,
+            label="Configured Google Full",
+        ),
         scopes=full_scopes,
         client=ClientMetadata(
             kind=ClientKind.PUBLIC,

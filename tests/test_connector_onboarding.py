@@ -71,6 +71,42 @@ def _identity(provider: str, fingerprint: str = FP_ONE) -> ConnectorIdentity:
     )
 
 
+def test_custody_is_probed_before_any_provider_interaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    probes = 0
+
+    def unavailable_custody() -> None:
+        nonlocal probes
+        probes += 1
+        raise SetupError("synthetic custody unavailable")
+
+    monkeypatch.setattr(manager, "probe_credential_custody", unavailable_custody)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=lambda provider: pytest.fail("registration loading reached"),
+        identity_verifier=lambda provider, credential: pytest.fail("provider identity reached"),
+    )
+
+    with pytest.raises(SetupError, match="custody unavailable"):
+        onboarding.connect_oauth(
+            "gmail",
+            access="read",
+            new_account=True,
+            confirm_identity=lambda review: pytest.fail("confirmation reached"),
+        )
+    with pytest.raises(SetupError, match="custody unavailable"):
+        onboarding.connect_discord(
+            b"synthetic-discord-bot-token",
+            access="full",
+            confirm_identity=lambda review: pytest.fail("confirmation reached"),
+        )
+
+    assert probes == 2
+
+
 def _credential(scopes: tuple[str, ...]) -> OAuthCredential:
     now = datetime.now(UTC)
     return OAuthCredential(
@@ -211,7 +247,8 @@ def test_oauth_stays_transient_until_identity_confirmation_and_denial_saves_noth
     assert result["status"] == "cancelled"
     assert result["nothing_saved"] is True
     assert result["provider_access_may_remain"] is True
-    assert "third-party access" in cast(str, result["next"])
+    assert result["next"] == "gsv connectors connect gmail --access read"
+    assert "third-party access" in cast(str, result["revocation_help"])
     assert manager.vault.get_connection_snapshot().connections == ()
     assert cast(ConnectionMetadata, observed["metadata"]).account.fingerprint is None
 
@@ -300,7 +337,8 @@ def test_wrong_account_upgrade_aborts_and_explicit_new_account_keeps_both(
     assert reviewed == ["Ada <ada@example.test>"]
     assert different["status"] == "different_account"
     assert different["nothing_saved"] is True
-    assert "--new-account" in cast(str, different["next"])
+    assert different["next"] == "gsv connectors connect outlook_calendar --access full"
+    assert "--new-account" in cast(str, different["new_account"])
     assert manager.vault.get_connection_snapshot().connection(old.connection_id) is not None
 
     connected = onboarding.connect_oauth(
@@ -339,7 +377,10 @@ def test_same_account_upgrade_keeps_read_ready_until_full_is_published_then_remo
         snapshot = manager.vault.get_connection_snapshot()
         current = snapshot.connection(old.connection_id)
         assert current is not None and current.health is ConnectionHealth.READY
-        assert manager.resolve_oauth_access_token(old.connection_id) == "transient-provider-token"
+        assert (
+            manager.resolve_oauth_access_token_state(old.connection_id).access_token
+            == "transient-provider-token"
+        )
         return real_publish(metadata, credential)
 
     monkeypatch.setattr(manager, "publish_new_oauth_connection", publish)
@@ -540,7 +581,8 @@ def test_resume_shows_wrong_identity_before_returning_exact_retry(
     assert reviewed == ["Ada <ada@example.test>"]
     assert result["status"] == "different_account"
     assert result["connection_id"] == str(pending.connection_id)
-    assert "--new-account" in cast(str, result["next"])
+    assert result["next"] == f"gsv connectors resume {pending.connection_id}"
+    assert "--new-account" in cast(str, result["new_account"])
     current = manager.vault.get_connection_snapshot().connection(pending.connection_id)
     assert current is not None and current.health is ConnectionHealth.UNVERIFIED
 
@@ -563,6 +605,82 @@ def test_list_and_disconnected_status_include_registration_readiness(
         "gsv connectors connect gmail --access read",
         "gsv connectors connect gmail --access full",
     ]
+
+
+def test_catalog_counts_only_usable_accounts_as_connected(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.READ,
+        fingerprint=FP_ONE,
+    )
+    needs_attention = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.READ,
+        fingerprint=FP_TWO,
+    )
+    missing_identity = _unverified_oauth(
+        manager,
+        "gmail",
+        with_credential=True,
+        fingerprint=None,
+    )
+    snapshot = manager.vault.get_connection_snapshot()
+    manager.vault.mark_connection_health(
+        expected_revision=snapshot.revision,
+        connection_id=missing_identity.connection_id,
+        health=ConnectionHealth.READY,
+    )
+    snapshot = manager.vault.get_connection_snapshot()
+    manager.vault.mark_connection_health(
+        expected_revision=snapshot.revision,
+        connection_id=needs_attention.connection_id,
+        health=ConnectionHealth.REAUTHORIZATION_REQUIRED,
+    )
+
+    listed = ConnectorOnboarding(manager, registration_loader=_registration).list()
+    catalog = cast(list[dict[str, object]], listed["connector_catalog"])
+    gmail = next(row for row in catalog if row["connector"] == "gmail")
+
+    assert gmail == {
+        "connected_accounts": 1,
+        "configured_accounts": 3,
+        "connector": "gmail",
+        "credential_kind": "oauth2",
+        "needs_attention_accounts": 2,
+        "registration": {"sign_in": "available", "status": "ready"},
+        "status": "connected_with_attention",
+    }
+
+
+def test_catalog_rejects_a_mixed_connection_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    connection = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.READ,
+    )
+    status = manager.status
+
+    def racing_status() -> dict[str, object]:
+        result = status()
+        snapshot = manager.vault.get_connection_snapshot()
+        manager.vault.mark_connection_health(
+            expected_revision=snapshot.revision,
+            connection_id=connection.connection_id,
+            health=ConnectionHealth.DEGRADED,
+        )
+        return result
+
+    monkeypatch.setattr(manager, "status", racing_status)
+
+    with pytest.raises(ConflictError, match="status changed"):
+        ConnectorOnboarding(manager, registration_loader=_registration).list()
 
 
 def test_failed_upgrade_cleanup_keeps_both_connections_visible(
@@ -623,7 +741,11 @@ def test_discord_is_full_only_verifies_bot_and_never_persists_before_confirmatio
         confirm_identity=lambda review: False,
     )
 
+    assert result["status"] == "cancelled"
     assert result["nothing_saved"] is True
+    assert result["next"] == "gsv connectors connect discord --access full"
+    assert "provider_access_may_remain" not in result
+    assert "revocation_help" not in result
     assert observed == {"provider": "discord", "scheme": AuthorizationScheme.BOT}
     assert manager.vault.get_connection_snapshot().connections == ()
 
@@ -720,7 +842,7 @@ def test_discord_same_bot_reconnect_reuses_connection_and_refreshes_credential(
     assert second["connection_id"] == first["connection_id"]
     assert third["status"] == "already_connected"
     assert third["connection_id"] == first["connection_id"]
-    assert manager.resolve_credential(cast(str, first["connection_id"])) == (
+    assert manager.resolve_credential_state(cast(str, first["connection_id"])).value == (
         b"discord-bot-token-v3"
     )
     snapshot = manager.vault.get_connection_snapshot()
@@ -802,7 +924,13 @@ def test_discord_stuck_unverified_same_bot_returns_resume_instead_of_duplicate(
     assert retry["connection_id"] == connection_id
     assert retry["next"] == f"gsv connectors resume {connection_id}"
     assert len(manager.vault.get_connection_snapshot().connections) == 1
-    assert manager.resolve_credential_state(connection_id) == before
+    assert (
+        manager.resolve_credential_state(
+            connection_id,
+            require_verified_identity=False,
+        )
+        == before
+    )
 
     resumed = onboarding.resume(connection_id, confirm_identity=lambda review: True)
     assert resumed["status"] == "connected"
@@ -864,6 +992,12 @@ def test_discord_different_bot_requires_explicit_new_account(
         confirm_identity=lambda review: True,
     )
     connection_id = cast(str, first["connection_id"])
+    assert first["next"] == "gsv discord-source binding-status"
+    assert first["source_status"] == "source_setup_required"
+    source_setup = cast(dict[str, object], first["source_setup"])
+    assert source_setup["connection_id"] == connection_id
+    assert "does not package or recommend" in cast(str, source_setup["blocker"])
+    assert "then" not in first and "required_configuration" not in first
     before = manager.resolve_credential_state(connection_id)
 
     second = onboarding.connect_discord(
@@ -874,6 +1008,7 @@ def test_discord_different_bot_requires_explicit_new_account(
 
     assert second["status"] == "different_account"
     assert second["nothing_saved"] is True
+    assert "provider_access_may_remain" not in second
     after = manager.resolve_credential_state(connection_id)
     assert after.state.version == before.state.version
     assert after.value == before.value
@@ -984,6 +1119,46 @@ def test_legacy_google_bundle_reports_held_permanent_delete_capability(tmp_path:
 
     assert row["connector"] == "legacy_provider_bundle"
     assert row["permanent_delete"] is True
+
+
+def test_missing_legacy_bundle_custody_returns_executable_fallback(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    profile = get_profile("google")
+    now = datetime.now(UTC)
+    metadata = ConnectionMetadata(
+        connection_id=new_connection_id(),
+        provider=profile.provider,
+        source_ids=profile.source_ids,
+        credential_kind=profile.credential_kind,
+        account=AccountMetadata(fingerprint=FP_ONE, label="google:legacy"),
+        scopes=profile.read_scopes,
+        client=ClientMetadata(
+            kind=ClientKind.PUBLIC,
+            identifier="google-public-client",
+            redirect_uris=(_registration("google").redirect_template,),
+            authorization_endpoint=profile.authorization_endpoint,
+            token_endpoint=profile.token_endpoint,
+        ),
+        health=ConnectionHealth.UNVERIFIED,
+        created_at=now,
+        updated_at=now,
+        version=1,
+    )
+    snapshot = manager.vault.get_connection_snapshot()
+    manager.vault.put_connection(
+        expected_revision=snapshot.revision,
+        connection=metadata,
+        observed_at=now,
+    )
+
+    result = ConnectorOnboarding(manager, registration_loader=_registration).resume(
+        str(metadata.connection_id),
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result["status"] == "credential_missing_reconnect_required"
+    assert result["next"] == "gsv-auth status"
+    assert manager.vault.get_connection_snapshot().connection(metadata.connection_id) is None
 
 
 def test_read_preflight_prefers_a_healthy_sufficient_grant_over_broken_broader_grant(

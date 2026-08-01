@@ -67,7 +67,10 @@ def _prepared(
         provider=provider,
         source_ids=(source_id,),
         credential_kind=CredentialKind.OAUTH2,
-        account=AccountMetadata(label="Synthetic account"),
+        account=AccountMetadata(
+            fingerprint="sha256:" + "a" * 64,
+            label="Synthetic account",
+        ),
         scopes=scopes,
         client=ClientMetadata(
             kind=ClientKind.PUBLIC,
@@ -84,10 +87,11 @@ def _prepared(
             authorization_endpoint=authorization_endpoint,
             token_endpoint=token_endpoint or default_token_endpoint,
         ),
-        health=ConnectionHealth.UNKNOWN,
+        health=ConnectionHealth.READY,
         created_at=BASE_TIME,
         updated_at=BASE_TIME,
         version=1,
+        last_verified_at=BASE_TIME,
     )
     vault.put_connection(
         expected_revision=vault.get_connection_snapshot().revision,
@@ -738,6 +742,99 @@ def test_private_provider_failures_reduce_to_fixed_error_receipts(
     assert malformed["errorCode"] == "read_failed"
     assert malformed["items"] == []
     assert PRIVATE_BODY not in json.dumps(malformed, sort_keys=True)
+
+
+def test_unverified_connection_is_refused_before_provider_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, manager, connection_id = _prepared(
+        tmp_path,
+        source_id="gmail",
+        provider="google",
+        marker="u",
+    )
+    snapshot = vault.get_connection_snapshot()
+    vault.mark_connection_health(
+        expected_revision=snapshot.revision,
+        connection_id=connection_id,
+        health=ConnectionHealth.UNVERIFIED,
+        observed_at=BASE_TIME.replace(microsecond=1),
+    )
+    provider_calls = 0
+
+    def provider_must_not_run(
+        url: str,
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> object:
+        nonlocal provider_calls
+        del url, headers, timeout
+        provider_calls += 1
+        pytest.fail("provider access reached")
+
+    _install_reader(
+        monkeypatch,
+        vault=vault,
+        manager=manager,
+        get_json=provider_must_not_run,
+    )
+
+    failure = read_connector_source(
+        vault,
+        connection_id=str(connection_id),
+        source_id="gmail",
+        observed_at=BASE_TIME,
+    )
+
+    assert failure["errorCode"] == "auth_required"
+    assert provider_calls == 0
+
+
+def test_provider_auth_rejection_requires_reauthorization_before_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SLACK_CHANNEL_ID", "C123456789")
+    vault, manager, connection_id = _prepared(
+        tmp_path,
+        source_id="slack",
+        provider="slack",
+        marker="v",
+    )
+    provider_calls = 0
+
+    def invalid_auth(
+        url: str,
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> object:
+        nonlocal provider_calls
+        del headers, timeout
+        assert url.endswith("/auth.test")
+        provider_calls += 1
+        return {"ok": False, "error": "invalid_auth"}
+
+    _install_reader(monkeypatch, vault=vault, manager=manager, get_json=invalid_auth)
+    first = read_connector_source(
+        vault,
+        connection_id=str(connection_id),
+        source_id="slack",
+        observed_at=BASE_TIME,
+    )
+    second = read_connector_source(
+        vault,
+        connection_id=str(connection_id),
+        source_id="slack",
+        observed_at=BASE_TIME,
+    )
+
+    connection = vault.get_connection_snapshot().connection(connection_id)
+    assert first["errorCode"] == "auth_expired"
+    assert second["errorCode"] == "auth_required"
+    assert connection is not None
+    assert connection.health is ConnectionHealth.REAUTHORIZATION_REQUIRED
+    assert provider_calls == 1
 
 
 def test_slack_reads_one_exact_channel_with_portable_user_oauth(

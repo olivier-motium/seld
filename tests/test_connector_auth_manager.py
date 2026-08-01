@@ -23,7 +23,11 @@ from continuity_kernel.connector_auth import (
 )
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_credentials import OAuthCredential
-from continuity_kernel.connector_identifiers import ConnectionId, parse_connection_id
+from continuity_kernel.connector_identifiers import (
+    ConnectionId,
+    SecretName,
+    parse_connection_id,
+)
 from continuity_kernel.connector_oauth import (
     OAuthTokenEndpointError,
     OAuthTokenSet,
@@ -49,13 +53,57 @@ GOOGLE_ACCOUNT_FINGERPRINT = "sha256:" + "f" * 64
 MICROSOFT_ACCOUNT_FINGERPRINT = "sha256:" + "e" * 64
 
 
+class _AmbiguousProbeStore(InMemorySecretStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_calls = 0
+
+    def set_secret(
+        self,
+        connection_id: ConnectionId,
+        name: SecretName,
+        value: bytes,
+    ) -> None:
+        super().set_secret(connection_id, name, value)
+        if name == "readiness-probe":
+            raise SetupError("synthetic ambiguous keyring write")
+
+    def delete_secret(self, connection_id: ConnectionId, name: SecretName) -> None:
+        self.cleanup_calls += 1
+        super().delete_secret(connection_id, name)
+
+    @property
+    def retained_values(self) -> int:
+        return len(self._values)
+
+
+class _InterruptedProbeStore(InMemorySecretStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.interruption = KeyboardInterrupt()
+
+    def set_secret(
+        self,
+        connection_id: ConnectionId,
+        name: SecretName,
+        value: bytes,
+    ) -> None:
+        super().set_secret(connection_id, name, value)
+        if name == "readiness-probe":
+            raise self.interruption
+
+    @property
+    def retained_values(self) -> int:
+        return len(self._values)
+
+
 def _manager(
     tmp_path: Path,
     *,
     redirect_port: int = 0,
     scopes: tuple[str, ...] = (GOOGLE_SCOPE,),
-    fingerprint: str | None = None,
-    health: ConnectionHealth = ConnectionHealth.UNKNOWN,
+    fingerprint: str | None = GOOGLE_ACCOUNT_FINGERPRINT,
+    health: ConnectionHealth = ConnectionHealth.READY,
 ) -> ConnectorAuthManager:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Portable auth")
@@ -107,8 +155,8 @@ def _manager(
 def _microsoft_manager(
     tmp_path: Path,
     *,
-    fingerprint: str | None = None,
-    health: ConnectionHealth = ConnectionHealth.UNKNOWN,
+    fingerprint: str | None = MICROSOFT_ACCOUNT_FINGERPRINT,
+    health: ConnectionHealth = ConnectionHealth.READY,
 ) -> ConnectorAuthManager:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Portable Microsoft auth")
@@ -132,6 +180,45 @@ def _microsoft_manager(
         updated_at=BASE_TIME,
         version=1,
         last_verified_at=(BASE_TIME if fingerprint is not None else None),
+    )
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=metadata,
+        observed_at=BASE_TIME,
+    )
+    return ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+
+
+def _discord_manager(
+    tmp_path: Path,
+    *,
+    health: ConnectionHealth = ConnectionHealth.READY,
+    fingerprint: str | None = GOOGLE_ACCOUNT_FINGERPRINT,
+    scopes: tuple[str, ...] | None = None,
+) -> ConnectorAuthManager:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Portable Discord auth")
+    profile = get_profile("discord")
+    metadata = ConnectionMetadata(
+        connection_id=CONNECTION_ID,
+        provider=profile.provider,
+        source_ids=profile.source_ids,
+        credential_kind=profile.credential_kind,
+        account=AccountMetadata(
+            fingerprint=fingerprint,
+            label="Synthetic Discord bot",
+        ),
+        scopes=profile.full_scopes if scopes is None else scopes,
+        client=ClientMetadata(kind=ClientKind.EXTERNAL),
+        health=health,
+        created_at=BASE_TIME,
+        updated_at=BASE_TIME,
+        version=1,
+        last_verified_at=BASE_TIME if fingerprint is not None else None,
     )
     vault.put_connection(
         expected_revision=vault.get_connection_snapshot().revision,
@@ -182,6 +269,204 @@ def _import_oauth_credential(
     metadata = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
     assert metadata is not None
     return manager.ensure_imported_credential(metadata, credential.to_bytes())
+
+
+@pytest.mark.parametrize(
+    ("health", "message"),
+    (
+        (ConnectionHealth.UNVERIFIED, "gsv connectors resume"),
+        (ConnectionHealth.REAUTHORIZATION_REQUIRED, "gsv connectors reauthorize"),
+        (ConnectionHealth.UNKNOWN, "--new-account"),
+    ),
+)
+def test_runtime_resolution_requires_a_verified_identity(
+    tmp_path: Path,
+    health: ConnectionHealth,
+    message: str,
+) -> None:
+    manager = _manager(tmp_path, health=health)
+    _import_oauth_credential(manager, _expired_credential())
+
+    with pytest.raises(ValidationError, match=message):
+        manager.resolve_oauth_access_token_state(
+            CONNECTION_ID,
+            observed_at=BASE_TIME,
+        )
+
+
+def test_degraded_verified_identity_remains_runtime_usable(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, health=ConnectionHealth.DEGRADED)
+    credential = replace(
+        _expired_credential(),
+        expires_at=BASE_TIME + timedelta(hours=1),
+    )
+    _import_oauth_credential(manager, credential)
+
+    resolved = manager.resolve_oauth_access_token_state(
+        CONNECTION_ID,
+        observed_at=BASE_TIME,
+    )
+
+    assert resolved.access_token == credential.access_token
+
+
+def test_custody_probe_cleans_up_an_ambiguous_write(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "probe-vault")
+    vault.initialize(name="Custody probe")
+    store = _AmbiguousProbeStore()
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=store,
+        state_root=tmp_path / "probe-state",
+    )
+
+    with pytest.raises(SetupError, match="ambiguous keyring write"):
+        manager.probe_credential_custody()
+
+    assert store.cleanup_calls == 1
+    assert store.retained_values == 0
+
+
+def test_custody_probe_cleans_up_and_preserves_an_interruption(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "interrupted-probe-vault")
+    vault.initialize(name="Interrupted custody probe")
+    store = _InterruptedProbeStore()
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=store,
+        state_root=tmp_path / "interrupted-probe-state",
+    )
+
+    with pytest.raises(KeyboardInterrupt) as failure:
+        manager.probe_credential_custody()
+
+    assert failure.value is store.interruption
+    assert store.retained_values == 0
+
+
+def test_status_parse_validates_oauth_custody_and_gives_recovery(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.tokens.update(
+        CONNECTION_ID,
+        expected_version=0,
+        value=b"not-an-oauth-credential",
+    )
+
+    rows = manager.status()["connections"]
+
+    assert isinstance(rows, list)
+    assert rows[0]["host_credential"] == "invalid"
+    assert rows[0]["next"] == f"gsv connectors reauthorize {CONNECTION_ID}"
+
+
+def test_status_requires_disconnect_for_an_invalid_credential_pointer(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    _import_oauth_credential(manager, _expired_credential())
+    state_path = manager.tokens.root / "state" / f"{CONNECTION_ID}.json"
+    state_path.write_text("not-json", encoding="utf-8")
+
+    rows = manager.status()["connections"]
+
+    assert isinstance(rows, list)
+    assert rows[0]["host_credential"] == "invalid"
+    assert rows[0]["next"] == (
+        f"gsv connectors disconnect {CONNECTION_ID}; "
+        "gsv connectors connect gmail --access read --new-account"
+    )
+
+
+def test_status_reconnects_legacy_ready_connection_without_verified_identity(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(
+        tmp_path,
+        fingerprint=None,
+        health=ConnectionHealth.READY,
+    )
+    _import_oauth_credential(manager, _expired_credential())
+
+    rows = manager.status()["connections"]
+
+    assert isinstance(rows, list)
+    assert rows[0]["host_credential"] == "available"
+    assert rows[0]["next"] == (
+        f"gsv connectors disconnect {CONNECTION_ID}; "
+        "gsv connectors connect gmail --access read --new-account"
+    )
+
+
+def test_legacy_provider_bundle_recovery_never_emits_unsupported_connector(
+    tmp_path: Path,
+) -> None:
+    manager = _microsoft_manager(
+        tmp_path,
+        fingerprint=None,
+        health=ConnectionHealth.READY,
+    )
+
+    rows = manager.status()["connections"]
+
+    assert isinstance(rows, list)
+    assert rows[0]["next"] == (f"gsv connectors disconnect {CONNECTION_ID}; gsv-auth status")
+
+    with pytest.raises(ValidationError, match="then `gsv-auth status`"):
+        manager.resolve_oauth_access_token_state(CONNECTION_ID)
+
+
+def test_status_reconnects_a_missing_discord_credential_without_oauth_language(
+    tmp_path: Path,
+) -> None:
+    manager = _discord_manager(tmp_path)
+
+    rows = manager.status()["connections"]
+
+    assert isinstance(rows, list)
+    assert rows[0]["host_credential"] == "missing"
+    assert rows[0]["next"] == "gsv connectors connect discord --access full"
+
+
+def test_legacy_empty_scope_discord_recovery_always_uses_full_access(tmp_path: Path) -> None:
+    manager = _discord_manager(
+        tmp_path,
+        health=ConnectionHealth.UNKNOWN,
+        fingerprint=None,
+        scopes=(),
+    )
+
+    rows = manager.status()["connections"]
+
+    assert isinstance(rows, list)
+    assert rows[0]["next"] == (
+        f"gsv connectors disconnect {CONNECTION_ID}; "
+        "gsv connectors connect discord --access full --new-account"
+    )
+
+
+def test_stale_provider_auth_rejection_cannot_downgrade_a_rotated_credential(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    original = _import_oauth_credential(manager, _expired_credential())
+    snapshot = manager.vault.get_connection_snapshot()
+    manager.tokens.update(
+        CONNECTION_ID,
+        expected_version=original.version,
+        value=replace(
+            _expired_credential(),
+            access_token="replacement-access",
+        ).to_bytes(),
+    )
+
+    with pytest.raises(ConflictError, match="credential changed"):
+        manager.mark_reauthorization_required(
+            CONNECTION_ID,
+            expected_connection_revision=snapshot.revision,
+            expected_token_version=original.version,
+        )
+
+    current = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert current is not None
+    assert current.health is ConnectionHealth.READY
 
 
 def _rotation_manager(
@@ -253,9 +538,11 @@ def test_concurrent_refresh_uses_a_rotating_provider_token_once(
     with ThreadPoolExecutor(max_workers=20) as executor:
         results = list(
             executor.map(
-                lambda _index: manager.resolve_oauth_access_token(
-                    CONNECTION_ID,
-                    observed_at=observed_at,
+                lambda _index: (
+                    manager.resolve_oauth_access_token_state(
+                        CONNECTION_ID,
+                        observed_at=observed_at,
+                    ).access_token
                 ),
                 range(20),
             )
@@ -291,7 +578,7 @@ def test_invalid_refresh_preserves_secret_and_marks_reauthorization(
 
     monkeypatch.setattr(connector_oauth, "_post_form", invalid_grant)
     with pytest.raises(OAuthTokenEndpointError) as failure:
-        manager.resolve_oauth_access_token(
+        manager.resolve_oauth_access_token_state(
             CONNECTION_ID,
             observed_at=BASE_TIME + timedelta(hours=1),
         )
@@ -328,7 +615,7 @@ def test_refresh_error_downgrade_advances_a_stale_observation(
 
     monkeypatch.setattr(connector_oauth, "_post_form", reject_refresh)
     with pytest.raises(OAuthTokenEndpointError, match="invalid_grant"):
-        manager.resolve_oauth_access_token(
+        manager.resolve_oauth_access_token_state(
             CONNECTION_ID,
             observed_at=before_metadata.updated_at,
         )
@@ -373,13 +660,13 @@ def test_refresh_sink_rejects_a_connection_swap_and_unpinned_endpoint(
 
     monkeypatch.setattr(connector_oauth, "_post_form", leak_refresh_token)
     with pytest.raises(ConflictError, match="connection changed"):
-        manager.resolve_oauth_access_token(
+        manager.resolve_oauth_access_token_state(
             CONNECTION_ID,
             expected_connection_revision=safe_snapshot.revision,
             observed_at=BASE_TIME + timedelta(hours=1),
         )
     with pytest.raises(ValidationError, match="built-in provider"):
-        manager.resolve_oauth_access_token(
+        manager.resolve_oauth_access_token_state(
             CONNECTION_ID,
             expected_connection_revision=manager.vault.get_connection_snapshot().revision,
             observed_at=BASE_TIME + timedelta(hours=1),
@@ -502,7 +789,139 @@ def test_oauth_acquisition_survives_browser_failure_without_persisting(
     assert manager.tokens.state(CONNECTION_ID) is None
     unchanged = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
     assert unchanged is not None
-    assert unchanged.health is ConnectionHealth.UNKNOWN
+    assert unchanged.health is ConnectionHealth.READY
+
+
+def test_oauth_failure_is_annotated_only_after_authorization_was_presented(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    metadata = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert metadata is not None
+
+    class Listener:
+        redirect_uri = "http://127.0.0.1:48123"
+
+        def configure(self, config: object, attempt: object) -> None:
+            del config, attempt
+
+        def wait_for_code(self, *, timeout_seconds: float) -> str:
+            assert timeout_seconds > 0
+            raise SetupError("synthetic callback failure")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.BoundLoopbackCallback.bind",
+        lambda **_values: Listener(),
+    )
+
+    with pytest.raises(SetupError, match="synthetic callback failure") as failure:
+        manager.acquire_oauth_credential(
+            metadata,
+            browser_opener=lambda _url: True,
+        )
+
+    assert failure.value.provider_authorization_may_remain is True
+
+
+def test_browser_open_interruption_retains_provider_cleanup_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    metadata = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert metadata is not None
+
+    class Listener:
+        redirect_uri = "http://127.0.0.1:48123"
+
+        def configure(self, config: object, attempt: object) -> None:
+            del config, attempt
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.BoundLoopbackCallback.bind",
+        lambda **_values: Listener(),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as failure:
+        manager.acquire_oauth_credential(
+            metadata,
+            browser_opener=lambda _url: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+
+    assert getattr(failure.value, "provider_authorization_may_remain", False) is True
+
+
+@pytest.mark.parametrize(
+    ("token_set", "message"),
+    (
+        (
+            OAuthTokenSet(
+                access_token="post-exchange-access",
+                refresh_token="post-exchange-refresh",
+                token_type=OAuthTokenType.BEARER,
+                expires_in_seconds=3600,
+                scopes=("unexpected.scope",),
+            ),
+            "scopes",
+        ),
+        (
+            OAuthTokenSet(
+                access_token="post-exchange-access",
+                refresh_token="post-exchange-refresh",
+                token_type=OAuthTokenType.BEARER,
+                expires_in_seconds=10**100,
+                scopes=(GOOGLE_SCOPE,),
+            ),
+            "supported time range",
+        ),
+    ),
+)
+def test_post_exchange_validation_retains_provider_cleanup_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    token_set: OAuthTokenSet,
+    message: str,
+) -> None:
+    manager = _manager(tmp_path)
+    metadata = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert metadata is not None
+
+    class Listener:
+        redirect_uri = "http://127.0.0.1:48123"
+
+        def configure(self, config: object, attempt: object) -> None:
+            del config, attempt
+
+        def wait_for_code(self, *, timeout_seconds: float) -> str:
+            assert timeout_seconds > 0
+            return "one-time-code"
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.BoundLoopbackCallback.bind",
+        lambda **_values: Listener(),
+    )
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.exchange_authorization_code",
+        lambda *args, **kwargs: token_set,
+    )
+
+    with pytest.raises(ValidationError, match=message) as failure:
+        manager.acquire_oauth_credential(
+            metadata,
+            browser_opener=lambda _url: True,
+        )
+
+    assert failure.value.provider_authorization_may_remain is True
 
 
 def test_authorize_downgrades_before_token_publish_and_can_resume_after_failure(
@@ -1337,7 +1756,7 @@ def test_interrupted_removal_leaves_a_terminal_retryable_revocation(
     assert connection.health is ConnectionHealth.REVOKED
     assert manager.tokens.read(CONNECTION_ID).value == _expired_credential().to_bytes()
     with pytest.raises(ValidationError, match="revoked"):
-        manager.resolve_oauth_access_token(CONNECTION_ID)
+        manager.resolve_oauth_access_token_state(CONNECTION_ID)
 
     removed = manager.remove(CONNECTION_ID, expected_revision=interrupted.revision)
     assert removed["connections"] == []

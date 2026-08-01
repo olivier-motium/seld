@@ -91,6 +91,39 @@ class ConnectorProfile:
         }
 
 
+def connector_connect_command(
+    profile: ConnectorProfile,
+    scopes: Sequence[str],
+    *,
+    new_account: bool = False,
+    connection_id: str | None = None,
+    access: ConnectorAccessTier | None = None,
+    include_permanent_delete: bool | None = None,
+) -> str:
+    """Build the canonical guided-onboarding command for one profile."""
+
+    if profile.name not in CONNECTOR_PROFILES:
+        return "gsv-auth status"
+    selected_access = access or (
+        ConnectorAccessTier.FULL
+        if profile.name == "discord"
+        else profile.access_for_scopes(tuple(scopes))
+    )
+    command = f"gsv connectors connect {profile.name} --access {selected_access.value}"
+    has_permanent_delete_scope = any(scope in scopes for scope in profile.supplemental_scopes)
+    if profile.name == "gmail" and (
+        include_permanent_delete
+        if include_permanent_delete is not None
+        else has_permanent_delete_scope
+    ):
+        command += " --with-permanent-delete"
+    if new_account:
+        command += " --new-account"
+    if connection_id is not None:
+        command += f" --connection-id {connection_id}"
+    return command
+
+
 PROFILES: Final[Mapping[str, ConnectorProfile]] = MappingProxyType(
     {
         "discord": ConnectorProfile(

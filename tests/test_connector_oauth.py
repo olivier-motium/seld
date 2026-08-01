@@ -944,3 +944,21 @@ def test_persisted_oauth_credential_has_absolute_expiry_and_strict_shape() -> No
     malformed["provider_payload"] = "forbidden"
     with pytest.raises(ValidationError, match="unsupported shape"):
         OAuthCredential.from_bytes(json.dumps(malformed).encode())
+
+
+def test_oauth_expiry_rejects_the_first_second_beyond_datetime_capacity() -> None:
+    issued_at = datetime(2026, 1, 1, tzinfo=UTC)
+    remaining = datetime.max.replace(tzinfo=UTC) - issued_at
+    first_overflowing_second = remaining.days * 86_400 + remaining.seconds + 1
+
+    with pytest.raises(ValidationError, match="supported time range"):
+        credential_from_token_set(
+            OAuthTokenSet(
+                access_token="bounded-access",
+                token_type=OAuthTokenType.BEARER,
+                refresh_token="bounded-refresh",
+                expires_in_seconds=first_overflowing_second,
+                scopes=("messages.read",),
+            ),
+            issued_at=issued_at,
+        )

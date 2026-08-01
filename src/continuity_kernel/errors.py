@@ -6,6 +6,14 @@ from __future__ import annotations
 class ContinuityError(Exception):
     """Base class for expected, user-actionable failures."""
 
+    provider_authorization_may_remain = False
+
+
+def mark_provider_authorization_may_remain(error: BaseException) -> None:
+    """Annotate a failure only after provider authorization could have occurred."""
+
+    error.__dict__["provider_authorization_may_remain"] = True
+
 
 class ValidationError(ContinuityError):
     """Stored or supplied data violates the public format."""

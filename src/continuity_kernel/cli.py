@@ -126,7 +126,11 @@ def main(arguments: list[str] | None = None) -> int:
             return failure[0]
         return 0
     except ContinuityError as exc:
-        oauth_guidance = _connector_oauth_failure_guidance(args)
+        oauth_guidance = (
+            _connector_oauth_failure_guidance(args)
+            if exc.provider_authorization_may_remain
+            else None
+        )
         if getattr(args, "json", False):
             payload: dict[str, object] = {"error": str(exc), "ok": False}
             if oauth_guidance is not None:
@@ -146,20 +150,23 @@ def main(arguments: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
         return 2
-    except KeyboardInterrupt:
-        if getattr(args, "command", None) == "connectors" and getattr(
-            args, "connectors_command", None
-        ) in {"connect", "reauthorize"}:
-            connector = getattr(args, "connector", None)
-            profile = CONNECTOR_PROFILES.get(connector) if isinstance(connector, str) else None
-            guidance = (
-                provider_revocation_guidance(profile.provider)
-                if profile is not None
-                else "Review the provider's connected-app settings."
-            )
+    except KeyboardInterrupt as exc:
+        authorization_may_remain = bool(getattr(exc, "provider_authorization_may_remain", False))
+        guidance = _connector_oauth_failure_guidance(args) if authorization_may_remain else None
+        if getattr(args, "json", False):
+            interrupted_payload: dict[str, object] = {"error": "cancelled", "ok": False}
+            if guidance is not None:
+                interrupted_payload.update(
+                    {
+                        "provider_access_may_remain": True,
+                        "revocation_help": guidance,
+                    }
+                )
+            print(json.dumps(interrupted_payload, ensure_ascii=False), file=sys.stderr)
+        elif guidance is not None:
             print(
-                "Cancelled locally. If provider sign-in had completed, provider access may "
-                f"remain. {guidance} Run `gsv connectors list` before retrying or reauthorizing.",
+                "Cancelled locally after provider sign-in may have started. "
+                f"{guidance} Run `gsv connectors list` before retrying or reauthorizing.",
                 file=sys.stderr,
             )
         else:
@@ -636,11 +643,12 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
             raise ValidationError("browser options are unavailable for Discord bot onboarding")
         if args.connector == "discord" and args.timeout is not None:
             raise ValidationError("--timeout is unavailable for Discord bot onboarding")
-        print(
-            f"Connecting {args.connector.replace('_', ' ').title()} with {args.access.title()} "
-            "access…",
-            file=sys.stderr,
-        )
+        if not args.json:
+            print(
+                f"Connecting {args.connector.replace('_', ' ').title()} with "
+                f"{args.access.title()} access…",
+                file=sys.stderr,
+            )
         if args.connector == "discord":
             if not sys.stdin.isatty():
                 raise SetupError(
@@ -691,8 +699,9 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
         ):
             return {
                 "connection_id": args.connection_id,
+                "next": f"gsv connectors status {args.connection_id}",
                 "nothing_changed": True,
-                "status": "cancelled",
+                "status": "disconnect_cancelled",
             }
         return onboarding.disconnect(args.connection_id)
     if args.connectors_command == "revocation-help":
@@ -801,6 +810,36 @@ def _revocation_guidance(provider: str) -> str:
 def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | None:
     if not isinstance(result, dict):
         return None
+    connector_failure_messages = {
+        "account_selection_required": (
+            "Choose one candidate account command from result.candidates and retry."
+        ),
+        "cancelled": "Connector sign-in was cancelled; follow result.next to inspect or retry.",
+        "credential_invalid_reconnect_required": (
+            "The saved connector credential is invalid; follow result.next to repair it."
+        ),
+        "credential_missing_reconnect_required": (
+            "The connector credential is missing; follow result.next to reconnect."
+        ),
+        "credential_pointer_invalid_reconnect_required": (
+            "The connector credential pointer is invalid; follow result.next to reconnect."
+        ),
+        "different_account": (
+            "A different account was selected; use result.retry or result.new_account."
+        ),
+        "disconnect_cancelled": "Disconnect cancelled; nothing changed.",
+        "identity_binding_missing_reconnect_required": (
+            "The connector identity binding is missing; follow result.next to reconnect."
+        ),
+        "setup_incomplete": "Connector setup is incomplete; follow result.next to resume.",
+    }
+    status = result.get("status")
+    if (
+        args.command == "connectors"
+        and isinstance(status, str)
+        and status in connector_failure_messages
+    ):
+        return 3, connector_failure_messages[status]
     if args.command == "setup" and result.get("setup_complete") is False:
         return 3, "Seld setup stopped because the local record is unhealthy; follow result.next."
     if (

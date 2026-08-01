@@ -97,7 +97,10 @@ def _runtime(
         provider="microsoft",
         source_ids=profile.source_ids,
         credential_kind=profile.credential_kind,
-        account=AccountMetadata(label="Configured Outlook Full"),
+        account=AccountMetadata(
+            fingerprint="sha256:" + "d" * 64,
+            label="Configured Outlook Full",
+        ),
         scopes=scopes,
         client=ClientMetadata(
             kind=ClientKind.PUBLIC,

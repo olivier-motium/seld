@@ -44,7 +44,11 @@ from continuity_kernel.connector_transfer import (
     ArtifactStore,
     PreparedUploadCache,
 )
-from continuity_kernel.connector_transport import ConnectorTransport
+from continuity_kernel.connector_transport import (
+    ConnectorOrigin,
+    ConnectorProviderError,
+    ConnectorTransport,
+)
 from continuity_kernel.errors import ConflictError, ValidationError
 from continuity_kernel.local_files import (
     FILE_TRANSFER_CHUNK_BYTES,
@@ -76,6 +80,7 @@ class _Adapter:
         self.upload_chunk_started: Event | None = None
         self.release_upload_chunk: Event | None = None
         self.upload_chunks_delivered = 0
+        self.provider_error: ConnectorProviderError | None = None
 
     def classify_effect(self, operation: OperationSpec, input_value: object) -> ConnectorEffect:
         self.classifications.append(input_value)
@@ -105,6 +110,8 @@ class _Adapter:
     ) -> ConnectorAdapterResult:
         del credential, transport
         self.calls.append((operation.name, input_value, continuation, write_idempotency_key))
+        if self.provider_error is not None:
+            raise self.provider_error
         transferred: dict[tuple[str | int, ...], bytes] = {}
         if transfer is not None:
             for path, upload in transfer.uploads.items():
@@ -183,12 +190,19 @@ def _prepared(
         provider=profile.provider,
         source_ids=profile.source_ids,
         credential_kind=profile.credential_kind,
-        account=AccountMetadata(label="Alice at Example"),
+        account=AccountMetadata(
+            fingerprint="sha256:" + "a" * 64,
+            label="Alice at Example",
+        ),
         scopes=profile.scopes_for(access),
         client=ClientMetadata(
             kind=ClientKind.PUBLIC,
             identifier=f"public-{profile_name}-client",
-            redirect_uris=("http://127.0.0.1:0",),
+            redirect_uris=(
+                "http://localhost:43127/oauth/callback"
+                if profile_name == "slack"
+                else "http://127.0.0.1:0",
+            ),
             authorization_endpoint=profile.authorization_endpoint,
             token_endpoint=profile.token_endpoint,
         ),
@@ -282,6 +296,68 @@ def _install_local_upload_catalog(
         "OPERATION_CATALOG",
         OperationCatalog((operation,)),
     )
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "provider", "tool", "operation", "origin", "status", "code"),
+    (
+        (
+            "google",
+            "gmail",
+            "gsv_gmail_read",
+            "messages.list",
+            ConnectorOrigin.GMAIL,
+            401,
+            "UNAUTHENTICATED",
+        ),
+        (
+            "slack",
+            "slack",
+            "gsv_slack_read",
+            "identity.get",
+            ConnectorOrigin.SLACK,
+            200,
+            "invalid_auth",
+        ),
+    ),
+)
+def test_interactive_auth_failure_requires_reauthorization_before_retry(
+    tmp_path: Path,
+    profile_name: str,
+    provider: str,
+    tool: str,
+    operation: str,
+    origin: ConnectorOrigin,
+    status: int,
+    code: str,
+) -> None:
+    adapter = _Adapter()
+    adapter.providers = frozenset({provider})
+    adapter.provider_error = ConnectorProviderError(
+        origin=origin,
+        status=status,
+        code=code,
+    )
+    vault, _manager, _adapter, runtime = _prepared(
+        tmp_path,
+        adapter=adapter,
+        profile_name=profile_name,
+    )
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {},
+        "operation": operation,
+    }
+
+    with pytest.raises(ConnectorProviderError):
+        runtime.call_tool(tool, values)
+    with pytest.raises(ValidationError, match="verified before interactive use"):
+        runtime.call_tool(tool, values)
+
+    connection = vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert connection is not None
+    assert connection.health is ConnectionHealth.REAUTHORIZATION_REQUIRED
+    assert len(adapter.calls) == 1
 
 
 def _local_upload_values(grant_id: str) -> dict[str, object]:

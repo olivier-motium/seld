@@ -48,8 +48,11 @@ from continuity_kernel.connector_transfer import (
     PreparedUploadReservation,
 )
 from continuity_kernel.connector_transport import (
+    SLACK_AUTH_FAILURE_CODES,
     AuthorizationScheme,
     ConnectorCredential,
+    ConnectorOrigin,
+    ConnectorProviderError,
     ConnectorTransport,
 )
 from continuity_kernel.errors import (
@@ -268,15 +271,14 @@ class ConnectorRuntime:
         adapter = self.adapters.get(provider)
         continuation: object | None = None
         if mode is ConnectorMode.READ:
-            effect = _classified_effect(
+            effect = self._classify_effect(
                 operation.effect,
-                _classify_adapter_effect(
-                    adapter,
-                    operation,
-                    input_value,
-                    credential=credential,
-                    transport=self.transport,
-                ),
+                adapter,
+                operation,
+                input_value,
+                connection_id=connection_id,
+                connection_revision=connection_snapshot.revision,
+                credential=credential,
             )
             cursor = envelope.get("cursor")
             if cursor is not None:
@@ -297,6 +299,8 @@ class ConnectorRuntime:
                 credential=credential,
                 write_idempotency_key=None,
                 prepared_bundle=None,
+                connection_id=connection_id,
+                connection_revision=connection_snapshot.revision,
             )
         else:
             confirmation = envelope.get("confirmation_token")
@@ -305,20 +309,21 @@ class ConnectorRuntime:
                     input_value,
                     adapter=adapter,
                     operation=operation,
+                    connection_id=connection_id,
+                    connection_revision=connection_snapshot.revision,
                     credential=credential,
                 )
                 preview_bundle = prepared.bundle
                 try:
-                    effect = _classified_effect(
+                    effect = self._classify_effect(
                         operation.effect,
-                        _classify_adapter_effect(
-                            adapter,
-                            operation,
-                            prepared.adapter_input,
-                            credential=credential,
-                            transport=self.transport,
-                            transfer=_prepared_transfer_context(prepared.bundle),
-                        ),
+                        adapter,
+                        operation,
+                        prepared.adapter_input,
+                        connection_id=connection_id,
+                        connection_revision=connection_snapshot.revision,
+                        credential=credential,
+                        transfer=_prepared_transfer_context(prepared.bundle),
                     )
                     effect = _promote_prepared_upload_effect(effect, prepared.bundle)
                     if effect is ConnectorEffect.SAFE_MUTATION:
@@ -330,6 +335,8 @@ class ConnectorRuntime:
                             credential=credential,
                             write_idempotency_key=None,
                             prepared_bundle=preview_bundle,
+                            connection_id=connection_id,
+                            connection_revision=connection_snapshot.revision,
                         )
                     else:
                         preview = self._confirmation_preview(
@@ -374,16 +381,15 @@ class ConnectorRuntime:
                         raise ConflictError(
                             "prepared upload authority changed; request a fresh preview"
                         )
-                    effect = _classified_effect(
+                    effect = self._classify_effect(
                         operation.effect,
-                        _classify_adapter_effect(
-                            adapter,
-                            operation,
-                            prepared.adapter_input,
-                            credential=credential,
-                            transport=self.transport,
-                            transfer=_prepared_transfer_context(prepared.bundle),
-                        ),
+                        adapter,
+                        operation,
+                        prepared.adapter_input,
+                        connection_id=connection_id,
+                        connection_revision=connection_snapshot.revision,
+                        credential=credential,
+                        transfer=_prepared_transfer_context(prepared.bundle),
                     )
                     effect = _promote_prepared_upload_effect(effect, prepared.bundle)
                     if effect is ConnectorEffect.SAFE_MUTATION:
@@ -415,6 +421,8 @@ class ConnectorRuntime:
                             credential=credential,
                             write_idempotency_key=write_idempotency_key,
                             prepared_bundle=confirmed_bundle,
+                            connection_id=connection_id,
+                            connection_revision=connection_snapshot.revision,
                         )
                     finally:
                         if confirmed_bundle is not None:
@@ -463,12 +471,45 @@ class ConnectorRuntime:
                     self._artifacts().discard(result.artifact)
             raise
 
+    def _classify_effect(
+        self,
+        catalog_effect: ConnectorEffect,
+        adapter: ConnectorAdapter,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        connection_id: str,
+        connection_revision: str,
+        credential: ConnectorRuntimeCredential,
+        transfer: ConnectorTransferContext | None = None,
+    ) -> ConnectorEffect:
+        try:
+            adapter_effect = _classify_adapter_effect(
+                adapter,
+                operation,
+                input_value,
+                credential=credential,
+                transport=self.transport,
+                transfer=transfer,
+            )
+        except ConnectorProviderError as exc:
+            self._project_auth_failure(
+                exc,
+                connection_id=connection_id,
+                connection_revision=connection_revision,
+                credential_version=credential.version,
+            )
+            raise
+        return _classified_effect(catalog_effect, adapter_effect)
+
     def _prepare_input(
         self,
         input_value: object,
         *,
         adapter: ConnectorAdapter,
         operation: OperationSpec,
+        connection_id: str,
+        connection_revision: str,
         credential: ConnectorRuntimeCredential,
     ) -> _PreparedInput:
         selectors = _local_file_selectors(input_value)
@@ -484,17 +525,26 @@ class ConnectorRuntime:
         grant_ids = tuple(sorted({selector.grant_id for selector in selectors}))
         self._assert_grant_authority(set(grant_ids))
         limit_input = _sanitize_upload_limit_input(input_value)
-        limits = {
-            selector.path: _adapter_upload_limit(
-                adapter,
-                operation,
-                limit_input,
-                path=selector.path,
-                credential=credential,
-                transport=self.transport,
+        try:
+            limits = {
+                selector.path: _adapter_upload_limit(
+                    adapter,
+                    operation,
+                    limit_input,
+                    path=selector.path,
+                    credential=credential,
+                    transport=self.transport,
+                )
+                for selector in selectors
+            }
+        except ConnectorProviderError as exc:
+            self._project_auth_failure(
+                exc,
+                connection_id=connection_id,
+                connection_revision=connection_revision,
+                credential_version=credential.version,
             )
-            for selector in selectors
-        }
+            raise
         assembly = _PreparedInputAssembly()
         authority = self._local_files().register_transfer_authority(
             grant_ids,
@@ -650,6 +700,8 @@ class ConnectorRuntime:
         credential: ConnectorRuntimeCredential,
         write_idempotency_key: str | None,
         prepared_bundle: PreparedUploadBundle | None,
+        connection_id: str,
+        connection_revision: str,
     ) -> ConnectorAdapterResult:
         artifact_scope: ConnectorArtifactScope | None = None
 
@@ -696,11 +748,38 @@ class ConnectorRuntime:
             else:
                 artifact_scope.complete(result.artifact)
             return result
+        except ConnectorProviderError as exc:
+            if artifact_scope is not None:
+                with suppress(Exception):
+                    artifact_scope.close()
+            self._project_auth_failure(
+                exc,
+                connection_id=connection_id,
+                connection_revision=connection_revision,
+                credential_version=credential.version,
+            )
+            raise
         except Exception:
             if artifact_scope is not None:
                 with suppress(Exception):
                     artifact_scope.close()
             raise
+
+    def _project_auth_failure(
+        self,
+        error: ConnectorProviderError,
+        *,
+        connection_id: str,
+        connection_revision: str,
+        credential_version: int,
+    ) -> None:
+        if not _requires_reauthorization(error):
+            return
+        self.auth_manager.mark_reauthorization_required(
+            connection_id,
+            expected_connection_revision=connection_revision,
+            expected_token_version=credential_version,
+        )
 
     def _resolve_credential(
         self,
@@ -1080,6 +1159,12 @@ def _scope_error(provider: str, operation: str) -> str:
             "permanent-delete permission"
         )
     return "the provider did not grant the permission required for this operation"
+
+
+def _requires_reauthorization(error: ConnectorProviderError) -> bool:
+    return error.status == 401 or (
+        error.origin is ConnectorOrigin.SLACK and error.code in SLACK_AUTH_FAILURE_CODES
+    )
 
 
 def _effect_warning(

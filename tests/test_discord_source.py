@@ -35,6 +35,7 @@ from continuity_kernel.vault import Vault
 CHANNEL = "111111111111111111"
 TOKEN = "unit-test-secret-that-must-not-persist"
 ACCOUNT = f"discord-bot-v1:sha256:{'a' * 64}"
+CONNECTION_FINGERPRINT = "sha256:" + "c" * 64
 USER_ACCOUNT = f"discord-user-v1:sha256:{'b' * 64}"
 USER_WARNING = (
     "Discord forbids normal-user self-bot automation and may terminate the account; "
@@ -52,7 +53,7 @@ def _auth_manager(
     provider: str = "discord",
     source_ids: tuple[str, ...] = ("discord",),
     credential_kind: CredentialKind = CredentialKind.BEARER,
-    health: ConnectionHealth = ConnectionHealth.UNKNOWN,
+    health: ConnectionHealth = ConnectionHealth.READY,
     store_credential: bool = True,
 ) -> ConnectorAuthManager:
     metadata = ConnectionMetadata(
@@ -60,13 +61,26 @@ def _auth_manager(
         provider=provider,
         source_ids=source_ids,
         credential_kind=credential_kind,
-        account=AccountMetadata(label="Synthetic Discord bot"),
-        scopes=(),
+        account=AccountMetadata(
+            fingerprint=CONNECTION_FINGERPRINT,
+            label="Synthetic Discord bot",
+        ),
+        scopes=("seld.discord.full",),
         client=ClientMetadata(kind=ClientKind.EXTERNAL),
         health=health,
         created_at=BASE_TIME,
         updated_at=BASE_TIME,
         version=1,
+        last_verified_at=(
+            BASE_TIME
+            if health
+            in {
+                ConnectionHealth.READY,
+                ConnectionHealth.DEGRADED,
+                ConnectionHealth.REAUTHORIZATION_REQUIRED,
+            }
+            else None
+        ),
     )
     vault.put_connection(
         expected_revision=vault.get_connection_snapshot().revision,
@@ -79,7 +93,7 @@ def _auth_manager(
         state_root=tmp_path / f"connector-auth-{vault.root.name}",
     )
     if store_credential:
-        manager.store_credential(CONNECTION_ID, TOKEN.encode(), expected_token_version=0)
+        manager.tokens.update(CONNECTION_ID, value=TOKEN.encode(), expected_version=0)
     return manager
 
 
@@ -90,7 +104,7 @@ def _bridge(
     provider: str = "discord",
     source_ids: tuple[str, ...] = ("discord",),
     credential_kind: CredentialKind = CredentialKind.BEARER,
-    health: ConnectionHealth = ConnectionHealth.UNKNOWN,
+    health: ConnectionHealth = ConnectionHealth.READY,
     store_credential: bool = True,
 ) -> DiscordSourceBridge:
     manager = _auth_manager(
@@ -519,11 +533,18 @@ def test_legacy_binding_requires_explicit_connection_migration(
             "discord",
             ("discord",),
             CredentialKind.BEARER,
+            ConnectionHealth.UNVERIFIED,
+            "identity is not confirmed",
+        ),
+        (
+            "discord",
+            ("discord",),
+            CredentialKind.BEARER,
             ConnectionHealth.REVOKED,
-            "requires reauthorization",
+            "connection is revoked",
         ),
     ],
-    ids=("wrong-provider", "wrong-source", "wrong-kind", "revoked"),
+    ids=("wrong-provider", "wrong-source", "wrong-kind", "unverified", "revoked"),
 )
 def test_binding_preflights_exact_portable_discord_authority(
     tmp_path: Path,
@@ -562,10 +583,10 @@ def test_status_and_poll_recheck_connection_health_and_token_shape(
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Discord operation preflight")
     bridge = _bridge(vault, tmp_path, store_credential=False)
-    bridge.auth_manager.store_credential(
+    bridge.auth_manager.tokens.update(
         CONNECTION_ID,
-        b"credential with whitespace",
-        expected_token_version=0,
+        value=b"credential with whitespace",
+        expected_version=0,
     )
     bridge.bind(
         _runtime(tmp_path / "runtime"),
@@ -582,10 +603,10 @@ def test_status_and_poll_recheck_connection_health_and_token_shape(
     assert not bridge.state_path.exists()
 
     bridge.auth_manager.tokens.delete(CONNECTION_ID)
-    bridge.auth_manager.store_credential(
+    bridge.auth_manager.tokens.update(
         CONNECTION_ID,
-        TOKEN.encode(),
-        expected_token_version=0,
+        value=TOKEN.encode(),
+        expected_version=0,
     )
     snapshot = vault.get_connection_snapshot()
     vault.mark_connection_health(
