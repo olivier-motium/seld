@@ -75,7 +75,9 @@ _DATE = _string(32, min_length=1)
 _TIME_ZONE = _string(128, min_length=1)
 _EMAIL = _string(320, min_length=3, pattern=r"^[^@\s]+@[^@\s]+$")
 _PAGE_SIZE = {"maximum": 100, "minimum": 1, "type": "integer"}
+_CALENDAR_WINDOW_PAGE_SIZE = {"maximum": 1_000, "minimum": 1, "type": "integer"}
 _MESSAGES_PAGE_SIZE = {"maximum": 1_000, "minimum": 1, "type": "integer"}
+_FREEBUSY_INTERVAL_MINUTES = {"maximum": 1_440, "minimum": 5, "type": "integer"}
 _IMPORTANCE = _enum("low", "normal", "high")
 _FOLLOW_UP = _enum("not_flagged", "flagged", "complete")
 _SENSITIVITY = _enum("normal", "personal", "private", "confidential")
@@ -104,7 +106,7 @@ _ATTENDEES = _array(
         },
         required=("email", "type"),
     ),
-    max_items=100,
+    max_items=500,
 )
 _CATEGORIES = _array(_string(128, min_length=1), max_items=32)
 _LOCAL_FILE = _object(
@@ -285,9 +287,8 @@ _MESSAGES_LIST = _object(
 )
 _CALENDARS_LIST = _object(
     {
-        "order_by": _enum("name", "last_modified_at"),
+        "order_by": _enum("name"),
         "page_size": _PAGE_SIZE,
-        "search": _string(4_096),
     }
 )
 _EVENTS_LIST = _object(
@@ -295,11 +296,76 @@ _EVENTS_LIST = _object(
         "calendar_id": _ID,
         "order_by": _enum("start_at", "end_at", "subject", "last_modified_at"),
         "page_size": _PAGE_SIZE,
-        "search": _string(4_096),
         "sort_direction": _enum("ascending", "descending"),
+        "time_zone": _TIME_ZONE,
     },
     required=("calendar_id",),
 )
+_ONLINE_MEETING_PROVIDER = _enum("teams_for_business")
+_EVENT_CREATE_PROPERTIES = {
+    "attendees": _ATTENDEES,
+    "body": _BODY,
+    "calendar_id": _ID,
+    "categories": _CATEGORIES,
+    "end": _EVENT_TIME,
+    "importance": _IMPORTANCE,
+    "is_all_day": {"type": "boolean"},
+    "is_reminder_on": {"type": "boolean"},
+    "location": _SHORT_TEXT,
+    "recurrence": _RECURRENCE,
+    "reminder_minutes_before_start": {
+        "maximum": 10_080,
+        "minimum": 0,
+        "type": "integer",
+    },
+    "response_requested": {"type": "boolean"},
+    "sensitivity": _SENSITIVITY,
+    "show_as": _SHOW_AS,
+    "start": _EVENT_TIME,
+    "subject": _string(4_096),
+    "transaction_id": _string(256, min_length=1),
+}
+_EVENT_CREATE_REQUIRED = (
+    "calendar_id",
+    "transaction_id",
+    "subject",
+    "body",
+    "start",
+    "end",
+)
+
+
+def _event_create_variant(
+    online_properties: dict[str, object],
+    *,
+    online_required: tuple[str, ...] = (),
+) -> dict[str, object]:
+    return _object(
+        {**_EVENT_CREATE_PROPERTIES, **online_properties},
+        required=(*_EVENT_CREATE_REQUIRED, *online_required),
+    )
+
+
+_EVENT_CREATE_SCHEMA = _event_create_variant(
+    {
+        "is_online_meeting": {"type": "boolean"},
+        "online_meeting_provider": _ONLINE_MEETING_PROVIDER,
+    }
+)
+_EVENT_CREATE_SCHEMA["oneOf"] = [
+    _event_create_variant({}),
+    _event_create_variant(
+        {"is_online_meeting": {"const": False}},
+        online_required=("is_online_meeting",),
+    ),
+    _event_create_variant(
+        {
+            "is_online_meeting": {"const": True},
+            "online_meeting_provider": _ONLINE_MEETING_PROVIDER,
+        },
+        online_required=("is_online_meeting",),
+    ),
+]
 
 
 MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
@@ -645,7 +711,7 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         ConnectorEffect.READ,
         _CALENDAR_READ_SCOPES,
         _object(
-            {"calendar_id": _ID, "event_id": _ID},
+            {"calendar_id": _ID, "event_id": _ID, "time_zone": _TIME_ZONE},
             required=("calendar_id", "event_id"),
         ),
     ),
@@ -659,6 +725,7 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
             {
                 "calendar_id": _ID,
                 "end": _DATE_TIME,
+                "page_size": _CALENDAR_WINDOW_PAGE_SIZE,
                 "start": _DATE_TIME,
                 "time_zone": _TIME_ZONE,
             },
@@ -676,6 +743,7 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
                 "calendar_id": _ID,
                 "end": _DATE_TIME,
                 "event_id": _ID,
+                "page_size": _CALENDAR_WINDOW_PAGE_SIZE,
                 "start": _DATE_TIME,
                 "time_zone": _TIME_ZONE,
             },
@@ -690,8 +758,9 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         _CALENDAR_READ_SCOPES,
         _object(
             {
-                "attendees": _array(_EMAIL, max_items=100, min_items=1),
+                "attendees": _array(_EMAIL, max_items=20, min_items=1),
                 "end": _DATE_TIME,
+                "interval_minutes": _FREEBUSY_INTERVAL_MINUTES,
                 "start": _DATE_TIME,
                 "time_zone": _TIME_ZONE,
             },
@@ -783,32 +852,7 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         "events.create",
         ConnectorEffect.SAFE_MUTATION,
         _CALENDAR_WRITE_SCOPES,
-        _object(
-            {
-                "attendees": _ATTENDEES,
-                "body": _BODY,
-                "calendar_id": _ID,
-                "categories": _CATEGORIES,
-                "end": _EVENT_TIME,
-                "importance": _IMPORTANCE,
-                "is_all_day": {"type": "boolean"},
-                "is_reminder_on": {"type": "boolean"},
-                "location": _SHORT_TEXT,
-                "recurrence": _RECURRENCE,
-                "reminder_minutes_before_start": {
-                    "maximum": 10_080,
-                    "minimum": 0,
-                    "type": "integer",
-                },
-                "response_requested": {"type": "boolean"},
-                "sensitivity": _SENSITIVITY,
-                "show_as": _SHOW_AS,
-                "start": _EVENT_TIME,
-                "subject": _string(4_096),
-                "transaction_id": _string(256, min_length=1),
-            },
-            required=("calendar_id", "transaction_id", "subject", "body", "start", "end"),
-        ),
+        _EVENT_CREATE_SCHEMA,
     ),
     _operation(
         "outlook_calendar",
@@ -852,7 +896,7 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         _CALENDAR_WRITE_SCOPES,
         _object(
             {"calendar_id": _ID, "change_key": _CHANGE_KEY, "event_id": _ID},
-            required=("calendar_id", "event_id"),
+            required=("calendar_id", "event_id", "change_key"),
         ),
     ),
     _operation(
@@ -976,7 +1020,7 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         _CALENDAR_WRITE_SCOPES,
         _object(
             {"calendar_id": _ID, "change_key": _CHANGE_KEY, "event_id": _ID},
-            required=("calendar_id", "event_id"),
+            required=("calendar_id", "event_id", "change_key"),
         ),
     ),
 )

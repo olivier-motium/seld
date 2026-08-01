@@ -161,6 +161,10 @@ class _PreflightAdapter(_Adapter):
         return super().classify_effect(operation, input_value)
 
 
+class _OutlookAdapter(_Adapter):
+    providers = frozenset({"outlook_calendar"})
+
+
 def _prepared(
     tmp_path: Path,
     *,
@@ -168,21 +172,22 @@ def _prepared(
     adapter: _Adapter | None = None,
     artifact_store: ArtifactStore | None = None,
     prepared_uploads: PreparedUploadCache | None = None,
+    profile_name: str = "google",
 ) -> tuple[Vault, ConnectorAuthManager, _Adapter, ConnectorRuntime]:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Connector runtime")
-    profile = get_profile("google")
+    profile = get_profile(profile_name)
     now = datetime.now(UTC)
     metadata = ConnectionMetadata(
         connection_id=CONNECTION_ID,
-        provider="google",
+        provider=profile.provider,
         source_ids=profile.source_ids,
         credential_kind=profile.credential_kind,
         account=AccountMetadata(label="Alice at Example"),
         scopes=profile.scopes_for(access),
         client=ClientMetadata(
             kind=ClientKind.PUBLIC,
-            identifier="public-google-client",
+            identifier=f"public-{profile_name}-client",
             redirect_uris=("http://127.0.0.1:0",),
             authorization_endpoint=profile.authorization_endpoint,
             token_endpoint=profile.token_endpoint,
@@ -403,6 +408,44 @@ def test_safe_mutation_executes_once_but_outward_effect_requires_bound_confirmat
             {**values, "confirmation_token": preview["confirmation_token"]},
         )
     assert [call[0] for call in adapter.calls] == ["drafts.create", "drafts.send"]
+
+
+def test_outlook_event_delete_and_cancel_previews_disclose_attendee_cancellations(
+    tmp_path: Path,
+) -> None:
+    adapter = _OutlookAdapter()
+    _vault, _manager, _adapter, runtime = _prepared(
+        tmp_path,
+        adapter=adapter,
+        profile_name="microsoft",
+    )
+    inputs = {
+        "events.cancel": {"calendar_id": "primary", "event_id": "event-1"},
+        "events.delete": {
+            "calendar_id": "primary",
+            "change_key": "event-version-1",
+            "event_id": "event-1",
+        },
+    }
+    for operation, input_value in inputs.items():
+        preview = runtime.call_tool(
+            "gsv_outlook_calendar_write",
+            {
+                "connection_id": str(CONNECTION_ID),
+                "input": input_value,
+                "operation": operation,
+            },
+        )
+        assert preview["status"] == "confirmation_required"
+        assert preview["effect"] == "destructive"
+        warning = str(preview["warning"])
+        assert "removes or archives provider content" in warning
+        assert "Outlook" in warning
+        assert "email" in warning
+        assert "attendees" in warning
+        assert "cancellation" in warning
+    assert adapter.calls == []
+    assert adapter.classifications == list(inputs.values())
 
 
 def test_confirmation_is_bound_to_exact_mutation_and_adapter_cannot_downgrade(

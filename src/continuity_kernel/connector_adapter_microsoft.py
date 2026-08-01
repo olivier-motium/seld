@@ -41,10 +41,12 @@ _ORIGIN: Final = ConnectorOrigin.MICROSOFT_GRAPH
 _GRAPH_HOST: Final = "graph.microsoft.com"
 _ROOT: Final = "/v1.0/me"
 _PERMANENT_DELETE_UNSUPPORTED: Final = frozenset({404, 405, 501})
-_CALENDAR_PERMANENT_DELETE_UNSUPPORTED: Final = frozenset({400, 403, 404, 405, 501})
+_CALENDAR_PERMANENT_DELETE_UNSUPPORTED: Final = frozenset({403, 404, 405, 501})
 _RESTORE_TTL_SECONDS: Final = 24 * 60 * 60
 _MAX_RESTORE_HANDLES: Final = 4_096
-_EXISTING_EVENT_MUTATIONS: Final = frozenset({"events.update", "attachments.add"})
+_EXISTING_EVENT_MUTATIONS: Final = frozenset(
+    {"events.delete", "events.purge", "events.update", "attachments.add"}
+)
 _LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
 _OUTLOOK_UPLOAD_MAX_BYTES: Final = 150 * 1024**2
 _OUTLOOK_SESSION_THRESHOLD_BYTES: Final = 3 * 1000**2
@@ -69,6 +71,7 @@ _MEETING_BLOB_CLASS: Final = "me-email-text"
 _CONTINUATION_KEYS: Final = frozenset(
     {"$filter", "$orderby", "$search", "$skip", "$skiptoken", "$top"}
 )
+_WINDOW_CONTINUATION_KEYS: Final = frozenset({"endDateTime", "startDateTime"})
 _OPERATIONS: Final = {operation.key: operation for operation in MICROSOFT_OPERATIONS}
 _FOLLOW_UP_STATUS: Final = {
     "not_flagged": "notFlagged",
@@ -83,6 +86,7 @@ _SHOW_AS: Final = {
     "working_elsewhere": "workingElsewhere",
     "unknown": "unknown",
 }
+_ONLINE_MEETING_PROVIDERS: Final = {"teams_for_business": "teamsForBusiness"}
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,7 @@ class _RequestShape:
     json_body: object | None = None
     expected_statuses: frozenset[int] = frozenset({200})
     time_zone: str | None = None
+    continuation_window: tuple[tuple[str, str], tuple[str, str]] | None = None
     mime: bool = False
     metadata_only: bool = False
     response_bound: int = 16 * 1024 * 1024
@@ -220,11 +225,30 @@ class MicrosoftConnectorAdapter:
         known, data = _known_operation(operation, input_value, transfer=transfer)
         if (credential is None) is not (transport is None):
             raise ValidationError("Microsoft effect preflight requires credential and transport")
+        _preflight_deletable_calendar(
+            known,
+            data,
+            credential=credential,
+            transport=transport,
+        )
         if known.provider == "outlook_calendar" and known.name in _EXISTING_EVENT_MUTATIONS:
             if credential is None or transport is None:
+                if known.name in {"events.delete", "events.purge"}:
+                    return known.effect
                 return ConnectorEffect.OUTWARD
-            event = _preflight_event(data, credential=credential, transport=transport)
+            event = _preflight_event(
+                data,
+                credential=credential,
+                transport=transport,
+                identity_mismatch_code=(
+                    "event_calendar_binding_mismatch"
+                    if known.name == "events.purge"
+                    else "event_identity_mismatch"
+                ),
+            )
             _event_precondition_data(data, event)
+            if known.name in {"events.delete", "events.purge"}:
+                return known.effect
             return _existing_event_effect(data, event)
         if (
             known.provider == "outlook_calendar"
@@ -250,6 +274,12 @@ class MicrosoftConnectorAdapter:
             raise ValidationError("connector runtime credential is invalid")
         if continuation is not None and known.mode is not ConnectorMode.READ:
             raise ValidationError("connector write operation cannot use a continuation")
+        _preflight_deletable_calendar(
+            known,
+            data,
+            credential=credential,
+            transport=transport,
+        )
 
         if known.name.endswith(".purge"):
             return _execute_permanent_delete(
@@ -283,21 +313,19 @@ class MicrosoftConnectorAdapter:
             )
 
         event: Mapping[str, object] | None = None
+        request_data = data
         if known.provider == "outlook_calendar" and known.name in _EXISTING_EVENT_MUTATIONS:
             event = _preflight_event(data, credential=credential, transport=transport)
-            _event_precondition_data(data, event)
+            request_data = _event_precondition_data(data, event)
             if (
-                _existing_event_effect(data, event) is ConnectorEffect.OUTWARD
+                known.name != "events.delete"
+                and _existing_event_effect(data, event) is ConnectorEffect.OUTWARD
                 and write_idempotency_key is None
             ):
                 raise ValidationError(
                     "the Outlook event is shared; request a fresh outward confirmation preview"
                 )
 
-        request_data = data
-        if known.provider == "outlook_calendar" and known.name in _EXISTING_EVENT_MUTATIONS:
-            assert event is not None
-            request_data = _event_precondition_data(data, event)
         if known.name == "attachments.add" and _has_local_attachment(data):
             if transfer is None:
                 raise ValidationError("Outlook local-file upload requires transfer context")
@@ -318,23 +346,41 @@ class MicrosoftConnectorAdapter:
                 continuation,
                 path=shape.path,
                 required_select=_ATTACHMENT_METADATA_SELECT if shape.metadata_only else None,
+                required_window=shape.continuation_window,
             )
-        response = transport.request(
-            origin=_ORIGIN,
-            method=shape.method,
-            path=shape.path,
-            credential=credential.credential,
-            query=query,
-            json_body=shape.json_body,
-            headers=_headers(request_data, time_zone=shape.time_zone),
-            expected_statuses=shape.expected_statuses,
-            response_bound=shape.response_bound,
-        )
+        try:
+            response = transport.request(
+                origin=_ORIGIN,
+                method=shape.method,
+                path=shape.path,
+                credential=credential.credential,
+                query=query,
+                json_body=shape.json_body,
+                headers=_headers(request_data, time_zone=shape.time_zone),
+                expected_statuses=shape.expected_statuses,
+                response_bound=shape.response_bound,
+            )
+        except ConnectorProviderError as exc:
+            if exc.status == 412 and "change_key" in data:
+                raise _stale_outlook_resource_error(known) from exc
+            if (
+                known.provider == "outlook_calendar"
+                and known.name == "freebusy.query"
+                and exc.status == 403
+            ):
+                raise ConnectorProviderError(
+                    origin=_ORIGIN,
+                    status=exc.status,
+                    code="freebusy_unsupported_for_account_or_permission",
+                    retry_after=exc.retry_after,
+                ) from exc
+            raise
         return _result(
             response,
             path=shape.path,
             mime=shape.mime,
             metadata_only=shape.metadata_only,
+            continuation_window=shape.continuation_window,
             delivery=delivery if shape.mime else None,
         )
 
@@ -670,11 +716,13 @@ def _calendar_shape(name: str, data: dict[str, object]) -> _RequestShape:
             f"{_calendar_path(_text(data, 'calendar_id'))}/events",
             ConnectorMethod.GET,
             query=_event_query(data),
+            time_zone=_optional_text(data, "time_zone"),
         )
     if name == "events.get":
         return _RequestShape(
             _event_path(_text(data, "calendar_id"), _text(data, "event_id")),
             ConnectorMethod.GET,
+            time_zone=_optional_text(data, "time_zone"),
         )
     if name == "events.window":
         return _window_shape(data, "calendarView")
@@ -682,14 +730,17 @@ def _calendar_shape(name: str, data: dict[str, object]) -> _RequestShape:
         return _window_shape(data, "instances", event_id=_text(data, "event_id"))
     if name == "freebusy.query":
         time_zone = _time_zone(data)
+        schedule_body: dict[str, object] = {
+            "endTime": _graph_time({"date_time": data["end"], "time_zone": time_zone}),
+            "schedules": _strings(data["attendees"]),
+            "startTime": _graph_time({"date_time": data["start"], "time_zone": time_zone}),
+        }
+        if "interval_minutes" in data:
+            schedule_body["availabilityViewInterval"] = _integer(data["interval_minutes"])
         return _RequestShape(
             f"{_ROOT}/calendar/getSchedule",
             ConnectorMethod.POST,
-            json_body={
-                "endTime": _graph_time({"date_time": data["end"], "time_zone": time_zone}),
-                "schedules": _strings(data["attendees"]),
-                "startTime": _graph_time({"date_time": data["start"], "time_zone": time_zone}),
-            },
+            json_body=schedule_body,
             time_zone=_optional_text(data, "time_zone"),
         )
     if name == "attachments.list":
@@ -804,6 +855,54 @@ def _calendar_path(calendar_id: str) -> str:
     return f"{_ROOT}/calendars/{_segment(calendar_id)}"
 
 
+def _preflight_deletable_calendar(
+    operation: OperationSpec,
+    data: Mapping[str, object],
+    *,
+    credential: ConnectorRuntimeCredential | None,
+    transport: ConnectorTransport | None,
+) -> None:
+    if operation.provider != "outlook_calendar" or operation.name not in {
+        "calendars.delete",
+        "calendars.purge",
+    }:
+        return
+    calendar_id = _text(data, "calendar_id")
+    if calendar_id == _PRIMARY_CALENDAR_ALIAS:
+        raise ValidationError(
+            "The Outlook primary calendar cannot be deleted or permanently purged."
+        )
+    if credential is None or transport is None:
+        return
+    response = transport.request(
+        origin=_ORIGIN,
+        method=ConnectorMethod.GET,
+        path=_calendar_path(calendar_id),
+        credential=credential.credential,
+        query=(("$select", "id,isDefaultCalendar"),),
+        headers=_headers({}, time_zone=None),
+        expected_statuses=frozenset({200}),
+    )
+    calendar = _provider_mapping(response, "Outlook calendar delete preflight")
+    if _required_provider_text(calendar, "id", "calendar ID") != calendar_id:
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=response.status,
+            code="calendar_identity_mismatch",
+        )
+    is_default = calendar.get("isDefaultCalendar")
+    if type(is_default) is not bool:
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=response.status,
+            code="invalid_calendar_default_state",
+        )
+    if is_default:
+        raise ValidationError(
+            "The Outlook primary calendar cannot be deleted or permanently purged."
+        )
+
+
 def _event_path(calendar_id: str, event_id: str) -> str:
     return f"{_calendar_path(calendar_id)}/events/{_segment(event_id)}"
 
@@ -846,7 +945,13 @@ def _execute_permanent_delete(
     transport: ConnectorTransport,
 ) -> ConnectorAdapterResult:
     if operation.provider == "outlook_calendar" and operation.name == "events.purge":
-        _preflight_event_association(data, credential=credential, transport=transport)
+        event = _preflight_event(
+            data,
+            credential=credential,
+            transport=transport,
+            identity_mismatch_code="event_calendar_binding_mismatch",
+        )
+        _event_precondition_data(data, event)
     subject = _resolve_graph_subject(credential=credential, transport=transport)
     user_root = f"/v1.0/users/{_segment(subject)}"
     if operation.provider == "outlook_mail" and operation.name == "messages.purge":
@@ -870,6 +975,8 @@ def _execute_permanent_delete(
             expected_statuses=shape.expected_statuses,
         )
     except ConnectorProviderError as exc:
+        if exc.status == 412 and "change_key" in data:
+            raise _stale_outlook_resource_error(operation) from exc
         if (
             operation.provider == "outlook_calendar"
             and operation.name == "calendars.purge"
@@ -944,18 +1051,27 @@ def _window_shape(
     event_id: str | None = None,
 ) -> _RequestShape:
     calendar_id = _text(data, "calendar_id")
+    start = _text(data, "start")
+    end = _text(data, "end")
     if event_id is None:
         path = f"{_calendar_path(calendar_id)}/{suffix}"
     else:
         path = f"{_event_path(calendar_id, event_id)}/{suffix}"
+    query: list[tuple[str, str]] = [
+        ("startDateTime", start),
+        ("endDateTime", end),
+    ]
+    if "page_size" in data:
+        query.append(("$top", str(_integer(data["page_size"]))))
     return _RequestShape(
         path,
         ConnectorMethod.GET,
-        query=(
-            ("startDateTime", _text(data, "start")),
-            ("endDateTime", _text(data, "end")),
-        ),
+        query=tuple(query),
         time_zone=_optional_text(data, "time_zone"),
+        continuation_window=(
+            ("startDateTime", start),
+            ("endDateTime", end),
+        ),
     )
 
 
@@ -981,7 +1097,7 @@ def _message_query(data: dict[str, object]) -> tuple[tuple[str, str], ...]:
 
 
 def _calendar_query(data: dict[str, object]) -> tuple[tuple[str, str], ...]:
-    return _list_query(data, {"last_modified_at": "lastModifiedDateTime", "name": "name"})
+    return _list_query(data, {"name": "name"})
 
 
 def _event_query(data: dict[str, object]) -> tuple[tuple[str, str], ...]:
@@ -1106,6 +1222,12 @@ def _event_body(data: dict[str, object]) -> dict[str, object]:
         body["reminderMinutesBeforeStart"] = _integer(data["reminder_minutes_before_start"])
     if "response_requested" in data:
         body["responseRequested"] = _boolean(data["response_requested"])
+    if "is_online_meeting" in data:
+        is_online_meeting = _boolean(data["is_online_meeting"])
+        body["isOnlineMeeting"] = is_online_meeting
+        if is_online_meeting:
+            provider = _optional_text(data, "online_meeting_provider") or "teams_for_business"
+            body["onlineMeetingProvider"] = _ONLINE_MEETING_PROVIDERS[provider]
     if "sensitivity" in data:
         body["sensitivity"] = _text(data, "sensitivity")
     if "show_as" in data:
@@ -1584,6 +1706,7 @@ def _preflight_event(
     *,
     credential: ConnectorRuntimeCredential,
     transport: ConnectorTransport,
+    identity_mismatch_code: str = "event_identity_mismatch",
 ) -> Mapping[str, object]:
     event_id = _text(data, "event_id")
     response = transport.request(
@@ -1606,34 +1729,9 @@ def _preflight_event(
         raise ConnectorProviderError(
             origin=_ORIGIN,
             status=response.status,
-            code="event_identity_mismatch",
+            code=identity_mismatch_code,
         )
     return event
-
-
-def _preflight_event_association(
-    data: dict[str, object],
-    *,
-    credential: ConnectorRuntimeCredential,
-    transport: ConnectorTransport,
-) -> None:
-    event_id = _text(data, "event_id")
-    response = transport.request(
-        origin=_ORIGIN,
-        method=ConnectorMethod.GET,
-        path=_event_path(_text(data, "calendar_id"), event_id),
-        credential=credential.credential,
-        query=(("$select", "id"),),
-        headers=_headers({}, time_zone=None),
-        expected_statuses=frozenset({200}),
-    )
-    event = _provider_mapping(response, "Outlook event purge preflight")
-    if _required_provider_text(event, "id", "event ID") != event_id:
-        raise ConnectorProviderError(
-            origin=_ORIGIN,
-            status=response.status,
-            code="event_calendar_binding_mismatch",
-        )
 
 
 def _existing_event_effect(
@@ -1665,11 +1763,28 @@ def _event_precondition_data(
     provider_change_key = _required_provider_text(existing, "changeKey", "event change key")
     requested_change_key = _text(data, "change_key")
     if requested_change_key != provider_change_key:
-        raise ValidationError(
-            "Outlook event changed; read it again and request a fresh preview with its latest "
-            "change_key"
-        )
+        raise _stale_event_error()
     return data
+
+
+def _stale_event_error() -> ValidationError:
+    return ValidationError(
+        "Outlook event changed; read it again and request a fresh preview with its latest "
+        "change_key"
+    )
+
+
+def _stale_outlook_resource_error(operation: OperationSpec) -> ValidationError:
+    if operation.provider == "outlook_calendar":
+        resource = "calendar" if operation.name.startswith("calendars.") else "event"
+    elif operation.provider == "outlook_mail":
+        resource = "folder" if operation.name.startswith("folders.") else "message"
+    else:
+        raise ValidationError("Microsoft stale-write operation is invalid")
+    return ValidationError(
+        f"Outlook {resource} changed; read it again and request a fresh preview with its "
+        "latest change_key"
+    )
 
 
 def _event_is_online_meeting(existing: Mapping[str, object]) -> bool:
@@ -1770,6 +1885,7 @@ def _result(
     path: str,
     mime: bool,
     metadata_only: bool = False,
+    continuation_window: tuple[tuple[str, str], tuple[str, str]] | None = None,
     delivery: str | None = None,
 ) -> ConnectorAdapterResult:
     if mime:
@@ -1802,6 +1918,7 @@ def _result(
         path=path,
         status=response.status,
         required_select=_ATTACHMENT_METADATA_SELECT if metadata_only else None,
+        required_window=continuation_window,
     )
     return ConnectorAdapterResult(payload, continuation=continuation)
 
@@ -1825,6 +1942,7 @@ def _next_link(
     path: str,
     status: int,
     required_select: str | None = None,
+    required_window: tuple[tuple[str, str], tuple[str, str]] | None = None,
 ) -> object | None:
     if value is None:
         return None
@@ -1864,6 +1982,9 @@ def _next_link(
         ) from exc
     continuation_pairs: list[tuple[str, str]] = []
     select_seen = False
+    allowed_keys = _CONTINUATION_KEYS
+    if required_window is not None:
+        allowed_keys = allowed_keys | _WINDOW_CONTINUATION_KEYS
     for key, item in pairs:
         if key == "$select" and required_select is not None:
             if select_seen or item != required_select:
@@ -1874,15 +1995,27 @@ def _next_link(
                 )
             select_seen = True
             continue
-        if key not in _CONTINUATION_KEYS:
+        if key not in allowed_keys:
             raise ConnectorProviderError(
                 origin=_ORIGIN,
                 status=status,
                 code="invalid_next_link",
             )
         continuation_pairs.append((key, item))
-    if not continuation_pairs:
-        raise ConnectorProviderError(origin=_ORIGIN, status=status, code="invalid_next_link")
+    if not _has_continuation_progress(continuation_pairs):
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=status,
+            code="invalid_next_link",
+        )
+    if required_window is not None and not _has_exact_required_window(
+        continuation_pairs, required_window
+    ):
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=status,
+            code="invalid_next_link",
+        )
     return {"path": path, "query": [[key, item] for key, item in continuation_pairs]}
 
 
@@ -1891,6 +2024,7 @@ def _continuation_query(
     *,
     path: str,
     required_select: str | None = None,
+    required_window: tuple[tuple[str, str], tuple[str, str]] | None = None,
 ) -> tuple[tuple[str, str], ...]:
     continuation = _mapping(value)
     if set(continuation) != {"path", "query"} or continuation.get("path") != path:
@@ -1899,16 +2033,43 @@ def _continuation_query(
     if not query or len(query) > 128:
         raise ValidationError("connector continuation is invalid")
     pairs: list[tuple[str, str]] = []
+    allowed_keys = _CONTINUATION_KEYS
+    if required_window is not None:
+        allowed_keys = allowed_keys | _WINDOW_CONTINUATION_KEYS
     for item in query:
         pair = _items(item)
         if len(pair) != 2 or not isinstance(pair[0], str) or not isinstance(pair[1], str):
             raise ValidationError("connector continuation is invalid")
-        if pair[0] not in _CONTINUATION_KEYS:
+        if pair[0] not in allowed_keys:
             raise ValidationError("connector continuation is invalid")
         pairs.append((pair[0], pair[1]))
+    if not _has_continuation_progress(pairs):
+        raise ValidationError("connector continuation is invalid")
+    if required_window is not None and not _has_exact_required_window(pairs, required_window):
+        raise ValidationError("connector continuation is invalid")
     if required_select is None:
         return tuple(pairs)
     return (("$select", required_select), *pairs)
+
+
+def _has_continuation_progress(pairs: list[tuple[str, str]]) -> bool:
+    progress = [(key, item) for key, item in pairs if key in {"$skip", "$skiptoken"}]
+    if len(progress) != 1:
+        return False
+    key, item = progress[0]
+    return (key == "$skiptoken" and bool(item)) or (
+        key == "$skip" and item.isascii() and item.isdecimal() and not item.startswith("0")
+    )
+
+
+def _has_exact_required_window(
+    pairs: list[tuple[str, str]],
+    required_window: tuple[tuple[str, str], tuple[str, str]],
+) -> bool:
+    return all(
+        [item for key, item in pairs if key == required_key] == [required_value]
+        for required_key, required_value in required_window
+    )
 
 
 def _mapping(value: object) -> Mapping[str, object]:

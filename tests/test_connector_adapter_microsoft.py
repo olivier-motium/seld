@@ -28,6 +28,7 @@ class _FakeTransport:
         response: bytes = b"{}",
         failure: Exception | None = None,
         *,
+        calendar: dict[str, object] | None = None,
         fail_after: int = 0,
         event: dict[str, object] | None = None,
         message: dict[str, object] | None = None,
@@ -38,6 +39,10 @@ class _FakeTransport:
         self._failure = failure
         self._fail_after = fail_after
         self._subject_id = subject_id
+        self._calendar = calendar or {
+            "id": "calendar-1",
+            "isDefaultCalendar": False,
+        }
         self._event = event or {
             "attendees": [],
             "body": {"content": "Existing", "contentType": "html"},
@@ -60,6 +65,8 @@ class _FakeTransport:
         response = self._response
         if path == "/v1.0/me" and query == (("$select", "id"),):
             response = json.dumps({"id": self._subject_id}).encode()
+        elif query == (("$select", "id,isDefaultCalendar"),):
+            response = json.dumps(self._calendar).encode()
         elif query == (("$select", "id,parentFolderId"),):
             response = json.dumps(self._message).encode()
         elif query == (("$select", "id"),) and isinstance(path, str) and "/events/" in path:
@@ -193,7 +200,11 @@ def _input_for(operation: OperationSpec) -> dict[str, object]:
             "event_id": "event-1",
             "subject": "Changed",
         },
-        "events.delete": {"calendar_id": "primary", "event_id": "event-1"},
+        "events.delete": {
+            "calendar_id": "primary",
+            "change_key": "event-version-1",
+            "event_id": "event-1",
+        },
         "events.cancel": {"calendar_id": "primary", "event_id": "event-1"},
         "events.accept": {"calendar_id": "primary", "event_id": "event-1"},
         "events.tentative": {"calendar_id": "primary", "event_id": "event-1"},
@@ -214,7 +225,11 @@ def _input_for(operation: OperationSpec) -> dict[str, object]:
             "event_id": "event-1",
             "attachment_id": "attachment-1",
         },
-        "events.purge": {"calendar_id": "primary", "event_id": "event-1"},
+        "events.purge": {
+            "calendar_id": "primary",
+            "change_key": "event-version-1",
+            "event_id": "event-1",
+        },
     }
     return values[operation.name]
 
@@ -366,6 +381,272 @@ def test_immutable_ids_and_continuations_are_internal_and_stripped_from_payload(
     )
     assert transport.calls[0]["headers"] == {"Prefer": 'IdType="ImmutableId"'}
     assert transport.calls[1]["query"] == (("$skiptoken", "opaque"), ("$top", "10"))
+
+    numeric = _FakeTransport(
+        json.dumps(
+            {
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=1",
+                "value": [],
+            }
+        ).encode()
+    )
+    numeric_result = adapter.execute(
+        operation,
+        {},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, numeric),
+    )
+    assert numeric_result.continuation == {
+        "path": "/v1.0/me/messages",
+        "query": [["$skip", "1"]],
+    }
+
+    for invalid_progress in (
+        "$skiptoken=",
+        "$skip=0",
+        "$skip=1&$skiptoken=opaque",
+    ):
+        invalid = _FakeTransport(
+            json.dumps(
+                {
+                    "@odata.nextLink": (
+                        "https://graph.microsoft.com/v1.0/me/messages?" + invalid_progress
+                    ),
+                    "value": [],
+                }
+            ).encode()
+        )
+        with pytest.raises(ConnectorProviderError) as raised:
+            adapter.execute(
+                operation,
+                {},
+                continuation=None,
+                credential=_credential(),
+                transport=cast(ConnectorTransport, invalid),
+            )
+        assert raised.value.code == "invalid_next_link"
+
+
+def test_tampered_microsoft_continuation_replay_fails_before_transport() -> None:
+    start = "2026-08-01T09:00:00"
+    end = "2026-08-01T10:00:00"
+    messages = _operation("outlook_mail", ConnectorMode.READ, "messages.list")
+    window = _operation("outlook_calendar", ConnectorMode.READ, "events.window")
+    message_input: dict[str, object] = {}
+    window_input = {
+        "calendar_id": "primary",
+        "end": end,
+        "start": start,
+    }
+    cases = (
+        (
+            messages,
+            message_input,
+            {"path": "/v1.0/me/mailFolders", "query": [["$skiptoken", "opaque"]]},
+            "fixed Graph route",
+        ),
+        (
+            messages,
+            message_input,
+            {"path": "/v1.0/me/messages", "query": [["$top", "10"]]},
+            "continuation is invalid",
+        ),
+        (
+            messages,
+            message_input,
+            {"path": "/v1.0/me/messages", "query": [["$skip", "0"]]},
+            "continuation is invalid",
+        ),
+        (
+            messages,
+            message_input,
+            {
+                "path": "/v1.0/me/messages",
+                "query": [["$skiptoken", "opaque"], ["url", "https://example.test"]],
+            },
+            "continuation is invalid",
+        ),
+        (
+            window,
+            window_input,
+            {
+                "path": "/v1.0/me/calendar/calendarView",
+                "query": [
+                    ["startDateTime", "2026-08-02T09:00:00"],
+                    ["endDateTime", end],
+                    ["$skiptoken", "opaque"],
+                ],
+            },
+            "continuation is invalid",
+        ),
+        (
+            window,
+            window_input,
+            {
+                "path": "/v1.0/me/calendar/calendarView",
+                "query": [
+                    ["startDateTime", start],
+                    ["startDateTime", start],
+                    ["endDateTime", end],
+                    ["$skiptoken", "opaque"],
+                ],
+            },
+            "continuation is invalid",
+        ),
+    )
+
+    for operation, input_value, continuation, error in cases:
+        transport = _FakeTransport()
+        with pytest.raises(ValidationError, match=error):
+            MicrosoftConnectorAdapter().execute(
+                operation,
+                input_value,
+                continuation=continuation,
+                credential=_credential(),
+                transport=cast(ConnectorTransport, transport),
+            )
+        assert transport.calls == []
+
+
+def test_calendar_read_options_map_to_graph_query_and_prefer_header() -> None:
+    adapter = MicrosoftConnectorAdapter()
+    events_list = _operation("outlook_calendar", ConnectorMode.READ, "events.list")
+    events_get = _operation("outlook_calendar", ConnectorMode.READ, "events.get")
+    window = _operation("outlook_calendar", ConnectorMode.READ, "events.window")
+
+    transport = _FakeTransport()
+    adapter.execute(
+        events_list,
+        {"calendar_id": "primary", "page_size": 100, "time_zone": "Europe/Brussels"},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.calls[0]["query"] == (("$top", "100"),)
+    assert transport.calls[0]["headers"] == {
+        "Prefer": 'IdType="ImmutableId", outlook.timezone="Europe/Brussels"'
+    }
+
+    adapter.execute(
+        events_get,
+        {"calendar_id": "primary", "event_id": "event-1", "time_zone": "UTC"},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.calls[1]["headers"] == {
+        "Prefer": 'IdType="ImmutableId", outlook.timezone="UTC"'
+    }
+
+    window_transport = _FakeTransport()
+    adapter.execute(
+        window,
+        {
+            "calendar_id": "primary",
+            "end": "2026-08-01T10:00:00",
+            "page_size": 1_000,
+            "start": "2026-08-01T09:00:00",
+            "time_zone": "Europe/Brussels",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, window_transport),
+    )
+    assert window_transport.calls[0]["query"] == (
+        ("startDateTime", "2026-08-01T09:00:00"),
+        ("endDateTime", "2026-08-01T10:00:00"),
+        ("$top", "1000"),
+    )
+    assert window_transport.calls[0]["headers"] == {
+        "Prefer": 'IdType="ImmutableId", outlook.timezone="Europe/Brussels"'
+    }
+
+
+def test_calendar_window_materializes_the_documented_1000_event_page() -> None:
+    events = [{"id": f"event-{index}"} for index in range(1_000)]
+    transport = _FakeTransport(response=json.dumps({"value": events}).encode())
+
+    result = MicrosoftConnectorAdapter().execute(
+        _operation("outlook_calendar", ConnectorMode.READ, "events.window"),
+        {
+            "calendar_id": "primary",
+            "end": "2026-08-01T10:00:00",
+            "page_size": 1_000,
+            "start": "2026-08-01T09:00:00",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert isinstance(result.payload, dict)
+    assert result.payload["value"] == events
+
+
+def test_calendar_window_next_link_round_trips_exact_dates_and_rejects_forgery() -> None:
+    start = "2026-08-01T09:00:00"
+    end = "2026-08-01T10:00:00"
+    operation = _operation("outlook_calendar", ConnectorMode.READ, "events.window")
+    value = {"calendar_id": "primary", "end": end, "start": start}
+    next_link = (
+        "https://graph.microsoft.com/v1.0/me/calendar/calendarView?"
+        f"startDateTime={start}&endDateTime={end}&$skiptoken=opaque-page-two"
+    )
+    transport = _FakeTransport(
+        response=json.dumps({"@odata.nextLink": next_link, "value": []}).encode()
+    )
+    adapter = MicrosoftConnectorAdapter()
+    result = adapter.execute(
+        operation,
+        value,
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert result.continuation == {
+        "path": "/v1.0/me/calendar/calendarView",
+        "query": [
+            ["startDateTime", start],
+            ["endDateTime", end],
+            ["$skiptoken", "opaque-page-two"],
+        ],
+    }
+
+    adapter.execute(
+        operation,
+        value,
+        continuation=result.continuation,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.calls[1]["query"] == (
+        ("startDateTime", start),
+        ("endDateTime", end),
+        ("$skiptoken", "opaque-page-two"),
+    )
+
+    forged_links = (
+        next_link.replace("/me/calendar/calendarView", "/me/calendars/other/calendarView"),
+        next_link.replace(f"startDateTime={start}", "startDateTime=2026-08-02T09:00:00"),
+        next_link.replace(f"endDateTime={end}", f"endDateTime={end}&endDateTime={end}"),
+        next_link.replace("&$skiptoken=opaque-page-two", ""),
+        next_link.replace("$skiptoken=opaque-page-two", "$skiptoken="),
+        next_link.replace("$skiptoken=opaque-page-two", "$skip=0"),
+    )
+    for forged in forged_links:
+        forged_transport = _FakeTransport(
+            response=json.dumps({"@odata.nextLink": forged, "value": []}).encode()
+        )
+        with pytest.raises(ConnectorProviderError) as raised:
+            adapter.execute(
+                operation,
+                value,
+                continuation=None,
+                credential=_credential(),
+                transport=cast(ConnectorTransport, forged_transport),
+            )
+        assert raised.value.code == "invalid_next_link"
 
 
 def test_message_update_and_event_fields_use_fixed_typed_graph_bodies() -> None:
@@ -539,6 +820,340 @@ def test_send_effect_precondition_and_typed_message_and_event_bodies() -> None:
         adapter.classify_effect(event_create, _event("shared-calendar", attendees=False))
         is ConnectorEffect.OUTWARD
     )
+
+
+def test_freebusy_interval_maps_and_graph_forbidden_is_typed() -> None:
+    adapter = MicrosoftConnectorAdapter()
+    operation = _operation("outlook_calendar", ConnectorMode.READ, "freebusy.query")
+    value = {
+        "attendees": ["ada@example.test"],
+        "end": "2026-08-01T10:00:00",
+        "interval_minutes": 30,
+        "start": "2026-08-01T09:00:00",
+    }
+    transport = _FakeTransport()
+    adapter.execute(
+        operation,
+        value,
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.calls[0]["json_body"] == {
+        "availabilityViewInterval": 30,
+        "endTime": {"dateTime": "2026-08-01T10:00:00", "timeZone": "UTC"},
+        "schedules": ["ada@example.test"],
+        "startTime": {"dateTime": "2026-08-01T09:00:00", "timeZone": "UTC"},
+    }
+
+    failure = ConnectorProviderError(
+        origin=ConnectorOrigin.MICROSOFT_GRAPH,
+        status=403,
+        code="ErrorAccessDenied",
+        retry_after="30",
+    )
+    with pytest.raises(ConnectorProviderError) as raised:
+        adapter.execute(
+            operation,
+            value,
+            continuation=None,
+            credential=_credential(),
+            transport=cast(ConnectorTransport, _FakeTransport(failure=failure)),
+        )
+    assert raised.value.code == "freebusy_unsupported_for_account_or_permission"
+    assert raised.value.retry_after == "30"
+
+
+def test_event_delete_preflights_change_key_and_pins_if_match() -> None:
+    operation = _operation("outlook_calendar", ConnectorMode.WRITE, "events.delete")
+    value = {
+        "calendar_id": "primary",
+        "change_key": "event-version-1",
+        "event_id": "event-1",
+    }
+    adapter = MicrosoftConnectorAdapter()
+
+    stale = _FakeTransport(
+        event={
+            "attendees": [],
+            "body": {"content": "Existing", "contentType": "html"},
+            "changeKey": "event-version-2",
+            "id": "event-1",
+            "isOnlineMeeting": False,
+            "isOrganizer": True,
+        }
+    )
+    with pytest.raises(ValidationError, match="read it again"):
+        adapter.classify_effect(
+            operation,
+            value,
+            credential=_credential(),
+            transport=cast(ConnectorTransport, stale),
+        )
+    assert [call["method"] for call in stale.calls] == [ConnectorMethod.GET]
+
+    stale_execution = _FakeTransport(
+        event={
+            "attendees": [],
+            "body": {"content": "Existing", "contentType": "html"},
+            "changeKey": "event-version-2",
+            "id": "event-1",
+            "isOnlineMeeting": False,
+            "isOrganizer": True,
+        }
+    )
+    with pytest.raises(ValidationError, match="read it again"):
+        adapter.execute(
+            operation,
+            value,
+            continuation=None,
+            credential=_credential(),
+            transport=cast(ConnectorTransport, stale_execution),
+            write_idempotency_key="confirmed-delete",
+        )
+    assert [call["method"] for call in stale_execution.calls] == [ConnectorMethod.GET]
+
+    fresh = _FakeTransport()
+    assert (
+        adapter.classify_effect(
+            operation,
+            value,
+            credential=_credential(),
+            transport=cast(ConnectorTransport, fresh),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+    fresh_execution = _FakeTransport()
+    adapter.execute(
+        operation,
+        value,
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, fresh_execution),
+        write_idempotency_key="confirmed-delete",
+    )
+    assert [call["method"] for call in fresh_execution.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.DELETE,
+    ]
+    assert fresh_execution.calls[-1]["headers"] == {
+        "If-Match": "event-version-1",
+        "Prefer": 'IdType="ImmutableId"',
+    }
+
+
+@pytest.mark.parametrize(
+    ("operation_name", "extra_input"),
+    (("events.delete", {}), ("events.update", {"subject": "Updated"})),
+)
+def test_event_write_412_uses_the_same_fresh_preview_guidance(
+    operation_name: str,
+    extra_input: dict[str, object],
+) -> None:
+    failure = ConnectorProviderError(
+        origin=ConnectorOrigin.MICROSOFT_GRAPH,
+        status=412,
+        code="ErrorPreconditionFailed",
+    )
+    transport = _FakeTransport(failure=failure, fail_after=1)
+
+    with pytest.raises(ValidationError, match=r"read it again.*fresh preview"):
+        MicrosoftConnectorAdapter().execute(
+            _operation("outlook_calendar", ConnectorMode.WRITE, operation_name),
+            {
+                "calendar_id": "primary",
+                "change_key": "event-version-1",
+                "event_id": "event-1",
+                **extra_input,
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+            write_idempotency_key="confirmed-write",
+        )
+
+    assert [call["method"] for call in transport.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.DELETE if operation_name == "events.delete" else ConnectorMethod.PATCH,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("provider", "operation_name", "input_value", "fail_after", "resource"),
+    (
+        (
+            "outlook_calendar",
+            "events.cancel",
+            {
+                "calendar_id": "primary",
+                "change_key": "event-version-1",
+                "event_id": "event-1",
+            },
+            0,
+            "event",
+        ),
+        (
+            "outlook_calendar",
+            "calendars.delete",
+            {"calendar_id": "calendar-1", "change_key": "calendar-version-1"},
+            1,
+            "calendar",
+        ),
+        (
+            "outlook_mail",
+            "messages.update",
+            {
+                "change_key": "message-version-1",
+                "is_read": True,
+                "message_id": "message-1",
+            },
+            0,
+            "message",
+        ),
+        (
+            "outlook_mail",
+            "folders.update",
+            {
+                "change_key": "folder-version-1",
+                "display_name": "Updated",
+                "folder_id": "folder-1",
+            },
+            0,
+            "folder",
+        ),
+    ),
+)
+def test_optional_change_key_412_has_resource_specific_fresh_preview_guidance(
+    provider: str,
+    operation_name: str,
+    input_value: dict[str, object],
+    fail_after: int,
+    resource: str,
+) -> None:
+    failure = ConnectorProviderError(
+        origin=ConnectorOrigin.MICROSOFT_GRAPH,
+        status=412,
+        code="ErrorPreconditionFailed",
+    )
+    transport = _FakeTransport(failure=failure, fail_after=fail_after)
+
+    with pytest.raises(ValidationError, match=f"Outlook {resource} changed"):
+        MicrosoftConnectorAdapter().execute(
+            _operation(provider, ConnectorMode.WRITE, operation_name),
+            input_value,
+            continuation=None,
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+            write_idempotency_key="confirmed-write",
+        )
+
+    assert len(transport.calls) == fail_after + 1
+    assert cast(dict[str, str], transport.calls[-1]["headers"])["If-Match"] == cast(
+        str, input_value["change_key"]
+    )
+
+
+def test_primary_calendar_delete_and_purge_fail_before_transport() -> None:
+    adapter = MicrosoftConnectorAdapter()
+    for name in ("calendars.delete", "calendars.purge"):
+        transport = _FakeTransport()
+        with pytest.raises(ValidationError, match="primary calendar"):
+            adapter.classify_effect(
+                _operation("outlook_calendar", ConnectorMode.WRITE, name),
+                {"calendar_id": "primary"},
+            )
+        with pytest.raises(ValidationError, match="primary calendar"):
+            adapter.execute(
+                _operation("outlook_calendar", ConnectorMode.WRITE, name),
+                {"calendar_id": "primary"},
+                continuation=None,
+                credential=_credential(),
+                transport=cast(ConnectorTransport, transport),
+            )
+        assert transport.calls == []
+
+        real_id = _FakeTransport(calendar={"id": "calendar-1", "isDefaultCalendar": True})
+        with pytest.raises(ValidationError, match="primary calendar"):
+            adapter.classify_effect(
+                _operation("outlook_calendar", ConnectorMode.WRITE, name),
+                {"calendar_id": "calendar-1"},
+                credential=_credential(),
+                transport=cast(ConnectorTransport, real_id),
+            )
+        assert len(real_id.calls) == 1
+        assert real_id.calls[0]["method"] is ConnectorMethod.GET
+        assert real_id.calls[0]["path"] == _CALENDAR
+        assert real_id.calls[0]["query"] == (("$select", "id,isDefaultCalendar"),)
+
+        replay = _FakeTransport(calendar={"id": "calendar-1", "isDefaultCalendar": True})
+        with pytest.raises(ValidationError, match="primary calendar"):
+            adapter.execute(
+                _operation("outlook_calendar", ConnectorMode.WRITE, name),
+                {"calendar_id": "calendar-1"},
+                continuation=None,
+                credential=_credential(),
+                transport=cast(ConnectorTransport, replay),
+            )
+        assert len(replay.calls) == 1
+        assert replay.calls[0]["method"] is ConnectorMethod.GET
+
+
+def test_teams_event_create_maps_default_and_rejects_cross_field_provider() -> None:
+    operation = _operation("outlook_calendar", ConnectorMode.WRITE, "events.create")
+    adapter = MicrosoftConnectorAdapter()
+    transport = _FakeTransport()
+    adapter.execute(
+        operation,
+        {**_event(attendees=False), "is_online_meeting": True},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.calls[-1]["json_body"] == {
+        "body": {"content": "Planning", "contentType": "Text"},
+        "end": {"dateTime": "2026-08-01T10:00:00", "timeZone": "Europe/Brussels"},
+        "isOnlineMeeting": True,
+        "onlineMeetingProvider": "teamsForBusiness",
+        "start": {"dateTime": "2026-08-01T09:00:00", "timeZone": "Europe/Brussels"},
+        "subject": "Planning",
+        "transactionId": "client-transaction-1",
+    }
+
+    explicit_transport = _FakeTransport()
+    adapter.execute(
+        operation,
+        {
+            **_event(attendees=False),
+            "is_online_meeting": True,
+            "online_meeting_provider": "teams_for_business",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, explicit_transport),
+    )
+    assert (
+        cast(dict[str, object], explicit_transport.calls[-1]["json_body"])["onlineMeetingProvider"]
+        == "teamsForBusiness"
+    )
+
+    for invalid in (
+        {**_event(attendees=False), "online_meeting_provider": "teams_for_business"},
+        {
+            **_event(attendees=False),
+            "is_online_meeting": False,
+            "online_meeting_provider": "teams_for_business",
+        },
+    ):
+        invalid_transport = _FakeTransport()
+        with pytest.raises(ValidationError):
+            adapter.execute(
+                operation,
+                invalid,
+                continuation=None,
+                credential=_credential(),
+                transport=cast(ConnectorTransport, invalid_transport),
+            )
+        assert invalid_transport.calls == []
 
 
 def test_unsupported_permanent_delete_is_clear_and_never_retried() -> None:
@@ -1087,7 +1702,11 @@ def test_event_purge_rejects_calendar_binding_mismatch_before_permanent_delete()
     with pytest.raises(ConnectorProviderError) as raised:
         MicrosoftConnectorAdapter().execute(
             _operation("outlook_calendar", ConnectorMode.WRITE, "events.purge"),
-            {"calendar_id": "primary", "event_id": "event-1"},
+            {
+                "calendar_id": "primary",
+                "change_key": "event-version-1",
+                "event_id": "event-1",
+            },
             continuation=None,
             credential=_credential(),
             transport=cast(ConnectorTransport, transport),
@@ -1095,7 +1714,60 @@ def test_event_purge_rejects_calendar_binding_mismatch_before_permanent_delete()
     assert raised.value.code == "event_calendar_binding_mismatch"
     assert len(transport.calls) == 1
     assert transport.calls[0]["path"] == _EVENT
-    assert transport.calls[0]["query"] == (("$select", "id"),)
+    assert "changeKey" in str(transport.calls[0]["query"])
+
+
+def test_event_purge_requires_current_change_key_and_remaps_dispatch_412() -> None:
+    stale = _FakeTransport(
+        event={
+            "attendees": [],
+            "body": {"content": "Existing", "contentType": "html"},
+            "changeKey": "event-version-2",
+            "id": "event-1",
+            "isOnlineMeeting": False,
+            "isOrganizer": True,
+        }
+    )
+    adapter = MicrosoftConnectorAdapter()
+    operation = _operation("outlook_calendar", ConnectorMode.WRITE, "events.purge")
+    value = {
+        "calendar_id": "primary",
+        "change_key": "event-version-1",
+        "event_id": "event-1",
+    }
+    with pytest.raises(ValidationError, match=r"read it again.*fresh preview"):
+        adapter.classify_effect(
+            operation,
+            value,
+            credential=_credential(),
+            transport=cast(ConnectorTransport, stale),
+        )
+    assert len(stale.calls) == 1
+
+    failure = ConnectorProviderError(
+        origin=ConnectorOrigin.MICROSOFT_GRAPH,
+        status=412,
+        code="ErrorPreconditionFailed",
+    )
+    dispatch = _FakeTransport(failure=failure, fail_after=2)
+    with pytest.raises(ValidationError, match=r"read it again.*fresh preview"):
+        adapter.execute(
+            operation,
+            value,
+            continuation=None,
+            credential=_credential(),
+            transport=cast(ConnectorTransport, dispatch),
+            write_idempotency_key="confirmed-purge",
+        )
+    assert [call["method"] for call in dispatch.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.GET,
+        ConnectorMethod.POST,
+    ]
+    assert dispatch.calls[-1]["headers"] == {
+        "If-Match": "event-version-1",
+        "Prefer": 'IdType="ImmutableId"',
+    }
 
 
 def test_personal_account_calendar_purge_returns_typed_unsupported_after_subject_resolution() -> (
@@ -1107,7 +1779,7 @@ def test_personal_account_calendar_purge_returns_typed_unsupported_after_subject
         code="ErrorAccessDenied",
     )
     adapter = MicrosoftConnectorAdapter()
-    transport = _FakeTransport(failure=failure, fail_after=1)
+    transport = _FakeTransport(failure=failure, fail_after=2)
 
     with pytest.raises(ConnectorProviderError) as raised:
         adapter.execute(
@@ -1118,5 +1790,6 @@ def test_personal_account_calendar_purge_returns_typed_unsupported_after_subject
             transport=cast(ConnectorTransport, transport),
         )
     assert raised.value.code == "calendar_permanent_delete_unsupported_for_account"
-    assert transport.calls[0]["query"] == (("$select", "id"),)
-    assert transport.calls[1]["path"] == ("/v1.0/users/user-1/calendars/calendar-1/permanentDelete")
+    assert transport.calls[0]["query"] == (("$select", "id,isDefaultCalendar"),)
+    assert transport.calls[1]["query"] == (("$select", "id"),)
+    assert transport.calls[2]["path"] == ("/v1.0/users/user-1/calendars/calendar-1/permanentDelete")

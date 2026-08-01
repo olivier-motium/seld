@@ -16,6 +16,7 @@ from continuity_kernel.errors import ValidationError
 
 MAX_JSON_DEPTH: Final = 16
 MAX_COLLECTION_ITEMS: Final = 128
+MAX_JSON_ARRAY_ITEMS: Final = 1_000
 MAX_STRING_LENGTH: Final = 256_000
 MAX_SCHEMA_BRANCHES: Final = 64
 MAX_SEALED_TOKEN_LENGTH: Final = 8_192
@@ -317,7 +318,7 @@ def _clone_json(value: object, *, depth: int) -> object:
             items.append((key, _clone_json(item, depth=depth + 1)))
         return {key: item for key, item in sorted(items)}
     if isinstance(value, list):
-        if len(value) > MAX_COLLECTION_ITEMS:
+        if len(value) > MAX_JSON_ARRAY_ITEMS:
             raise ValidationError("JSON array exceeds its collection bound")
         return [_clone_json(item, depth=depth + 1) for item in value]
     raise ValidationError("value is not JSON")
@@ -431,7 +432,7 @@ def _normalize_schema(
         normalized,
         "minItems",
         "maxItems",
-        MAX_COLLECTION_ITEMS,
+        MAX_JSON_ARRAY_ITEMS,
     )
     if any(key in normalized for key in ("minLength", "maxLength")) and schema_type != "string":
         raise ValidationError("JSON string bounds require a string type")

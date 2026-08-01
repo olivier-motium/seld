@@ -223,6 +223,107 @@ def test_message_page_size_and_follow_up_status_are_bounded(catalog: OperationCa
         )
 
 
+def test_calendar_read_schemas_expose_only_supported_query_fields(
+    catalog: OperationCatalog,
+) -> None:
+    calendars = catalog.lookup("outlook_calendar", ConnectorMode.READ, "calendars.list")
+    events_list = catalog.lookup("outlook_calendar", ConnectorMode.READ, "events.list")
+    events_get = catalog.lookup("outlook_calendar", ConnectorMode.READ, "events.get")
+    window = catalog.lookup("outlook_calendar", ConnectorMode.READ, "events.window")
+    instances = catalog.lookup("outlook_calendar", ConnectorMode.READ, "events.instances")
+
+    calendar_properties = cast(dict[str, object], calendars.input_schema["properties"])
+    calendar_order = cast(dict[str, object], calendar_properties["order_by"])
+    assert "search" not in calendar_properties
+    assert calendar_order["enum"] == ("name",)
+
+    event_list_properties = cast(dict[str, object], events_list.input_schema["properties"])
+    assert "search" not in event_list_properties
+    assert "time_zone" in event_list_properties
+    assert "time_zone" in cast(dict[str, object], events_get.input_schema["properties"])
+    for operation in (window, instances):
+        properties = cast(dict[str, object], operation.input_schema["properties"])
+        page_size = cast(dict[str, object], properties["page_size"])
+        assert page_size["minimum"] == 1
+        assert page_size["maximum"] == 1_000
+
+
+def test_freebusy_attendees_and_interval_are_provider_bounded(catalog: OperationCatalog) -> None:
+    base = {
+        "attendees": ["person@example.test"],
+        "end": "2026-08-01T10:00:00",
+        "start": "2026-08-01T09:00:00",
+    }
+    valid = catalog.validate_input(
+        "outlook_calendar",
+        ConnectorMode.READ,
+        "freebusy.query",
+        {**base, "interval_minutes": 30},
+    )
+    assert cast(dict[str, object], valid)["interval_minutes"] == 30
+    maximum_schedules = [f"person-{index}@example.test" for index in range(20)]
+    bounded = catalog.validate_input(
+        "outlook_calendar",
+        ConnectorMode.READ,
+        "freebusy.query",
+        {**base, "attendees": maximum_schedules},
+    )
+    assert cast(dict[str, object], bounded)["attendees"] == maximum_schedules
+    for interval in (5, 1_440):
+        boundary = catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.READ,
+            "freebusy.query",
+            {**base, "interval_minutes": interval},
+        )
+        assert cast(dict[str, object], boundary)["interval_minutes"] == interval
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.READ,
+            "freebusy.query",
+            {
+                **base,
+                "attendees": [f"person-{index}@example.test" for index in range(21)],
+            },
+        )
+    for interval in (4, 1_441):
+        with pytest.raises(ValidationError):
+            catalog.validate_input(
+                "outlook_calendar",
+                ConnectorMode.READ,
+                "freebusy.query",
+                {**base, "interval_minutes": interval},
+            )
+
+
+def test_event_attendees_match_graphs_500_person_limit(catalog: OperationCatalog) -> None:
+    attendees = [
+        {"email": f"person-{index}@example.test", "type": "required"} for index in range(500)
+    ]
+    validated = catalog.validate_input(
+        "outlook_calendar",
+        ConnectorMode.WRITE,
+        "events.create",
+        {**_event(), "attendees": attendees},
+    )
+    assert len(cast(dict[str, object], validated)["attendees"]) == 500
+
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "events.create",
+            {
+                **_event(),
+                "attendees": [
+                    *attendees,
+                    {"email": "person-500@example.test", "type": "required"},
+                ],
+            },
+        )
+
+
 def test_existing_event_mutations_require_the_confirmed_change_key(
     catalog: OperationCatalog,
 ) -> None:
@@ -242,6 +343,12 @@ def test_existing_event_mutations_require_the_confirmed_change_key(
         "change_key": "event-version-1",
         "event_id": "event-1",
     }
+    delete = {
+        "calendar_id": "primary",
+        "change_key": "event-version-1",
+        "event_id": "event-1",
+    }
+    purge = dict(delete)
 
     assert (
         catalog.validate_input(
@@ -261,6 +368,24 @@ def test_existing_event_mutations_require_the_confirmed_change_key(
         )
         == attachment
     )
+    assert (
+        catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "events.delete",
+            delete,
+        )
+        == delete
+    )
+    assert (
+        catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "events.purge",
+            purge,
+        )
+        == purge
+    )
     with pytest.raises(ValidationError):
         catalog.validate_input(
             "outlook_calendar",
@@ -274,6 +399,20 @@ def test_existing_event_mutations_require_the_confirmed_change_key(
             ConnectorMode.WRITE,
             "attachments.add",
             {key: value for key, value in attachment.items() if key != "change_key"},
+        )
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "events.delete",
+            {key: value for key, value in delete.items() if key != "change_key"},
+        )
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "outlook_calendar",
+            ConnectorMode.WRITE,
+            "events.purge",
+            {key: value for key, value in purge.items() if key != "change_key"},
         )
 
 

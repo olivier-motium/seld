@@ -4,6 +4,7 @@ import pytest
 
 from continuity_kernel.connector_contract import (
     MAX_COLLECTION_ITEMS,
+    MAX_JSON_ARRAY_ITEMS,
     ConnectorEffect,
     ConnectorMode,
     OperationCatalog,
@@ -167,8 +168,14 @@ def test_schema_boundary_rejects_proxy_nonfinite_oversized_deep_and_ambiguous_va
         validate_json({1: "not JSON"}, _object({}))
     with pytest.raises(ValidationError):
         validate_json(
-            list(range(MAX_COLLECTION_ITEMS + 1)),
+            list(range(MAX_JSON_ARRAY_ITEMS + 1)),
             {"items": {"type": "integer"}, "type": "array"},
+        )
+
+    with pytest.raises(ValidationError, match="collection bound"):
+        validate_json(
+            {str(index): index for index in range(MAX_COLLECTION_ITEMS + 1)},
+            _object({}),
         )
 
     deep: object = "leaf"

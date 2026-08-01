@@ -84,6 +84,16 @@ _EFFECT_ORDER: Final = {
 }
 _PREVIEW_TEXT_CHARS: Final = 2_000
 _LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
+_OPERATION_WARNINGS: Final = {
+    (
+        "outlook_calendar",
+        "events.cancel",
+    ): "Outlook will email event attendees a cancellation notice.",
+    (
+        "outlook_calendar",
+        "events.delete",
+    ): ("If this is an organized meeting, Outlook will email attendees a cancellation notice."),
+}
 
 
 @dataclass(frozen=True)
@@ -765,7 +775,7 @@ class ConnectorRuntime:
             "preview": _preview_value(preview_value),
             "provider": provider,
             "status": "confirmation_required",
-            "warning": _effect_warning(effect),
+            "warning": _effect_warning(effect, provider=provider, operation=operation),
         }
 
     def _state_changed(
@@ -1072,14 +1082,28 @@ def _scope_error(provider: str, operation: str) -> str:
     return "the provider did not grant the permission required for this operation"
 
 
-def _effect_warning(effect: ConnectorEffect) -> str:
+def _effect_warning(
+    effect: ConnectorEffect,
+    *,
+    provider: str | None = None,
+    operation: str | None = None,
+) -> str:
     if effect is ConnectorEffect.PERMANENT:
-        return "This cannot be undone. Review the exact target before confirming."
-    if effect is ConnectorEffect.DESTRUCTIVE:
-        return (
+        effect_warning = "This cannot be undone. Review the exact target before confirming."
+    elif effect is ConnectorEffect.DESTRUCTIVE:
+        effect_warning = (
             "This removes or archives provider content. Review the exact target before confirming."
         )
-    return "This affects other people or sends data outward. Review it before confirming."
+    else:
+        effect_warning = (
+            "This affects other people or sends data outward. Review it before confirming."
+        )
+    if provider is None or operation is None:
+        return effect_warning
+    operation_warning = _OPERATION_WARNINGS.get((provider, operation))
+    if operation_warning is None:
+        return effect_warning
+    return f"{effect_warning} {operation_warning}"
 
 
 def _preview_value(value: object) -> object:
