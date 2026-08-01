@@ -49,6 +49,55 @@ def _array(
     }
 
 
+def _local_file() -> dict[str, object]:
+    return _object(
+        {
+            "grant_id": _text(128, minimum=1),
+            "relative_path": _text(16 * 1024, minimum=1),
+        },
+        ("grant_id", "relative_path"),
+    )
+
+
+def _binary_upload(
+    metadata: dict[str, object],
+    required: tuple[str, ...],
+) -> dict[str, object]:
+    source_fields = {
+        **metadata,
+        "content_base64": _BASE64,
+        "local_file": _local_file(),
+    }
+    schema = _object(source_fields)
+    schema["oneOf"] = [
+        _object(
+            {**metadata, "content_base64": source_fields["content_base64"]},
+            (*required, "content_base64"),
+        ),
+        _object(
+            {**metadata, "local_file": source_fields["local_file"]},
+            (*required, "local_file"),
+        ),
+    ]
+    return schema
+
+
+def _binary_delivery(
+    identifiers: dict[str, object],
+    required: tuple[str, ...],
+) -> dict[str, object]:
+    return _object(
+        {
+            **identifiers,
+            "delivery": {
+                "enum": ["artifact", "inline_chunk"],
+                "type": "string",
+            },
+        },
+        required,
+    )
+
+
 def _operation(
     provider: str,
     mode: ConnectorMode,
@@ -474,7 +523,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.download",
         ConnectorEffect.READ,
         _SLACK_FILES_READ,
-        _object({"file_id": _SLACK_ID}, ("file_id",)),
+        _binary_delivery({"file_id": _SLACK_ID}, ("file_id",)),
     ),
     _operation(
         "slack",
@@ -650,15 +699,14 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.upload",
         ConnectorEffect.OUTWARD,
         _SLACK_FILES_UPLOAD,
-        _object(
+        _binary_upload(
             {
                 "channel": _SLACK_ID,
-                "content_base64": _BASE64,
                 "filename": _text(255, minimum=1),
                 "thread_ts": _SLACK_TIMESTAMP,
                 "title": _text(255, minimum=1),
             },
-            ("channel", "content_base64", "filename"),
+            ("channel", "filename"),
         ),
     ),
     _operation(
@@ -773,7 +821,7 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "attachments.get",
         ConnectorEffect.READ,
         _DISCORD_BOT,
-        _object(
+        _binary_delivery(
             {
                 "attachment_id": _SNOWFLAKE,
                 "channel_id": _SNOWFLAKE,
@@ -989,15 +1037,14 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "attachments.add",
         ConnectorEffect.OUTWARD,
         _DISCORD_BOT,
-        _object(
+        _binary_upload(
             {
                 "channel_id": _SNOWFLAKE,
-                "content_base64": _BASE64,
                 "description": _text(1_024, minimum=1),
                 "filename": _text(255, minimum=1),
                 "message_id": _SNOWFLAKE,
             },
-            ("channel_id", "content_base64", "filename", "message_id"),
+            ("channel_id", "filename", "message_id"),
         ),
     ),
     _operation(

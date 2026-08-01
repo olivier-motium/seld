@@ -195,6 +195,85 @@ def test_representative_message_thread_and_file_inputs_are_exactly_validated() -
 
 
 @pytest.mark.parametrize(
+    ("provider", "name", "metadata"),
+    [
+        ("slack", "files.upload", {"channel": "C123", "filename": "report.pdf"}),
+        (
+            "discord",
+            "attachments.add",
+            {
+                "channel_id": "123456789012345678",
+                "filename": "report.pdf",
+                "message_id": "223456789012345678",
+            },
+        ),
+    ],
+)
+def test_binary_uploads_require_exactly_one_inline_or_local_file_source(
+    provider: str,
+    name: str,
+    metadata: dict[str, object],
+) -> None:
+    operation = _operation(provider, ConnectorMode.WRITE, name)
+    selector = {
+        "grant_id": "grant-1",
+        "relative_path": "exports/report.pdf",
+    }
+
+    assert (
+        _validated_input(operation, {**metadata, "local_file": selector})["local_file"] == selector
+    )
+    assert (
+        _validated_input(operation, {**metadata, "content_base64": "cGRm"})["content_base64"]
+        == "cGRm"
+    )
+    with pytest.raises(ValidationError, match="oneOf"):
+        operation.validate_input(metadata)
+    with pytest.raises(ValidationError, match="oneOf"):
+        operation.validate_input(
+            {
+                **metadata,
+                "content_base64": "cGRm",
+                "local_file": selector,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider", "name", "identifiers"),
+    [
+        ("slack", "files.download", {"file_id": "F123"}),
+        (
+            "discord",
+            "attachments.get",
+            {
+                "attachment_id": "323456789012345678",
+                "channel_id": "123456789012345678",
+                "message_id": "223456789012345678",
+            },
+        ),
+    ],
+)
+def test_binary_downloads_default_to_artifacts_and_keep_explicit_inline_compatibility(
+    provider: str,
+    name: str,
+    identifiers: dict[str, object],
+) -> None:
+    operation = _operation(provider, ConnectorMode.READ, name)
+
+    assert _validated_input(operation, identifiers) == identifiers
+    assert _validated_input(operation, {**identifiers, "delivery": "artifact"})["delivery"] == (
+        "artifact"
+    )
+    assert (
+        _validated_input(operation, {**identifiers, "delivery": "inline_chunk"})["delivery"]
+        == "inline_chunk"
+    )
+    with pytest.raises(ValidationError):
+        operation.validate_input({**identifiers, "delivery": "provider_url"})
+
+
+@pytest.mark.parametrize(
     ("provider", "mode", "name", "value"),
     [
         ("slack", ConnectorMode.READ, "messages.list", {"channel": "C123", "cursor": "opaque"}),

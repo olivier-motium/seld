@@ -34,6 +34,8 @@ from continuity_kernel.errors import ValidationError
 class _FakeTransport:
     application_flags: int | None = 1 << 19
     bot: bool = True
+    discord_channel_guild_id: str | None = "323456789012345678"
+    discord_premium_tier: int = 0
     message_author: str = "bot-1"
     message_content: str = "confirmed"
     slack_cursor: str | None = None
@@ -114,6 +116,17 @@ class _FakeTransport:
             if self.application_flags is not None:
                 payload["flags"] = self.application_flags
             return _response(origin, payload)
+        if path == "/api/v10/channels/123456789012345678" and method is ConnectorMethod.GET:
+            payload = {"id": "123456789012345678"}
+            if self.discord_channel_guild_id is not None:
+                payload["guild_id"] = self.discord_channel_guild_id
+            return _response(origin, payload)
+        if (
+            self.discord_channel_guild_id is not None
+            and path == f"/api/v10/guilds/{self.discord_channel_guild_id}"
+            and method is ConnectorMethod.GET
+        ):
+            return _response(origin, {"premium_tier": self.discord_premium_tier})
         if "/messages/" in path and method is ConnectorMethod.GET:
             return _response(
                 origin,
@@ -202,7 +215,7 @@ def _input(operation: OperationSpec) -> dict[str, object]:
         },
         ("slack", "files.list"): {"count": 50, "page": 1},
         ("slack", "files.get"): {"file_id": "F123"},
-        ("slack", "files.download"): {"file_id": "F123"},
+        ("slack", "files.download"): {"delivery": "inline_chunk", "file_id": "F123"},
         ("slack", "reactions.list"): {"channel": "C123", "timestamp": "1712345678.000001"},
         ("slack", "dms.open"): {"users": ["U123"]},
         ("slack", "dms.close"): {"channel": "D123"},
@@ -249,7 +262,11 @@ def _input(operation: OperationSpec) -> dict[str, object]:
         ("discord", "threads.archived_private"): {"channel_id": "123456789012345678", "limit": 50},
         ("discord", "messages.list"): {"channel_id": "123456789012345678", "limit": 50},
         ("discord", "messages.get"): common_discord,
-        ("discord", "attachments.get"): {**common_discord, "attachment_id": "3"},
+        ("discord", "attachments.get"): {
+            **common_discord,
+            "attachment_id": "3",
+            "delivery": "inline_chunk",
+        },
         ("discord", "reactions.list"): {**common_discord, "emoji": "wave", "limit": 50},
         ("discord", "dms.open"): {"user_id": "123456789012345678"},
         ("discord", "dms.close"): {"channel_id": "123456789012345678"},
@@ -371,6 +388,105 @@ def test_adapter_requires_the_exact_canonical_operation_and_rejects_unknown_quer
         )
 
     assert not transport.requests
+
+
+def test_local_file_limit_hook_accepts_only_the_two_sanitized_upload_shapes() -> None:
+    adapter = CollaborationConnectorAdapter()
+    slack = _operation("slack", ConnectorMode.WRITE, "files.upload")
+    discord = _operation("discord", ConnectorMode.WRITE, "attachments.add")
+    slack_transport = _FakeTransport()
+
+    assert (
+        adapter.max_local_file_bytes(
+            slack,
+            {
+                "channel": "C123",
+                "filename": "report.bin",
+                "local_file": "opaque-local-file",
+            },
+            path=("local_file",),
+            credential=_credential(slack),
+            transport=cast(ConnectorTransport, slack_transport),
+        )
+        == 1_000_000_000
+    )
+    assert slack_transport.requests == []
+
+    discord_input = {
+        "channel_id": "123456789012345678",
+        "filename": "report.bin",
+        "local_file": "opaque-local-file",
+        "message_id": "223456789012345678",
+    }
+    for tier, expected in ((0, 10), (1, 10), (2, 50), (3, 100), (4, 100)):
+        transport = _FakeTransport(discord_premium_tier=tier)
+        assert (
+            adapter.max_local_file_bytes(
+                discord,
+                discord_input,
+                path=("local_file",),
+                credential=_credential(discord),
+                transport=cast(ConnectorTransport, transport),
+            )
+            == expected * 1024**2
+        )
+        assert [request["path"] for request in transport.requests] == [
+            "/api/v10/channels/123456789012345678",
+            "/api/v10/guilds/323456789012345678",
+        ]
+        assert all(request["method"] is ConnectorMethod.GET for request in transport.requests)
+
+    dm_transport = _FakeTransport(discord_channel_guild_id=None)
+    assert (
+        adapter.max_local_file_bytes(
+            discord,
+            discord_input,
+            path=("local_file",),
+            credential=_credential(discord),
+            transport=cast(ConnectorTransport, dm_transport),
+        )
+        == 10 * 1024**2
+    )
+    assert [request["path"] for request in dm_transport.requests] == [
+        "/api/v10/channels/123456789012345678"
+    ]
+
+    malformed_transport = _FakeTransport(discord_premium_tier=-1)
+    with pytest.raises(ValidationError, match="premium tier"):
+        adapter.max_local_file_bytes(
+            discord,
+            discord_input,
+            path=("local_file",),
+            credential=_credential(discord),
+            transport=cast(ConnectorTransport, malformed_transport),
+        )
+    wrong_auth_transport = _FakeTransport()
+    with pytest.raises(ValidationError, match="bot authorization"):
+        adapter.max_local_file_bytes(
+            discord,
+            discord_input,
+            path=("local_file",),
+            credential=_credential(discord, scheme=AuthorizationScheme.BEARER),
+            transport=cast(ConnectorTransport, wrong_auth_transport),
+        )
+    assert wrong_auth_transport.requests == []
+    for operation, value, path in (
+        (slack, {"local_file": "wrong-marker"}, ("local_file",)),
+        (slack, {"local_file": "opaque-local-file"}, ("nested", "local_file")),
+        (
+            _operation("slack", ConnectorMode.READ, "files.download"),
+            {"local_file": "opaque-local-file"},
+            ("local_file",),
+        ),
+    ):
+        with pytest.raises(ValidationError, match="not permitted"):
+            adapter.max_local_file_bytes(
+                operation,
+                value,
+                path=path,
+                credential=_credential(operation),
+                transport=cast(ConnectorTransport, _FakeTransport()),
+            )
 
 
 def test_slack_pagination_extracts_the_provider_cursor_and_never_exposes_it_in_payload() -> None:
@@ -738,7 +854,11 @@ def test_slack_external_upload_and_private_download_use_only_response_bound_loca
     assert transport.locations[0]["location"] == "https://files.slack.com/upload"
     assert transport.locations[1]["credential"] == _credential(download).credential
     assert transport.locations[1]["location"] == "https://files.slack.com/private"
-    assert downloaded.payload == {"content_base64": "ZG93bmxvYWRlZA==", "file_id": "F123"}
+    assert downloaded.payload == {
+        "content_base64": "ZG93bmxvYWRlZA==",
+        "delivery": "inline_chunk",
+        "file_id": "F123",
+    }
 
 
 def test_slack_upload_verifies_completion_and_reconciles_unknown_outcome_once() -> None:

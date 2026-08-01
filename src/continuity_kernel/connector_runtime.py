@@ -16,6 +16,7 @@ from continuity_kernel.connector_adapter import (
     ConnectorAdapter,
     ConnectorAdapterRegistry,
     ConnectorAdapterResult,
+    ConnectorProviderUploadLimitAdapter,
     ConnectorRuntimeCredential,
     ConnectorTransferAdapter,
     ConnectorTransferContext,
@@ -294,6 +295,7 @@ class ConnectorRuntime:
                     input_value,
                     adapter=adapter,
                     operation=operation,
+                    credential=credential,
                 )
                 preview_bundle = prepared.bundle
                 try:
@@ -457,6 +459,7 @@ class ConnectorRuntime:
         *,
         adapter: ConnectorAdapter,
         operation: OperationSpec,
+        credential: ConnectorRuntimeCredential,
     ) -> _PreparedInput:
         selectors = _local_file_selectors(input_value)
         if not selectors:
@@ -468,6 +471,8 @@ class ConnectorRuntime:
                 bundle=None,
             )
 
+        grant_ids = tuple(sorted({selector.grant_id for selector in selectors}))
+        self._assert_grant_authority(set(grant_ids))
         limit_input = _sanitize_upload_limit_input(input_value)
         limits = {
             selector.path: _adapter_upload_limit(
@@ -475,11 +480,11 @@ class ConnectorRuntime:
                 operation,
                 limit_input,
                 path=selector.path,
+                credential=credential,
+                transport=self.transport,
             )
             for selector in selectors
         }
-        grant_ids = tuple(sorted({selector.grant_id for selector in selectors}))
-        self._assert_grant_authority(set(grant_ids))
         assembly = _PreparedInputAssembly()
         authority = self._local_files().register_transfer_authority(
             grant_ids,
@@ -937,16 +942,39 @@ def _adapter_upload_limit(
     input_value: object,
     *,
     path: tuple[str | int, ...],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
 ) -> int:
     method = getattr(adapter, "max_local_file_bytes", None)
     if not callable(method):
         raise ValidationError("connector adapter has no exact local-file limit for this operation")
-    limit_adapter = cast(ConnectorUploadLimitAdapter, adapter)
-    limit = limit_adapter.max_local_file_bytes(
-        operation,
-        input_value,
-        path=path,
-    )
+    parameters: Mapping[str, Parameter]
+    try:
+        parameters = signature(method).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_credential = _accepts_keyword(parameters, "credential")
+    accepts_transport = _accepts_keyword(parameters, "transport")
+    if accepts_credential is not accepts_transport:
+        raise ValidationError(
+            "connector adapter upload-limit preflight must accept credential and transport together"
+        )
+    if accepts_credential:
+        provider_limit_adapter = cast(ConnectorProviderUploadLimitAdapter, adapter)
+        limit = provider_limit_adapter.max_local_file_bytes(
+            operation,
+            input_value,
+            path=path,
+            credential=credential,
+            transport=transport,
+        )
+    else:
+        limit_adapter = cast(ConnectorUploadLimitAdapter, adapter)
+        limit = limit_adapter.max_local_file_bytes(
+            operation,
+            input_value,
+            path=path,
+        )
     if type(limit) is not int or not 1 <= limit <= MAX_FILE_TRANSFER_BYTES:
         raise ValidationError(
             "connector adapter returned no exact local-file limit for this operation"

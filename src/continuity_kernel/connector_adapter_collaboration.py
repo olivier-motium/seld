@@ -6,20 +6,32 @@ import base64
 import binascii
 import json
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Final, cast
 from urllib.parse import quote
 
-from continuity_kernel.connector_adapter import ConnectorAdapterResult, ConnectorRuntimeCredential
+from continuity_kernel.connector_adapter import (
+    ConnectorAdapterResult,
+    ConnectorRuntimeCredential,
+    ConnectorTransferContext,
+)
 from continuity_kernel.connector_contract import ConnectorEffect, OperationCatalog, OperationSpec
 from continuity_kernel.connector_operations_collaboration import COLLABORATION_OPERATIONS
+from continuity_kernel.connector_transfer import (
+    MAX_ARTIFACT_BYTES,
+    ConnectorInputPath,
+    PreparedUpload,
+    sanitize_artifact_name,
+)
 from continuity_kernel.connector_transport import (
+    MAX_STREAM_CHUNK_BYTES,
     AuthorizationScheme,
     ConnectorMethod,
     ConnectorOrigin,
     ConnectorOutcomeUnknown,
     ConnectorProviderError,
     ConnectorResponse,
+    ConnectorStreamResponse,
     ConnectorTransport,
 )
 from continuity_kernel.errors import ContinuityError, ValidationError
@@ -29,7 +41,23 @@ __all__ = ["CollaborationConnectorAdapter", "SlackUploadOutcomeUnknown"]
 
 _PROVIDERS: Final = frozenset({"discord", "slack"})
 OPERATION_CATALOG: Final = OperationCatalog(COLLABORATION_OPERATIONS)
+_COLLABORATION_BY_KEY: Final = {operation.key: operation for operation in COLLABORATION_OPERATIONS}
 _MAX_BINARY_BYTES: Final = 180_000
+_SLACK_MAX_LOCAL_FILE_BYTES: Final = 1_000_000_000
+_DISCORD_DEFAULT_LOCAL_FILE_BYTES: Final = 10 * 1024**2
+_DISCORD_TIER_2_LOCAL_FILE_BYTES: Final = 50 * 1024**2
+_DISCORD_TIER_3_LOCAL_FILE_BYTES: Final = 100 * 1024**2
+_LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
+_LOCAL_FILE_PLACEHOLDER: Final = {
+    "grant_id": "prepared",
+    "relative_path": "prepared",
+}
+_LOCAL_UPLOAD_OPERATIONS: Final = frozenset(
+    {
+        ("discord", "attachments.add"),
+        ("slack", "files.upload"),
+    }
+)
 _MULTIPART_BOUNDARY_ATTEMPTS: Final = 8
 _MULTIPART_BOUNDARY_BYTES: Final = 16
 _SLACK_CHANNEL_TYPES: Final = {
@@ -69,8 +97,44 @@ class CollaborationConnectorAdapter:
     def providers(self) -> frozenset[str]:
         return _PROVIDERS
 
-    def classify_effect(self, operation: OperationSpec, input_value: object) -> ConnectorEffect:
-        self._validated_input(operation, input_value)
+    def max_local_file_bytes(
+        self,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        path: ConnectorInputPath,
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+    ) -> int:
+        """Return the provider policy ceiling for one sanitized local-file input."""
+
+        expected = (
+            _COLLABORATION_BY_KEY.get(operation.key)
+            if isinstance(operation, OperationSpec)
+            else None
+        )
+        if expected is None or operation != expected:
+            raise ValidationError("collaboration operation is not in the collaboration catalog")
+        if not (
+            (operation.provider, operation.name) in _LOCAL_UPLOAD_OPERATIONS
+            and path == ("local_file",)
+            and isinstance(input_value, Mapping)
+            and input_value.get("local_file") == _LOCAL_FILE_LIMIT_MARKER
+        ):
+            raise ValidationError("collaboration local-file upload path is not permitted")
+        self._validate_runtime(operation, credential)
+        if operation.provider == "slack":
+            return _SLACK_MAX_LOCAL_FILE_BYTES
+        return self._discord_local_file_limit(input_value, credential, transport)
+
+    def classify_effect(
+        self,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        transfer: ConnectorTransferContext | None = None,
+    ) -> ConnectorEffect:
+        self._validated_input(operation, input_value, transfer=transfer)
         return operation.effect
 
     def execute(
@@ -82,8 +146,9 @@ class CollaborationConnectorAdapter:
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
         write_idempotency_key: str | None = None,
+        transfer: ConnectorTransferContext | None = None,
     ) -> ConnectorAdapterResult:
-        value = self._validated_input(operation, input_value)
+        value = self._validated_input(operation, input_value, transfer=transfer)
         self._validate_runtime(operation, credential)
         if operation.provider == "slack":
             return self._execute_slack(
@@ -93,6 +158,7 @@ class CollaborationConnectorAdapter:
                 credential,
                 transport,
                 write_idempotency_key=write_idempotency_key,
+                transfer=transfer,
             )
         return self._execute_discord(
             operation,
@@ -101,9 +167,16 @@ class CollaborationConnectorAdapter:
             credential,
             transport,
             write_idempotency_key=write_idempotency_key,
+            transfer=transfer,
         )
 
-    def _validated_input(self, operation: OperationSpec, input_value: object) -> dict[str, object]:
+    def _validated_input(
+        self,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        transfer: ConnectorTransferContext | None,
+    ) -> dict[str, object]:
         if not isinstance(operation, OperationSpec):
             raise ValidationError("connector operation is outside the collaboration catalog")
         try:
@@ -116,10 +189,16 @@ class CollaborationConnectorAdapter:
             raise ValidationError(
                 "connector operation differs from the canonical collaboration catalog"
             )
-        value = canonical.validate_input(input_value)
+        validation_input = _prepared_validation_input(operation, input_value, transfer=transfer)
+        value = canonical.validate_input(validation_input)
         if not isinstance(value, dict):
             raise ValidationError("connector operation input is invalid")
-        _validate_collaboration_semantics(canonical, value)
+        _validate_collaboration_semantics(
+            canonical,
+            value,
+            input_value=input_value,
+            transfer=transfer,
+        )
         return value
 
     def _validate_runtime(
@@ -137,6 +216,53 @@ class CollaborationConnectorAdapter:
         elif credential.credential.scheme is not AuthorizationScheme.BOT:
             raise ValidationError("Discord connectors require bot authorization")
 
+    def _discord_local_file_limit(
+        self,
+        input_value: Mapping[str, object],
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+    ) -> int:
+        channel_id = _required_discord_id(
+            input_value.get("channel_id"),
+            "Discord channel identifier",
+        )
+        channel = self._discord_request(
+            transport,
+            credential,
+            ConnectorMethod.GET,
+            f"/api/v10/channels/{channel_id}",
+        ).payload
+        if not isinstance(channel, Mapping):
+            raise ConnectorProviderError(
+                origin=ConnectorOrigin.DISCORD,
+                status=200,
+                code="invalid_channel_response",
+            )
+        raw_guild_id = channel.get("guild_id")
+        if raw_guild_id is None:
+            return _DISCORD_DEFAULT_LOCAL_FILE_BYTES
+        guild_id = _required_discord_id(raw_guild_id, "Discord guild identifier")
+        guild = self._discord_request(
+            transport,
+            credential,
+            ConnectorMethod.GET,
+            f"/api/v10/guilds/{guild_id}",
+        ).payload
+        if not isinstance(guild, Mapping):
+            raise ConnectorProviderError(
+                origin=ConnectorOrigin.DISCORD,
+                status=200,
+                code="invalid_guild_response",
+            )
+        tier = guild.get("premium_tier")
+        if type(tier) is not int or tier < 0:
+            raise ValidationError("Discord guild premium tier is invalid")
+        if tier >= 3:
+            return _DISCORD_TIER_3_LOCAL_FILE_BYTES
+        if tier == 2:
+            return _DISCORD_TIER_2_LOCAL_FILE_BYTES
+        return _DISCORD_DEFAULT_LOCAL_FILE_BYTES
+
     def _execute_slack(
         self,
         operation: OperationSpec,
@@ -146,14 +272,15 @@ class CollaborationConnectorAdapter:
         transport: ConnectorTransport,
         *,
         write_idempotency_key: str | None,
+        transfer: ConnectorTransferContext | None,
     ) -> ConnectorAdapterResult:
         name = operation.name
         if name == "files.upload":
             _reject_continuation(continuation)
-            return self._slack_upload(value, credential, transport)
+            return self._slack_upload(value, credential, transport, transfer=transfer)
         if name == "files.download":
             _reject_continuation(continuation)
-            return self._slack_download(value, credential, transport)
+            return self._slack_download(value, credential, transport, transfer=transfer)
 
         if name == "identity.get":
             _reject_continuation(continuation)
@@ -319,29 +446,45 @@ class CollaborationConnectorAdapter:
         value: dict[str, object],
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
+        *,
+        transfer: ConnectorTransferContext | None,
     ) -> ConnectorAdapterResult:
-        content = _decode_base64(value["content_base64"])
+        source = _upload_source(value, transfer)
+        upload = source if isinstance(source, PreparedUpload) else None
+        content_length = upload.size if upload is not None else len(cast(bytes, source))
         start = transport.request(
             origin=ConnectorOrigin.SLACK,
             method=ConnectorMethod.POST,
             path="/api/files.getUploadURLExternal",
             credential=credential.credential,
-            json_body={"filename": value["filename"], "length": len(content)},
+            json_body={"filename": value["filename"], "length": content_length},
             expected_statuses=frozenset({200}),
         )
         start_payload, _ = _slack_payload(start)
         upload_location = _required_text(start_payload.get("upload_url"), "Slack upload location")
         external_file_id = _required_slack_id(start_payload.get("file_id"), "Slack file identifier")
-        transport.request_provider_location(
-            origin=ConnectorOrigin.SLACK,
-            method=ConnectorMethod.POST,
-            location=upload_location,
-            credential=None,
-            body=content,
-            content_type="application/octet-stream",
-            expected_statuses=frozenset({200, 201, 204}),
-            response_bound=_MAX_BINARY_BYTES,
-        )
+        if upload is not None:
+            transport.request_stream(
+                origin=ConnectorOrigin.SLACK,
+                method=ConnectorMethod.POST,
+                source=upload,
+                content_length=upload.size,
+                location=upload_location,
+                credential=None,
+                content_type="application/octet-stream",
+                expected_statuses=frozenset({200, 201, 204}),
+            )
+        else:
+            transport.request_provider_location(
+                origin=ConnectorOrigin.SLACK,
+                method=ConnectorMethod.POST,
+                location=upload_location,
+                credential=None,
+                body=cast(bytes, source),
+                content_type="application/octet-stream",
+                expected_statuses=frozenset({200, 201, 204}),
+                response_bound=_MAX_BINARY_BYTES,
+            )
         file_detail: dict[str, object] = {"id": external_file_id}
         if "title" in value:
             file_detail["title"] = value["title"]
@@ -425,6 +568,8 @@ class CollaborationConnectorAdapter:
         value: dict[str, object],
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
+        *,
+        transfer: ConnectorTransferContext | None,
     ) -> ConnectorAdapterResult:
         info = transport.request(
             origin=ConnectorOrigin.SLACK,
@@ -443,7 +588,45 @@ class CollaborationConnectorAdapter:
                 code="invalid_file_response",
             )
         location = _required_text(file_value.get("url_private_download"), "Slack private download")
-        downloaded = transport.request_provider_location(
+        delivery = _download_delivery(value)
+        if delivery == "artifact":
+            if transfer is None:
+                raise ValidationError("Slack artifact delivery requires transfer context")
+            filename = sanitize_artifact_name(
+                _required_text(file_value.get("name"), "Slack file name")
+            )
+            media_type = _artifact_media_type(file_value.get("mimetype"), "Slack MIME type")
+            size = _required_download_size(file_value.get("size"), "Slack file size")
+            writer = transfer.artifacts.start(
+                filename,
+                media_type=media_type,
+                expected_size=size,
+            )
+            try:
+                downloaded = transport.download_stream(
+                    origin=ConnectorOrigin.SLACK,
+                    sink=writer,
+                    location=location,
+                    credential=credential.credential,
+                    expected_length=size,
+                    expected_statuses=frozenset({200}),
+                    max_bytes=MAX_ARTIFACT_BYTES,
+                )
+            except Exception:
+                writer.abort()
+                raise
+            if downloaded.artifact is None:
+                writer.abort()
+                raise ValidationError("Slack artifact delivery produced no receipt")
+            return ConnectorAdapterResult(
+                {
+                    "bytes": downloaded.bytes_transferred,
+                    "delivery": "artifact",
+                    "file_id": value["file_id"],
+                },
+                artifact=downloaded.artifact,
+            )
+        inline_download = transport.request_provider_location(
             origin=ConnectorOrigin.SLACK,
             method=ConnectorMethod.GET,
             location=location,
@@ -453,7 +636,8 @@ class CollaborationConnectorAdapter:
         )
         return ConnectorAdapterResult(
             {
-                "content_base64": base64.b64encode(downloaded.body).decode("ascii"),
+                "content_base64": base64.b64encode(inline_download.body).decode("ascii"),
+                "delivery": "inline_chunk",
                 "file_id": value["file_id"],
             }
         )
@@ -466,6 +650,7 @@ class CollaborationConnectorAdapter:
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
         *,
+        transfer: ConnectorTransferContext | None,
         write_idempotency_key: str | None,
     ) -> ConnectorAdapterResult:
         _reject_continuation(continuation)
@@ -530,7 +715,12 @@ class CollaborationConnectorAdapter:
                 f"/api/v10/channels/{value['channel_id']}/messages/{value['message_id']}",
             )
         if name == "attachments.get":
-            return self._discord_download_attachment(value, credential, transport)
+            return self._discord_download_attachment(
+                value,
+                credential,
+                transport,
+                transfer=transfer,
+            )
         if name == "reactions.list":
             return self._discord_request(
                 transport,
@@ -662,7 +852,13 @@ class CollaborationConnectorAdapter:
             )
         if name == "attachments.add":
             message = self._discord_owned_message(value, bot_id, credential, transport)
-            return self._discord_add_attachment(value, message, credential, transport)
+            return self._discord_add_attachment(
+                value,
+                message,
+                credential,
+                transport,
+                transfer=transfer,
+            )
         if name == "attachments.update":
             message = self._discord_owned_message(value, bot_id, credential, transport)
             return self._discord_update_attachment(
@@ -751,6 +947,8 @@ class CollaborationConnectorAdapter:
         value: dict[str, object],
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
+        *,
+        transfer: ConnectorTransferContext | None,
     ) -> ConnectorAdapterResult:
         message = self._discord_request(
             transport,
@@ -766,6 +964,47 @@ class CollaborationConnectorAdapter:
             )
         attachment = _attachment_by_id(message.payload, value["attachment_id"])
         location = _required_text(attachment.get("url"), "Discord attachment location")
+        delivery = _download_delivery(value)
+        if delivery == "artifact":
+            if transfer is None:
+                raise ValidationError("Discord artifact delivery requires transfer context")
+            filename = sanitize_artifact_name(
+                _required_text(attachment.get("filename"), "Discord attachment filename")
+            )
+            media_type = _artifact_media_type(
+                attachment.get("content_type"),
+                "Discord attachment media type",
+            )
+            size = _required_download_size(attachment.get("size"), "Discord attachment size")
+            writer = transfer.artifacts.start(
+                filename,
+                media_type=media_type,
+                expected_size=size,
+            )
+            try:
+                downloaded = transport.download_stream(
+                    origin=ConnectorOrigin.DISCORD,
+                    sink=writer,
+                    location=location,
+                    credential=None,
+                    expected_length=size,
+                    expected_statuses=frozenset({200}),
+                    max_bytes=MAX_ARTIFACT_BYTES,
+                )
+            except Exception:
+                writer.abort()
+                raise
+            if downloaded.artifact is None:
+                writer.abort()
+                raise ValidationError("Discord artifact delivery produced no receipt")
+            return ConnectorAdapterResult(
+                {
+                    "attachment_id": value["attachment_id"],
+                    "bytes": downloaded.bytes_transferred,
+                    "delivery": "artifact",
+                },
+                artifact=downloaded.artifact,
+            )
         response = transport.request_provider_location(
             origin=ConnectorOrigin.DISCORD,
             method=ConnectorMethod.GET,
@@ -778,6 +1017,7 @@ class CollaborationConnectorAdapter:
             {
                 "attachment_id": value["attachment_id"],
                 "content_base64": base64.b64encode(response.body).decode("ascii"),
+                "delivery": "inline_chunk",
             }
         )
 
@@ -787,15 +1027,33 @@ class CollaborationConnectorAdapter:
         message: dict[str, object],
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
+        *,
+        transfer: ConnectorTransferContext | None,
     ) -> ConnectorAdapterResult:
-        content = _decode_base64(value["content_base64"])
+        source = _upload_source(value, transfer)
         attachments = _existing_attachments(message)
         new_attachment: dict[str, object] = {"filename": value["filename"], "id": 0}
         if "description" in value:
             new_attachment["description"] = value["description"]
         attachments.append(new_attachment)
+        payload = {"attachments": attachments}
+        if isinstance(source, PreparedUpload):
+            multipart = _DiscordMultipartUpload(payload, value["filename"], source)
+            response = transport.request_stream(
+                origin=ConnectorOrigin.DISCORD,
+                method=ConnectorMethod.PATCH,
+                source=multipart,
+                content_length=multipart.size,
+                path=(f"/api/v10/channels/{value['channel_id']}/messages/{value['message_id']}"),
+                credential=credential.credential,
+                content_type=multipart.content_type,
+                expected_statuses=frozenset({200}),
+            )
+            return ConnectorAdapterResult(_discord_stream_payload(response))
         body, content_type = _multipart_body(
-            {"attachments": attachments}, value["filename"], content
+            payload,
+            value["filename"],
+            source,
         )
         return self._discord_request(
             transport,
@@ -1164,6 +1422,12 @@ def _discord_payload(response: ConnectorResponse) -> object:
     return response.json()
 
 
+def _discord_stream_payload(response: ConnectorStreamResponse) -> object:
+    if not response.body:
+        return {}
+    return response.json()
+
+
 def _discord_guilds_list_query(value: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
     query: list[tuple[str, str]] = []
     if "after" in value:
@@ -1320,9 +1584,65 @@ def _discord_application_flags(application: Mapping[str, object]) -> int | None:
     return None
 
 
-def _validate_collaboration_semantics(
-    operation: OperationSpec, value: Mapping[str, object]
+def _prepared_validation_input(
+    operation: OperationSpec,
+    input_value: object,
+    *,
+    transfer: ConnectorTransferContext | None,
+) -> object:
+    if (
+        (operation.provider, operation.name) not in _LOCAL_UPLOAD_OPERATIONS
+        or not isinstance(input_value, Mapping)
+        or "content_base64" in input_value
+        or "local_file" in input_value
+        or transfer is None
+        or ("local_file",) not in transfer.uploads
+    ):
+        return input_value
+    prepared = dict(input_value)
+    prepared["local_file"] = _LOCAL_FILE_PLACEHOLDER
+    return prepared
+
+
+def _validate_transfer_source(
+    operation: OperationSpec,
+    input_value: object,
+    transfer: ConnectorTransferContext | None,
 ) -> None:
+    upload_operation = (operation.provider, operation.name) in _LOCAL_UPLOAD_OPERATIONS
+    uploads = frozenset() if transfer is None else frozenset(transfer.uploads)
+    if not upload_operation:
+        if uploads:
+            raise ValidationError("collaboration operation received unexpected prepared uploads")
+        return
+    if not isinstance(input_value, Mapping):
+        raise ValidationError("collaboration upload input is invalid")
+    expected_path = ("local_file",)
+    if uploads and uploads != {expected_path}:
+        raise ValidationError("collaboration upload has an unexpected prepared-file binding")
+    has_inline = "content_base64" in input_value
+    has_selector = "local_file" in input_value
+    has_prepared = expected_path in uploads
+    if has_selector:
+        raise ValidationError(
+            "collaboration local-file selector must be prepared by the connector runtime"
+        )
+    if has_inline and has_prepared:
+        raise ValidationError("collaboration upload has multiple binary sources")
+    if not has_inline and not has_prepared:
+        raise ValidationError("collaboration upload has no prepared or inline binary source")
+    if has_prepared and transfer is not None and transfer.upload(expected_path).size == 0:
+        raise ValidationError("collaboration prepared upload cannot be empty")
+
+
+def _validate_collaboration_semantics(
+    operation: OperationSpec,
+    value: Mapping[str, object],
+    *,
+    input_value: object,
+    transfer: ConnectorTransferContext | None,
+) -> None:
+    _validate_transfer_source(operation, input_value, transfer)
     if operation.provider == "slack":
         if operation.name in {
             "messages.create",
@@ -1467,7 +1787,41 @@ def _existing_attachments(message: Mapping[str, object]) -> list[dict[str, objec
     return shaped
 
 
+class _DiscordMultipartUpload(Iterable[bytes]):
+    """Exact-length Discord multipart body whose file bytes remain streamed."""
+
+    def __init__(self, payload: object, filename: object, upload: PreparedUpload) -> None:
+        if not isinstance(upload, PreparedUpload):
+            raise ValidationError("Discord prepared attachment is invalid")
+        safe_filename = _discord_attachment_filename(filename)
+        payload_json = _multipart_payload(payload)
+        boundary = _multipart_boundary(payload_json, safe_filename.encode("utf-8"))
+        prefix, suffix = _multipart_framing(payload_json, safe_filename, boundary)
+        if len(prefix) > MAX_STREAM_CHUNK_BYTES or len(suffix) > MAX_STREAM_CHUNK_BYTES:
+            raise ValidationError("Discord multipart metadata exceeds its stream chunk bound")
+        self._prefix = prefix
+        self._suffix = suffix
+        self._upload = upload
+        self.size = len(prefix) + upload.size + len(suffix)
+        self.content_type = f"multipart/form-data; boundary={boundary}"
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self._prefix
+        yield from self._upload.iter_chunks()
+        yield self._suffix
+
+
 def _multipart_body(payload: object, filename: object, content: bytes) -> tuple[bytes, str]:
+    if not isinstance(content, bytes):
+        raise ValidationError("Discord attachment content is invalid")
+    safe_filename = _discord_attachment_filename(filename)
+    payload_json = _multipart_payload(payload)
+    boundary = _multipart_boundary(payload_json, safe_filename.encode("utf-8"), content)
+    prefix, suffix = _multipart_framing(payload_json, safe_filename, boundary)
+    return prefix + content + suffix, f"multipart/form-data; boundary={boundary}"
+
+
+def _discord_attachment_filename(filename: object) -> str:
     if (
         not isinstance(filename, str)
         or not filename
@@ -1477,17 +1831,31 @@ def _multipart_body(payload: object, filename: object, content: bytes) -> tuple[
         )
     ):
         raise ValidationError("Discord attachment filename is invalid")
-    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    boundary: str | None = None
+    return filename
+
+
+def _multipart_payload(payload: object) -> bytes:
+    try:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (RecursionError, TypeError, UnicodeError, ValueError) as exc:
+        raise ValidationError("Discord attachment metadata is invalid") from exc
+
+
+def _multipart_boundary(*metadata: bytes) -> str:
     for _ in range(_MULTIPART_BOUNDARY_ATTEMPTS):
         candidate = f"seld-discord-attachment-{secrets.token_hex(_MULTIPART_BOUNDARY_BYTES)}"
         candidate_bytes = candidate.encode("ascii")
-        if candidate_bytes not in payload_json and candidate_bytes not in content:
-            boundary = candidate
-            break
-    if boundary is None:
-        raise ValidationError("Discord attachment multipart boundary could not be made safe")
-    parts = (
+        if all(candidate_bytes not in item for item in metadata):
+            return candidate
+    raise ValidationError("Discord attachment multipart boundary could not be made safe")
+
+
+def _multipart_framing(
+    payload_json: bytes,
+    filename: str,
+    boundary: str,
+) -> tuple[bytes, bytes]:
+    prefix = (
         (
             f"--{boundary}\r\n"
             'Content-Disposition: form-data; name="payload_json"\r\n'
@@ -1499,10 +1867,48 @@ def _multipart_body(payload: object, filename: object, content: bytes) -> tuple[
             f'Content-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n'
             "Content-Type: application/octet-stream\r\n\r\n"
         ).encode()
-        + content
-        + f"\r\n--{boundary}--\r\n".encode("ascii")
     )
-    return parts, f"multipart/form-data; boundary={boundary}"
+    suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
+    return prefix, suffix
+
+
+def _upload_source(
+    value: Mapping[str, object],
+    transfer: ConnectorTransferContext | None,
+) -> bytes | PreparedUpload:
+    if "content_base64" in value:
+        return _decode_base64(value["content_base64"])
+    if transfer is None:
+        raise ValidationError("collaboration prepared upload requires transfer context")
+    return transfer.upload(("local_file",))
+
+
+def _download_delivery(value: Mapping[str, object]) -> str:
+    delivery = value.get("delivery", "artifact")
+    if delivery not in {"artifact", "inline_chunk"}:
+        raise ValidationError("collaboration file delivery is invalid")
+    return delivery
+
+
+def _artifact_media_type(value: object, label: str) -> str:
+    if value is None or value == "":
+        return "application/octet-stream"
+    if (
+        not isinstance(value, str)
+        or len(value) > 255
+        or "\x00" in value
+        or "\r" in value
+        or "\n" in value
+        or "/" not in value
+    ):
+        raise ValidationError(f"{label} is invalid")
+    return value
+
+
+def _required_download_size(value: object, label: str) -> int:
+    if type(value) is not int or not 0 <= value <= MAX_ARTIFACT_BYTES:
+        raise ValidationError(f"{label} is invalid")
+    return value
 
 
 def _decode_base64(value: object) -> bytes:
@@ -1543,6 +1949,17 @@ def _required_slack_id(value: object, label: str) -> str:
         or not 1 <= len(value) <= 128
         or not value.isascii()
         or not value.isalnum()
+    ):
+        raise ValidationError(f"{label} is invalid")
+    return value
+
+
+def _required_discord_id(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 20
+        or not value.isascii()
+        or not value.isdigit()
     ):
         raise ValidationError(f"{label} is invalid")
     return value

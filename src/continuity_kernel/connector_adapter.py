@@ -184,6 +184,20 @@ class ConnectorUploadLimitAdapter(Protocol):
     ) -> int: ...
 
 
+class ConnectorProviderUploadLimitAdapter(Protocol):
+    """Optional upload limit hook that may read current provider-owned policy."""
+
+    def max_local_file_bytes(
+        self,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        path: ConnectorInputPath,
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+    ) -> int: ...
+
+
 class ConnectorAdapterRegistry:
     """Immutable exact provider-to-adapter lookup."""
 
