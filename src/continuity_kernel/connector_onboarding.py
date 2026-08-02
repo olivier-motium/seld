@@ -28,6 +28,7 @@ from continuity_kernel.connector_identifiers import (
     parse_connection_id,
 )
 from continuity_kernel.connector_identity import ConnectorIdentity, verify_identity
+from continuity_kernel.connector_oauth import OAuthAuthorizationRejectedError
 from continuity_kernel.connector_profiles import (
     CONNECTOR_PROFILES,
     ConnectorAccessTier,
@@ -67,6 +68,7 @@ _CONNECTED_HEALTH: Final = frozenset({ConnectionHealth.READY, ConnectionHealth.D
 _REAUTH_HEALTH: Final = _CONNECTED_HEALTH | frozenset({ConnectionHealth.REAUTHORIZATION_REQUIRED})
 _CANDIDATE_HEALTH: Final = _REAUTH_HEALTH | frozenset({ConnectionHealth.UNVERIFIED})
 _RETAINED_BROADER_CREDENTIAL: Final = "existing_broader_grant_retained"
+_GMAIL_SETTINGS_BASIC: Final = "https://www.googleapis.com/auth/gmail.settings.basic"
 
 
 @dataclass(frozen=True, repr=False)
@@ -78,6 +80,7 @@ class ConnectorIdentityReview:
     access: ConnectorAccessTier
     display_label: str
     permanent_delete: bool = False
+    gmail_settings_control: bool = False
     permission_update: str | None = None
 
     def __repr__(self) -> str:
@@ -85,6 +88,7 @@ class ConnectorIdentityReview:
             "ConnectorIdentityReview("
             f"connector={self.connector!r}, provider={self.provider!r}, "
             f"access={self.access!r}, permanent_delete={self.permanent_delete!r}, "
+            f"gmail_settings_control={self.gmail_settings_control!r}, "
             f"permission_update={self.permission_update is not None!r}, "
             "display_label=<redacted>)"
         )
@@ -171,6 +175,15 @@ class ConnectorOnboarding:
             )
             if early_result is not None:
                 return early_result
+            if (
+                candidate is not None
+                and tier is ConnectorAccessTier.FULL
+                and _permanent_delete_enabled(profile, candidate.scopes)
+            ):
+                # Scope evolution must not silently discard a stronger, separately chosen
+                # Gmail grant. Retain it while adding the new base Full permissions.
+                include_permanent_delete = True
+                requested_scopes = profile.scopes_for(tier, include_supplemental=True)
             if candidate is not None and reauthorize:
                 return self.reauthorize_oauth(
                     str(candidate.connection_id),
@@ -220,11 +233,14 @@ class ConnectorOnboarding:
             registration,
             include_permanent_delete=include_permanent_delete,
         )
+        retry_connection_id = clean_connection_id
+        if retry_connection_id is None and candidate is not None:
+            retry_connection_id = candidate.connection_id
         retry_command = _connect_command(
             profile,
             pending.scopes,
             new_account=new_account,
-            connection_id=(str(clean_connection_id) if clean_connection_id is not None else None),
+            connection_id=(str(retry_connection_id) if retry_connection_id is not None else None),
             alias=validated_alias,
             browser_mode=validated_browser_mode,
             timeout_seconds=timeout_seconds,
@@ -243,6 +259,22 @@ class ConnectorOnboarding:
                 pending.scopes,
                 exc,
                 retry_command=retry_command,
+                connection_id=(
+                    str(retry_connection_id) if retry_connection_id is not None else None
+                ),
+                existing_connection_preserved=bool(preserved_connections),
+                existing_effective_access=existing_effective_access,
+                existing_permanent_delete=existing_permanent_delete,
+            )
+        except OAuthAuthorizationRejectedError:
+            return _oauth_authorization_rejected_result(
+                profile,
+                tier,
+                pending.scopes,
+                retry_command=retry_command,
+                connection_id=(
+                    str(retry_connection_id) if retry_connection_id is not None else None
+                ),
                 existing_connection_preserved=bool(preserved_connections),
                 existing_effective_access=existing_effective_access,
                 existing_permanent_delete=existing_permanent_delete,
@@ -359,6 +391,20 @@ class ConnectorOnboarding:
                     connection.scopes,
                 ),
             )
+        except OAuthAuthorizationRejectedError:
+            return _oauth_authorization_rejected_result(
+                profile,
+                access,
+                connection.scopes,
+                retry_command=retry_command,
+                connection_id=str(clean_id),
+                existing_connection_preserved=True,
+                existing_effective_access=access.value,
+                existing_permanent_delete=_permanent_delete_enabled(
+                    profile,
+                    connection.scopes,
+                ),
+            )
         with _provider_authorization_phase():
             identity = self.identity_verifier(
                 profile.provider,
@@ -389,6 +435,10 @@ class ConnectorOnboarding:
                 access=access,
                 display_label=identity.display_label,
                 permanent_delete=_permanent_delete_enabled(profile, connection.scopes),
+                gmail_settings_control=_gmail_settings_control(
+                    profile,
+                    connection.scopes,
+                ),
             )
             if confirm_identity(review) is not True:
                 return _cancelled_identity_result(
@@ -564,7 +614,12 @@ class ConnectorOnboarding:
 
         if selected.account.fingerprint is None:
             return None, _identity_binding_recovery_result(profile, selected), False
-        if _capability_rank(profile, selected.scopes) > requested_rank:
+        scopes_sufficient = _scopes_satisfy_requirement(
+            profile,
+            selected.scopes,
+            requested_scopes,
+        )
+        if _capability_rank(profile, selected.scopes) > requested_rank and scopes_sufficient:
             custody_status = self.manager.inspect_custody(selected)
             if custody_status != "valid":
                 return (
@@ -582,11 +637,7 @@ class ConnectorOnboarding:
                 ),
                 False,
             )
-        if not _scopes_satisfy_requirement(
-            profile,
-            selected.scopes,
-            requested_scopes,
-        ):
+        if not scopes_sufficient:
             return selected, None, False
         if selected.health is ConnectionHealth.REAUTHORIZATION_REQUIRED:
             return selected, None, True
@@ -841,6 +892,7 @@ class ConnectorOnboarding:
                     if len(connection.source_ids) == 1
                     else "legacy_provider_bundle",
                     "permanent_delete": _permanent_delete_enabled(profile, connection.scopes),
+                    **_gmail_settings_status(profile, connection, access=access),
                 }
             )
         readiness = self.registration_readiness()
@@ -1051,6 +1103,7 @@ class ConnectorOnboarding:
             access=access,
             display_label=identity.display_label,
             permanent_delete=_permanent_delete_enabled(profile, connection.scopes),
+            gmail_settings_control=_gmail_settings_control(profile, connection.scopes),
         )
         if confirm_identity(review) is not True:
             return _cancelled_identity_result(
@@ -1248,6 +1301,7 @@ class ConnectorOnboarding:
             access=access,
             display_label=identity.display_label,
             permanent_delete=_permanent_delete_enabled(profile, pending.scopes),
+            gmail_settings_control=_gmail_settings_control(profile, pending.scopes),
             permission_update=permission_update,
         )
         if confirm_identity(review) is not True:
@@ -1620,6 +1674,42 @@ def _permanent_delete_enabled(profile: ConnectorProfile, scopes: tuple[str, ...]
     )
 
 
+def _gmail_settings_control(profile: ConnectorProfile, scopes: tuple[str, ...]) -> bool:
+    return (
+        profile.provider == "google"
+        and "gmail" in profile.source_ids
+        and _GMAIL_SETTINGS_BASIC in scopes
+    )
+
+
+def _gmail_settings_status(
+    profile: ConnectorProfile,
+    connection: ConnectionMetadata,
+    *,
+    access: str,
+) -> dict[str, object]:
+    if profile.name != "gmail":
+        return {}
+    if access == ConnectorAccessTier.READ.value:
+        return {"settings_control": "read_only"}
+    keep_permanent_delete = _permanent_delete_enabled(profile, connection.scopes)
+    current_scopes = profile.scopes_for(
+        ConnectorAccessTier.FULL,
+        include_supplemental=keep_permanent_delete,
+    )
+    if _scopes_satisfy_requirement(profile, connection.scopes, current_scopes):
+        return {"settings_control": "ready"}
+    return {
+        "settings_control": "upgrade_required",
+        "settings_upgrade": _connect_command(
+            profile,
+            current_scopes,
+            access=ConnectorAccessTier.FULL,
+            connection_id=str(connection.connection_id),
+        ),
+    }
+
+
 def _requested_capability_rank(
     profile: ConnectorProfile,
     access: ConnectorAccessTier,
@@ -1639,9 +1729,15 @@ def _scopes_satisfy_requirement(
 ) -> bool:
     capability = _capability_rank(profile, scopes)
     required_capability = _capability_rank(profile, required_scopes)
-    return capability > required_capability or (
-        capability == required_capability and frozenset(required_scopes).issubset(scopes)
-    )
+    if capability < required_capability:
+        return False
+    if capability > required_capability and required_capability == 0:
+        # Full grants semantically include the provider's Read authority even when the
+        # provider expresses those tiers with different scope strings.
+        return True
+    # Supplemental authority ranks above Full, but it cannot stand in for a newly added
+    # base Full permission. Exact inclusion distinguishes current Full from legacy Full.
+    return frozenset(required_scopes).issubset(scopes)
 
 
 def _sufficient_connections(
@@ -1806,7 +1902,13 @@ def _account_selection_row(
             candidate.scopes,
             access=access,
             connection_id=str(candidate.connection_id),
-            include_permanent_delete=include_permanent_delete,
+            include_permanent_delete=(
+                include_permanent_delete
+                or (
+                    access is ConnectorAccessTier.FULL
+                    and _permanent_delete_enabled(profile, candidate.scopes)
+                )
+            ),
             alias=alias,
             browser_mode=browser_mode,
             timeout_seconds=timeout_seconds,
@@ -1960,6 +2062,39 @@ def _oauth_permission_failure_result(
         provider_authorization=True,
         existing_connection_preserved=existing_connection_preserved,
     )
+    return result
+
+
+def _oauth_authorization_rejected_result(
+    profile: ConnectorProfile,
+    access: ConnectorAccessTier,
+    scopes: tuple[str, ...],
+    *,
+    retry_command: str,
+    connection_id: str | None = None,
+    existing_connection_preserved: bool,
+    existing_effective_access: str,
+    existing_permanent_delete: bool,
+) -> dict[str, object]:
+    """Return a stable cancellation result without implying a provider grant exists."""
+
+    result: dict[str, object] = {
+        "access": existing_effective_access,
+        "connector": profile.name,
+        "effective_access": existing_effective_access,
+        "existing_connection_preserved": existing_connection_preserved,
+        "existing_permanent_delete": existing_permanent_delete,
+        "next": retry_command,
+        "nothing_saved": True,
+        "permanent_delete": existing_permanent_delete,
+        "reason": "authorization_rejected",
+        "requested_access": access.value,
+        "requested_permanent_delete": _permanent_delete_enabled(profile, scopes),
+        "retry": retry_command,
+        "status": "cancelled",
+    }
+    if connection_id is not None:
+        result["connection_id"] = connection_id
     return result
 
 

@@ -41,7 +41,7 @@ from continuity_kernel.connector_transport import (
     ConnectorStreamResponse,
     ConnectorTransport,
 )
-from continuity_kernel.errors import ContinuityError, ValidationError
+from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
 
 _GOOGLE_PROVIDERS: Final = frozenset({"gmail", "google_calendar", "google_drive"})
 _GOOGLE_BY_KEY: Final = {operation.key: operation for operation in GOOGLE_OPERATIONS}
@@ -67,6 +67,49 @@ _GMAIL_RESUMABLE_FINAL_STATUSES: Final = frozenset({200, 201})
 _GMAIL_WRITE_RECEIPT_FIELDS: Final = frozenset(
     {"historyId", "id", "labelIds", "sizeEstimate", "threadId"}
 )
+_GMAIL_USERS_ME_BASE: Final = "/gmail/v1/users/me"
+_GMAIL_SIMPLE_SETTINGS_READ_PATHS: Final = {
+    "settings.auto_forwarding.get": "autoForwarding",
+    "settings.filters.list": "filters",
+    "settings.forwarding_addresses.list": "forwardingAddresses",
+    "settings.imap.get": "imap",
+    "settings.language.get": "language",
+    "settings.pop.get": "pop",
+    "settings.vacation.get": "vacation",
+}
+_GMAIL_SEND_AS_FIELDS: Final = frozenset(
+    {
+        "displayName",
+        "isDefault",
+        "isPrimary",
+        "replyToAddress",
+        "sendAsEmail",
+        "signature",
+        "treatAsAlias",
+        "verificationStatus",
+    }
+)
+_GMAIL_SEND_AS_BOOLEAN_FIELDS: Final = frozenset({"isDefault", "isPrimary", "treatAsAlias"})
+_GMAIL_SEND_AS_STRING_FIELDS: Final = _GMAIL_SEND_AS_FIELDS - _GMAIL_SEND_AS_BOOLEAN_FIELDS
+_GMAIL_SEND_AS_FIELDS_QUERY: Final = ",".join(sorted(_GMAIL_SEND_AS_FIELDS))
+_GMAIL_SEND_AS_LIST_FIELDS_QUERY: Final = f"sendAs({_GMAIL_SEND_AS_FIELDS_QUERY})"
+_GMAIL_FILTER_FIELDS: Final = frozenset({"action", "criteria", "id"})
+# These provider-shape allowlists deliberately mirror the closed camelCase
+# snapshot schema in connector_operations_google. Drift fails closed in tests.
+_GMAIL_FILTER_CRITERIA_FIELDS: Final = frozenset(
+    {
+        "excludeChats",
+        "from",
+        "hasAttachment",
+        "negatedQuery",
+        "query",
+        "size",
+        "sizeComparison",
+        "subject",
+        "to",
+    }
+)
+_GMAIL_FILTER_ACTION_FIELDS: Final = frozenset({"addLabelIds", "forward", "removeLabelIds"})
 _DRIVE_MAX_LOCAL_FILE_BYTES: Final = 5 * 1024**4
 _DRIVE_RESUMABLE_INIT_STATUSES: Final = frozenset({200})
 _DRIVE_RESUMABLE_FINAL_STATUSES: Final = frozenset({200, 201})
@@ -283,6 +326,32 @@ class GoogleConnectorAdapter:
             and _drive_has_binary_upload(values, transfer)
         ):
             return ConnectorEffect.OUTWARD
+        if operation.provider == "gmail" and operation.name == "settings.filters.create":
+            return _gmail_filter_effect(values)
+        if operation.provider == "gmail" and operation.name == "settings.filters.delete":
+            if credential is None or transport is None:
+                raise ValidationError(
+                    "Gmail filter deletion preflight requires credential and transport"
+                )
+            _gmail_filter_delete_snapshot(values, credential, transport)
+            return operation.effect
+        if operation.provider == "gmail" and operation.name == "settings.imap.update":
+            return _gmail_imap_effect(values)
+        if operation.provider == "gmail" and operation.name == "settings.pop.update":
+            return _gmail_pop_effect(values)
+        if operation.provider == "gmail" and operation.name == "settings.vacation.update":
+            _validate_gmail_vacation(values)
+            return (
+                ConnectorEffect.OUTWARD
+                if values.get("enable_auto_reply") is True
+                else operation.effect
+            )
+        if operation.provider == "gmail" and operation.name == "settings.send_as.patch":
+            _validate_gmail_send_as_patch(values)
+            if credential is None or transport is None:
+                raise ValidationError("Gmail send-as preflight requires credential and transport")
+            _gmail_primary_send_as(values, credential, transport)
+            return operation.effect
         if operation.provider != "google_calendar":
             return operation.effect
         if operation.name == "calendars.update" and values.get("calendar_id") != "primary":
@@ -535,7 +604,7 @@ def _execute_gmail(
     *,
     transfer: ConnectorTransferContext | None,
 ) -> ConnectorAdapterResult:
-    base = "/gmail/v1/users/me"
+    base = _GMAIL_USERS_ME_BASE
     name = operation.name
     if name in {"messages.list", "threads.list"}:
         resource = name.split(".", 1)[0]
@@ -576,6 +645,58 @@ def _execute_gmail(
                 ) from exc
             raise
     _reject_continuation(continuation)
+    settings_path = _GMAIL_SIMPLE_SETTINGS_READ_PATHS.get(name)
+    if settings_path is not None:
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.GET,
+            path=f"{base}/settings/{settings_path}",
+            credential=credential,
+        )
+    if name == "settings.filters.get":
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.GET,
+            path=f"{base}/settings/filters/{_segment(_required(values, 'filter_id'))}",
+            credential=credential,
+        )
+    if name == "settings.forwarding_addresses.get":
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.GET,
+            path=(
+                f"{base}/settings/forwardingAddresses/"
+                f"{_segment(_required(values, 'forwarding_email'))}"
+            ),
+            credential=credential,
+        )
+    if name == "settings.send_as.list":
+        return _gmail_send_as_result(
+            _json_request(
+                transport,
+                origin=ConnectorOrigin.GMAIL,
+                method=ConnectorMethod.GET,
+                path=f"{base}/settings/sendAs",
+                credential=credential,
+                query=(("fields", _GMAIL_SEND_AS_LIST_FIELDS_QUERY),),
+            ),
+            collection=True,
+        )
+    if name == "settings.send_as.get":
+        return _gmail_send_as_result(
+            _json_request(
+                transport,
+                origin=ConnectorOrigin.GMAIL,
+                method=ConnectorMethod.GET,
+                path=f"{base}/settings/sendAs/{_segment(_required(values, 'send_as_email'))}",
+                credential=credential,
+                query=(("fields", _GMAIL_SEND_AS_FIELDS_QUERY),),
+            ),
+            collection=False,
+        )
     if name == "profile.get":
         return _json_request(
             transport,
@@ -843,7 +964,362 @@ def _execute_gmail(
             credential=credential,
             expected_statuses=_DELETE_STATUSES,
         )
+    if name == "settings.filters.create":
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.POST,
+            path=f"{base}/settings/filters",
+            credential=credential,
+            json_body=_gmail_filter_body(values),
+            expected_statuses=_JSON_STATUSES,
+        )
+    if name == "settings.filters.delete":
+        _gmail_filter_delete_snapshot(values, credential, transport)
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.DELETE,
+            path=f"{base}/settings/filters/{_segment(_required(values, 'filter_id'))}",
+            credential=credential,
+            expected_statuses=_DELETE_STATUSES,
+        )
+    if name == "settings.imap.update":
+        return _gmail_setting_update(
+            transport,
+            credential=credential,
+            path=f"{base}/settings/imap",
+            body=_selected(
+                values,
+                {
+                    "auto_expunge": "autoExpunge",
+                    "enabled": "enabled",
+                    "expunge_behavior": "expungeBehavior",
+                    "max_folder_size": "maxFolderSize",
+                },
+            ),
+        )
+    if name == "settings.language.update":
+        return _gmail_setting_update(
+            transport,
+            credential=credential,
+            path=f"{base}/settings/language",
+            body={"displayLanguage": _required(values, "display_language")},
+        )
+    if name == "settings.pop.update":
+        return _gmail_setting_update(
+            transport,
+            credential=credential,
+            path=f"{base}/settings/pop",
+            body=_selected(
+                values,
+                {"access_window": "accessWindow", "disposition": "disposition"},
+            ),
+        )
+    if name == "settings.vacation.update":
+        _validate_gmail_vacation(values)
+        return _gmail_setting_update(
+            transport,
+            credential=credential,
+            path=f"{base}/settings/vacation",
+            body=_gmail_vacation_body(values),
+        )
+    if name == "settings.send_as.patch":
+        _validate_gmail_send_as_patch(values)
+        _gmail_primary_send_as(values, credential, transport)
+        return _gmail_send_as_result(
+            _json_request(
+                transport,
+                origin=ConnectorOrigin.GMAIL,
+                method=ConnectorMethod.PATCH,
+                path=f"{base}/settings/sendAs/{_segment(_required(values, 'send_as_email'))}",
+                credential=credential,
+                query=(("fields", _GMAIL_SEND_AS_FIELDS_QUERY),),
+                json_body=_selected(
+                    values,
+                    {
+                        "display_name": "displayName",
+                        "is_default": "isDefault",
+                        "reply_to_address": "replyToAddress",
+                        "signature": "signature",
+                    },
+                ),
+                expected_statuses=_JSON_STATUSES,
+            ),
+            collection=False,
+        )
     raise ValidationError("Gmail operation has no fixed route")
+
+
+def _gmail_setting_update(
+    transport: ConnectorTransport,
+    *,
+    credential: ConnectorRuntimeCredential,
+    path: str,
+    body: Mapping[str, object],
+) -> ConnectorAdapterResult:
+    return _json_request(
+        transport,
+        origin=ConnectorOrigin.GMAIL,
+        method=ConnectorMethod.PUT,
+        path=path,
+        credential=credential,
+        json_body=dict(body),
+        expected_statuses=_JSON_STATUSES,
+    )
+
+
+def _gmail_filter_parts(
+    values: Mapping[str, object],
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    criteria = values.get("criteria")
+    action = values.get("action")
+    if not isinstance(criteria, Mapping) or not criteria:
+        raise ValidationError("Gmail filter requires at least one matching criterion")
+    if not isinstance(action, Mapping) or not action:
+        raise ValidationError("Gmail filter requires at least one action")
+    if ("size" in criteria) is not ("size_comparison" in criteria):
+        raise ValidationError("Gmail filter size and comparison must be provided together")
+    add_labels = action.get("add_label_ids", [])
+    remove_labels = action.get("remove_label_ids", [])
+    if not isinstance(add_labels, list) or not isinstance(remove_labels, list):
+        raise ValidationError("Gmail filter label actions are invalid")
+    if set(_strings(add_labels)) & set(_strings(remove_labels)):
+        raise ValidationError("Gmail filter cannot add and remove the same label")
+    return criteria, action
+
+
+def _gmail_filter_body(values: Mapping[str, object]) -> dict[str, object]:
+    criteria, action = _gmail_filter_parts(values)
+    return {
+        "action": _selected(
+            action,
+            {
+                "add_label_ids": "addLabelIds",
+                "forward": "forward",
+                "remove_label_ids": "removeLabelIds",
+            },
+        ),
+        "criteria": _selected(
+            criteria,
+            {
+                "exclude_chats": "excludeChats",
+                "from": "from",
+                "has_attachment": "hasAttachment",
+                "negated_query": "negatedQuery",
+                "query": "query",
+                "size": "size",
+                "size_comparison": "sizeComparison",
+                "subject": "subject",
+                "to": "to",
+            },
+        ),
+    }
+
+
+def _gmail_filter_effect(values: Mapping[str, object]) -> ConnectorEffect:
+    _criteria, action = _gmail_filter_parts(values)
+    add_labels = set(_strings(action.get("add_label_ids", [])))
+    remove_labels = set(_strings(action.get("remove_label_ids", [])))
+    if add_labels.intersection({"SPAM", "TRASH"}) or "INBOX" in remove_labels:
+        return ConnectorEffect.DESTRUCTIVE
+    if "forward" in action:
+        return ConnectorEffect.OUTWARD
+    return ConnectorEffect.SAFE_MUTATION
+
+
+def _gmail_filter_delete_snapshot(
+    values: Mapping[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> None:
+    filter_id = _required(values, "filter_id")
+    expected = _gmail_filter_snapshot_resource(
+        values.get("expected_filter"),
+        context="Gmail expected filter",
+    )
+    if expected["id"] != filter_id:
+        raise ValidationError("Gmail expected filter ID does not match the deletion target")
+    current = _gmail_filter_snapshot_resource(
+        _provider_mapping(
+            _json_request(
+                transport,
+                origin=ConnectorOrigin.GMAIL,
+                method=ConnectorMethod.GET,
+                path=f"{_GMAIL_USERS_ME_BASE}/settings/filters/{_segment(filter_id)}",
+                credential=credential,
+            ),
+            context="Gmail filter deletion preflight",
+        ),
+        context="Gmail current filter",
+    )
+    if current != expected:
+        raise ConflictError("Gmail filter changed; read it again before deleting it")
+
+
+def _gmail_filter_snapshot_resource(value: object, *, context: str) -> dict[str, object]:
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str) or key not in _GMAIL_FILTER_FIELDS for key in value
+    ):
+        raise ValidationError(f"{context} contains unsupported fields")
+    identifier = value.get("id")
+    if not isinstance(identifier, str) or not identifier:
+        raise ValidationError(f"{context} has no usable ID")
+    return {
+        "action": _gmail_filter_snapshot_part(
+            value.get("action"),
+            allowed=_GMAIL_FILTER_ACTION_FIELDS,
+            context=f"{context} action",
+        ),
+        "criteria": _gmail_filter_snapshot_part(
+            value.get("criteria"),
+            allowed=_GMAIL_FILTER_CRITERIA_FIELDS,
+            context=f"{context} criteria",
+        ),
+        "id": identifier,
+    }
+
+
+def _gmail_filter_snapshot_part(
+    value: object,
+    *,
+    allowed: frozenset[str],
+    context: str,
+) -> dict[str, object]:
+    if (
+        not isinstance(value, Mapping)
+        or not value
+        or any(not isinstance(key, str) or key not in allowed for key in value)
+    ):
+        raise ValidationError(f"{context} is invalid")
+    return {key: value[key] for key in sorted(allowed) if key in value}
+
+
+def _gmail_send_as_result(
+    result: ConnectorAdapterResult,
+    *,
+    collection: bool,
+) -> ConnectorAdapterResult:
+    payload = _provider_mapping(result, context="Gmail send-as response")
+    if not collection:
+        return ConnectorAdapterResult(_gmail_send_as_resource(payload))
+    raw_resources = payload.get("sendAs", [])
+    if not isinstance(raw_resources, list):
+        raise ValidationError("Gmail send-as list returned an invalid resource collection")
+    return ConnectorAdapterResult(
+        {"sendAs": [_gmail_send_as_resource(resource) for resource in raw_resources]}
+    )
+
+
+def _gmail_send_as_resource(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValidationError("Gmail send-as response returned an invalid resource")
+    email = value.get("sendAsEmail")
+    if not isinstance(email, str) or not email:
+        raise ValidationError("Gmail send-as response has no usable email address")
+    result: dict[str, object] = {}
+    for key in sorted(_GMAIL_SEND_AS_FIELDS):
+        if key not in value:
+            continue
+        field = value[key]
+        if key in _GMAIL_SEND_AS_BOOLEAN_FIELDS:
+            if type(field) is not bool:
+                raise ValidationError(f"Gmail send-as response has an invalid {key} field")
+        elif key in _GMAIL_SEND_AS_STRING_FIELDS and not isinstance(field, str):
+            raise ValidationError(f"Gmail send-as response has an invalid {key} field")
+        result[key] = field
+    return result
+
+
+def _gmail_imap_effect(values: Mapping[str, object]) -> ConnectorEffect:
+    if values.get("expunge_behavior") == "deleteForever":
+        return ConnectorEffect.PERMANENT
+    if values.get("enabled") is True:
+        return ConnectorEffect.OUTWARD
+    return ConnectorEffect.SAFE_MUTATION
+
+
+def _gmail_pop_effect(values: Mapping[str, object]) -> ConnectorEffect:
+    if values.get("disposition") in {"archive", "trash"}:
+        return ConnectorEffect.DESTRUCTIVE
+    if values.get("access_window") != "disabled":
+        return ConnectorEffect.OUTWARD
+    return ConnectorEffect.SAFE_MUTATION
+
+
+def _validate_gmail_vacation(values: Mapping[str, object]) -> None:
+    start = values.get("start_time")
+    end = values.get("end_time")
+    maximum_epoch = 2**63 - 1
+    for label, value in (("start", start), ("end", end)):
+        if value is not None and (
+            not isinstance(value, str)
+            or not value.isdecimal()
+            or not 0 <= int(value) <= maximum_epoch
+        ):
+            raise ValidationError(f"Gmail vacation {label} time is invalid")
+    if isinstance(start, str) and isinstance(end, str) and int(start) >= int(end):
+        raise ValidationError("Gmail vacation start time must precede end time")
+    if values.get("enable_auto_reply") is True and not any(
+        isinstance(values.get(name), str) and bool(values[name])
+        for name in (
+            "response_body_html",
+            "response_body_plain_text",
+            "response_subject",
+        )
+    ):
+        raise ValidationError("Gmail vacation replies require a non-empty subject or body")
+
+
+def _gmail_vacation_body(values: Mapping[str, object]) -> dict[str, object]:
+    body = _selected(
+        values,
+        {
+            "enable_auto_reply": "enableAutoReply",
+            "end_time": "endTime",
+            "response_body_html": "responseBodyHtml",
+            "response_body_plain_text": "responseBodyPlainText",
+            "response_subject": "responseSubject",
+            "restrict_to_contacts": "restrictToContacts",
+            "restrict_to_domain": "restrictToDomain",
+            "start_time": "startTime",
+        },
+    )
+    # Explicit null means no schedule boundary. Gmail expresses that final state
+    # by omitting the optional field from the whole VacationSettings PUT body.
+    return {key: value for key, value in body.items() if value is not None}
+
+
+def _validate_gmail_send_as_patch(values: Mapping[str, object]) -> None:
+    if not set(values) - {"send_as_email"}:
+        raise ValidationError("Gmail send-as patch requires at least one setting change")
+
+
+def _gmail_primary_send_as(
+    values: Mapping[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> None:
+    requested = _required(values, "send_as_email")
+    current = _provider_mapping(
+        _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.GET,
+            path=f"{_GMAIL_USERS_ME_BASE}/settings/sendAs/{_segment(requested)}",
+            credential=credential,
+            query=(("fields", "isPrimary,sendAsEmail"),),
+        ),
+        context="Gmail send-as effect preflight",
+    )
+    actual = current.get("sendAsEmail")
+    if not isinstance(actual, str) or actual.casefold() != requested.casefold():
+        raise ValidationError("Gmail send-as preflight returned a different alias")
+    if current.get("isPrimary") is not True:
+        raise ValidationError(
+            "Gmail user OAuth can update only the primary send-as alias; custom aliases require "
+            "a separately authorized Workspace administrator connection"
+        )
 
 
 def _execute_calendar(
@@ -2735,7 +3211,7 @@ def _gmail_reply_context(
             transport,
             origin=ConnectorOrigin.GMAIL,
             method=ConnectorMethod.GET,
-            path=f"/gmail/v1/users/me/messages/{_segment(provider_message_id)}",
+            path=f"{_GMAIL_USERS_ME_BASE}/messages/{_segment(provider_message_id)}",
             credential=credential,
             query=(
                 ("format", "metadata"),
@@ -2826,7 +3302,7 @@ def _gmail_attachment_request(
     transfer: ConnectorTransferContext | None,
 ) -> ConnectorAdapterResult:
     path = (
-        f"/gmail/v1/users/me/messages/{_segment(_required(values, 'message_id'))}/attachments/"
+        f"{_GMAIL_USERS_ME_BASE}/messages/{_segment(_required(values, 'message_id'))}/attachments/"
         f"{_segment(_required(values, 'attachment_id'))}"
     )
     delivery = values.get("delivery", "artifact")
@@ -2895,7 +3371,7 @@ def _gmail_raw_message_request(
         response = transport.download_stream(
             origin=ConnectorOrigin.GMAIL,
             sink=decoder,
-            path=(f"/gmail/v1/users/me/messages/{_segment(_required(values, 'message_id'))}"),
+            path=(f"{_GMAIL_USERS_ME_BASE}/messages/{_segment(_required(values, 'message_id'))}"),
             query=(("format", "raw"), ("fields", "raw")),
             credential=credential.credential,
             max_bytes=MAX_ARTIFACT_BYTES,
@@ -3024,9 +3500,9 @@ def _gmail_raw_message_upload(
         require_date=source == "dateHeader",
     )
     upload_path = {
-        "messages.import": "/gmail/v1/users/me/messages/import",
-        "messages.insert": "/gmail/v1/users/me/messages",
-        "messages.send": "/gmail/v1/users/me/messages/send",
+        "messages.import": f"{_GMAIL_USERS_ME_BASE}/messages/import",
+        "messages.insert": f"{_GMAIL_USERS_ME_BASE}/messages",
+        "messages.send": f"{_GMAIL_USERS_ME_BASE}/messages/send",
     }.get(operation_name)
     if upload_path is None:  # pragma: no cover - guarded by the finite operation set
         raise ValidationError("Gmail raw-message operation is invalid")

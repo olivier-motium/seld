@@ -93,6 +93,33 @@ _PREPARED_PREVIEW_MAX_BYTES: Final = 16 * 1_024
 _LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
 _OPERATION_WARNINGS: Final = {
     (
+        "gmail",
+        "settings.filters.create",
+    ): "This rule will apply automatically to future matching messages.",
+    (
+        "gmail",
+        "settings.filters.delete",
+    ): "Gmail has no restore operation for a deleted filter.",
+    (
+        "gmail",
+        "settings.imap.update",
+    ): (
+        "Review enabled, auto-expunge, and expunge behavior; deleteForever makes future IMAP "
+        "expunges unrecoverable."
+    ),
+    (
+        "gmail",
+        "settings.pop.update",
+    ): "This changes how future POP retrieval affects messages.",
+    (
+        "gmail",
+        "settings.send_as.patch",
+    ): "These primary identity settings affect future outgoing messages.",
+    (
+        "gmail",
+        "settings.vacation.update",
+    ): "Gmail will send this reply automatically to future qualifying messages.",
+    (
         "outlook_calendar",
         "events.cancel",
     ): "Outlook will email event attendees a cancellation notice.",
@@ -1217,6 +1244,11 @@ def _scope_error(provider: str, operation: str) -> str:
         return (
             "Gmail permanent delete is not enabled; reconnect Full access with the separate "
             "permanent-delete permission"
+        )
+    if provider == "gmail" and operation.startswith("settings."):
+        return (
+            "Gmail settings control is not enabled; reconnect Gmail Full access to add it while "
+            "the existing connection keeps working"
         )
     return "the provider did not grant the permission required for this operation"
 

@@ -814,6 +814,25 @@ def _confirm_connector_identity(review: ConnectorIdentityReview) -> bool:
     ]
     if review.permission_update is not None:
         lines.append(f"Permission update: {review.permission_update}")
+    if review.connector in {"gmail", "google"}:
+        if review.access is ConnectorAccessTier.FULL:
+            if review.gmail_settings_control:
+                lines.append(
+                    "Gmail Full: mailbox changes plus everyday settings such as filters, "
+                    "signatures, language, POP/IMAP, and vacation replies. Workspace "
+                    "administrator delegation is not requested."
+                )
+            else:
+                lines.append(
+                    "Legacy Gmail Full: mailbox changes only. This reauthorization does not add "
+                    "everyday settings control; after sign-in, run `gsv connectors status gmail` "
+                    "for the separate settings upgrade."
+                )
+        else:
+            lines.append(
+                "Gmail Read: messages and current everyday settings are visible, but settings "
+                "changes are off."
+            )
     if review.permanent_delete:
         lines.append(
             "Explicit Gmail purge: ON — Seld can permanently erase Gmail messages, threads, or "
@@ -862,7 +881,10 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
             "This connector has broader access than selected and needs reauthorization. "
             "Nothing changed; follow result.next or review result.downgrade_help."
         ),
-        "cancelled": "Connector sign-in was cancelled; follow result.next to inspect or retry.",
+        "cancelled": (
+            "Connector sign-in was not approved or was denied; the existing setup is unchanged. "
+            "Follow result.next to inspect or retry."
+        ),
         "credential_invalid_reconnect_required": (
             "The saved connector credential is invalid; follow result.next to repair it."
         ),

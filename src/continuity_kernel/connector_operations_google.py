@@ -8,6 +8,7 @@ from continuity_kernel.connector_contract import ConnectorEffect, ConnectorMode,
 
 _GMAIL_READONLY: Final = "https://www.googleapis.com/auth/gmail.readonly"
 _GMAIL_MODIFY: Final = "https://www.googleapis.com/auth/gmail.modify"
+_GMAIL_SETTINGS_BASIC: Final = "https://www.googleapis.com/auth/gmail.settings.basic"
 _MAIL: Final = "https://mail.google.com/"
 
 _CALENDAR_LIST_READONLY: Final = "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
@@ -183,6 +184,145 @@ def _gmail_migration(*, importing: bool) -> dict[str, object]:
             }
         )
     return _object(fields, required=("local_file",))
+
+
+def _gmail_filter_criteria() -> dict[str, object]:
+    return _object(
+        {
+            "exclude_chats": {"type": "boolean"},
+            "from": _text(8_192),
+            "has_attachment": {"type": "boolean"},
+            "negated_query": _text(8_192),
+            "query": _text(8_192),
+            "size": {"maximum": 2_147_483_647, "minimum": 0, "type": "integer"},
+            "size_comparison": {"enum": ["larger", "smaller"], "type": "string"},
+            "subject": _text(8_192),
+            "to": _text(8_192),
+        }
+    )
+
+
+def _gmail_filter_action() -> dict[str, object]:
+    return _object(
+        {
+            "add_label_ids": _array(_id(), maximum=100, minimum=1),
+            "forward": _text(512),
+            "remove_label_ids": _array(_id(), maximum=100, minimum=1),
+        }
+    )
+
+
+def _gmail_filter_create() -> dict[str, object]:
+    return _object(
+        {
+            "action": _gmail_filter_action(),
+            "criteria": _gmail_filter_criteria(),
+        },
+        required=("action", "criteria"),
+    )
+
+
+def _gmail_filter_snapshot() -> dict[str, object]:
+    # This provider-shape snapshot intentionally mirrors the adapter's closed
+    # camelCase allowlists. Tests reject drift on either side before deletion.
+    return _object(
+        {
+            "action": _object(
+                {
+                    "addLabelIds": _array(_id(), maximum=100, minimum=1),
+                    "forward": _text(512),
+                    "removeLabelIds": _array(_id(), maximum=100, minimum=1),
+                }
+            ),
+            "criteria": _object(
+                {
+                    "excludeChats": {"type": "boolean"},
+                    "from": _text(8_192),
+                    "hasAttachment": {"type": "boolean"},
+                    "negatedQuery": _text(8_192),
+                    "query": _text(8_192),
+                    "size": {"maximum": 2_147_483_647, "minimum": 0, "type": "integer"},
+                    "sizeComparison": {"enum": ["larger", "smaller"], "type": "string"},
+                    "subject": _text(8_192),
+                    "to": _text(8_192),
+                }
+            ),
+            "id": _id(),
+        },
+        required=("action", "criteria", "id"),
+    )
+
+
+def _gmail_imap_update() -> dict[str, object]:
+    return _object(
+        {
+            "auto_expunge": {"type": "boolean"},
+            "enabled": {"type": "boolean"},
+            "expunge_behavior": {
+                "enum": ["archive", "deleteForever", "trash"],
+                "type": "string",
+            },
+            "max_folder_size": {"enum": [0, 1_000, 2_000, 5_000, 10_000]},
+        },
+        required=("auto_expunge", "enabled", "expunge_behavior", "max_folder_size"),
+    )
+
+
+def _gmail_pop_update() -> dict[str, object]:
+    return _object(
+        {
+            "access_window": {"enum": ["allMail", "disabled", "fromNowOn"], "type": "string"},
+            "disposition": {
+                "enum": ["archive", "leaveInInbox", "markRead", "trash"],
+                "type": "string",
+            },
+        },
+        required=("access_window", "disposition"),
+    )
+
+
+def _gmail_vacation_update() -> dict[str, object]:
+    epoch_millis = {
+        "maxLength": 20,
+        "minLength": 1,
+        "pattern": "^[0-9]+$",
+        "type": "string",
+    }
+    return _object(
+        {
+            "enable_auto_reply": {"type": "boolean"},
+            "end_time": {"oneOf": [epoch_millis, {"type": "null"}]},
+            "response_body_html": _text(200_000, minimum=0),
+            "response_body_plain_text": _text(200_000, minimum=0),
+            "response_subject": _text(998, minimum=0),
+            "restrict_to_contacts": {"type": "boolean"},
+            "restrict_to_domain": {"type": "boolean"},
+            "start_time": {"oneOf": [epoch_millis, {"type": "null"}]},
+        },
+        required=(
+            "enable_auto_reply",
+            "end_time",
+            "response_body_html",
+            "response_body_plain_text",
+            "response_subject",
+            "restrict_to_contacts",
+            "restrict_to_domain",
+            "start_time",
+        ),
+    )
+
+
+def _gmail_send_as_patch() -> dict[str, object]:
+    return _object(
+        {
+            "display_name": _text(998, minimum=0),
+            "is_default": {"const": True, "type": "boolean"},
+            "reply_to_address": _text(512, minimum=0),
+            "send_as_email": _text(512),
+            "signature": _text(200_000, minimum=0),
+        },
+        required=("send_as_email",),
+    )
 
 
 def _mail_list() -> dict[str, object]:
@@ -764,6 +904,7 @@ def _drive_move_schema() -> dict[str, object]:
 
 _GMAIL_READ_SCOPES: Final = _scopes(_GMAIL_READONLY, _GMAIL_MODIFY, _MAIL)
 _GMAIL_WRITE_SCOPES: Final = _scopes(_GMAIL_MODIFY, _MAIL)
+_GMAIL_SETTINGS_WRITE_SCOPES: Final = _scopes(_GMAIL_SETTINGS_BASIC)
 _GMAIL_PURGE_SCOPES: Final = _scopes(_MAIL)
 _CALENDAR_LIST_SCOPES: Final = _scopes(_CALENDAR_LIST_READONLY, _CALENDAR)
 _CALENDAR_EVENT_READ_SCOPES: Final = _scopes(
@@ -908,6 +1049,94 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
             },
             required=("start_history_id",),
         ),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.auto_forwarding.get",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.imap.get",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.language.get",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.pop.get",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.vacation.get",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.filters.list",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.filters.get",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({"filter_id": _id()}, required=("filter_id",)),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.forwarding_addresses.list",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.forwarding_addresses.get",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({"forwarding_email": _text(512)}, required=("forwarding_email",)),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.send_as.list",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "settings.send_as.get",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({"send_as_email": _text(512)}, required=("send_as_email",)),
     ),
     _operation(
         "gmail",
@@ -1086,6 +1315,68 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.PERMANENT,
         _GMAIL_WRITE_SCOPES,
         _object({"label_id": _id()}, required=("label_id",)),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "settings.filters.create",
+        ConnectorEffect.SAFE_MUTATION,
+        _GMAIL_SETTINGS_WRITE_SCOPES,
+        _gmail_filter_create(),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "settings.filters.delete",
+        ConnectorEffect.PERMANENT,
+        _GMAIL_SETTINGS_WRITE_SCOPES,
+        _object(
+            {
+                "expected_filter": _gmail_filter_snapshot(),
+                "filter_id": _id(),
+            },
+            required=("expected_filter", "filter_id"),
+        ),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "settings.imap.update",
+        ConnectorEffect.SAFE_MUTATION,
+        _GMAIL_SETTINGS_WRITE_SCOPES,
+        _gmail_imap_update(),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "settings.language.update",
+        ConnectorEffect.SAFE_MUTATION,
+        _GMAIL_SETTINGS_WRITE_SCOPES,
+        _object({"display_language": _text(64)}, required=("display_language",)),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "settings.pop.update",
+        ConnectorEffect.SAFE_MUTATION,
+        _GMAIL_SETTINGS_WRITE_SCOPES,
+        _gmail_pop_update(),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "settings.vacation.update",
+        ConnectorEffect.SAFE_MUTATION,
+        _GMAIL_SETTINGS_WRITE_SCOPES,
+        _gmail_vacation_update(),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "settings.send_as.patch",
+        ConnectorEffect.OUTWARD,
+        _GMAIL_SETTINGS_WRITE_SCOPES,
+        _gmail_send_as_patch(),
     ),
     _operation(
         "google_calendar",

@@ -59,6 +59,7 @@ def test_builtin_connector_profiles_are_finite_and_expose_both_access_tiers() ->
         "openid",
         "email",
         "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/gmail.settings.basic",
         "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
         "https://www.googleapis.com/auth/calendar.events",
         "https://www.googleapis.com/auth/calendar.calendars",
@@ -66,6 +67,7 @@ def test_builtin_connector_profiles_are_finite_and_expose_both_access_tiers() ->
         "https://www.googleapis.com/auth/drive",
     )
     assert google.scopes_for("full", include_supplemental=True)[-1] == ("https://mail.google.com/")
+    assert "https://www.googleapis.com/auth/gmail.settings.sharing" not in google.allowed_scopes
 
     microsoft = get_profile("microsoft")
     assert microsoft.scopes_for("read") == (
@@ -117,6 +119,11 @@ def test_access_tier_classification_preserves_legacy_read_connections() -> None:
     with pytest.raises(ValidationError, match="built-in access tier"):
         google.access_for_scopes(("https://www.googleapis.com/auth/gmail.readonly",))
     assert google.access_for_scopes(google.full_scopes) is ConnectorAccessTier.FULL
+    assert google.access_for_scopes(google.legacy_full_scopes[0]) is ConnectorAccessTier.FULL
+    assert (
+        google.access_for_scopes((*google.legacy_full_scopes[0], *google.supplemental_scopes))
+        is ConnectorAccessTier.FULL
+    )
     assert (
         google.access_for_scopes(google.scopes_for("full", include_supplemental=True))
         is ConnectorAccessTier.FULL
@@ -248,8 +255,10 @@ def test_logical_connector_profiles_are_finite_single_source_least_authority_pro
         "openid",
         "email",
         "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/gmail.settings.basic",
     )
     assert gmail.scopes_for("full", include_supplemental=True)[-1] == "https://mail.google.com/"
+    assert "https://www.googleapis.com/auth/gmail.settings.sharing" not in gmail.allowed_scopes
     assert "calendar" not in " ".join(gmail.scopes_for("read"))
     assert "drive" not in " ".join(gmail.scopes_for("full"))
 
@@ -270,6 +279,11 @@ def test_logical_profiles_classify_current_and_legacy_single_source_scope_sets()
     gmail = get_connector_profile("gmail")
     assert gmail.access_for_scopes(gmail.read_scopes) is ConnectorAccessTier.READ
     assert gmail.access_for_scopes(gmail.full_scopes) is ConnectorAccessTier.FULL
+    assert gmail.access_for_scopes(gmail.legacy_full_scopes[0]) is ConnectorAccessTier.FULL
+    assert (
+        gmail.access_for_scopes((*gmail.legacy_full_scopes[0], *gmail.supplemental_scopes))
+        is ConnectorAccessTier.FULL
+    )
     assert (
         gmail.access_for_scopes(("https://www.googleapis.com/auth/gmail.readonly",))
         is ConnectorAccessTier.READ

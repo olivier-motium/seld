@@ -263,24 +263,45 @@ def test_identity_confirmation_shows_exact_account_and_defaults_to_no(
 
 
 @pytest.mark.parametrize(
-    ("access", "permanent_delete", "expected_phrases"),
+    ("access", "permanent_delete", "gmail_settings_control", "expected_phrases"),
     [
-        (ConnectorAccessTier.READ, False, ("Explicit Gmail purge", "not available with Read")),
+        (
+            ConnectorAccessTier.READ,
+            False,
+            False,
+            ("current everyday settings", "Explicit Gmail purge", "not available with Read"),
+        ),
         (
             ConnectorAccessTier.FULL,
             False,
-            ("Explicit Gmail purge: off", "recoverable Trash", "deleted=true", "permanently"),
+            True,
+            (
+                "everyday settings",
+                "administrator delegation is not requested",
+                "Explicit Gmail purge: off",
+                "recoverable Trash",
+                "deleted=true",
+                "permanently",
+            ),
         ),
         (
             ConnectorAccessTier.FULL,
             True,
-            ("Explicit Gmail purge: ON", "skipping the Trash", "cannot be undone"),
+            True,
+            (
+                "everyday settings",
+                "administrator delegation is not requested",
+                "Explicit Gmail purge: ON",
+                "skipping the Trash",
+                "cannot be undone",
+            ),
         ),
     ],
 )
 def test_gmail_confirmation_discloses_permission_update_and_delete_semantics(
     access: ConnectorAccessTier,
     permanent_delete: bool,
+    gmail_settings_control: bool,
     expected_phrases: tuple[str, ...],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -291,6 +312,7 @@ def test_gmail_confirmation_discloses_permission_update_and_delete_semantics(
         access=access,
         display_label="Ada <ada@example.test>",
         permanent_delete=permanent_delete,
+        gmail_settings_control=gmail_settings_control,
         permission_update=(
             "Replaces the existing connection after the current permissions are ready."
         ),
@@ -306,7 +328,7 @@ def test_gmail_confirmation_discloses_permission_update_and_delete_semantics(
         assert phrase in stderr
 
 
-def test_legacy_google_confirmation_still_discloses_permanent_gmail_deletion(
+def test_legacy_google_confirmation_is_honest_about_settings_and_permanent_deletion(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -321,6 +343,9 @@ def test_legacy_google_confirmation_still_discloses_permanent_gmail_deletion(
 
     assert cli._confirm_connector_identity(review) is False
     stderr = capsys.readouterr().err
+    assert "Legacy Gmail Full: mailbox changes only" in stderr
+    assert "does not add everyday settings control" in stderr
+    assert "gsv connectors status gmail" in stderr
     assert "Explicit Gmail purge: ON" in stderr
     assert "Gmail messages" in stderr
     assert "cannot be undone" in stderr

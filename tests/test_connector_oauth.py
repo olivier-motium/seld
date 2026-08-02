@@ -12,6 +12,7 @@ import pytest
 
 from continuity_kernel.connector_credentials import OAuthCredential, credential_from_token_set
 from continuity_kernel.connector_oauth import (
+    OAuthAuthorizationRejectedError,
     OAuthCallbackError,
     OAuthClientConfig,
     OAuthConfigurationError,
@@ -385,6 +386,22 @@ def test_callback_fails_closed(
         validate_authorization_callback(
             oauth_config,
             callback_url=callback_url,
+            expected_state="expected",
+        )
+
+
+def test_access_denied_callback_has_a_specific_recoverable_error(
+    oauth_config: OAuthClientConfig,
+) -> None:
+    with pytest.raises(
+        OAuthAuthorizationRejectedError,
+        match=r"OAuth authorization was rejected \(access_denied\)",
+    ):
+        validate_authorization_callback(
+            oauth_config,
+            callback_url=(
+                "http://127.0.0.1:49152/oauth/callback?error=access_denied&state=expected"
+            ),
             expected_state="expected",
         )
 

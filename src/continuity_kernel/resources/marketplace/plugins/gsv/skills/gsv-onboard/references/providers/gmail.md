@@ -13,8 +13,25 @@ gsv connectors connect gmail --access full --alias 'Personal Gmail'
 
 Choose one command. Read grants the typed Gmail read catalog. Full adds drafts,
 send, raw-message transfer, label changes, read-state changes, trash/restore,
-and delete operations. Explicit message, thread, or batch purge uses Google's
-separate broad mail permission and remains a separately confirmed operation.
+delete operations, and ordinary Gmail settings control for filters, the primary
+signature, language, POP/IMAP, and vacation replies. Explicit message, thread,
+or batch purge uses Google's separate broad mail permission and remains a
+separately confirmed operation. Full requests Google's settings-basic permission;
+it never requests Workspace administrator delegation.
+
+Google classifies settings-basic as a restricted Gmail permission, so the public
+OAuth app must be verified for it and Workspace policy may still deny it. If an
+upgrade is denied or incomplete, Seld leaves the existing Full connection and
+its current mailbox capabilities unchanged; a first-time connection saves
+nothing and returns a copyable retry command. When an older Full connection
+already has permanent-delete authority, the settings upgrade retains that
+separately chosen authority and shows it again before replacing the old grant.
+`gsv connectors status gmail` reports `settings_control=upgrade_required` for
+an older Full connection and returns the exact reconnect command; the mailbox
+connection remains usable while the person decides whether to upgrade.
+If status identifies a `legacy_provider_bundle`, leave that bundle intact and
+connect a separate logical Gmail Full account; the runtime's settings error
+directs the person to reconnect logical Gmail Full access.
 The command opens Google OAuth with PKCE and a loopback callback, verifies the
 returned Google identity, shows the account, and asks `Use this account? [y/N]`
 before anything is published. The default is no. During a Read-to-Full upgrade,
@@ -39,10 +56,31 @@ interactive connector.
 
 The separate `gsv_connectors` MCP server exposes `gsv_gmail_read` and
 `gsv_gmail_write`. Their closed schemas cover message, thread, attachment,
-draft, and label operations. Sends are outward and confirmed. Trash, restore,
-and label moves are one-step recoverable operations, including batches of up
-to 1,000 messages. `messages.purge`, `threads.purge`, and
-`messages.batch_purge` are permanent and require a bound confirmation.
+draft, label, filter, forwarding-visibility, primary send-as, language, POP/IMAP,
+and vacation operations. Sends and automatic future replies or forwarding are
+outward and confirmed. Future auto-archive, Spam-routing, or Trash-routing rules
+are destructive and confirmed. IMAP `deleteForever` and filter deletion are
+permanent and confirmed.
+Trash, restore, and ordinary label moves remain one-step recoverable operations,
+including batches of up to 1,000 messages. `messages.purge`, `threads.purge`,
+and `messages.batch_purge` are permanent and require a bound confirmation.
+Before deleting a filter, read it with `settings.filters.get`, then pass the
+returned `id`, `criteria`, and `action` as `expected_filter`. The confirmation
+shows that complete reviewed rule, and Seld reads it again before deletion so a
+rule changed in another client is never deleted under a stale confirmation.
+`settings.vacation.update` is an explicit whole-state replacement: read the
+current vacation settings first, then provide every subject/body/restriction
+field and both schedule boundaries. Use `null` for a missing start or end
+boundary; Seld omits that optional provider field while binding the explicit
+no-boundary choice in the confirmation.
+
+The consumer OAuth connector deliberately does not expose Workspace administrator
+operations that Google restricts to a service account with domain-wide delegation:
+delegate management, forwarding-address creation/deletion, automatic-forwarding
+updates, and custom send-as lifecycle. It also excludes SMTP passwords, hosted
+S/MIME private-key material, and client-side-encryption key management. Those need
+a separate administrator/security credential model; reconnecting ordinary Gmail
+Full must never request `gmail.settings.sharing`.
 
 For an existing `.eml` file, use the typed `local_file` selector rather than
 copying raw bytes into the conversation. `messages.send` sends that exact

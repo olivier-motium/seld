@@ -47,6 +47,24 @@ _EXPECTED_NAMES = {
         "labels.create",
         "labels.update",
         "labels.delete",
+        "settings.auto_forwarding.get",
+        "settings.filters.create",
+        "settings.filters.delete",
+        "settings.filters.get",
+        "settings.filters.list",
+        "settings.forwarding_addresses.get",
+        "settings.forwarding_addresses.list",
+        "settings.imap.get",
+        "settings.imap.update",
+        "settings.language.get",
+        "settings.language.update",
+        "settings.pop.get",
+        "settings.pop.update",
+        "settings.send_as.get",
+        "settings.send_as.list",
+        "settings.send_as.patch",
+        "settings.vacation.get",
+        "settings.vacation.update",
     },
     "google_calendar": {
         "calendars.list",
@@ -126,11 +144,11 @@ def test_google_provider_mode_partitions_and_exact_operation_surface() -> None:
         for provider in _EXPECTED_NAMES
     }
     assert names == _EXPECTED_NAMES
-    assert len(GOOGLE_OPERATIONS) == 74
+    assert len(GOOGLE_OPERATIONS) == 92
     assert {
         provider: sum(item.provider == provider for item in GOOGLE_OPERATIONS) for provider in names
     } == {
-        "gmail": 31,
+        "gmail": 49,
         "google_calendar": 14,
         "google_drive": 29,
     }
@@ -159,6 +177,13 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
         ("gmail", "labels.create"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "labels.update"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "labels.delete"): ConnectorEffect.PERMANENT,
+        ("gmail", "settings.filters.create"): ConnectorEffect.SAFE_MUTATION,
+        ("gmail", "settings.filters.delete"): ConnectorEffect.PERMANENT,
+        ("gmail", "settings.imap.update"): ConnectorEffect.SAFE_MUTATION,
+        ("gmail", "settings.language.update"): ConnectorEffect.SAFE_MUTATION,
+        ("gmail", "settings.pop.update"): ConnectorEffect.SAFE_MUTATION,
+        ("gmail", "settings.send_as.patch"): ConnectorEffect.OUTWARD,
+        ("gmail", "settings.vacation.update"): ConnectorEffect.SAFE_MUTATION,
         ("google_calendar", "calendars.create"): ConnectorEffect.SAFE_MUTATION,
         ("google_calendar", "calendars.update"): ConnectorEffect.SAFE_MUTATION,
         ("google_calendar", "calendars.delete"): ConnectorEffect.PERMANENT,
@@ -203,6 +228,109 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
         assert purge.required_scopes == (frozenset({"https://mail.google.com/"}),)
         assert purge.scope_grant_satisfies(["https://mail.google.com/"])
         assert not purge.scope_grant_satisfies(["https://www.googleapis.com/auth/gmail.modify"])
+
+    for item in GOOGLE_OPERATIONS:
+        if (
+            item.provider == "gmail"
+            and item.mode is ConnectorMode.WRITE
+            and item.name.startswith("settings.")
+        ):
+            assert item.required_scopes == (
+                frozenset({"https://www.googleapis.com/auth/gmail.settings.basic"}),
+            )
+            assert not item.scope_grant_satisfies(
+                ["https://mail.google.com/", "https://www.googleapis.com/auth/gmail.modify"]
+            )
+
+
+def test_gmail_settings_schemas_are_closed_and_require_explicit_final_states() -> None:
+    imap = _operation("gmail", ConnectorMode.WRITE, "settings.imap.update")
+    validated = imap.validate_input(
+        {
+            "auto_expunge": False,
+            "enabled": True,
+            "expunge_behavior": "trash",
+            "max_folder_size": 5_000,
+        }
+    )
+    assert isinstance(validated, dict)
+    assert validated["max_folder_size"] == 5_000
+    for invalid_imap in (
+        {"enabled": True},
+        {
+            "auto_expunge": False,
+            "enabled": True,
+            "expunge_behavior": "deleteSometimes",
+            "max_folder_size": 0,
+        },
+        {
+            "auto_expunge": False,
+            "enabled": True,
+            "expunge_behavior": "trash",
+            "max_folder_size": 500,
+        },
+    ):
+        with pytest.raises(ValidationError):
+            imap.validate_input(invalid_imap)
+
+    pop = _operation("gmail", ConnectorMode.WRITE, "settings.pop.update")
+    assert pop.validate_input({"access_window": "fromNowOn", "disposition": "leaveInInbox"}) == {
+        "access_window": "fromNowOn",
+        "disposition": "leaveInInbox",
+    }
+    with pytest.raises(ValidationError):
+        pop.validate_input({"access_window": "allMail"})
+
+    vacation = _operation("gmail", ConnectorMode.WRITE, "settings.vacation.update")
+    vacation_state = {
+        "enable_auto_reply": True,
+        "end_time": None,
+        "response_body_html": "",
+        "response_body_plain_text": "Back Monday",
+        "response_subject": "Away",
+        "restrict_to_contacts": False,
+        "restrict_to_domain": False,
+        "start_time": None,
+    }
+    assert vacation.validate_input(vacation_state) == vacation_state
+    with pytest.raises(ValidationError):
+        vacation.validate_input({"response_subject": "Away"})
+    with pytest.raises(ValidationError):
+        vacation.validate_input({**vacation_state, "provider_field": True})
+    with pytest.raises(ValidationError):
+        vacation.validate_input(
+            {key: value for key, value in vacation_state.items() if key != "end_time"}
+        )
+
+    send_as = _operation("gmail", ConnectorMode.WRITE, "settings.send_as.patch")
+    with pytest.raises(ValidationError):
+        send_as.validate_input({"is_default": False, "send_as_email": "me@example.test"})
+    with pytest.raises(ValidationError):
+        send_as.validate_input(
+            {"send_as_email": "me@example.test", "smtp_password": "must-never-enter"}
+        )
+
+    delete_filter = _operation("gmail", ConnectorMode.WRITE, "settings.filters.delete")
+    expected_filter = {
+        "action": {"addLabelIds": ["STARRED"]},
+        "criteria": {"from": "sender@example.test"},
+        "id": "filter-1",
+    }
+    assert delete_filter.validate_input(
+        {"expected_filter": expected_filter, "filter_id": "filter-1"}
+    ) == {"expected_filter": expected_filter, "filter_id": "filter-1"}
+    for invalid_filter in (
+        {"filter_id": "filter-1"},
+        {
+            "expected_filter": {
+                **expected_filter,
+                "action": {"providerFutureAction": True},
+            },
+            "filter_id": "filter-1",
+        },
+    ):
+        with pytest.raises(ValidationError):
+            delete_filter.validate_input(invalid_filter)
 
 
 def test_gmail_history_uses_a_bounded_decimal_uint64_cursor() -> None:

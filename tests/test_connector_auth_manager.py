@@ -1273,7 +1273,7 @@ def test_gmail_purge_selection_reports_a_missing_supplemental_grant(tmp_path: Pa
     assert manager.tokens.state(CONNECTION_ID) is None
 
 
-def test_gmail_purge_scope_semantically_satisfies_modify_when_google_returns_only_broader_scope(
+def test_gmail_purge_scope_satisfies_modify_but_retains_the_settings_grant(
     tmp_path: Path,
 ) -> None:
     profile = get_connector_profile("gmail")
@@ -1285,7 +1285,12 @@ def test_gmail_purge_scope_semantically_satisfies_modify_when_google_returns_onl
         access_token="purge-access",
         refresh_token="purge-refresh",
         token_type=OAuthTokenType.BEARER,
-        scopes=("openid", "email", "https://mail.google.com/"),
+        scopes=(
+            "openid",
+            "email",
+            "https://mail.google.com/",
+            "https://www.googleapis.com/auth/gmail.settings.basic",
+        ),
         issued_at=BASE_TIME,
         expires_at=None,
     )
@@ -1299,6 +1304,29 @@ def test_gmail_purge_scope_semantically_satisfies_modify_when_google_returns_onl
     )
     assert "https://mail.google.com/" in resolved.scopes
     assert "https://www.googleapis.com/auth/gmail.modify" not in resolved.scopes
+    assert "https://www.googleapis.com/auth/gmail.settings.basic" in resolved.scopes
+
+
+def test_gmail_purge_scope_does_not_substitute_for_the_settings_grant(tmp_path: Path) -> None:
+    profile = get_connector_profile("gmail")
+    manager = _manager(
+        tmp_path,
+        scopes=profile.scopes_for("full", include_supplemental=True),
+    )
+    credential = OAuthCredential(
+        access_token="purge-without-settings-access",
+        refresh_token="purge-without-settings-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=("openid", "email", "https://mail.google.com/"),
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    with pytest.raises(OAuthPermissionGrantError) as failure:
+        _import_oauth_credential(manager, credential)
+
+    assert failure.value.reason == "missing_selected_permissions"
+    assert manager.tokens.state(CONNECTION_ID) is None
 
 
 def test_declared_legacy_calendar_grant_remains_usable_end_to_end(tmp_path: Path) -> None:

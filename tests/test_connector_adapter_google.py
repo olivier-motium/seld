@@ -36,7 +36,7 @@ from continuity_kernel.connector_transport import (
     ConnectorStreamResponse,
     ConnectorTransport,
 )
-from continuity_kernel.errors import ContinuityError, ValidationError
+from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
 
 
 class _Transport(ConnectorTransport):
@@ -191,6 +191,7 @@ def _credential() -> ConnectorRuntimeCredential:
         credential=ConnectorCredential(AuthorizationScheme.BEARER, "test-secret"),
         granted_scopes=(
             "https://mail.google.com/",
+            "https://www.googleapis.com/auth/gmail.settings.basic",
             "https://www.googleapis.com/auth/calendar",
             "https://www.googleapis.com/auth/drive",
         ),
@@ -371,7 +372,18 @@ def test_google_local_file_limit_hook_allows_only_sanitized_provider_shapes() ->
 def _sample(operation: OperationSpec) -> dict[str, object]:
     name = operation.name
     if operation.provider == "gmail":
-        if name in {"labels.list", "profile.get"}:
+        if name in {
+            "labels.list",
+            "profile.get",
+            "settings.auto_forwarding.get",
+            "settings.filters.list",
+            "settings.forwarding_addresses.list",
+            "settings.imap.get",
+            "settings.language.get",
+            "settings.pop.get",
+            "settings.send_as.list",
+            "settings.vacation.get",
+        }:
             return {}
         if name == "history.list":
             return {"page_size": 1, "start_history_id": "1"}
@@ -415,6 +427,50 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
             return {"name": "Projects"}
         if name in {"labels.get", "labels.update", "labels.delete"}:
             return {"label_id": "label"}
+        if name == "settings.filters.get":
+            return {"filter_id": "filter"}
+        if name == "settings.filters.delete":
+            return {
+                "expected_filter": {
+                    "action": {"addLabelIds": ["STARRED"]},
+                    "criteria": {"from": "sender@example.test"},
+                    "id": "filter",
+                },
+                "filter_id": "filter",
+            }
+        if name == "settings.filters.create":
+            return {
+                "action": {"add_label_ids": ["STARRED"]},
+                "criteria": {"from": "sender@example.test"},
+            }
+        if name == "settings.forwarding_addresses.get":
+            return {"forwarding_email": "forward@example.test"}
+        if name == "settings.imap.update":
+            return {
+                "auto_expunge": False,
+                "enabled": False,
+                "expunge_behavior": "archive",
+                "max_folder_size": 0,
+            }
+        if name == "settings.language.update":
+            return {"display_language": "en-GB"}
+        if name == "settings.pop.update":
+            return {"access_window": "disabled", "disposition": "leaveInInbox"}
+        if name == "settings.send_as.get":
+            return {"send_as_email": "primary@example.test"}
+        if name == "settings.send_as.patch":
+            return {"send_as_email": "primary@example.test", "signature": "Signed"}
+        if name == "settings.vacation.update":
+            return {
+                "enable_auto_reply": False,
+                "end_time": None,
+                "response_body_html": "",
+                "response_body_plain_text": "",
+                "response_subject": "",
+                "restrict_to_contacts": False,
+                "restrict_to_domain": False,
+                "start_time": None,
+            }
     if operation.provider == "google_calendar":
         if name == "calendars.list":
             return {"page_size": 1}
@@ -567,6 +623,24 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests(tmp_pat
                 "messages.send",
             }:
                 transport.body = b'{"id":"message"}'
+            if operation.provider == "gmail" and operation.name == "settings.send_as.patch":
+                transport.body = b'{"isPrimary":true,"sendAsEmail":"primary@example.test"}'
+                expected_requests = 2
+            if operation.provider == "gmail" and operation.name in {
+                "settings.send_as.get",
+                "settings.send_as.list",
+            }:
+                transport.body = (
+                    b'{"sendAs":[{"sendAsEmail":"primary@example.test"}]}'
+                    if operation.name.endswith(".list")
+                    else b'{"sendAsEmail":"primary@example.test"}'
+                )
+            if operation.provider == "gmail" and operation.name == "settings.filters.delete":
+                transport.body = (
+                    b'{"action":{"addLabelIds":["STARRED"]},'
+                    b'"criteria":{"from":"sender@example.test"},"id":"filter"}'
+                )
+                expected_requests = 2
             if operation.provider == "gmail" and operation.name in {
                 "messages.import",
                 "messages.insert",
@@ -586,7 +660,7 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests(tmp_pat
             assert len(transport.calls) == before + expected_requests
     finally:
         raw_upload.close()
-    assert len(transport.calls) == len(GOOGLE_OPERATIONS) + 6
+    assert len(transport.calls) == len(GOOGLE_OPERATIONS) + 8
     assert {call["origin"] for call in transport.calls} == {
         ConnectorOrigin.GMAIL,
         ConnectorOrigin.GOOGLE,
@@ -842,6 +916,610 @@ def test_gmail_raw_migration_effects_follow_exact_provider_consequences(
         assert effect is expected
     finally:
         upload.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "values", "path"),
+    (
+        ("settings.auto_forwarding.get", {}, "/gmail/v1/users/me/settings/autoForwarding"),
+        ("settings.imap.get", {}, "/gmail/v1/users/me/settings/imap"),
+        ("settings.language.get", {}, "/gmail/v1/users/me/settings/language"),
+        ("settings.pop.get", {}, "/gmail/v1/users/me/settings/pop"),
+        ("settings.vacation.get", {}, "/gmail/v1/users/me/settings/vacation"),
+        ("settings.filters.list", {}, "/gmail/v1/users/me/settings/filters"),
+        (
+            "settings.filters.get",
+            {"filter_id": "filter/id"},
+            "/gmail/v1/users/me/settings/filters/filter%2Fid",
+        ),
+        (
+            "settings.forwarding_addresses.list",
+            {},
+            "/gmail/v1/users/me/settings/forwardingAddresses",
+        ),
+        (
+            "settings.forwarding_addresses.get",
+            {"forwarding_email": "archive+mail@example.test"},
+            "/gmail/v1/users/me/settings/forwardingAddresses/archive%2Bmail%40example.test",
+        ),
+    ),
+)
+def test_gmail_settings_reads_use_only_fixed_me_routes(
+    name: str,
+    values: dict[str, object],
+    path: str,
+) -> None:
+    transport = _Transport()
+    GoogleConnectorAdapter().execute(
+        _operation("gmail", name),
+        values,
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["method"] is ConnectorMethod.GET
+    assert transport.calls[0]["path"] == path
+    assert transport.calls[0]["query"] == ()
+
+
+def test_gmail_send_as_reads_allowlist_output_and_drop_smtp_credentials() -> None:
+    adapter = GoogleConnectorAdapter()
+    resource = {
+        "displayName": "Ada",
+        "isDefault": True,
+        "isPrimary": True,
+        "replyToAddress": "reply@example.test",
+        "sendAsEmail": "primary@example.test",
+        "signature": "<p>Signed</p>",
+        "smtpMsa": {
+            "host": "smtp.example.test",
+            "password": "must-never-escape",
+            "username": "private-user",
+        },
+        "unexpectedCredential": "must-never-escape",
+        "verificationStatus": "accepted",
+    }
+    list_transport = _Transport(body=json.dumps({"sendAs": [resource]}).encode())
+    listed = adapter.execute(
+        _operation("gmail", "settings.send_as.list"),
+        {},
+        continuation=None,
+        credential=_credential(),
+        transport=list_transport,
+    )
+    get_transport = _Transport(body=json.dumps(resource).encode())
+    fetched = adapter.execute(
+        _operation("gmail", "settings.send_as.get"),
+        {"send_as_email": "primary@example.test"},
+        continuation=None,
+        credential=_credential(),
+        transport=get_transport,
+    )
+
+    expected = {
+        key: value
+        for key, value in resource.items()
+        if key not in {"smtpMsa", "unexpectedCredential"}
+    }
+    assert listed.payload == {"sendAs": [expected]}
+    assert fetched.payload == expected
+    assert "must-never-escape" not in repr((listed.payload, fetched.payload))
+    assert list_transport.calls[0]["query"] == (
+        (
+            "fields",
+            "sendAs(displayName,isDefault,isPrimary,replyToAddress,sendAsEmail,signature,"
+            "treatAsAlias,verificationStatus)",
+        ),
+    )
+    assert get_transport.calls[0]["query"] == (
+        (
+            "fields",
+            "displayName,isDefault,isPrimary,replyToAddress,sendAsEmail,signature,treatAsAlias,"
+            "verificationStatus",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed_field",
+    (
+        {"signature": {"smtpMsa": {"password": "nested-secret"}}},
+        {"isPrimary": "true"},
+    ),
+)
+def test_gmail_send_as_reads_reject_non_scalar_provider_fields(
+    malformed_field: dict[str, object],
+) -> None:
+    resource = {"sendAsEmail": "primary@example.test", **malformed_field}
+
+    with pytest.raises(ValidationError, match="send-as response has an invalid"):
+        GoogleConnectorAdapter().execute(
+            _operation("gmail", "settings.send_as.get"),
+            {"send_as_email": "primary@example.test"},
+            continuation=None,
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(resource).encode()),
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "values", "path", "body"),
+    (
+        (
+            "settings.imap.update",
+            {
+                "auto_expunge": False,
+                "enabled": True,
+                "expunge_behavior": "trash",
+                "max_folder_size": 5_000,
+            },
+            "/gmail/v1/users/me/settings/imap",
+            {
+                "autoExpunge": False,
+                "enabled": True,
+                "expungeBehavior": "trash",
+                "maxFolderSize": 5_000,
+            },
+        ),
+        (
+            "settings.language.update",
+            {"display_language": "fr"},
+            "/gmail/v1/users/me/settings/language",
+            {"displayLanguage": "fr"},
+        ),
+        (
+            "settings.pop.update",
+            {"access_window": "allMail", "disposition": "markRead"},
+            "/gmail/v1/users/me/settings/pop",
+            {"accessWindow": "allMail", "disposition": "markRead"},
+        ),
+        (
+            "settings.vacation.update",
+            {
+                "enable_auto_reply": True,
+                "end_time": "1785772800000",
+                "response_body_html": "",
+                "response_body_plain_text": "Back Monday",
+                "response_subject": "Away",
+                "restrict_to_contacts": True,
+                "restrict_to_domain": False,
+                "start_time": "1785686400000",
+            },
+            "/gmail/v1/users/me/settings/vacation",
+            {
+                "enableAutoReply": True,
+                "endTime": "1785772800000",
+                "responseBodyHtml": "",
+                "responseBodyPlainText": "Back Monday",
+                "responseSubject": "Away",
+                "restrictToContacts": True,
+                "restrictToDomain": False,
+                "startTime": "1785686400000",
+            },
+        ),
+        (
+            "settings.vacation.update",
+            {
+                "enable_auto_reply": False,
+                "end_time": None,
+                "response_body_html": "",
+                "response_body_plain_text": "Saved for later",
+                "response_subject": "",
+                "restrict_to_contacts": False,
+                "restrict_to_domain": False,
+                "start_time": None,
+            },
+            "/gmail/v1/users/me/settings/vacation",
+            {
+                "enableAutoReply": False,
+                "responseBodyHtml": "",
+                "responseBodyPlainText": "Saved for later",
+                "responseSubject": "",
+                "restrictToContacts": False,
+                "restrictToDomain": False,
+            },
+        ),
+    ),
+)
+def test_gmail_basic_settings_updates_use_exact_put_payloads(
+    name: str,
+    values: dict[str, object],
+    path: str,
+    body: dict[str, object],
+) -> None:
+    transport = _Transport()
+    GoogleConnectorAdapter().execute(
+        _operation("gmail", name),
+        values,
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["method"] is ConnectorMethod.PUT
+    assert transport.calls[0]["path"] == path
+    assert transport.calls[0]["json_body"] == body
+
+
+def test_gmail_filter_routes_validate_and_preserve_exact_criteria_and_actions() -> None:
+    values = {
+        "action": {
+            "add_label_ids": ["STARRED"],
+            "forward": "archive@example.test",
+            "remove_label_ids": ["UNREAD"],
+        },
+        "criteria": {
+            "exclude_chats": True,
+            "from": "sender@example.test",
+            "has_attachment": True,
+            "negated_query": "label:spam",
+            "query": "newer_than:1d",
+            "size": 1_024,
+            "size_comparison": "larger",
+            "subject": "Status",
+            "to": "team@example.test",
+        },
+    }
+    transport = _Transport(body=b'{"id":"filter"}')
+    result = GoogleConnectorAdapter().execute(
+        _operation("gmail", "settings.filters.create"),
+        values,
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    assert result.payload == {"id": "filter"}
+    assert transport.calls[0]["method"] is ConnectorMethod.POST
+    assert transport.calls[0]["path"] == "/gmail/v1/users/me/settings/filters"
+    assert transport.calls[0]["json_body"] == {
+        "action": {
+            "addLabelIds": ["STARRED"],
+            "forward": "archive@example.test",
+            "removeLabelIds": ["UNREAD"],
+        },
+        "criteria": {
+            "excludeChats": True,
+            "from": "sender@example.test",
+            "hasAttachment": True,
+            "negatedQuery": "label:spam",
+            "query": "newer_than:1d",
+            "size": 1_024,
+            "sizeComparison": "larger",
+            "subject": "Status",
+            "to": "team@example.test",
+        },
+    }
+
+    expected_filter = {
+        "action": {"addLabelIds": ["STARRED"]},
+        "criteria": {"from": "sender@example.test"},
+        "id": "filter/id",
+    }
+    deleted = _Transport(bodies=(json.dumps(expected_filter).encode(), b"{}"))
+    GoogleConnectorAdapter().execute(
+        _operation("gmail", "settings.filters.delete"),
+        {"expected_filter": expected_filter, "filter_id": "filter/id"},
+        continuation=None,
+        credential=_credential(),
+        transport=deleted,
+    )
+    assert [call["method"] for call in deleted.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.DELETE,
+    ]
+    assert {call["path"] for call in deleted.calls} == {
+        "/gmail/v1/users/me/settings/filters/filter%2Fid"
+    }
+
+
+def test_gmail_filter_delete_fails_closed_when_the_reviewed_rule_changed() -> None:
+    expected = {
+        "action": {"addLabelIds": ["STARRED"]},
+        "criteria": {"from": "sender@example.test"},
+        "id": "filter",
+    }
+    changed = {
+        **expected,
+        "action": {"forward": "archive@example.test"},
+    }
+    transport = _Transport(body=json.dumps(changed).encode())
+
+    with pytest.raises(ConflictError, match="read it again"):
+        GoogleConnectorAdapter().classify_effect(
+            _operation("gmail", "settings.filters.delete"),
+            {"expected_filter": expected, "filter_id": "filter"},
+            credential=_credential(),
+            transport=transport,
+        )
+
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["method"] is ConnectorMethod.GET
+
+
+def test_gmail_filter_delete_rejects_unreviewed_provider_fields() -> None:
+    expected = {
+        "action": {"addLabelIds": ["STARRED"]},
+        "criteria": {"from": "sender@example.test"},
+        "id": "filter",
+    }
+    transport = _Transport(
+        body=json.dumps({**expected, "futureAction": {"destination": "unknown"}}).encode()
+    )
+
+    with pytest.raises(ValidationError, match="unsupported fields"):
+        GoogleConnectorAdapter().classify_effect(
+            _operation("gmail", "settings.filters.delete"),
+            {"expected_filter": expected, "filter_id": "filter"},
+            credential=_credential(),
+            transport=transport,
+        )
+
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "values", "expected"),
+    (
+        (
+            "settings.filters.create",
+            {
+                "action": {"add_label_ids": ["STARRED"]},
+                "criteria": {"from": "sender@example.test"},
+            },
+            ConnectorEffect.SAFE_MUTATION,
+        ),
+        (
+            "settings.filters.create",
+            {
+                "action": {"forward": "archive@example.test"},
+                "criteria": {"from": "sender@example.test"},
+            },
+            ConnectorEffect.OUTWARD,
+        ),
+        (
+            "settings.filters.create",
+            {
+                "action": {"add_label_ids": ["TRASH"], "forward": "archive@example.test"},
+                "criteria": {"from": "sender@example.test"},
+            },
+            ConnectorEffect.DESTRUCTIVE,
+        ),
+        (
+            "settings.filters.create",
+            {
+                "action": {"remove_label_ids": ["INBOX"]},
+                "criteria": {"from": "sender@example.test"},
+            },
+            ConnectorEffect.DESTRUCTIVE,
+        ),
+        (
+            "settings.filters.create",
+            {
+                "action": {"add_label_ids": ["SPAM"]},
+                "criteria": {"from": "sender@example.test"},
+            },
+            ConnectorEffect.DESTRUCTIVE,
+        ),
+        (
+            "settings.imap.update",
+            {
+                "auto_expunge": True,
+                "enabled": True,
+                "expunge_behavior": "deleteForever",
+                "max_folder_size": 0,
+            },
+            ConnectorEffect.PERMANENT,
+        ),
+        (
+            "settings.imap.update",
+            {
+                "auto_expunge": False,
+                "enabled": True,
+                "expunge_behavior": "archive",
+                "max_folder_size": 0,
+            },
+            ConnectorEffect.OUTWARD,
+        ),
+        (
+            "settings.pop.update",
+            {"access_window": "allMail", "disposition": "leaveInInbox"},
+            ConnectorEffect.OUTWARD,
+        ),
+        (
+            "settings.pop.update",
+            {"access_window": "disabled", "disposition": "trash"},
+            ConnectorEffect.DESTRUCTIVE,
+        ),
+        (
+            "settings.vacation.update",
+            {
+                "enable_auto_reply": True,
+                "end_time": None,
+                "response_body_html": "",
+                "response_body_plain_text": "",
+                "response_subject": "Away",
+                "restrict_to_contacts": False,
+                "restrict_to_domain": False,
+                "start_time": None,
+            },
+            ConnectorEffect.OUTWARD,
+        ),
+        (
+            "settings.vacation.update",
+            {
+                "enable_auto_reply": False,
+                "end_time": None,
+                "response_body_html": "",
+                "response_body_plain_text": "",
+                "response_subject": "",
+                "restrict_to_contacts": False,
+                "restrict_to_domain": False,
+                "start_time": None,
+            },
+            ConnectorEffect.SAFE_MUTATION,
+        ),
+    ),
+)
+def test_gmail_settings_effects_match_future_provider_consequences(
+    name: str,
+    values: dict[str, object],
+    expected: ConnectorEffect,
+) -> None:
+    assert GoogleConnectorAdapter().classify_effect(_operation("gmail", name), values) is expected
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    (
+        (
+            {"action": {}, "criteria": {"from": "sender@example.test"}},
+            "at least one action",
+        ),
+        (
+            {
+                "action": {"add_label_ids": ["STARRED"], "remove_label_ids": ["STARRED"]},
+                "criteria": {"from": "sender@example.test"},
+            },
+            "same label",
+        ),
+        (
+            {"action": {"add_label_ids": ["STARRED"]}, "criteria": {"size": 10}},
+            "size and comparison",
+        ),
+    ),
+)
+def test_gmail_filter_validation_fails_before_provider_access(
+    values: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        GoogleConnectorAdapter().classify_effect(
+            _operation("gmail", "settings.filters.create"), values
+        )
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        {"enable_auto_reply": True},
+        {
+            "enable_auto_reply": True,
+            "end_time": "100",
+            "response_body_html": "",
+            "response_body_plain_text": "",
+            "response_subject": "Away",
+            "restrict_to_contacts": False,
+            "restrict_to_domain": False,
+            "start_time": "100",
+        },
+        {
+            "enable_auto_reply": True,
+            "end_time": None,
+            "response_body_html": "",
+            "response_body_plain_text": "",
+            "response_subject": "Away",
+            "restrict_to_contacts": False,
+            "restrict_to_domain": False,
+            "start_time": str(2**63),
+        },
+    ),
+)
+def test_gmail_vacation_validation_fails_before_provider_access(
+    values: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        GoogleConnectorAdapter().classify_effect(
+            _operation("gmail", "settings.vacation.update"), values
+        )
+
+
+def test_gmail_send_as_patch_is_primary_only_and_never_accepts_smtp_credentials() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("gmail", "settings.send_as.patch")
+    values = {
+        "display_name": "Ada",
+        "is_default": True,
+        "reply_to_address": "reply@example.test",
+        "send_as_email": "primary@example.test",
+        "signature": "<p>Signed</p>",
+    }
+    primary = _Transport(body=b'{"isPrimary":true,"sendAsEmail":"primary@example.test"}')
+    assert (
+        adapter.classify_effect(
+            operation,
+            values,
+            credential=_credential(),
+            transport=primary,
+        )
+        is ConnectorEffect.OUTWARD
+    )
+    assert len(primary.calls) == 1
+    assert primary.calls[0]["query"] == (("fields", "isPrimary,sendAsEmail"),)
+
+    primary.calls.clear()
+    adapter.execute(
+        operation,
+        values,
+        continuation=None,
+        credential=_credential(),
+        transport=primary,
+    )
+    assert [call["method"] for call in primary.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.PATCH,
+    ]
+    assert primary.calls[1]["path"] == ("/gmail/v1/users/me/settings/sendAs/primary%40example.test")
+    assert primary.calls[1]["json_body"] == {
+        "displayName": "Ada",
+        "isDefault": True,
+        "replyToAddress": "reply@example.test",
+        "signature": "<p>Signed</p>",
+    }
+
+    malformed_patch = _Transport(
+        bodies=(
+            b'{"isPrimary":true,"sendAsEmail":"primary@example.test"}',
+            (
+                b'{"sendAsEmail":"primary@example.test",'
+                b'"signature":{"unexpectedCredential":"nested-secret"}}'
+            ),
+        )
+    )
+    with pytest.raises(ValidationError, match="invalid signature"):
+        adapter.execute(
+            operation,
+            values,
+            continuation=None,
+            credential=_credential(),
+            transport=malformed_patch,
+        )
+
+    custom = _Transport(body=b'{"isPrimary":false,"sendAsEmail":"alias@example.test"}')
+    with pytest.raises(ValidationError, match="only the primary"):
+        adapter.classify_effect(
+            operation,
+            {"send_as_email": "alias@example.test", "signature": "Signed"},
+            credential=_credential(),
+            transport=custom,
+        )
+    assert len(custom.calls) == 1
+
+    with pytest.raises(ValidationError, match="at least one setting change"):
+        adapter.classify_effect(
+            operation,
+            {"send_as_email": "primary@example.test"},
+            credential=_credential(),
+            transport=_Transport(),
+        )
+
+    with pytest.raises(ValidationError):
+        operation.validate_input(
+            {
+                "send_as_email": "primary@example.test",
+                "smtp_password": "must-never-enter",
+            }
+        )
 
 
 def test_gmail_batch_modify_and_purge_use_fixed_provider_routes() -> None:

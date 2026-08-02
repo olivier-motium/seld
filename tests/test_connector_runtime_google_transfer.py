@@ -125,6 +125,28 @@ class _GmailModifyTransport(ConnectorTransport):
         )
 
 
+class _GmailSettingsTransport(ConnectorTransport):
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.requests.append(kwargs)
+        return ConnectorResponse(kwargs["origin"], 200, {}, b'{"displayLanguage":"fr"}')
+
+
+class _GmailFilterDeleteTransport(ConnectorTransport):
+    def __init__(self, filter_resource: dict[str, object]) -> None:
+        self.filter_resource = filter_resource
+        self.requests: list[dict[str, Any]] = []
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.requests.append(kwargs)
+        body = b"{}"
+        if kwargs["method"] is ConnectorMethod.GET:
+            body = json.dumps(self.filter_resource).encode()
+        return ConnectorResponse(kwargs["origin"], 200, {}, body)
+
+
 class _AmbiguousGmailSendTransport(_GmailModifyTransport):
     def request(self, **kwargs: Any) -> ConnectorResponse:
         self.requests.append(kwargs)
@@ -169,15 +191,20 @@ def _runtime(
     monkeypatch: pytest.MonkeyPatch,
     *,
     include_permanent_delete: bool = False,
+    legacy_full: bool = False,
 ) -> tuple[Vault, ConnectorRuntime, _NoProviderHttp]:
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host-data"))
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Google transfer runtime")
     profile = get_profile("google")
     now = datetime.now(UTC)
-    full_scopes = profile.scopes_for(
-        "full",
-        include_supplemental=include_permanent_delete,
+    full_scopes = (
+        profile.legacy_full_scopes[0]
+        if legacy_full
+        else profile.scopes_for(
+            "full",
+            include_supplemental=include_permanent_delete,
+        )
     )
     connection = ConnectionMetadata(
         connection_id=_CONNECTION_ID,
@@ -730,6 +757,185 @@ def test_gmail_ambiguous_raw_send_spends_confirmation_and_never_replays(
                 {**values, "confirmation_token": token},
             )
         assert [call["kind"] for call in transport.calls] == ["request", "stream"]
+    finally:
+        runtime.close()
+
+
+def test_gmail_settings_confirmation_effects_are_bound_without_provider_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, transport = _runtime(tmp_path, monkeypatch)
+    cases = (
+        (
+            "settings.filters.create",
+            {
+                "action": {"forward": "archive@example.test"},
+                "criteria": {"from": "sender@example.test"},
+            },
+            ConnectorEffect.OUTWARD,
+            "future matching messages",
+        ),
+        (
+            "settings.filters.create",
+            {
+                "action": {"add_label_ids": ["TRASH"]},
+                "criteria": {"from": "sender@example.test"},
+            },
+            ConnectorEffect.DESTRUCTIVE,
+            "future matching messages",
+        ),
+        (
+            "settings.imap.update",
+            {
+                "auto_expunge": True,
+                "enabled": True,
+                "expunge_behavior": "deleteForever",
+                "max_folder_size": 0,
+            },
+            ConnectorEffect.PERMANENT,
+            "unrecoverable",
+        ),
+        (
+            "settings.pop.update",
+            {"access_window": "allMail", "disposition": "trash"},
+            ConnectorEffect.DESTRUCTIVE,
+            "future POP retrieval",
+        ),
+        (
+            "settings.vacation.update",
+            {
+                "enable_auto_reply": True,
+                "end_time": None,
+                "response_body_html": "",
+                "response_body_plain_text": "Back Monday",
+                "response_subject": "Away",
+                "restrict_to_contacts": False,
+                "restrict_to_domain": False,
+                "start_time": None,
+            },
+            ConnectorEffect.OUTWARD,
+            "future qualifying messages",
+        ),
+    )
+    try:
+        for operation, input_value, expected_effect, warning in cases:
+            preview = runtime.call_tool(
+                "gsv_gmail_write",
+                {
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": input_value,
+                    "operation": operation,
+                },
+            )
+            assert preview["status"] == "confirmation_required"
+            assert preview["effect"] == expected_effect.value
+            assert preview["preview"] == input_value
+            returned_warning = preview["warning"]
+            assert isinstance(returned_warning, str)
+            assert warning in returned_warning
+        assert transport.call_count == 0
+    finally:
+        runtime.close()
+
+
+def test_gmail_filter_delete_preview_shows_and_rechecks_the_exact_rule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    expected_filter = {
+        "action": {"addLabelIds": ["STARRED"], "removeLabelIds": ["UNREAD"]},
+        "criteria": {"from": "sender@example.test", "subject": "Daily status"},
+        "id": "filter-1",
+    }
+    transport = _GmailFilterDeleteTransport(expected_filter)
+    runtime.transport = transport
+    input_value = {"expected_filter": expected_filter, "filter_id": "filter-1"}
+    try:
+        preview = runtime.call_tool(
+            "gsv_gmail_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "settings.filters.delete",
+            },
+        )
+
+        assert preview["status"] == "confirmation_required"
+        assert preview["effect"] == ConnectorEffect.PERMANENT.value
+        assert preview["preview"] == input_value
+        assert [request["method"] for request in transport.requests] == [ConnectorMethod.GET]
+
+        completed = runtime.call_tool(
+            "gsv_gmail_write",
+            {
+                "confirmation_token": preview["confirmation_token"],
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "settings.filters.delete",
+            },
+        )
+
+        assert completed["status"] == "ok"
+        assert [request["method"] for request in transport.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.DELETE,
+        ]
+        assert {request["path"] for request in transport.requests} == {
+            "/gmail/v1/users/me/settings/filters/filter-1"
+        }
+    finally:
+        runtime.close()
+
+
+def test_gmail_safe_setting_update_is_one_step_and_uses_settings_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    transport = _GmailSettingsTransport()
+    runtime.transport = transport
+    try:
+        result = runtime.call_tool(
+            "gsv_gmail_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": {"display_language": "fr"},
+                "operation": "settings.language.update",
+            },
+        )
+        assert result["status"] == "ok"
+        assert result["effect"] == ConnectorEffect.SAFE_MUTATION.value
+        assert result["result"] == {"displayLanguage": "fr"}
+        assert len(transport.requests) == 1
+        assert transport.requests[0]["method"] is ConnectorMethod.PUT
+        assert transport.requests[0]["path"] == "/gmail/v1/users/me/settings/language"
+    finally:
+        runtime.close()
+
+
+def test_legacy_gmail_full_keeps_mail_authority_but_settings_upgrade_fails_actionably(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, transport = _runtime(tmp_path, monkeypatch, legacy_full=True)
+    try:
+        with pytest.raises(
+            ValidationError,
+            match=r"reconnect Gmail Full access.*existing connection keeps working",
+        ):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": {"display_language": "fr"},
+                    "operation": "settings.language.update",
+                },
+            )
+        assert transport.call_count == 0
     finally:
         runtime.close()
 

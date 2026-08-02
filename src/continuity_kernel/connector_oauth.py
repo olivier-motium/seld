@@ -48,6 +48,11 @@ class OAuthConfigurationError(ConnectorOAuthError): ...
 class OAuthCallbackError(ConnectorOAuthError): ...
 
 
+class OAuthAuthorizationRejectedError(OAuthCallbackError):
+    def __init__(self, error: str) -> None:
+        super().__init__(f"OAuth authorization was rejected ({error})")
+
+
 class OAuthStateMismatchError(OAuthCallbackError): ...
 
 
@@ -210,7 +215,9 @@ def validate_authorization_callback(
     if error is not None:
         if not error:
             raise OAuthCallbackError("OAuth callback contains an empty error")
-        raise OAuthCallbackError(f"OAuth authorization was rejected ({error})")
+        if error == "access_denied":
+            raise OAuthAuthorizationRejectedError(error)
+        raise OAuthCallbackError(f"OAuth authorization failed ({error})")
     code = parameters.get("code")
     if not code:
         raise OAuthCallbackError("OAuth callback does not contain an authorization code")

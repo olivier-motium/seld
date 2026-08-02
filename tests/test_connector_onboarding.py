@@ -24,7 +24,7 @@ from continuity_kernel.connector_identifiers import (
     parse_connection_id,
 )
 from continuity_kernel.connector_identity import ConnectorIdentity
-from continuity_kernel.connector_oauth import OAuthTokenType
+from continuity_kernel.connector_oauth import OAuthAuthorizationRejectedError, OAuthTokenType
 from continuity_kernel.connector_onboarding import (
     ConnectorIdentityReview,
     ConnectorOnboarding,
@@ -429,7 +429,18 @@ def test_wrong_account_upgrade_aborts_and_explicit_new_account_keeps_both(
     assert reviewed == ["Ada <ada@example.test>"]
     assert different["status"] == "different_account"
     assert different["nothing_saved"] is True
-    assert different["next"] == "gsv connectors connect outlook_calendar --access full"
+    assert different["next"] == format_connector_command(
+        (
+            "gsv",
+            "connectors",
+            "connect",
+            "outlook_calendar",
+            "--access",
+            "full",
+            "--connection-id",
+            str(old.connection_id),
+        )
+    )
     assert "--new-account" in cast(str, different["new_account"])
     assert manager.vault.get_connection_snapshot().connection(old.connection_id) is not None
 
@@ -458,7 +469,11 @@ def test_wrong_account_guidance_keeps_only_validated_alias_on_retry(
     browser_flag: str,
 ) -> None:
     manager = _manager(tmp_path)
-    _existing_oauth(manager, "outlook_calendar", access=ConnectorAccessTier.READ)
+    existing = _existing_oauth(
+        manager,
+        "outlook_calendar",
+        access=ConnectorAccessTier.READ,
+    )
     onboarding = ConnectorOnboarding(
         manager,
         registration_loader=_registration,
@@ -489,6 +504,8 @@ def test_wrong_account_guidance_keeps_only_validated_alias_on_retry(
         "outlook_calendar",
         "--access",
         "full",
+        "--connection-id",
+        str(existing.connection_id),
         f"--alias={alias}",
         "--timeout",
         "42.5",
@@ -625,6 +642,274 @@ def test_same_tier_legacy_read_is_replaced_only_after_current_grant_is_ready(
     assert replacement.connection_id != old.connection_id
     assert frozenset(replacement.scopes) == frozenset(profile.read_scopes)
     assert replacement.health is ConnectionHealth.READY
+
+
+def test_legacy_gmail_full_adds_settings_scope_only_after_atomic_same_account_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("gmail")
+    old = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=profile.legacy_full_scopes[0],
+    )
+    before = manager.tokens.read(old.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider),
+    )
+    events: list[str] = []
+
+    def acquire(metadata: ConnectionMetadata, **kwargs: object) -> OAuthCredential:
+        del kwargs
+        current = manager.vault.get_connection_snapshot().connection(old.connection_id)
+        assert current is not None and current.health is ConnectionHealth.READY
+        during = manager.tokens.read(old.connection_id)
+        assert during.state.version == before.state.version
+        assert during.value == before.value
+        assert "https://www.googleapis.com/auth/gmail.settings.basic" in metadata.scopes
+        assert "https://www.googleapis.com/auth/gmail.settings.sharing" not in metadata.scopes
+        events.append("acquire")
+        return _credential(metadata.scopes)
+
+    monkeypatch.setattr(manager, "acquire_oauth_credential", acquire)
+    reviews: list[ConnectorIdentityReview] = []
+
+    def confirm(review: ConnectorIdentityReview) -> bool:
+        reviews.append(review)
+        assert review.access is ConnectorAccessTier.FULL
+        assert review.gmail_settings_control is True
+        assert review.permission_update is not None
+        assert "existing connection keeps working until this succeeds" in review.permission_update
+        assert "https://" not in review.permission_update
+        return True
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="full",
+        confirm_identity=confirm,
+        present_permission_update=lambda message: (
+            events.append("permission_update")
+            if "https://" not in message
+            else pytest.fail("raw scope shown before sign-in")
+        ),
+    )
+
+    assert result["status"] == "connected"
+    assert result["replaced_connection_id"] == str(old.connection_id)
+    assert events == ["permission_update", "acquire"]
+    assert len(reviews) == 1
+    snapshot = manager.vault.get_connection_snapshot()
+    assert snapshot.connection(old.connection_id) is None
+    replacement = snapshot.connection(parse_connection_id(result["connection_id"]))
+    assert replacement is not None and replacement.health is ConnectionHealth.READY
+    assert frozenset(replacement.scopes) == frozenset(profile.full_scopes)
+
+
+def test_legacy_gmail_purge_upgrade_retains_purge_while_adding_settings_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("gmail")
+    legacy_purge_scopes = (*profile.legacy_full_scopes[0], *profile.supplemental_scopes)
+    old = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=legacy_purge_scopes,
+    )
+    before = manager.tokens.read(old.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider),
+    )
+
+    def acquire(metadata: ConnectionMetadata, **kwargs: object) -> OAuthCredential:
+        del kwargs
+        retained = manager.vault.get_connection_snapshot().connection(old.connection_id)
+        assert retained is not None and retained.health is ConnectionHealth.READY
+        during = manager.tokens.read(old.connection_id)
+        assert during.state.version == before.state.version
+        assert during.value == before.value
+        assert frozenset(metadata.scopes) == frozenset(
+            profile.scopes_for("full", include_supplemental=True)
+        )
+        return _credential(metadata.scopes)
+
+    monkeypatch.setattr(manager, "acquire_oauth_credential", acquire)
+
+    def confirm(review: ConnectorIdentityReview) -> bool:
+        assert review.access is ConnectorAccessTier.FULL
+        assert review.gmail_settings_control is True
+        assert review.permanent_delete is True
+        assert review.permission_update is not None
+        assert "including permanent Gmail deletion" in review.permission_update
+        return True
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="full",
+        confirm_identity=confirm,
+    )
+
+    assert result["status"] == "connected"
+    assert result["permanent_delete"] is True
+    assert result["replaced_connection_id"] == str(old.connection_id)
+    snapshot = manager.vault.get_connection_snapshot()
+    assert snapshot.connection(old.connection_id) is None
+    replacement = snapshot.connection(parse_connection_id(result["connection_id"]))
+    assert replacement is not None and replacement.health is ConnectionHealth.READY
+    assert frozenset(replacement.scopes) == frozenset(
+        profile.scopes_for("full", include_supplemental=True)
+    )
+
+
+def test_failed_legacy_gmail_purge_upgrade_preserves_token_and_exact_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("gmail")
+    old = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=(*profile.legacy_full_scopes[0], *profile.supplemental_scopes),
+    )
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = manager.tokens.read(old.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+
+    def acquire(metadata: ConnectionMetadata, **kwargs: object) -> OAuthCredential:
+        del kwargs
+        assert frozenset(metadata.scopes) == frozenset(
+            profile.scopes_for("full", include_supplemental=True)
+        )
+        raise OAuthPermissionGrantError("missing_selected_permissions")
+
+    monkeypatch.setattr(manager, "acquire_oauth_credential", acquire)
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="full",
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result["status"] == "oauth_permissions_missing"
+    assert result["existing_connection_preserved"] is True
+    assert result["requested_permanent_delete"] is True
+    assert result["existing_permanent_delete"] is True
+    assert result["connection_id"] == str(old.connection_id)
+    assert f"--connection-id {old.connection_id}" in cast(str, result["retry"])
+    assert "--with-permanent-delete" in cast(str, result["retry"])
+    assert manager.vault.get_connection_snapshot() == before_snapshot
+    after = manager.tokens.read(old.connection_id)
+    assert after.state.version == before.state.version
+    assert after.value == before.value
+
+
+def test_denied_legacy_gmail_upgrade_is_recoverable_and_preserves_purge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("gmail")
+    old = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=(*profile.legacy_full_scopes[0], *profile.supplemental_scopes),
+    )
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = manager.tokens.read(old.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+
+    def deny(metadata: ConnectionMetadata, **kwargs: object) -> OAuthCredential:
+        del kwargs
+        assert frozenset(metadata.scopes) == frozenset(
+            profile.scopes_for("full", include_supplemental=True)
+        )
+        raise OAuthAuthorizationRejectedError("access_denied")
+
+    monkeypatch.setattr(manager, "acquire_oauth_credential", deny)
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="full",
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result["status"] == "cancelled"
+    assert result["reason"] == "authorization_rejected"
+    assert result["access"] == "full"
+    assert result["effective_access"] == "full"
+    assert result["existing_connection_preserved"] is True
+    assert result["existing_permanent_delete"] is True
+    assert result["permanent_delete"] is True
+    assert result["requested_permanent_delete"] is True
+    assert result["nothing_saved"] is True
+    assert result["connection_id"] == str(old.connection_id)
+    assert result["next"] == result["retry"]
+    assert f"--connection-id {old.connection_id}" in cast(str, result["retry"])
+    assert "--with-permanent-delete" in cast(str, result["retry"])
+    assert "provider_access_may_remain" not in result
+    assert manager.vault.get_connection_snapshot() == before_snapshot
+    after = manager.tokens.read(old.connection_id)
+    assert after.state.version == before.state.version
+    assert after.value == before.value
+
+
+def test_first_time_oauth_denial_saves_nothing_and_returns_a_copyable_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: (_ for _ in ()).throw(
+            OAuthAuthorizationRejectedError("access_denied")
+        ),
+    )
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="full",
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    retry = "gsv connectors connect gmail --access full"
+    assert result["status"] == "cancelled"
+    assert result["reason"] == "authorization_rejected"
+    assert result["access"] == "none"
+    assert result["effective_access"] == "none"
+    assert result["existing_connection_preserved"] is False
+    assert result["existing_permanent_delete"] is False
+    assert result["permanent_delete"] is False
+    assert result["requested_access"] == "full"
+    assert result["requested_permanent_delete"] is False
+    assert result["nothing_saved"] is True
+    assert result["next"] == retry
+    assert result["retry"] == retry
+    assert "provider_access_may_remain" not in result
+    assert manager.vault.get_connection_snapshot().connections == ()
 
 
 def test_same_tier_partial_consent_keeps_old_grant_and_returns_exact_retry(
@@ -1151,6 +1436,43 @@ def test_list_and_disconnected_status_include_registration_readiness(
         "gsv connectors connect gmail --access read",
         "gsv connectors connect gmail --access full",
     ]
+
+
+@pytest.mark.parametrize("with_permanent_delete", (False, True))
+def test_legacy_gmail_full_status_exposes_the_exact_settings_upgrade(
+    tmp_path: Path,
+    with_permanent_delete: bool,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("gmail")
+    scopes = profile.legacy_full_scopes[0]
+    if with_permanent_delete:
+        scopes = (*scopes, *profile.supplemental_scopes)
+    connection = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=scopes,
+    )
+
+    status = ConnectorOnboarding(manager).status("gmail")
+    row = cast(list[dict[str, object]], status["connections"])[0]
+    expected_arguments = [
+        "gsv",
+        "connectors",
+        "connect",
+        "gmail",
+        "--access",
+        "full",
+    ]
+    if with_permanent_delete:
+        expected_arguments.append("--with-permanent-delete")
+    expected_arguments.extend(("--connection-id", str(connection.connection_id)))
+
+    assert row["access"] == "full"
+    assert row["permanent_delete"] is with_permanent_delete
+    assert row["settings_control"] == "upgrade_required"
+    assert row["settings_upgrade"] == format_connector_command(expected_arguments)
 
 
 def test_catalog_counts_only_usable_accounts_as_connected(tmp_path: Path) -> None:
@@ -2282,6 +2604,50 @@ def test_two_bound_accounts_require_selection_and_exact_selector_is_deterministi
     assert registration_calls == []
 
 
+def test_gmail_account_selection_retains_each_candidates_purge_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("gmail")
+    ordinary = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        fingerprint=FP_ONE,
+        scopes_override=profile.legacy_full_scopes[0],
+    )
+    purge = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        fingerprint=FP_TWO,
+        scopes_override=(*profile.legacy_full_scopes[0], *profile.supplemental_scopes),
+    )
+    onboarding = ConnectorOnboarding(manager, registration_loader=_registration)
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: pytest.fail("OAuth acquisition reached"),
+    )
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="full",
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result["status"] == "account_selection_required"
+    rows = {
+        cast(str, row["connection_id"]): cast(str, row["command"])
+        for row in cast(list[dict[str, object]], result["candidates"])
+    }
+    assert "--with-permanent-delete" not in rows[str(ordinary.connection_id)]
+    assert "--with-permanent-delete" in rows[str(purge.connection_id)]
+    assert f"--connection-id {ordinary.connection_id}" in rows[str(ordinary.connection_id)]
+    assert f"--connection-id {purge.connection_id}" in rows[str(purge.connection_id)]
+
+
 def test_unverified_valid_custody_returns_setup_incomplete_without_oauth(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2657,6 +3023,115 @@ def test_reauthorization_permission_mismatch_preserves_connection_and_exact_retr
     assert "https://" not in json.dumps(result, sort_keys=True)
     after = manager.tokens.read(existing.connection_id)
     assert manager.vault.get_connection_snapshot() == before_snapshot
+    assert after.state.version == before.state.version
+    assert after.value == before.value
+
+
+def test_reauthorization_denial_returns_retry_and_preserves_the_existing_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    existing = _existing_oauth(manager, "google_drive", access=ConnectorAccessTier.READ)
+    snapshot = manager.vault.get_connection_snapshot()
+    manager.vault.mark_connection_health(
+        expected_revision=snapshot.revision,
+        connection_id=existing.connection_id,
+        health=ConnectionHealth.REAUTHORIZATION_REQUIRED,
+    )
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = manager.tokens.read(existing.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=lambda provider: pytest.fail("registration loading reached"),
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: (_ for _ in ()).throw(
+            OAuthAuthorizationRejectedError("access_denied")
+        ),
+    )
+
+    result = onboarding.reauthorize_oauth(
+        str(existing.connection_id),
+        alias="Personal Drive",
+        browser_mode="firefox",
+        timeout_seconds=42.5,
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    retry = format_connector_command(
+        (
+            "gsv",
+            "connectors",
+            "reauthorize",
+            str(existing.connection_id),
+            "--alias=Personal Drive",
+            "--timeout",
+            "42.5",
+            "--browser",
+            "firefox",
+        )
+    )
+    assert result["status"] == "cancelled"
+    assert result["reason"] == "authorization_rejected"
+    assert result["connection_id"] == str(existing.connection_id)
+    assert result["access"] == "read"
+    assert result["effective_access"] == "read"
+    assert result["existing_connection_preserved"] is True
+    assert result["nothing_saved"] is True
+    assert result["next"] == retry
+    assert result["retry"] == retry
+    assert "provider_access_may_remain" not in result
+    after = manager.tokens.read(existing.connection_id)
+    assert manager.vault.get_connection_snapshot() == before_snapshot
+    assert after.state.version == before.state.version
+    assert after.value == before.value
+
+
+def test_legacy_gmail_reauthorization_review_does_not_claim_settings_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("gmail")
+    existing = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=profile.legacy_full_scopes[0],
+    )
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = manager.tokens.read(existing.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=lambda provider: pytest.fail("registration loading reached"),
+        identity_verifier=lambda provider, credential: _identity(provider),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: _credential(metadata.scopes),
+    )
+    reviews: list[ConnectorIdentityReview] = []
+
+    def reject_identity(review: ConnectorIdentityReview) -> bool:
+        reviews.append(review)
+        return False
+
+    result = onboarding.reauthorize_oauth(
+        str(existing.connection_id),
+        confirm_identity=reject_identity,
+    )
+
+    assert result["status"] == "cancelled"
+    assert len(reviews) == 1
+    assert reviews[0].access is ConnectorAccessTier.FULL
+    assert reviews[0].gmail_settings_control is False
+    assert manager.vault.get_connection_snapshot() == before_snapshot
+    after = manager.tokens.read(existing.connection_id)
     assert after.state.version == before.state.version
     assert after.value == before.value
 
