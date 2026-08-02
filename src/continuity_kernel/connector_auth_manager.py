@@ -56,6 +56,7 @@ from continuity_kernel.errors import (
     ContinuityError,
     MutationCommittedError,
     NotFoundError,
+    OAuthPermissionGrantError,
     SetupError,
     ValidationError,
     mark_provider_authorization_may_remain,
@@ -79,6 +80,9 @@ _PINNED_OAUTH_ENDPOINTS: Final = {
 _DEFAULT_BROWSER_OPENER: Final = object()
 _VERIFIED_HEALTH: Final = frozenset({ConnectionHealth.READY, ConnectionHealth.DEGRADED})
 _CUSTODY_PROBE_NAME: Final = parse_secret_name("readiness-probe")
+_GMAIL_MODIFY_SCOPE: Final = "https://www.googleapis.com/auth/gmail.modify"
+_GMAIL_READ_SCOPE: Final = "https://www.googleapis.com/auth/gmail.readonly"
+_GMAIL_PURGE_SCOPE: Final = "https://mail.google.com/"
 CustodyStatus = Literal["valid", "missing", "invalid", "pointer_invalid"]
 
 
@@ -1021,7 +1025,7 @@ class ConnectorAuthManager:
         )
         if requires_refresh and not credential.refresh_token:
             raise ValidationError("OAuth credential requires a non-empty refresh token")
-        allowed = ConnectorAuthManager._oauth_allowed_scopes(metadata)
+        ConnectorAuthManager._oauth_allowed_scopes(metadata)
         canonical_scopes = (
             canonicalize_google_scopes(credential.scopes)
             if metadata.provider == "google"
@@ -1043,26 +1047,65 @@ class ConnectorAuthManager:
         granted_access = frozenset(
             scope for scope in granted if scope.casefold() != "offline_access"
         )
-        if not configured_access.issubset(granted_access) or not granted.issubset(allowed):
-            raise ValidationError("OAuth credential grants scopes outside its selected access")
         profile = get_profile_for_connection(
             metadata.provider,
             metadata.source_ids,
             metadata.scopes,
         )
+        if profile.name in {"gmail", "google"} and _GMAIL_PURGE_SCOPE in granted_access:
+            granted_access |= {_GMAIL_MODIFY_SCOPE, _GMAIL_READ_SCOPE}
         configured_tier = profile.access_for_scopes(metadata.scopes)
-        if profile.exact_read_scopes:
-            try:
-                granted_tier = profile.access_for_scopes(tuple(canonical_scopes))
-            except ValidationError as exc:
-                raise ValidationError(
-                    "OAuth credential grants scopes outside its selected access"
-                ) from exc
-            if (
-                configured_tier is ConnectorAccessTier.READ
-                and granted_tier is ConnectorAccessTier.FULL
-            ):
-                raise ValidationError("OAuth credential grants scopes outside its selected access")
+        read_authority = ConnectorAuthManager._canonical_oauth_access_scopes(
+            metadata.provider,
+            (
+                *profile.read_scopes,
+                *(scope for bundle in profile.legacy_read_scopes for scope in bundle),
+            ),
+        )
+        full_authority = read_authority | ConnectorAuthManager._canonical_oauth_access_scopes(
+            metadata.provider,
+            (
+                *profile.full_scopes,
+                *(scope for bundle in profile.legacy_full_scopes for scope in bundle),
+            ),
+        )
+        purge_authority = full_authority | ConnectorAuthManager._canonical_oauth_access_scopes(
+            metadata.provider,
+            profile.supplemental_scopes,
+        )
+        if not granted_access.issubset(purge_authority):
+            raise OAuthPermissionGrantError("outside_selected_tier")
+        if granted_access.issubset(read_authority):
+            granted_capability = 0
+        elif granted_access.issubset(full_authority):
+            granted_capability = 1
+        else:
+            granted_capability = 2
+        selected_capability = 0 if configured_tier is ConnectorAccessTier.READ else 1
+        supplemental = ConnectorAuthManager._canonical_oauth_access_scopes(
+            metadata.provider,
+            profile.supplemental_scopes,
+        )
+        if configured_access & supplemental:
+            selected_capability = 2
+        if granted_capability > selected_capability:
+            raise OAuthPermissionGrantError("outside_selected_tier")
+        if not configured_access.issubset(granted_access):
+            raise OAuthPermissionGrantError("missing_selected_permissions")
+
+    @staticmethod
+    def _canonical_oauth_access_scopes(
+        provider: str,
+        scopes: tuple[str, ...],
+    ) -> frozenset[str]:
+        scopes = tuple(dict.fromkeys(scopes))
+        if provider == "google":
+            canonical = canonicalize_google_scopes(scopes)
+        elif provider == "microsoft":
+            canonical = canonicalize_microsoft_scopes(scopes)
+        else:
+            canonical = scopes
+        return frozenset(scope for scope in canonical if scope.casefold() != "offline_access")
 
     @staticmethod
     def _canonicalize_oauth_credential(

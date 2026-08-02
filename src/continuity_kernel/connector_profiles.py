@@ -32,13 +32,18 @@ class ConnectorProfile:
     full_scopes: tuple[str, ...] = ()
     supplemental_scopes: tuple[str, ...] = ()
     legacy_read_scopes: tuple[tuple[str, ...], ...] = ()
-    exact_read_scopes: bool = False
+    legacy_full_scopes: tuple[tuple[str, ...], ...] = ()
     authorization_endpoint: str | None = None
     token_endpoint: str | None = None
 
     @property
     def allowed_scopes(self) -> frozenset[str]:
-        return frozenset((*self.read_scopes, *self.full_scopes, *self.supplemental_scopes))
+        legacy = tuple(
+            scope
+            for bundle in (*self.legacy_read_scopes, *self.legacy_full_scopes)
+            for scope in bundle
+        )
+        return frozenset((*self.read_scopes, *self.full_scopes, *self.supplemental_scopes, *legacy))
 
     def scopes_for(
         self,
@@ -61,19 +66,19 @@ class ConnectorProfile:
 
     def access_for_scopes(self, scopes: tuple[str, ...]) -> ConnectorAccessTier:
         configured = frozenset(scopes)
-        full = frozenset(self.full_scopes)
-        if full and configured in {
-            full,
-            frozenset((*self.full_scopes, *self.supplemental_scopes)),
-        }:
+        full_sets = {
+            frozenset(option) for option in (self.full_scopes, *self.legacy_full_scopes) if option
+        }
+        full_with_supplemental = {
+            frozenset((*option, *self.supplemental_scopes))
+            for option in (self.full_scopes, *self.legacy_full_scopes)
+            if option and self.supplemental_scopes
+        }
+        if configured in full_sets | full_with_supplemental:
             return ConnectorAccessTier.FULL
         read_options = (self.read_scopes, *self.legacy_read_scopes)
-        read_sets = {frozenset(option) for option in read_options}
-        if configured in read_sets or (
-            configured
-            and not self.exact_read_scopes
-            and any(configured < option for option in read_sets)
-        ):
+        read_sets = {frozenset(option) for option in read_options if option}
+        if configured in read_sets:
             return ConnectorAccessTier.READ
         raise ValidationError("connector scopes do not match a built-in access tier")
 
@@ -104,6 +109,7 @@ def connector_connect_command(
     include_permanent_delete: bool | None = None,
     alias: str | None = None,
     browser_mode: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> str:
     """Build the canonical guided-onboarding command for one profile."""
 
@@ -135,6 +141,8 @@ def connector_connect_command(
         arguments.extend(("--connection-id", connection_id))
     if alias is not None:
         arguments.append(f"--alias={alias}")
+    if timeout_seconds is not None:
+        arguments.extend(("--timeout", format(timeout_seconds, "g")))
     arguments.extend(connector_browser_options(browser_mode))
     return format_connector_command(arguments)
 
@@ -301,7 +309,6 @@ PROFILES: Final[Mapping[str, ConnectorProfile]] = MappingProxyType(
                     "im:history",
                 ),
             ),
-            exact_read_scopes=True,
             authorization_endpoint="https://slack.com/oauth/v2_user/authorize",
             token_endpoint="https://slack.com/api/oauth.v2.user.access",
         ),

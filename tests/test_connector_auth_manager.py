@@ -33,12 +33,13 @@ from continuity_kernel.connector_oauth import (
     OAuthTokenSet,
     OAuthTokenType,
 )
-from continuity_kernel.connector_profiles import get_profile
+from continuity_kernel.connector_profiles import get_connector_profile, get_profile
 from continuity_kernel.connector_secrets import InMemorySecretStore
 from continuity_kernel.connector_token_store import TokenState
 from continuity_kernel.errors import (
     ConflictError,
     MutationCommittedError,
+    OAuthPermissionGrantError,
     SetupError,
     ValidationError,
 )
@@ -869,7 +870,7 @@ def test_browser_open_interruption_retains_provider_cleanup_context(
                 expires_in_seconds=3600,
                 scopes=("unexpected.scope",),
             ),
-            "scopes",
+            "outside the selected access tier",
         ),
         (
             OAuthTokenSet(
@@ -1225,9 +1226,135 @@ def test_oauth_credential_rejects_provider_grants_outside_the_profile(
         expires_at=None,
     )
 
-    with pytest.raises(ValidationError, match="outside its selected access"):
+    with pytest.raises(OAuthPermissionGrantError) as failure:
         _import_oauth_credential(manager, overbroad)
+    assert failure.value.reason == "outside_selected_tier"
     assert manager.tokens.state(CONNECTION_ID) is None
+
+
+def test_read_selection_rejects_a_known_full_tier_grant(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, scopes=GOOGLE_IDENTITY_SCOPES)
+    profile = get_connector_profile("gmail")
+    credential = OAuthCredential(
+        access_token="full-tier-access",
+        refresh_token="full-tier-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=profile.full_scopes,
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    with pytest.raises(OAuthPermissionGrantError) as failure:
+        _import_oauth_credential(manager, credential)
+
+    assert failure.value.reason == "outside_selected_tier"
+    assert manager.tokens.state(CONNECTION_ID) is None
+
+
+def test_gmail_purge_selection_reports_a_missing_supplemental_grant(tmp_path: Path) -> None:
+    profile = get_connector_profile("gmail")
+    manager = _manager(
+        tmp_path,
+        scopes=profile.scopes_for("full", include_supplemental=True),
+    )
+    credential = OAuthCredential(
+        access_token="plain-full-access",
+        refresh_token="plain-full-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=profile.full_scopes,
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    with pytest.raises(OAuthPermissionGrantError) as failure:
+        _import_oauth_credential(manager, credential)
+
+    assert failure.value.reason == "missing_selected_permissions"
+    assert manager.tokens.state(CONNECTION_ID) is None
+
+
+def test_gmail_purge_scope_semantically_satisfies_modify_when_google_returns_only_broader_scope(
+    tmp_path: Path,
+) -> None:
+    profile = get_connector_profile("gmail")
+    manager = _manager(
+        tmp_path,
+        scopes=profile.scopes_for("full", include_supplemental=True),
+    )
+    credential = OAuthCredential(
+        access_token="purge-access",
+        refresh_token="purge-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=("openid", "email", "https://mail.google.com/"),
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    result = _import_oauth_credential(manager, credential)
+
+    assert result.version == 1
+    resolved = manager.resolve_oauth_access_token_state(
+        CONNECTION_ID,
+        observed_at=BASE_TIME,
+    )
+    assert "https://mail.google.com/" in resolved.scopes
+    assert "https://www.googleapis.com/auth/gmail.modify" not in resolved.scopes
+
+
+def test_declared_legacy_calendar_grant_remains_usable_end_to_end(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Legacy Calendar grant")
+    profile = get_connector_profile("google_calendar")
+    scopes = profile.legacy_read_scopes[0]
+    metadata = ConnectionMetadata(
+        connection_id=CONNECTION_ID,
+        provider=profile.provider,
+        source_ids=profile.source_ids,
+        credential_kind=profile.credential_kind,
+        account=AccountMetadata(
+            fingerprint=GOOGLE_ACCOUNT_FINGERPRINT,
+            label="Legacy Calendar",
+        ),
+        scopes=scopes,
+        client=ClientMetadata(
+            kind=ClientKind.PUBLIC,
+            identifier="public-google-client",
+            redirect_uris=("http://127.0.0.1:0",),
+            authorization_endpoint=profile.authorization_endpoint,
+            token_endpoint=profile.token_endpoint,
+        ),
+        health=ConnectionHealth.READY,
+        created_at=BASE_TIME,
+        updated_at=BASE_TIME,
+        version=1,
+        last_verified_at=BASE_TIME,
+    )
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=metadata,
+        observed_at=BASE_TIME,
+    )
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    credential = OAuthCredential(
+        access_token="legacy-calendar-access",
+        refresh_token="legacy-calendar-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=scopes,
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    manager.ensure_imported_credential(metadata, credential.to_bytes())
+    assert manager.inspect_custody(metadata) == "valid"
+    resolved = manager.resolve_oauth_access_token_state(
+        CONNECTION_ID,
+        observed_at=BASE_TIME,
+    )
+    assert resolved.scopes == scopes
 
 
 def test_google_identity_url_scope_is_canonicalized_on_persistence_and_resolution(
@@ -1279,8 +1406,9 @@ def test_google_identity_alias_outside_the_canonical_profile_is_rejected(
     )
     before = manager.vault.get_connection_snapshot()
 
-    with pytest.raises(ValidationError, match="outside its selected access"):
+    with pytest.raises(OAuthPermissionGrantError) as failure:
         _import_oauth_credential(manager, credential)
+    assert failure.value.reason == "outside_selected_tier"
 
     assert manager.tokens.state(CONNECTION_ID) is None
     assert manager.vault.get_connection_snapshot() == before
@@ -1414,13 +1542,7 @@ def test_verified_same_id_oauth_rotation_accepts_recoverable_health(
 ) -> None:
     manager, original = _rotation_manager(tmp_path, health=health)
     before = manager.vault.get_connection_snapshot()
-    replacement = _rotation_replacement(
-        scopes=(
-            *GOOGLE_IDENTITY_SCOPES[:2],
-            GOOGLE_SCOPE,
-            "https://www.googleapis.com/auth/gmail.modify",
-        )
-    )
+    replacement = _rotation_replacement()
 
     result = manager.rotate_verified_oauth_credential(
         CONNECTION_ID,
@@ -1587,7 +1709,7 @@ def test_same_id_rotation_rejects_partial_grant_before_token_publish(tmp_path: P
     manager, original = _rotation_manager(tmp_path)
     before = manager.vault.get_connection_snapshot()
 
-    with pytest.raises(ValidationError, match="outside its selected access"):
+    with pytest.raises(OAuthPermissionGrantError) as failure:
         manager.rotate_verified_oauth_credential(
             CONNECTION_ID,
             expected_revision=before.revision,
@@ -1595,6 +1717,7 @@ def test_same_id_rotation_rejects_partial_grant_before_token_publish(tmp_path: P
             expected_token_version=1,
             replacement=_rotation_replacement(scopes=(GOOGLE_SCOPE,)),
         )
+    assert failure.value.reason == "missing_selected_permissions"
 
     assert manager.tokens.read(CONNECTION_ID).value == original.to_bytes()
     assert manager.vault.get_connection_snapshot() == before
@@ -1606,7 +1729,7 @@ def test_same_id_rotation_rejects_outside_profile_scope_before_token_publish(
     manager, original = _rotation_manager(tmp_path)
     before = manager.vault.get_connection_snapshot()
 
-    with pytest.raises(ValidationError, match="outside its selected access"):
+    with pytest.raises(OAuthPermissionGrantError) as failure:
         manager.rotate_verified_oauth_credential(
             CONNECTION_ID,
             expected_revision=before.revision,
@@ -1616,6 +1739,7 @@ def test_same_id_rotation_rejects_outside_profile_scope_before_token_publish(
                 scopes=(*GOOGLE_IDENTITY_SCOPES, "https://www.googleapis.com/auth/drive"),
             ),
         )
+    assert failure.value.reason == "outside_selected_tier"
 
     assert manager.tokens.read(CONNECTION_ID).value == original.to_bytes()
     assert manager.vault.get_connection_snapshot() == before

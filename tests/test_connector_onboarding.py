@@ -37,7 +37,13 @@ from continuity_kernel.connector_profiles import (
 )
 from continuity_kernel.connector_secrets import InMemorySecretStore
 from continuity_kernel.connector_transport import AuthorizationScheme, ConnectorCredential
-from continuity_kernel.errors import ConflictError, ContinuityError, SetupError, ValidationError
+from continuity_kernel.errors import (
+    ConflictError,
+    ContinuityError,
+    OAuthPermissionGrantError,
+    SetupError,
+    ValidationError,
+)
 from continuity_kernel.vault import Vault
 
 FP_ONE = "sha256:" + "1" * 64
@@ -131,11 +137,11 @@ def _existing_oauth(
     access: ConnectorAccessTier,
     fingerprint: str = FP_ONE,
     include_permanent_delete: bool = False,
+    scopes_override: tuple[str, ...] | None = None,
 ) -> ConnectionMetadata:
     profile = get_connector_profile(connector)
-    scopes = profile.scopes_for(
-        access,
-        include_supplemental=include_permanent_delete,
+    scopes = scopes_override or profile.scopes_for(
+        access, include_supplemental=include_permanent_delete
     )
     now = datetime.now(UTC)
     metadata = ConnectionMetadata(
@@ -209,6 +215,42 @@ def _unverified_oauth(
             value=_credential(scopes).to_bytes(),
             updated_at=now,
         )
+    return metadata
+
+
+def _unrecognized_oauth(
+    manager: ConnectorAuthManager,
+    *,
+    connector: str = "gmail",
+    scopes: tuple[str, ...] = ("openid",),
+) -> ConnectionMetadata:
+    profile = get_connector_profile(connector)
+    now = datetime.now(UTC)
+    metadata = ConnectionMetadata(
+        connection_id=new_connection_id(),
+        provider=profile.provider,
+        source_ids=profile.source_ids,
+        credential_kind=profile.credential_kind,
+        account=AccountMetadata(fingerprint=FP_ONE, label="google:legacy"),
+        scopes=scopes,
+        client=ClientMetadata(
+            kind=ClientKind.PUBLIC,
+            identifier="google-public-client",
+            redirect_uris=(_registration("google").redirect_template,),
+            authorization_endpoint=profile.authorization_endpoint,
+            token_endpoint=profile.token_endpoint,
+        ),
+        health=ConnectionHealth.READY,
+        created_at=now,
+        updated_at=now,
+        version=1,
+    )
+    snapshot = manager.vault.get_connection_snapshot()
+    manager.vault.put_connection(
+        expected_revision=snapshot.revision,
+        connection=metadata,
+        observed_at=now,
+    )
     return metadata
 
 
@@ -434,6 +476,7 @@ def test_wrong_account_guidance_keeps_only_validated_alias_on_retry(
         access="full",
         alias=alias,
         browser_mode=browser_mode,  # type: ignore[arg-type]
+        timeout_seconds=42.5,
         confirm_identity=lambda review: True,
     )
 
@@ -447,6 +490,8 @@ def test_wrong_account_guidance_keeps_only_validated_alias_on_retry(
         "--access",
         "full",
         f"--alias={alias}",
+        "--timeout",
+        "42.5",
     ]
     new_account_arguments = [
         "gsv",
@@ -456,6 +501,8 @@ def test_wrong_account_guidance_keeps_only_validated_alias_on_retry(
         "--access",
         "full",
         "--new-account",
+        "--timeout",
+        "42.5",
     ]
     option_arguments = browser_flag.split()
     assert retry == format_connector_command((*retry_arguments, *option_arguments))
@@ -506,6 +553,289 @@ def test_same_account_upgrade_keeps_read_ready_until_full_is_published_then_remo
     new = snapshot.connection(parse_connection_id(result["connection_id"]))
     assert new is not None and new.health is ConnectionHealth.READY
     assert "https://mail.google.com/" not in new.scopes
+
+
+def test_same_tier_legacy_read_is_replaced_only_after_current_grant_is_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("google_drive")
+    legacy_scopes = profile.legacy_read_scopes[0]
+    old = _existing_oauth(
+        manager,
+        "google_drive",
+        access=ConnectorAccessTier.READ,
+        scopes_override=legacy_scopes,
+    )
+    before = manager.tokens.read(old.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider),
+    )
+    events: list[str] = []
+
+    def acquire(metadata: ConnectionMetadata, **kwargs: object) -> OAuthCredential:
+        assert events == ["permission_update"]
+        events.append("acquire")
+        return _credential(metadata.scopes)
+
+    monkeypatch.setattr(manager, "acquire_oauth_credential", acquire)
+    real_publish = manager.publish_new_oauth_connection
+
+    def publish(metadata: ConnectionMetadata, credential: OAuthCredential) -> dict[str, object]:
+        current = manager.vault.get_connection_snapshot().connection(old.connection_id)
+        assert current is not None and current.health is ConnectionHealth.READY
+        during = manager.tokens.read(old.connection_id)
+        assert during.state.version == before.state.version
+        assert during.value == before.value
+        return real_publish(metadata, credential)
+
+    reviews: list[ConnectorIdentityReview] = []
+
+    def confirm(review: ConnectorIdentityReview) -> bool:
+        reviews.append(review)
+        assert review.access is ConnectorAccessTier.READ
+        assert review.permission_update is not None
+        assert "existing connection keeps working until this succeeds" in review.permission_update
+        assert "https://" not in review.permission_update
+        return True
+
+    monkeypatch.setattr(manager, "publish_new_oauth_connection", publish)
+    result = onboarding.connect_oauth(
+        "google_drive",
+        access="read",
+        confirm_identity=confirm,
+        present_permission_update=lambda message: (
+            events.append("permission_update")
+            if "https://" not in message
+            else pytest.fail("raw scope shown before sign-in")
+        ),
+    )
+
+    assert result["status"] == "connected"
+    assert result["replaced_connection_id"] == str(old.connection_id)
+    assert len(reviews) == 1
+    assert events == ["permission_update", "acquire"]
+    snapshot = manager.vault.get_connection_snapshot()
+    assert snapshot.connection(old.connection_id) is None
+    replacement = snapshot.connection(parse_connection_id(result["connection_id"]))
+    assert replacement is not None
+    assert replacement.connection_id != old.connection_id
+    assert frozenset(replacement.scopes) == frozenset(profile.read_scopes)
+    assert replacement.health is ConnectionHealth.READY
+
+
+def test_same_tier_partial_consent_keeps_old_grant_and_returns_exact_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("google_drive")
+    old = _existing_oauth(
+        manager,
+        "google_drive",
+        access=ConnectorAccessTier.READ,
+        scopes_override=profile.legacy_read_scopes[0],
+    )
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = manager.tokens.read(old.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: (_ for _ in ()).throw(
+            OAuthPermissionGrantError("missing_selected_permissions")
+        ),
+    )
+
+    result = onboarding.connect_oauth(
+        "google_drive",
+        access="read",
+        connection_id=str(old.connection_id),
+        alias="Personal Drive",
+        browser_mode="manual",
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    retry = format_connector_command(
+        (
+            "gsv",
+            "connectors",
+            "connect",
+            "google_drive",
+            "--access",
+            "read",
+            "--connection-id",
+            str(old.connection_id),
+            "--alias=Personal Drive",
+            "--no-browser",
+        )
+    )
+    assert result["status"] == "oauth_permissions_missing"
+    assert result["reason"] == "missing_selected_permissions"
+    assert result["access"] == "read"
+    assert result["effective_access"] == "read"
+    assert result["requested_access"] == "read"
+    assert result["connector"] == "google_drive"
+    assert result["existing_connection_preserved"] is True
+    assert result["nothing_saved"] is True
+    assert result["permanent_delete"] is False
+    assert result["existing_permanent_delete"] is False
+    assert result["requested_permanent_delete"] is False
+    assert result["provider_access_may_remain"] is True
+    assert result["next"] == retry
+    assert result["retry"] == retry
+    assert "third-party access" in cast(str, result["revocation_help"])
+    assert "retained existing connection" in cast(str, result["revocation_warning"])
+    assert "https://" not in json.dumps(result, sort_keys=True)
+    after_snapshot = manager.vault.get_connection_snapshot()
+    after = manager.tokens.read(old.connection_id)
+    assert after_snapshot == before_snapshot
+    assert after.state.version == before.state.version
+    assert after.value == before.value
+
+
+def test_failed_gmail_purge_consent_separates_requested_from_retained_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    existing = _existing_oauth(manager, "gmail", access=ConnectorAccessTier.FULL)
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = manager.tokens.read(existing.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: (_ for _ in ()).throw(
+            OAuthPermissionGrantError("missing_selected_permissions")
+        ),
+    )
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="full",
+        include_permanent_delete=True,
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result["status"] == "oauth_permissions_missing"
+    assert result["nothing_saved"] is True
+    assert result["existing_connection_preserved"] is True
+    assert result["requested_permanent_delete"] is True
+    assert result["existing_permanent_delete"] is False
+    assert result["permanent_delete"] is False
+    assert "--with-permanent-delete" in cast(str, result["retry"])
+    assert "https://" not in json.dumps(result, sort_keys=True)
+    after = manager.tokens.read(existing.connection_id)
+    assert manager.vault.get_connection_snapshot() == before_snapshot
+    assert after.state.version == before.state.version
+    assert after.value == before.value
+
+
+def test_exact_selection_failure_reports_all_retained_same_account_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("gmail")
+    selected = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.READ,
+        scopes_override=profile.legacy_read_scopes[0],
+    )
+    purge_sibling = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        include_permanent_delete=True,
+    )
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: (_ for _ in ()).throw(
+            OAuthPermissionGrantError("missing_selected_permissions")
+        ),
+    )
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="read",
+        connection_id=str(selected.connection_id),
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result["status"] == "oauth_permissions_missing"
+    assert result["effective_access"] == "unknown"
+    assert result["existing_permanent_delete"] is True
+    assert result["permanent_delete"] is True
+    snapshot = manager.vault.get_connection_snapshot()
+    assert snapshot.connection(selected.connection_id) == selected
+    assert snapshot.connection(purge_sibling.connection_id) == purge_sibling
+
+
+def test_failed_new_account_consent_discloses_retained_broader_purge_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    existing = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        include_permanent_delete=True,
+    )
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = manager.tokens.read(existing.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: (_ for _ in ()).throw(
+            OAuthPermissionGrantError("missing_selected_permissions")
+        ),
+    )
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="read",
+        new_account=True,
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result["status"] == "oauth_permissions_missing"
+    assert result["requested_access"] == "read"
+    assert result["effective_access"] == "full"
+    assert result["access"] == "full"
+    assert result["existing_connection_preserved"] is True
+    assert result["requested_permanent_delete"] is False
+    assert result["existing_permanent_delete"] is True
+    assert result["permanent_delete"] is True
+    assert "https://" not in json.dumps(result, sort_keys=True)
+    after = manager.tokens.read(existing.connection_id)
+    assert manager.vault.get_connection_snapshot() == before_snapshot
+    assert after.state.version == before.state.version
+    assert after.value == before.value
 
 
 def test_gmail_permanent_delete_is_a_separate_explicit_full_step_up(
@@ -583,17 +913,65 @@ def test_sufficient_existing_oauth_fast_path_keeps_equal_and_broader_grants_unch
     assert after.state.version == before.state.version
     assert after.value == before.value
 
-    broader = _existing_oauth(manager, "gmail", access=ConnectorAccessTier.FULL)
+    broader = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        include_permanent_delete=True,
+    )
     broader_before = manager.tokens.read(broader.connection_id)
     retained = onboarding.connect_oauth(
         "gmail",
         access="read",
-        confirm_identity=lambda review: True,
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
     )
+    assert retained["status"] == "broader_access_already_connected"
     assert retained["credential"] == "unchanged"
+    assert retained["requested_access"] == "read"
+    assert retained["effective_access"] == "full"
+    assert retained["permanent_delete"] is True
+    assert retained["nothing_saved"] is True
+    assert retained["connection_id"] == str(broader.connection_id)
+    assert "https://" not in json.dumps(retained, sort_keys=True)
     broader_after = manager.tokens.read(broader.connection_id)
     assert broader_after.state.version == broader_before.state.version
     assert broader_after.value == broader_before.value
+
+
+def test_broken_broader_preflight_returns_custody_recovery_before_sign_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    existing = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        include_permanent_delete=True,
+    )
+    manager.tokens.delete(existing.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=lambda provider: pytest.fail("registration loading reached"),
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: pytest.fail("OAuth acquisition reached"),
+    )
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="read",
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result["status"] == "credential_missing_reconnect_required"
+    assert result["connection_id"] == str(existing.connection_id)
+    assert result["access"] == "full"
+    assert result["permanent_delete"] is True
+    assert result["nothing_saved"] is True
 
 
 def test_degraded_valid_oauth_fast_path_does_not_force_reauthorization(
@@ -823,6 +1201,192 @@ def test_catalog_counts_only_usable_accounts_as_connected(tmp_path: Path) -> Non
     }
 
 
+def test_catalog_keeps_unrecognized_oauth_scope_metadata_recoverable(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    connection = _unrecognized_oauth(manager)
+
+    result = ConnectorOnboarding(manager, registration_loader=_registration).list()
+    row = cast(list[dict[str, object]], result["connections"])[0]
+    catalog = cast(list[dict[str, object]], result["connector_catalog"])
+    gmail = next(item for item in catalog if item["connector"] == "gmail")
+
+    assert row["access"] == "unknown"
+    assert row["connector"] == "gmail"
+    assert row["error_code"] == "oauth_scope_profile_unrecognized"
+    assert row["next"] == f"gsv connectors disconnect {connection.connection_id}"
+    assert row["permanent_delete"] is False
+    assert gmail["connected_accounts"] == 0
+    assert gmail["configured_accounts"] == 1
+    assert gmail["needs_attention_accounts"] == 1
+    assert gmail["status"] == "needs_attention"
+
+
+def test_new_account_permission_failure_tolerates_unrecognized_retained_scopes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    retained = _unrecognized_oauth(
+        manager,
+        scopes=("openid", "https://mail.google.com/"),
+    )
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: (_ for _ in ()).throw(
+            OAuthPermissionGrantError("missing_selected_permissions")
+        ),
+    )
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="read",
+        new_account=True,
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result["status"] == "oauth_permissions_missing"
+    assert result["requested_access"] == "read"
+    assert result["effective_access"] == "unknown"
+    assert result["access"] == "unknown"
+    assert result["existing_connection_preserved"] is True
+    assert result["existing_permanent_delete"] is True
+    assert result["permanent_delete"] is True
+    assert "https://" not in json.dumps(result, sort_keys=True)
+    assert manager.vault.get_connection_snapshot().connection(retained.connection_id) == retained
+
+
+def test_new_account_connect_skips_unrecognized_same_account_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    retained = _unrecognized_oauth(manager)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider, FP_ONE),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: _credential(metadata.scopes),
+    )
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="read",
+        new_account=True,
+        confirm_identity=lambda review: True,
+    )
+
+    assert result["status"] == "connected"
+    snapshot = manager.vault.get_connection_snapshot()
+    assert snapshot.connection(retained.connection_id) == retained
+    assert len(snapshot.connections) == 2
+
+
+def test_current_scope_upgrade_retains_unrecognized_same_account_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("google_drive")
+    old = _existing_oauth(
+        manager,
+        "google_drive",
+        access=ConnectorAccessTier.READ,
+        scopes_override=profile.legacy_read_scopes[0],
+    )
+    retained = _unrecognized_oauth(manager, connector="google_drive")
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider, FP_ONE),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: _credential(metadata.scopes),
+    )
+
+    result = onboarding.connect_oauth(
+        "google_drive",
+        access="read",
+        connection_id=str(old.connection_id),
+        confirm_identity=lambda review: True,
+    )
+
+    assert result["status"] == "connected"
+    assert result["replaced_connection_id"] == str(old.connection_id)
+    snapshot = manager.vault.get_connection_snapshot()
+    assert snapshot.connection(old.connection_id) is None
+    assert snapshot.connection(retained.connection_id) == retained
+    assert len(snapshot.connections) == 2
+
+
+def test_account_selection_exposes_safe_recovery_for_unrecognized_scopes(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    malformed = _unrecognized_oauth(manager)
+    valid = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.READ,
+        fingerprint=FP_TWO,
+    )
+
+    result = ConnectorOnboarding(manager, registration_loader=_registration).connect_oauth(
+        "gmail",
+        access="read",
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result["status"] == "account_selection_required"
+    rows = cast(list[dict[str, object]], result["candidates"])
+    malformed_row = next(
+        row for row in rows if row["connection_id"] == str(malformed.connection_id)
+    )
+    valid_row = next(row for row in rows if row["connection_id"] == str(valid.connection_id))
+    assert malformed_row["access"] == "unknown"
+    assert malformed_row["error_code"] == "oauth_scope_profile_unrecognized"
+    assert malformed_row["command"] == f"gsv connectors disconnect {malformed.connection_id}"
+    assert "--connection-id" in cast(str, valid_row["command"])
+
+
+def test_exact_unrecognized_scope_selection_returns_recovery_without_oauth(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    malformed = _unrecognized_oauth(manager)
+
+    result = ConnectorOnboarding(manager, registration_loader=_registration).connect_oauth(
+        "gmail",
+        access="read",
+        connection_id=str(malformed.connection_id),
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    assert result == {
+        "access": "unknown",
+        "account_label": "google:legacy",
+        "connection_id": str(malformed.connection_id),
+        "connector": "gmail",
+        "error_code": "oauth_scope_profile_unrecognized",
+        "health": "ready",
+        "next": f"gsv connectors disconnect {malformed.connection_id}",
+        "nothing_saved": True,
+        "permanent_delete": False,
+        "status": "oauth_scope_profile_unrecognized",
+    }
+
+
 def test_catalog_rejects_a_mixed_connection_revision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -879,9 +1443,51 @@ def test_failed_upgrade_cleanup_keeps_both_connections_visible(
         confirm_identity=lambda review: True,
     )
 
-    assert result["upgrade_cleanup"] == "lower_capability_connection_retained"
+    assert result["upgrade_cleanup"] == "superseded_connection_retained"
     assert len(manager.vault.get_connection_snapshot().connections) == 2
     assert manager.vault.get_connection_snapshot().connection(old.connection_id) is not None
+
+
+def test_failed_same_tier_cleanup_reports_a_superseded_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("google_drive")
+    old = _existing_oauth(
+        manager,
+        "google_drive",
+        access=ConnectorAccessTier.READ,
+        scopes_override=profile.legacy_read_scopes[0],
+    )
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: _credential(metadata.scopes),
+    )
+    monkeypatch.setattr(
+        manager,
+        "remove",
+        lambda *args, **kwargs: (_ for _ in ()).throw(SetupError("cleanup unavailable")),
+    )
+
+    result = onboarding.connect_oauth(
+        "google_drive",
+        access="read",
+        confirm_identity=lambda review: True,
+    )
+
+    assert result["status"] == "connected"
+    assert result["upgrade_cleanup"] == "superseded_connection_retained"
+    assert "superseded" in cast(str, result["warning"])
+    snapshot = manager.vault.get_connection_snapshot()
+    assert len(snapshot.connections) == 2
+    assert snapshot.connection(old.connection_id) is not None
 
 
 def test_discord_is_full_only_verifies_bot_and_never_persists_before_confirmation(
@@ -1471,6 +2077,42 @@ def test_read_preflight_prefers_valid_narrower_custody_over_missing_broader_cust
     assert result["credential"] == "unchanged"
 
 
+def test_read_preflight_prefers_exact_read_when_healthy_broader_grant_also_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    exact_read = _existing_oauth(manager, "gmail", access=ConnectorAccessTier.READ)
+    _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        include_permanent_delete=True,
+    )
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=lambda provider: pytest.fail("registration loading reached"),
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: pytest.fail("OAuth acquisition reached"),
+    )
+
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="read",
+        confirm_identity=lambda review: pytest.fail("confirmation reached"),
+    )
+
+    assert result["status"] == "already_connected"
+    assert result["connection_id"] == str(exact_read.connection_id)
+    assert result["access"] == "read"
+    assert result["permanent_delete"] is False
+    assert result["credential"] == "unchanged"
+
+
 def test_unbound_lower_capability_record_requires_cleanup_before_step_up(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1593,6 +2235,9 @@ def test_two_bound_accounts_require_selection_and_exact_selector_is_deterministi
     selected = onboarding.connect_oauth(
         "google_drive",
         access="read",
+        alias="Work Drive",
+        browser_mode="firefox",
+        timeout_seconds=42.5,
         confirm_identity=lambda review: pytest.fail("confirmation reached"),
     )
 
@@ -1603,7 +2248,24 @@ def test_two_bound_accounts_require_selection_and_exact_selector_is_deterministi
         str(second.connection_id),
     }
     assert all(row["access"] == "read" and row["health"] == "ready" for row in rows)
-    assert all("--connection-id" in cast(str, row["command"]) for row in rows)
+    for row in rows:
+        assert row["command"] == format_connector_command(
+            (
+                "gsv",
+                "connectors",
+                "connect",
+                "google_drive",
+                "--access",
+                "read",
+                "--connection-id",
+                cast(str, row["connection_id"]),
+                "--alias=Work Drive",
+                "--timeout",
+                "42.5",
+                "--browser",
+                "firefox",
+            )
+        )
     assert registration_calls == []
     encoded = json.dumps(selected)
     assert FP_ONE not in encoded and FP_TWO not in encoded
@@ -1935,6 +2597,70 @@ def test_exact_connect_repairs_a_corrupt_keyring_value_in_place(
     assert manager.tokens.read(existing.connection_id).value == replacement.to_bytes()
 
 
+def test_reauthorization_permission_mismatch_preserves_connection_and_exact_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    existing = _existing_oauth(manager, "google_drive", access=ConnectorAccessTier.READ)
+    snapshot = manager.vault.get_connection_snapshot()
+    manager.vault.mark_connection_health(
+        expected_revision=snapshot.revision,
+        connection_id=existing.connection_id,
+        health=ConnectionHealth.REAUTHORIZATION_REQUIRED,
+    )
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = manager.tokens.read(existing.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=lambda provider: pytest.fail("registration loading reached"),
+        identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: (_ for _ in ()).throw(
+            OAuthPermissionGrantError("outside_selected_tier")
+        ),
+    )
+
+    result = onboarding.reauthorize_oauth(
+        str(existing.connection_id),
+        alias="Personal Drive",
+        browser_mode="firefox",
+        timeout_seconds=42.5,
+        confirm_identity=lambda review: pytest.fail("identity confirmation reached"),
+    )
+
+    retry = format_connector_command(
+        (
+            "gsv",
+            "connectors",
+            "reauthorize",
+            str(existing.connection_id),
+            "--alias=Personal Drive",
+            "--timeout",
+            "42.5",
+            "--browser",
+            "firefox",
+        )
+    )
+    assert result["status"] == "oauth_permissions_outside_selected_tier"
+    assert result["reason"] == "outside_selected_tier"
+    assert result["connection_id"] == str(existing.connection_id)
+    assert result["existing_connection_preserved"] is True
+    assert result["nothing_saved"] is True
+    assert result["next"] == retry
+    assert result["retry"] == retry
+    assert result["provider_access_may_remain"] is True
+    assert "retained existing connection" in cast(str, result["revocation_warning"])
+    assert "https://" not in json.dumps(result, sort_keys=True)
+    after = manager.tokens.read(existing.connection_id)
+    assert manager.vault.get_connection_snapshot() == before_snapshot
+    assert after.state.version == before.state.version
+    assert after.value == before.value
+
+
 def test_reauthorization_wrong_account_saves_nothing_and_keeps_privacy_safe_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2158,9 +2884,58 @@ def test_retained_broader_grant_reports_its_actual_reauthorization_health(
         confirm_identity=lambda review: True,
     )
 
-    assert result["status"] == "already_connected"
-    assert result["credential"] == "existing_broader_grant_retained"
+    assert result["status"] == "broader_access_reauthorization_required"
+    assert result["credential"] == "unchanged"
+    assert result["requested_access"] == "read"
+    assert result["effective_access"] == "full"
     assert result["health"] == "reauthorization_required"
+    assert result["next"] == f"gsv connectors reauthorize {existing.connection_id}"
+    assert result["provider_access_may_remain"] is True
+    after = manager.tokens.read(existing.connection_id)
+    assert after.state.version == before.state.version
+    assert after.value == before.value
+
+
+def test_new_account_same_identity_retains_healthy_broader_grant_as_non_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    existing = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        include_permanent_delete=True,
+    )
+    before = manager.tokens.read(existing.connection_id)
+    profile = get_connector_profile("gmail")
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider, FP_ONE),
+    )
+    acquired: list[ConnectionId] = []
+
+    def acquire(metadata: ConnectionMetadata, **kwargs: object) -> OAuthCredential:
+        acquired.append(metadata.connection_id)
+        return _credential(profile.scopes_for(ConnectorAccessTier.READ))
+
+    monkeypatch.setattr(manager, "acquire_oauth_credential", acquire)
+    result = onboarding.connect_oauth(
+        "gmail",
+        access="read",
+        new_account=True,
+        confirm_identity=lambda review: True,
+    )
+
+    assert result["status"] == "broader_access_already_connected"
+    assert result["requested_access"] == "read"
+    assert result["effective_access"] == "full"
+    assert result["permanent_delete"] is True
+    assert result["nothing_saved"] is True
+    assert result["provider_access_may_remain"] is True
+    assert acquired and acquired[0] != existing.connection_id
+    assert manager.tokens.state(acquired[0]) is None
     after = manager.tokens.read(existing.connection_id)
     assert after.state.version == before.state.version
     assert after.value == before.value

@@ -54,7 +54,7 @@ from continuity_kernel.connector_onboarding import (
     provider_revocation_guidance,
 )
 from continuity_kernel.connector_operations import CONNECTOR_PROFILE
-from continuity_kernel.connector_profiles import CONNECTOR_PROFILES
+from continuity_kernel.connector_profiles import CONNECTOR_PROFILES, ConnectorAccessTier
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
 from continuity_kernel.direction import direction_aim, direction_dict
@@ -650,6 +650,11 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
                 f"{args.access.title()} access…",
                 file=sys.stderr,
             )
+        if args.with_permanent_delete:
+            _present_permission_update(
+                "Permanent delete is ON. Seld can erase Gmail messages without Trash, and "
+                "that cannot be undone."
+            )
         if args.connector == "discord":
             if not sys.stdin.isatty():
                 raise SetupError(
@@ -665,7 +670,6 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
                 alias=args.alias,
             )
         opener = _connector_browser_opener(args)
-        timeout_seconds = args.timeout if args.timeout is not None else 180.0
         return onboarding.connect_oauth(
             args.connector,
             access=args.access,
@@ -677,7 +681,8 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
             browser_opener=opener,
             browser_mode=_connector_browser_mode(args),
             present_authorization_url=_present_authorization_url,
-            timeout_seconds=timeout_seconds,
+            present_permission_update=_present_permission_update,
+            timeout_seconds=args.timeout,
         )
     if args.connectors_command == "alias":
         return onboarding.alias(
@@ -797,13 +802,32 @@ def _present_authorization_url(url: str, browser_opened: bool) -> None:
     print(url, file=sys.stderr)
 
 
+def _present_permission_update(message: str) -> None:
+    print(f"Permission update before sign-in: {message}", file=sys.stderr)
+
+
 def _confirm_connector_identity(review: ConnectorIdentityReview) -> bool:
-    print(
-        f"Provider account: {review.display_label}\n"
-        f"Connector: {review.connector.replace('_', ' ').title()}\n"
+    lines = [
+        f"Provider account: {review.display_label}",
+        f"Connector: {review.connector.replace('_', ' ').title()}",
         f"Access: {review.access.value.title()}",
-        file=sys.stderr,
-    )
+    ]
+    if review.permission_update is not None:
+        lines.append(f"Permission update: {review.permission_update}")
+    if review.permanent_delete:
+        lines.append(
+            "Permanent delete: ON — Seld can permanently erase Gmail messages, "
+            "skipping the Trash. This cannot be undone."
+        )
+    elif review.connector == "gmail":
+        if review.access is ConnectorAccessTier.FULL:
+            lines.append(
+                "Permanent delete: off — deleted Gmail messages go to the Trash and are "
+                "recoverable."
+            )
+        else:
+            lines.append("Permanent delete: not available with Read access.")
+    print("\n".join(lines), file=sys.stderr)
     return _confirm("Use this account? [y/N] ")
 
 
@@ -829,6 +853,14 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
         "account_selection_required": (
             "Choose one candidate account command from result.candidates and retry."
         ),
+        "broader_access_already_connected": (
+            "This connector already has broader access than selected. Nothing changed; "
+            "review result.effective_access and result.downgrade_help."
+        ),
+        "broader_access_reauthorization_required": (
+            "This connector has broader access than selected and needs reauthorization. "
+            "Nothing changed; follow result.next or review result.downgrade_help."
+        ),
         "cancelled": "Connector sign-in was cancelled; follow result.next to inspect or retry.",
         "credential_invalid_reconnect_required": (
             "The saved connector credential is invalid; follow result.next to repair it."
@@ -845,6 +877,18 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
         "disconnect_cancelled": "Disconnect cancelled; nothing changed.",
         "identity_binding_missing_reconnect_required": (
             "The connector identity binding is missing; follow result.next to reconnect."
+        ),
+        "oauth_permissions_missing": (
+            "The provider approved fewer permissions than the selected access. Nothing was "
+            "saved; follow result.retry."
+        ),
+        "oauth_permissions_outside_selected_tier": (
+            "The provider returned more access than selected. Nothing was saved; follow "
+            "result.retry."
+        ),
+        "oauth_scope_profile_unrecognized": (
+            "This saved connection has unrecognized OAuth permissions. Nothing changed; "
+            "follow result.next to disconnect it safely before reconnecting."
         ),
         "setup_incomplete": "Connector setup is incomplete; follow result.next to resume.",
     }
@@ -1570,7 +1614,7 @@ def _parser() -> argparse.ArgumentParser:
             "connection."
         ),
     )
-    connector_reauthorize.add_argument("--timeout", type=float, default=180.0)
+    connector_reauthorize.add_argument("--timeout", type=float)
     reauthorize_browser = connector_reauthorize.add_mutually_exclusive_group()
     reauthorize_browser.add_argument(
         "--browser",

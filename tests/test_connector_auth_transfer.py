@@ -381,7 +381,7 @@ def test_import_rejects_an_overbroad_oauth_grant_before_mutating_custody(
     identity = tmp_path / "identity.txt"
     identity.write_text("synthetic identity", encoding="utf-8")
 
-    with pytest.raises(ValidationError, match="outside its selected access"):
+    with pytest.raises(ValidationError, match="outside the selected access tier"):
         import_auth_archive(manager, encrypted, identity=identity)
 
     assert vault.get_connection_snapshot() == before

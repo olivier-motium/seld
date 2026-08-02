@@ -105,6 +105,8 @@ def test_connector_list_and_status_are_first_class_json_commands(
     "status",
     (
         "account_selection_required",
+        "broader_access_already_connected",
+        "broader_access_reauthorization_required",
         "cancelled",
         "credential_invalid_reconnect_required",
         "credential_missing_reconnect_required",
@@ -112,6 +114,9 @@ def test_connector_list_and_status_are_first_class_json_commands(
         "different_account",
         "disconnect_cancelled",
         "identity_binding_missing_reconnect_required",
+        "oauth_permissions_missing",
+        "oauth_permissions_outside_selected_tier",
+        "oauth_scope_profile_unrecognized",
         "setup_incomplete",
     ),
 )
@@ -195,6 +200,8 @@ def test_oauth_connect_passes_firefox_and_manual_url_fallback_without_credential
                 "full",
                 "--browser",
                 "firefox",
+                "--timeout",
+                "42.5",
             ]
         )
         == 0
@@ -205,6 +212,7 @@ def test_oauth_connect_passes_firefox_and_manual_url_fallback_without_credential
     assert connector == "gmail"
     assert kwargs["access"] == "full"
     assert kwargs["browser_mode"] == "firefox"
+    assert kwargs["timeout_seconds"] == 42.5
     opener = kwargs["browser_opener"]
     assert callable(opener) and opener("https://accounts.example/authorize") is True
     assert opened == ["https://accounts.example/authorize"]
@@ -220,6 +228,19 @@ def test_authorization_url_is_always_printed_even_when_browser_opened(
     assert "browser is open" in stderr
     assert "safe to copy" in stderr
     assert url in stderr
+
+
+def test_permission_update_is_presented_before_sign_in_without_raw_scopes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli._present_permission_update(
+        "The existing connection stays active until its replacement is ready."
+    )
+
+    stderr = capsys.readouterr().err
+    assert "before sign-in" in stderr
+    assert "existing connection stays active" in stderr
+    assert "https://" not in stderr
 
 
 def test_identity_confirmation_shows_exact_account_and_defaults_to_no(
@@ -239,6 +260,70 @@ def test_identity_confirmation_shows_exact_account_and_defaults_to_no(
     assert "Ada <ada@example.test>" in stderr
     assert "Outlook Mail" in stderr
     assert "Full" in stderr
+
+
+@pytest.mark.parametrize(
+    ("access", "permanent_delete", "expected_phrases"),
+    [
+        (ConnectorAccessTier.READ, False, ("not available with Read",)),
+        (
+            ConnectorAccessTier.FULL,
+            False,
+            ("Permanent delete: off", "go to the Trash", "recoverable"),
+        ),
+        (
+            ConnectorAccessTier.FULL,
+            True,
+            ("Permanent delete: ON", "skipping the Trash", "cannot be undone"),
+        ),
+    ],
+)
+def test_gmail_confirmation_discloses_permission_update_and_delete_semantics(
+    access: ConnectorAccessTier,
+    permanent_delete: bool,
+    expected_phrases: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    review = ConnectorIdentityReview(
+        connector="gmail",
+        provider="google",
+        access=access,
+        display_label="Ada <ada@example.test>",
+        permanent_delete=permanent_delete,
+        permission_update=(
+            "Replaces the existing connection after the current permissions are ready."
+        ),
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+
+    assert cli._confirm_connector_identity(review) is False
+    stderr = capsys.readouterr().err
+    assert "Permission update:" in stderr
+    assert "existing connection" in stderr
+    assert "https://" not in stderr
+    for phrase in expected_phrases:
+        assert phrase in stderr
+
+
+def test_legacy_google_confirmation_still_discloses_permanent_gmail_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    review = ConnectorIdentityReview(
+        connector="google",
+        provider="google",
+        access=ConnectorAccessTier.FULL,
+        display_label="Ada <ada@example.test>",
+        permanent_delete=True,
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+
+    assert cli._confirm_connector_identity(review) is False
+    stderr = capsys.readouterr().err
+    assert "Permanent delete: ON" in stderr
+    assert "Gmail messages" in stderr
+    assert "cannot be undone" in stderr
 
 
 def test_disconnect_requires_confirmation_and_explains_local_only_semantics(

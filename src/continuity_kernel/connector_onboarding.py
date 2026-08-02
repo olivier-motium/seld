@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final, Literal, cast
@@ -48,6 +48,7 @@ from continuity_kernel.connector_transport import (
 from continuity_kernel.errors import (
     ConflictError,
     ContinuityError,
+    OAuthPermissionGrantError,
     SetupError,
     ValidationError,
     mark_provider_authorization_may_remain,
@@ -58,6 +59,7 @@ IdentityVerifier = Callable[[str, ConnectorCredential], ConnectorIdentity]
 RegistrationLoader = Callable[[str], PublicClientRegistration]
 BrowserOpener = Callable[[str], bool]
 AuthorizationPresenter = Callable[[str, bool], None]
+PermissionUpdatePresenter = Callable[[str], None]
 BrowserMode = Literal["default", "firefox", "manual"]
 
 _DEFAULT_BROWSER: Final = object()
@@ -75,12 +77,16 @@ class ConnectorIdentityReview:
     provider: str
     access: ConnectorAccessTier
     display_label: str
+    permanent_delete: bool = False
+    permission_update: str | None = None
 
     def __repr__(self) -> str:
         return (
             "ConnectorIdentityReview("
             f"connector={self.connector!r}, provider={self.provider!r}, "
-            f"access={self.access!r}, display_label=<redacted>)"
+            f"access={self.access!r}, permanent_delete={self.permanent_delete!r}, "
+            f"permission_update={self.permission_update is not None!r}, "
+            "display_label=<redacted>)"
         )
 
 
@@ -116,15 +122,18 @@ class ConnectorOnboarding:
         connection_id: str | None = None,
         alias: str | None = None,
         include_permanent_delete: bool = False,
-        timeout_seconds: float = 180.0,
+        timeout_seconds: float | None = None,
         browser_opener: BrowserOpener | None | object = _DEFAULT_BROWSER,
         browser_mode: BrowserMode | None = None,
         present_authorization_url: AuthorizationPresenter | None = None,
+        present_permission_update: PermissionUpdatePresenter | None = None,
     ) -> dict[str, object]:
         """Connect one OAuth source, keeping every credential transient until confirmation."""
 
         if not callable(confirm_identity):
             raise ValidationError("connector identity confirmation is unavailable")
+        if present_permission_update is not None and not callable(present_permission_update):
+            raise ValidationError("connector permission update presenter is invalid")
         profile = get_connector_profile(connector)
         if profile.credential_kind is not CredentialKind.OAUTH2:
             raise ValidationError("this connector uses bot onboarding, not OAuth")
@@ -133,21 +142,32 @@ class ConnectorOnboarding:
             profile.name != "gmail" or tier is not ConnectorAccessTier.FULL
         ):
             raise ValidationError("--with-permanent-delete is available only for Gmail Full access")
+        requested_scopes = profile.scopes_for(
+            tier,
+            include_supplemental=include_permanent_delete,
+        )
         if connection_id is not None and new_account:
             raise ValidationError("--connection-id cannot be combined with --new-account")
         validated_alias = _alias(alias)
         validated_browser_mode = _browser_mode(browser_mode)
         clean_connection_id = None if connection_id is None else parse_connection_id(connection_id)
+        effective_timeout_seconds = 180.0 if timeout_seconds is None else timeout_seconds
 
+        candidate: ConnectionMetadata | None = None
         pinned_fingerprint: str | None = None
         preferred_label: str | None = None
+        permission_update: str | None = None
         force_fresh = False
         if not new_account:
             candidate, early_result, reauthorize = self._preflight_oauth(
                 profile,
                 tier,
                 clean_connection_id,
+                requested_scopes=requested_scopes,
                 include_permanent_delete=include_permanent_delete,
+                alias=validated_alias,
+                browser_mode=validated_browser_mode,
+                timeout_seconds=timeout_seconds,
             )
             if early_result is not None:
                 return early_result
@@ -165,6 +185,32 @@ class ConnectorOnboarding:
                 pinned_fingerprint = candidate.account.fingerprint
                 preferred_label = candidate.account.label
                 force_fresh = pinned_fingerprint is not None
+                if not _scopes_satisfy_requirement(
+                    profile,
+                    candidate.scopes,
+                    requested_scopes,
+                ):
+                    permission_update = _permission_update(
+                        profile,
+                        candidate.scopes,
+                        tier,
+                        include_permanent_delete=include_permanent_delete,
+                    )
+
+        existing_connections = tuple(self._existing_connections(profile))
+        preserved_connections = existing_connections
+        if candidate is not None and candidate.account.fingerprint is not None:
+            preserved_connections = tuple(
+                connection
+                for connection in existing_connections
+                if connection.account.fingerprint == candidate.account.fingerprint
+            )
+        existing_effective_access, existing_permanent_delete = _preserved_authority(
+            profile,
+            preserved_connections,
+        )
+        if permission_update is not None and present_permission_update is not None:
+            present_permission_update(permission_update)
 
         self.manager.probe_credential_custody()
         registration = self.registration_loader(profile.provider)
@@ -174,12 +220,33 @@ class ConnectorOnboarding:
             registration,
             include_permanent_delete=include_permanent_delete,
         )
-        credential = self._acquire_oauth_credential(
-            pending,
+        retry_command = _connect_command(
+            profile,
+            pending.scopes,
+            new_account=new_account,
+            connection_id=(str(clean_connection_id) if clean_connection_id is not None else None),
+            alias=validated_alias,
+            browser_mode=validated_browser_mode,
             timeout_seconds=timeout_seconds,
-            browser_opener=browser_opener,
-            present_authorization_url=present_authorization_url,
         )
+        try:
+            credential = self._acquire_oauth_credential(
+                pending,
+                timeout_seconds=effective_timeout_seconds,
+                browser_opener=browser_opener,
+                present_authorization_url=present_authorization_url,
+            )
+        except OAuthPermissionGrantError as exc:
+            return _oauth_permission_failure_result(
+                profile,
+                tier,
+                pending.scopes,
+                exc,
+                retry_command=retry_command,
+                existing_connection_preserved=bool(preserved_connections),
+                existing_effective_access=existing_effective_access,
+                existing_permanent_delete=existing_permanent_delete,
+            )
         with _provider_authorization_phase():
             identity = self.identity_verifier(
                 profile.provider,
@@ -203,22 +270,15 @@ class ConnectorOnboarding:
                 ),
                 pinned_fingerprint=pinned_fingerprint,
                 preferred_label=preferred_label,
+                permission_update=permission_update,
                 force_fresh=force_fresh,
-                retry_command=_connect_command(
-                    profile,
-                    pending.scopes,
-                    new_account=new_account,
-                    connection_id=(
-                        str(clean_connection_id) if clean_connection_id is not None else None
-                    ),
-                    alias=validated_alias,
-                    browser_mode=validated_browser_mode,
-                ),
+                retry_command=retry_command,
                 new_account_command=_connect_command(
                     profile,
                     pending.scopes,
                     new_account=True,
                     browser_mode=validated_browser_mode,
+                    timeout_seconds=timeout_seconds,
                 ),
                 publish=lambda metadata: self.manager.publish_new_oauth_connection(
                     metadata,
@@ -238,7 +298,7 @@ class ConnectorOnboarding:
         *,
         confirm_identity: ConfirmIdentity,
         alias: str | None = None,
-        timeout_seconds: float = 180.0,
+        timeout_seconds: float | None = None,
         browser_opener: BrowserOpener | None | object = _DEFAULT_BROWSER,
         browser_mode: BrowserMode | None = None,
         present_authorization_url: AuthorizationPresenter | None = None,
@@ -250,6 +310,7 @@ class ConnectorOnboarding:
             raise ValidationError("connector identity confirmation is unavailable")
         validated_alias = _alias(alias)
         validated_browser_mode = _browser_mode(browser_mode)
+        effective_timeout_seconds = 180.0 if timeout_seconds is None else timeout_seconds
         snapshot = self.manager.vault.get_connection_snapshot()
         connection = snapshot.connection(clean_id)
         if connection is None:
@@ -270,12 +331,34 @@ class ConnectorOnboarding:
         if custody_status == "pointer_invalid":
             return _credential_recovery_result(profile, connection, custody_status)
         self.manager.probe_credential_custody()
-        credential = self._acquire_oauth_credential(
-            connection,
+        retry_command = _reauthorize_command(
+            clean_id,
+            alias=validated_alias,
+            browser_mode=validated_browser_mode,
             timeout_seconds=timeout_seconds,
-            browser_opener=browser_opener,
-            present_authorization_url=present_authorization_url,
         )
+        try:
+            credential = self._acquire_oauth_credential(
+                connection,
+                timeout_seconds=effective_timeout_seconds,
+                browser_opener=browser_opener,
+                present_authorization_url=present_authorization_url,
+            )
+        except OAuthPermissionGrantError as exc:
+            return _oauth_permission_failure_result(
+                profile,
+                access,
+                connection.scopes,
+                exc,
+                retry_command=retry_command,
+                connection_id=str(clean_id),
+                existing_connection_preserved=True,
+                existing_effective_access=access.value,
+                existing_permanent_delete=_permanent_delete_enabled(
+                    profile,
+                    connection.scopes,
+                ),
+            )
         with _provider_authorization_phase():
             identity = self.identity_verifier(
                 profile.provider,
@@ -289,16 +372,13 @@ class ConnectorOnboarding:
                     profile,
                     connection.scopes,
                     connection_id=str(clean_id),
-                    retry_command=_reauthorize_command(
-                        clean_id,
-                        alias=validated_alias,
-                        browser_mode=validated_browser_mode,
-                    ),
+                    retry_command=retry_command,
                     new_account_command=_connect_command(
                         profile,
                         connection.scopes,
                         new_account=True,
                         browser_mode=validated_browser_mode,
+                        timeout_seconds=timeout_seconds,
                     ),
                     provider_authorization=True,
                     existing_connection_preserved=True,
@@ -308,17 +388,14 @@ class ConnectorOnboarding:
                 provider=profile.provider,
                 access=access,
                 display_label=identity.display_label,
+                permanent_delete=_permanent_delete_enabled(profile, connection.scopes),
             )
             if confirm_identity(review) is not True:
                 return _cancelled_identity_result(
                     profile,
                     connection_id=str(clean_id),
                     next_command=_status_command(clean_id),
-                    retry_command=_reauthorize_command(
-                        clean_id,
-                        alias=validated_alias,
-                        browser_mode=validated_browser_mode,
-                    ),
+                    retry_command=retry_command,
                     provider_authorization=True,
                     existing_connection_preserved=True,
                 )
@@ -327,16 +404,13 @@ class ConnectorOnboarding:
                     profile,
                     connection.scopes,
                     connection_id=str(clean_id),
-                    retry_command=_reauthorize_command(
-                        clean_id,
-                        alias=validated_alias,
-                        browser_mode=validated_browser_mode,
-                    ),
+                    retry_command=retry_command,
                     new_account_command=_connect_command(
                         profile,
                         connection.scopes,
                         new_account=True,
                         browser_mode=validated_browser_mode,
+                        timeout_seconds=timeout_seconds,
                     ),
                     provider_authorization=True,
                     existing_connection_preserved=True,
@@ -351,14 +425,30 @@ class ConnectorOnboarding:
             account_label = validated_alias or current.account.label or identity.portable_label
             token_state = self.manager.tokens.state(clean_id)
             expected_token_version = token_state.version if token_state is not None else 0
-            self.manager.rotate_verified_oauth_credential(
-                clean_id,
-                expected_revision=current_snapshot.revision,
-                expected_account_fingerprint=identity.fingerprint,
-                expected_token_version=expected_token_version,
-                replacement=credential,
-                account_label=account_label,
-            )
+            try:
+                self.manager.rotate_verified_oauth_credential(
+                    clean_id,
+                    expected_revision=current_snapshot.revision,
+                    expected_account_fingerprint=identity.fingerprint,
+                    expected_token_version=expected_token_version,
+                    replacement=credential,
+                    account_label=account_label,
+                )
+            except OAuthPermissionGrantError as exc:
+                return _oauth_permission_failure_result(
+                    profile,
+                    access,
+                    connection.scopes,
+                    exc,
+                    retry_command=retry_command,
+                    connection_id=str(clean_id),
+                    existing_connection_preserved=True,
+                    existing_effective_access=access.value,
+                    existing_permanent_delete=_permanent_delete_enabled(
+                        profile,
+                        connection.scopes,
+                    ),
+                )
             return {
                 **_connection_success_result(
                     profile,
@@ -376,7 +466,11 @@ class ConnectorOnboarding:
         access: ConnectorAccessTier,
         connection_id: object,
         *,
+        requested_scopes: tuple[str, ...],
         include_permanent_delete: bool,
+        alias: str | None,
+        browser_mode: BrowserMode | None,
+        timeout_seconds: float | None,
     ) -> tuple[ConnectionMetadata | None, dict[str, object] | None, bool]:
         snapshot = self.manager.vault.get_connection_snapshot()
         candidates = self._logical_candidates(profile, snapshot.connections)
@@ -393,6 +487,8 @@ class ConnectorOnboarding:
             )
             if selected is None:
                 raise ValidationError("connection ID does not identify this logical connector")
+            if _try_capability_rank(profile, selected.scopes) is None:
+                return None, _scope_profile_recovery_result(profile, selected), False
         else:
             bound_fingerprints = {
                 candidate.account.fingerprint
@@ -407,6 +503,9 @@ class ConnectorOnboarding:
                         candidates,
                         access,
                         include_permanent_delete=include_permanent_delete,
+                        alias=alias,
+                        browser_mode=browser_mode,
+                        timeout_seconds=timeout_seconds,
                     ),
                     False,
                 )
@@ -414,8 +513,20 @@ class ConnectorOnboarding:
                 profile,
                 candidates,
                 requested_rank,
+                requested_scopes,
             )
             if usable is not None:
+                if _capability_rank(profile, usable.scopes) > requested_rank:
+                    return (
+                        None,
+                        _broader_access_result(
+                            profile,
+                            usable,
+                            selected_access=access,
+                            requested_scopes=requested_scopes,
+                        ),
+                        False,
+                    )
                 return (
                     None,
                     {
@@ -428,7 +539,12 @@ class ConnectorOnboarding:
                     },
                     False,
                 )
-            selected = _select_preflight_candidate(profile, candidates, requested_rank)
+            selected = _select_preflight_candidate(
+                profile,
+                candidates,
+                requested_rank,
+                requested_scopes,
+            )
         if selected is None:
             return None, None, False
 
@@ -448,7 +564,29 @@ class ConnectorOnboarding:
 
         if selected.account.fingerprint is None:
             return None, _identity_binding_recovery_result(profile, selected), False
-        if _capability_rank(profile, selected.scopes) < requested_rank:
+        if _capability_rank(profile, selected.scopes) > requested_rank:
+            custody_status = self.manager.inspect_custody(selected)
+            if custody_status != "valid":
+                return (
+                    None,
+                    _credential_recovery_result(profile, selected, custody_status),
+                    False,
+                )
+            return (
+                None,
+                _broader_access_result(
+                    profile,
+                    selected,
+                    selected_access=access,
+                    requested_scopes=requested_scopes,
+                ),
+                False,
+            )
+        if not _scopes_satisfy_requirement(
+            profile,
+            selected.scopes,
+            requested_scopes,
+        ):
             return selected, None, False
         if selected.health is ConnectionHealth.REAUTHORIZATION_REQUIRED:
             return selected, None, True
@@ -484,6 +622,7 @@ class ConnectorOnboarding:
         profile: ConnectorProfile,
         candidates: Sequence[ConnectionMetadata],
         requested_capability: int,
+        requested_scopes: tuple[str, ...],
     ) -> ConnectionMetadata | None:
         for candidate in sorted(
             candidates,
@@ -491,13 +630,20 @@ class ConnectorOnboarding:
                 profile,
                 item,
                 requested_capability,
+                requested_scopes,
             ),
             reverse=True,
         ):
+            capability = _try_capability_rank(profile, candidate.scopes)
             if (
-                candidate.health in _CONNECTED_HEALTH
+                capability is not None
+                and candidate.health in _CONNECTED_HEALTH
                 and candidate.account.fingerprint is not None
-                and _capability_rank(profile, candidate.scopes) >= requested_capability
+                and _scopes_satisfy_requirement(
+                    profile,
+                    candidate.scopes,
+                    requested_scopes,
+                )
                 and self.manager.inspect_custody(candidate) == "valid"
             ):
                 return candidate
@@ -580,6 +726,7 @@ class ConnectorOnboarding:
             requested_capability=1,
             pinned_fingerprint=None,
             preferred_label=None,
+            permission_update=None,
             force_fresh=False,
             retry_command=_connect_command(profile, pending.scopes),
             new_account_command=_connect_command(
@@ -642,15 +789,54 @@ class ConnectorOnboarding:
             connection = snapshot.connection(cast(str, raw["connection_id"]))
             if connection is None:
                 raise SetupError("connector status changed while it was being read")
-            profile = get_profile_for_connection(
-                connection.provider,
-                connection.source_ids,
-                connection.scopes,
-            )
+            try:
+                profile = get_profile_for_connection(
+                    connection.provider,
+                    connection.source_ids,
+                    connection.scopes,
+                )
+                access = profile.access_for_scopes(connection.scopes).value
+            except ValidationError:
+                try:
+                    recovery_profile = get_profile_for_connection(
+                        connection.provider,
+                        connection.source_ids,
+                    )
+                except ValidationError:
+                    recovery_profile = None
+                connector = (
+                    connection.source_ids[0]
+                    if len(connection.source_ids) == 1
+                    else "legacy_provider_bundle"
+                )
+                projected.append(
+                    {
+                        **raw,
+                        "access": "unknown",
+                        "connector": connector,
+                        "error_code": "oauth_scope_profile_unrecognized",
+                        "next": format_connector_command(
+                            (
+                                "gsv",
+                                "connectors",
+                                "disconnect",
+                                str(connection.connection_id),
+                            )
+                        ),
+                        "permanent_delete": bool(
+                            recovery_profile is not None
+                            and _permanent_delete_enabled(
+                                recovery_profile,
+                                connection.scopes,
+                            )
+                        ),
+                    }
+                )
+                continue
             projected.append(
                 {
                     **raw,
-                    "access": profile.access_for_scopes(connection.scopes).value,
+                    "access": access,
                     "connector": connection.source_ids[0]
                     if len(connection.source_ids) == 1
                     else "legacy_provider_bundle",
@@ -864,6 +1050,7 @@ class ConnectorOnboarding:
             provider=profile.provider,
             access=access,
             display_label=identity.display_label,
+            permanent_delete=_permanent_delete_enabled(profile, connection.scopes),
         )
         if confirm_identity(review) is not True:
             return _cancelled_identity_result(
@@ -1013,6 +1200,7 @@ class ConnectorOnboarding:
         requested_capability: int,
         pinned_fingerprint: str | None,
         preferred_label: str | None,
+        permission_update: str | None,
         force_fresh: bool,
         retry_command: str | None,
         new_account_command: str | None,
@@ -1034,6 +1222,7 @@ class ConnectorOnboarding:
                 connection
                 for connection in same_account
                 if connection.health is ConnectionHealth.UNVERIFIED
+                and _try_capability_rank(profile, connection.scopes) is not None
             ),
             key=lambda connection: (connection.updated_at, str(connection.connection_id)),
             default=None,
@@ -1058,6 +1247,8 @@ class ConnectorOnboarding:
             provider=profile.provider,
             access=access,
             display_label=identity.display_label,
+            permanent_delete=_permanent_delete_enabled(profile, pending.scopes),
+            permission_update=permission_update,
         )
         if confirm_identity(review) is not True:
             return _cancelled_identity_result(
@@ -1085,7 +1276,12 @@ class ConnectorOnboarding:
                 existing_connection_preserved=True,
             )
         reusable, reusable_custody_status = (
-            self._reusable_connection(profile, same_account, requested_capability)
+            self._reusable_connection(
+                profile,
+                same_account,
+                requested_capability,
+                pending.scopes,
+            )
             if not force_fresh
             else (None, None)
         )
@@ -1099,8 +1295,43 @@ class ConnectorOnboarding:
                         reusable_custody_status,
                     ),
                 )
+            if _capability_rank(profile, reusable.scopes) > requested_capability:
+                if reusable_custody_status != "valid":
+                    return _post_authorization_discard(
+                        profile,
+                        _credential_recovery_result(
+                            profile,
+                            reusable,
+                            reusable_custody_status,
+                        ),
+                    )
+                return _post_authorization_discard(
+                    profile,
+                    _broader_access_result(
+                        profile,
+                        reusable,
+                        selected_access=access,
+                        requested_scopes=pending.scopes,
+                    ),
+                )
             account_label = _alias(alias) or reusable.account.label or identity.portable_label
-            reused = reuse(reusable, account_label)
+            try:
+                reused = reuse(reusable, account_label)
+            except OAuthPermissionGrantError as exc:
+                return _oauth_permission_failure_result(
+                    profile,
+                    access,
+                    pending.scopes,
+                    exc,
+                    retry_command=retry_command or _connect_command(profile, pending.scopes),
+                    connection_id=str(reusable.connection_id),
+                    existing_connection_preserved=True,
+                    existing_effective_access=profile.access_for_scopes(reusable.scopes).value,
+                    existing_permanent_delete=_permanent_delete_enabled(
+                        profile,
+                        reusable.scopes,
+                    ),
+                )
             if (
                 reusable_custody_status != "valid"
                 and reused.get("credential") == _RETAINED_BROADER_CREDENTIAL
@@ -1144,7 +1375,28 @@ class ConnectorOnboarding:
             updated_at=now,
             version=1,
         )
-        publish(metadata)
+        try:
+            publish(metadata)
+        except OAuthPermissionGrantError as exc:
+            preserved = tuple(
+                connection
+                for connection in existing
+                if connection.account.fingerprint == identity.fingerprint
+            )
+            existing_effective_access, existing_permanent_delete = _preserved_authority(
+                profile,
+                preserved,
+            )
+            return _oauth_permission_failure_result(
+                profile,
+                access,
+                pending.scopes,
+                exc,
+                retry_command=retry_command or _connect_command(profile, pending.scopes),
+                existing_connection_preserved=bool(preserved),
+                existing_effective_access=existing_effective_access,
+                existing_permanent_delete=existing_permanent_delete,
+            )
         result = _connection_success_result(
             profile,
             metadata,
@@ -1152,20 +1404,21 @@ class ConnectorOnboarding:
             health=ConnectionHealth.READY,
             account_label=account_label,
         )
-        removed, failed = self._cleanup_lower_capability_connections(
+        removed, failed = self._cleanup_superseded_connections(
             profile,
             identity.fingerprint,
             metadata.connection_id,
             _capability_rank(profile, metadata.scopes),
+            metadata.scopes,
         )
         if failed:
             result["upgrade_cleanup"] = (
-                "lower_capability_connection_retained"
+                "superseded_connection_retained"
                 if len(failed) == 1
-                else "lower_capability_connections_retained"
+                else "superseded_connections_retained"
             )
             result["warning"] = (
-                "The new capability is ready, but some lower-capability connections could not "
+                "The new capability is ready, but some superseded connections could not "
                 f"be removed safely ({len(failed)} retained)."
             )
         if len(removed) == 1:
@@ -1179,9 +1432,15 @@ class ConnectorOnboarding:
         profile: ConnectorProfile,
         connections: Sequence[ConnectionMetadata],
         requested_capability: int,
+        requested_scopes: tuple[str, ...],
     ) -> tuple[ConnectionMetadata | None, CustodyStatus | None]:
         fallback: tuple[ConnectionMetadata, CustodyStatus] | None = None
-        for candidate in _sufficient_connections(profile, connections, requested_capability):
+        for candidate in _sufficient_connections(
+            profile,
+            connections,
+            requested_capability,
+            requested_scopes,
+        ):
             custody_status = self.manager.inspect_custody(candidate)
             if custody_status == "valid":
                 return candidate, custody_status
@@ -1193,34 +1452,37 @@ class ConnectorOnboarding:
         snapshot = self.manager.vault.get_connection_snapshot()
         return self._logical_candidates(profile, snapshot.connections)
 
-    def _cleanup_lower_capability_connections(
+    def _cleanup_superseded_connections(
         self,
         profile: ConnectorProfile,
         fingerprint: str,
         new_connection_id: ConnectionId,
         new_capability: int,
+        required_scopes: tuple[str, ...],
     ) -> tuple[Sequence[str], Sequence[str]]:
         removed: list[str] = []
         failed: list[str] = []
         snapshot = self.manager.vault.get_connection_snapshot()
         for candidate in snapshot.connections:
-            if not _is_lower_capability_connection(
+            if not _is_superseded_connection(
                 profile,
                 candidate,
                 fingerprint=fingerprint,
                 new_connection_id=new_connection_id,
                 new_capability=new_capability,
+                required_scopes=required_scopes,
             ):
                 continue
             try:
                 fresh_snapshot = self.manager.vault.get_connection_snapshot()
                 current = fresh_snapshot.connection(candidate.connection_id)
-                if current is None or not _is_lower_capability_connection(
+                if current is None or not _is_superseded_connection(
                     profile,
                     current,
                     fingerprint=fingerprint,
                     new_connection_id=new_connection_id,
                     new_capability=new_capability,
+                    required_scopes=required_scopes,
                 ):
                     continue
                 self.manager.remove(
@@ -1234,22 +1496,35 @@ class ConnectorOnboarding:
         return removed, failed
 
 
-def _is_lower_capability_connection(
+def _is_superseded_connection(
     profile: ConnectorProfile,
     connection: ConnectionMetadata,
     *,
     fingerprint: str,
     new_connection_id: ConnectionId,
     new_capability: int,
+    required_scopes: tuple[str, ...],
 ) -> bool:
-    return (
+    if not (
         connection.connection_id != new_connection_id
         and connection.provider == profile.provider
         and connection.source_ids == profile.source_ids
         and connection.credential_kind is CredentialKind.OAUTH2
         and connection.account.fingerprint == fingerprint
         and connection.health not in {ConnectionHealth.REVOKED, ConnectionHealth.UNKNOWN}
-        and _capability_rank(profile, connection.scopes) < new_capability
+    ):
+        return False
+    capability = _try_capability_rank(profile, connection.scopes)
+    if capability is None:
+        # Unknown historical authority is never deleted as an upgrade side effect.
+        return False
+    return capability < new_capability or (
+        capability == new_capability
+        and not _scopes_satisfy_requirement(
+            profile,
+            connection.scopes,
+            required_scopes,
+        )
     )
 
 
@@ -1327,6 +1602,18 @@ def _capability_rank(profile: ConnectorProfile, scopes: tuple[str, ...]) -> int:
     return 1 if access is ConnectorAccessTier.FULL else 0
 
 
+def _try_capability_rank(
+    profile: ConnectorProfile,
+    scopes: tuple[str, ...],
+) -> int | None:
+    """Classify stored OAuth authority without trusting historical metadata."""
+
+    try:
+        return _capability_rank(profile, scopes)
+    except ValidationError:
+        return None
+
+
 def _permanent_delete_enabled(profile: ConnectorProfile, scopes: tuple[str, ...]) -> bool:
     return profile.provider == "google" and any(
         scope in scopes for scope in profile.supplemental_scopes
@@ -1345,39 +1632,71 @@ def _requested_capability_rank(
     )
 
 
+def _scopes_satisfy_requirement(
+    profile: ConnectorProfile,
+    scopes: tuple[str, ...],
+    required_scopes: tuple[str, ...],
+) -> bool:
+    capability = _capability_rank(profile, scopes)
+    required_capability = _capability_rank(profile, required_scopes)
+    return capability > required_capability or (
+        capability == required_capability and frozenset(required_scopes).issubset(scopes)
+    )
+
+
 def _sufficient_connections(
     profile: ConnectorProfile,
     connections: Sequence[ConnectionMetadata],
     requested_capability: int,
+    requested_scopes: tuple[str, ...],
 ) -> list[ConnectionMetadata]:
-    eligible = [
-        connection
-        for connection in connections
-        if connection.health in _REAUTH_HEALTH
-        and connection.account.fingerprint is not None
-        and _capability_rank(profile, connection.scopes) >= requested_capability
-    ]
-    return sorted(
-        eligible,
+    eligible: list[tuple[ConnectionMetadata, int]] = []
+    for connection in connections:
+        capability = _try_capability_rank(profile, connection.scopes)
+        if (
+            capability is not None
+            and connection.health in _REAUTH_HEALTH
+            and connection.account.fingerprint is not None
+            and _scopes_satisfy_requirement(
+                profile,
+                connection.scopes,
+                requested_scopes,
+            )
+        ):
+            eligible.append((connection, capability))
+    eligible.sort(
         key=lambda item: (
-            _capability_rank(profile, item.scopes),
-            item.updated_at,
-            str(item.connection_id),
+            item[1] == requested_capability,
+            item[1],
+            item[0].updated_at,
+            str(item[0].connection_id),
         ),
         reverse=True,
     )
+    return [connection for connection, _capability in eligible]
 
 
 def _select_preflight_candidate(
     profile: ConnectorProfile,
     connections: Sequence[ConnectionMetadata],
     requested_capability: int,
+    requested_scopes: tuple[str, ...],
 ) -> ConnectionMetadata | None:
-    if not connections:
+    recognized = [
+        connection
+        for connection in connections
+        if _try_capability_rank(profile, connection.scopes) is not None
+    ]
+    if not recognized:
         return None
     return max(
-        connections,
-        key=lambda item: _preflight_candidate_key(profile, item, requested_capability),
+        recognized,
+        key=lambda item: _preflight_candidate_key(
+            profile,
+            item,
+            requested_capability,
+            requested_scopes,
+        ),
     )
 
 
@@ -1385,10 +1704,30 @@ def _preflight_candidate_key(
     profile: ConnectorProfile,
     connection: ConnectionMetadata,
     requested_capability: int,
+    requested_scopes: tuple[str, ...],
 ) -> tuple[object, ...]:
-    capability = _capability_rank(profile, connection.scopes)
+    capability = _try_capability_rank(profile, connection.scopes)
+    if capability is None:
+        return (
+            False,
+            False,
+            False,
+            False,
+            connection.account.fingerprint is not None,
+            connection.health in _CONNECTED_HEALTH,
+            -1,
+            connection.updated_at,
+            str(connection.connection_id),
+        )
+    sufficient = _scopes_satisfy_requirement(
+        profile,
+        connection.scopes,
+        requested_scopes,
+    )
     return (
-        connection.health in _CONNECTED_HEALTH and capability >= requested_capability,
+        connection.health in _CONNECTED_HEALTH and sufficient,
+        sufficient,
+        capability == requested_capability,
         capability >= requested_capability,
         connection.account.fingerprint is not None,
         connection.health in _CONNECTED_HEALTH,
@@ -1404,22 +1743,20 @@ def _account_selection_required(
     access: ConnectorAccessTier,
     *,
     include_permanent_delete: bool,
+    alias: str | None,
+    browser_mode: BrowserMode | None,
+    timeout_seconds: float | None,
 ) -> dict[str, object]:
     rows = [
-        {
-            "access": profile.access_for_scopes(candidate.scopes).value,
-            "account_label": candidate.account.label,
-            "command": _connect_command(
-                profile,
-                candidate.scopes,
-                access=access,
-                connection_id=str(candidate.connection_id),
-                include_permanent_delete=include_permanent_delete,
-            ),
-            "connection_id": str(candidate.connection_id),
-            "health": candidate.health.value,
-            "permanent_delete": _permanent_delete_enabled(profile, candidate.scopes),
-        }
+        _account_selection_row(
+            profile,
+            candidate,
+            access,
+            include_permanent_delete=include_permanent_delete,
+            alias=alias,
+            browser_mode=browser_mode,
+            timeout_seconds=timeout_seconds,
+        )
         for candidate in sorted(
             candidates,
             key=lambda item: (
@@ -1434,6 +1771,69 @@ def _account_selection_required(
         "next": "Choose one candidates[].command after confirming its account_label.",
         "nothing_saved": True,
         "status": "account_selection_required",
+    }
+
+
+def _account_selection_row(
+    profile: ConnectorProfile,
+    candidate: ConnectionMetadata,
+    access: ConnectorAccessTier,
+    *,
+    include_permanent_delete: bool,
+    alias: str | None,
+    browser_mode: BrowserMode | None,
+    timeout_seconds: float | None,
+) -> dict[str, object]:
+    try:
+        effective_access = profile.access_for_scopes(candidate.scopes).value
+    except ValidationError:
+        return {
+            "access": "unknown",
+            "account_label": candidate.account.label,
+            "command": format_connector_command(
+                ("gsv", "connectors", "disconnect", str(candidate.connection_id))
+            ),
+            "connection_id": str(candidate.connection_id),
+            "error_code": "oauth_scope_profile_unrecognized",
+            "health": candidate.health.value,
+            "permanent_delete": _permanent_delete_enabled(profile, candidate.scopes),
+        }
+    return {
+        "access": effective_access,
+        "account_label": candidate.account.label,
+        "command": _connect_command(
+            profile,
+            candidate.scopes,
+            access=access,
+            connection_id=str(candidate.connection_id),
+            include_permanent_delete=include_permanent_delete,
+            alias=alias,
+            browser_mode=browser_mode,
+            timeout_seconds=timeout_seconds,
+        ),
+        "connection_id": str(candidate.connection_id),
+        "health": candidate.health.value,
+        "permanent_delete": _permanent_delete_enabled(profile, candidate.scopes),
+    }
+
+
+def _scope_profile_recovery_result(
+    profile: ConnectorProfile,
+    connection: ConnectionMetadata,
+) -> dict[str, object]:
+    return {
+        "access": "unknown",
+        "account_label": connection.account.label,
+        "connection_id": str(connection.connection_id),
+        "connector": profile.name,
+        "error_code": "oauth_scope_profile_unrecognized",
+        "health": connection.health.value,
+        "next": format_connector_command(
+            ("gsv", "connectors", "disconnect", str(connection.connection_id))
+        ),
+        "nothing_saved": True,
+        "permanent_delete": _permanent_delete_enabled(profile, connection.scopes),
+        "status": "oauth_scope_profile_unrecognized",
     }
 
 
@@ -1471,6 +1871,112 @@ def _connection_success_result(
         "permanent_delete": _permanent_delete_enabled(profile, connection.scopes),
         "status": status,
     }
+
+
+def _broader_access_result(
+    profile: ConnectorProfile,
+    connection: ConnectionMetadata,
+    *,
+    selected_access: ConnectorAccessTier,
+    requested_scopes: tuple[str, ...],
+) -> dict[str, object]:
+    effective_access = profile.access_for_scopes(connection.scopes)
+    reconnect = _connect_command(
+        profile,
+        requested_scopes,
+        access=selected_access,
+    )
+    disconnect = format_connector_command(
+        (
+            "gsv",
+            "connectors",
+            "disconnect",
+            str(connection.connection_id),
+        )
+    )
+    status = "broader_access_already_connected"
+    next_command = _status_command(connection.connection_id)
+    if connection.health is ConnectionHealth.REAUTHORIZATION_REQUIRED:
+        status = "broader_access_reauthorization_required"
+        next_command = _reauthorize_command(connection.connection_id)
+    return {
+        **_connection_success_result(
+            profile,
+            connection,
+            status=status,
+        ),
+        "credential": "unchanged",
+        "disconnect": disconnect,
+        "downgrade_help": (
+            "Nothing changed. To use only the selected access, disconnect this local "
+            "connection, remove Seld from the provider's app-consent page, then run reconnect."
+        ),
+        "effective_access": effective_access.value,
+        "next": next_command,
+        "nothing_saved": True,
+        "reconnect": reconnect,
+        "requested_access": selected_access.value,
+        "revocation_help": provider_revocation_guidance(profile.provider),
+    }
+
+
+def _oauth_permission_failure_result(
+    profile: ConnectorProfile,
+    access: ConnectorAccessTier,
+    scopes: tuple[str, ...],
+    error: OAuthPermissionGrantError,
+    *,
+    retry_command: str,
+    connection_id: str | None = None,
+    existing_connection_preserved: bool,
+    existing_effective_access: str,
+    existing_permanent_delete: bool,
+) -> dict[str, object]:
+    status = (
+        "oauth_permissions_missing"
+        if error.reason == "missing_selected_permissions"
+        else "oauth_permissions_outside_selected_tier"
+    )
+    result: dict[str, object] = {
+        "access": existing_effective_access,
+        "connector": profile.name,
+        "existing_connection_preserved": existing_connection_preserved,
+        "effective_access": existing_effective_access,
+        "existing_permanent_delete": existing_permanent_delete,
+        "next": retry_command,
+        "nothing_saved": True,
+        "permanent_delete": existing_permanent_delete,
+        "reason": error.reason,
+        "requested_access": access.value,
+        "requested_permanent_delete": _permanent_delete_enabled(profile, scopes),
+        "retry": retry_command,
+        "status": status,
+    }
+    if connection_id is not None:
+        result["connection_id"] = connection_id
+    _add_provider_authorization_context(
+        result,
+        profile,
+        provider_authorization=True,
+        existing_connection_preserved=existing_connection_preserved,
+    )
+    return result
+
+
+def _preserved_authority(
+    profile: ConnectorProfile,
+    connections: Sequence[ConnectionMetadata],
+) -> tuple[str, bool]:
+    if not connections:
+        return "none", False
+    effective_access = "unknown"
+    if len(connections) == 1:
+        with suppress(ValidationError):
+            effective_access = profile.access_for_scopes(connections[0].scopes).value
+    permanent_delete = any(
+        _permanent_delete_enabled(profile, connection.scopes) for connection in connections
+    )
+    return effective_access, permanent_delete
 
 
 def _credential_recovery_result(
@@ -1670,6 +2176,25 @@ def _browser_mode(value: BrowserMode | None) -> BrowserMode | None:
     return value
 
 
+def _permission_update(
+    profile: ConnectorProfile,
+    existing_scopes: tuple[str, ...],
+    access: ConnectorAccessTier,
+    *,
+    include_permanent_delete: bool,
+) -> str:
+    connector = profile.name.replace("_", " ").title()
+    existing = profile.access_for_scopes(existing_scopes).value.title()
+    tier = access.value.title()
+    authority = f"{tier} permissions" if existing == tier else f"{tier} access"
+    if include_permanent_delete:
+        authority = f"{tier} access including permanent Gmail deletion"
+    return (
+        f"Replaces your existing {connector} {existing} connection with Seld's current "
+        f"{authority}. The existing connection keeps working until this succeeds."
+    )
+
+
 def _status_command(connection_id: ConnectionId | str) -> str:
     return format_connector_command(("gsv", "connectors", "status", str(connection_id)))
 
@@ -1690,10 +2215,13 @@ def _reauthorize_command(
     *,
     alias: str | None = None,
     browser_mode: BrowserMode | None = None,
+    timeout_seconds: float | None = None,
 ) -> str:
     arguments = ["gsv", "connectors", "reauthorize", str(connection_id)]
     if alias is not None:
         arguments.append(f"--alias={alias}")
+    if timeout_seconds is not None:
+        arguments.extend(("--timeout", format(timeout_seconds, "g")))
     arguments.extend(connector_browser_options(browser_mode))
     return format_connector_command(arguments)
 

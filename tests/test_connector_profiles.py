@@ -6,9 +6,11 @@ import shlex
 import pytest
 
 import continuity_kernel.cli as cli_module
+from continuity_kernel.connector_auth import CredentialKind
 from continuity_kernel.connector_profiles import (
     CONNECTOR_PROFILES,
     ConnectorAccessTier,
+    ConnectorProfile,
     connector_connect_command,
     get_connector_profile,
     get_profile,
@@ -111,10 +113,9 @@ def test_builtin_connector_profiles_are_finite_and_expose_both_access_tiers() ->
 
 def test_access_tier_classification_preserves_legacy_read_connections() -> None:
     google = get_profile("google")
-    assert (
+    assert google.access_for_scopes(google.legacy_read_scopes[0]) is ConnectorAccessTier.READ
+    with pytest.raises(ValidationError, match="built-in access tier"):
         google.access_for_scopes(("https://www.googleapis.com/auth/gmail.readonly",))
-        is ConnectorAccessTier.READ
-    )
     assert google.access_for_scopes(google.full_scopes) is ConnectorAccessTier.FULL
     assert (
         google.access_for_scopes(google.scopes_for("full", include_supplemental=True))
@@ -127,6 +128,41 @@ def test_access_tier_classification_preserves_legacy_read_connections() -> None:
         slack.access_for_scopes(("channels:history",))
     with pytest.raises(ValidationError, match="built-in access tier"):
         slack.access_for_scopes((*slack.read_scopes, "admin"))
+
+    for profile in (*CONNECTOR_PROFILES.values(), google, get_profile("microsoft"), slack):
+        for bundle in (*profile.legacy_read_scopes, *profile.legacy_full_scopes):
+            assert set(bundle) <= profile.allowed_scopes
+
+
+def test_scope_classification_rejects_undeclared_read_subsets() -> None:
+    gmail = get_connector_profile("gmail")
+    calendar = get_connector_profile("google_calendar")
+
+    for profile, scopes in (
+        (gmail, ("openid",)),
+        (gmail, ("openid", "email")),
+        (calendar, ("https://www.googleapis.com/auth/calendar.events.readonly",)),
+        (calendar, ("https://www.googleapis.com/auth/calendar.freebusy",)),
+    ):
+        with pytest.raises(ValidationError, match="built-in access tier"):
+            profile.access_for_scopes(scopes)
+
+
+def test_declared_legacy_full_bundle_and_optional_supplemental_are_supported() -> None:
+    profile = ConnectorProfile(
+        name="synthetic",
+        provider="synthetic",
+        source_ids=("synthetic",),
+        credential_kind=CredentialKind.OAUTH2,
+        read_scopes=("read.current",),
+        full_scopes=("full.current",),
+        supplemental_scopes=("purge.current",),
+        legacy_full_scopes=(("full.legacy",),),
+    )
+
+    assert profile.access_for_scopes(("full.legacy",)) is ConnectorAccessTier.FULL
+    assert profile.access_for_scopes(("full.legacy", "purge.current")) is ConnectorAccessTier.FULL
+    assert {"full.legacy", "purge.current"} <= profile.allowed_scopes
 
 
 def test_supplemental_grant_is_only_available_on_supported_full_profiles() -> None:
@@ -160,12 +196,18 @@ def test_connector_connect_command_carries_explicit_browser_and_quotes_alias() -
         gmail.scopes_for("read"),
         alias=alias,
         browser_mode="manual",
+        timeout_seconds=42.5,
     )
 
     if os.name == "nt":
         assert "'--alias=Finance; $(touch /tmp/should-not-run) ''quoted'''" in command
     else:
-        assert shlex.split(command)[-2:] == [f"--alias={alias}", "--no-browser"]
+        assert shlex.split(command)[-4:] == [
+            f"--alias={alias}",
+            "--timeout",
+            "42.5",
+            "--no-browser",
+        ]
     assert command.endswith("--no-browser")
 
 
