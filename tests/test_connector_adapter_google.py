@@ -27,6 +27,8 @@ from continuity_kernel.connector_transport import (
     ConnectorCredential,
     ConnectorMethod,
     ConnectorOrigin,
+    ConnectorOutcomeUnknown,
+    ConnectorProviderError,
     ConnectorResponse,
     ConnectorStreamResponse,
     ConnectorTransport,
@@ -107,6 +109,53 @@ class _Transport(ConnectorTransport):
         )
 
 
+class _DriveRecoveryTransport(ConnectorTransport):
+    def __init__(
+        self,
+        *,
+        stream_outcomes: Sequence[ConnectorStreamResponse | Exception],
+        probe_outcomes: Sequence[ConnectorStreamResponse | Exception] = (),
+    ) -> None:
+        self.stream_outcomes = list(stream_outcomes)
+        self.probe_outcomes = list(probe_outcomes)
+        self.calls: list[dict[str, Any]] = []
+        self.sessions = 0
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.sessions += 1
+        self.calls.append({"kind": "request", **kwargs})
+        return ConnectorResponse(
+            kwargs["origin"],
+            200,
+            {"location": f"https://www.googleapis.com/upload/session/{self.sessions}"},
+            b"{}",
+        )
+
+    def request_stream(self, **kwargs: Any) -> ConnectorStreamResponse:
+        source = kwargs["source"]
+        if isinstance(source, PreparedUpload):
+            body = b"".join(
+                source.iter_chunks(
+                    offset=kwargs.get("byte_offset", 0),
+                    length=kwargs["content_length"],
+                )
+            )
+        else:
+            body = b"".join(source)
+        self.calls.append({"kind": "stream", "sent_body": body, **kwargs})
+        outcome = self.stream_outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def probe_resumable_upload(self, **kwargs: Any) -> ConnectorStreamResponse:
+        self.calls.append({"kind": "probe", **kwargs})
+        outcome = self.probe_outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 def _credential() -> ConnectorRuntimeCredential:
     return ConnectorRuntimeCredential(
         credential=ConnectorCredential(AuthorizationScheme.BEARER, "test-secret"),
@@ -129,8 +178,10 @@ def _event_time() -> dict[str, str]:
     return {"date_time": "2026-08-01T09:00:00+02:00", "time_zone": "Europe/Brussels"}
 
 
-def _prepared_upload(tmp_path: Path) -> PreparedUpload:
-    content = b"streamed Google Drive content"
+def _prepared_upload(
+    tmp_path: Path,
+    content: bytes = b"streamed Google Drive content",
+) -> PreparedUpload:
     path = tmp_path / "private-source.bin"
     path.write_bytes(content)
     descriptor = os.open(path, os.O_RDONLY)
@@ -140,6 +191,23 @@ def _prepared_upload(tmp_path: Path) -> PreparedUpload:
         size=len(content),
         sha256=hashlib.sha256(content).hexdigest(),
         descriptor=descriptor,
+    )
+
+
+def _drive_stream_response(
+    status: int,
+    *,
+    next_offset: int | None = None,
+    body: bytes = b"",
+) -> ConnectorStreamResponse:
+    return ConnectorStreamResponse(
+        ConnectorOrigin.GOOGLE,
+        status,
+        {},
+        0,
+        None,
+        next_offset=next_offset,
+        control_body=body,
     )
 
 
@@ -1009,9 +1077,15 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
     initiated, sent = transport.calls[-2:]
     assert initiated["path"] == "/upload/drive/v3/files"
     assert initiated["query"] == (("uploadType", "resumable"),)
-    assert sent["kind"] == "provider_location"
+    assert initiated["headers"] == {
+        "X-Upload-Content-Length": "5",
+        "X-Upload-Content-Type": "text/plain",
+    }
+    assert sent["kind"] == "stream"
     assert sent["location"] == "https://www.googleapis.com/upload/session/one"
-    assert sent["body"] == b"hello"
+    assert b"".join(sent["source"]) == b"hello"
+    assert sent["content_length"] == 5
+    assert sent["total_length"] == 5
     assert sent["credential"] is None
 
 
@@ -1075,15 +1149,367 @@ def test_drive_local_file_upload_uses_the_prepared_snapshot_and_fixed_routes(
         assert initiated["method"] is method
         assert initiated["path"] == path
         assert initiated["query"] == (("uploadType", "resumable"),)
+        assert initiated["headers"] == {
+            "X-Upload-Content-Length": str(upload.size),
+            "X-Upload-Content-Type": "application/octet-stream",
+        }
         assert sent["kind"] == "stream"
         assert sent["source"] is upload
         assert sent["location"] == "https://www.googleapis.com/upload/session/one"
         assert sent["credential"] is None
         assert sent["content_length"] == upload.size
         assert sent["content_type"] == "application/octet-stream"
+        assert sent["byte_offset"] == 0
+        assert sent["total_length"] == upload.size
         assert "body" not in sent
         assert "headers" not in sent
         assert "relative_path" not in repr(sent)
+
+
+def test_drive_resumable_upload_resends_only_the_unacknowledged_prepared_suffix(
+    tmp_path: Path,
+) -> None:
+    upload = _prepared_upload(tmp_path)
+    split = 8
+    transport = _DriveRecoveryTransport(
+        stream_outcomes=(
+            _drive_stream_response(308, next_offset=split),
+            _drive_stream_response(200, body=b'{"id":"file-1"}'),
+        )
+    )
+    try:
+        result = GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.create"),
+            {
+                "local_file": {"grant_id": "grant", "relative_path": "note.txt"},
+                "mime_type": "application/octet-stream",
+                "name": "note.txt",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-upload",
+            transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+        )
+    finally:
+        upload.close()
+
+    initiated, first, second = transport.calls
+    assert result.payload == {"id": "file-1"}
+    assert initiated["headers"] == {
+        "X-Upload-Content-Length": str(upload.size),
+        "X-Upload-Content-Type": "application/octet-stream",
+    }
+    assert first["source"] is upload
+    assert second["source"] is upload
+    assert first["sent_body"] == b"streamed Google Drive content"
+    assert second["sent_body"] == b"streamed Google Drive content"[split:]
+    assert first["byte_offset"] == 0
+    assert second["byte_offset"] == split
+    assert first["content_length"] == upload.size
+    assert second["content_length"] == upload.size - split
+    assert first["total_length"] == upload.size
+    assert second["total_length"] == upload.size
+    assert first["credential"] is None
+    assert second["credential"] is None
+
+
+def test_drive_resumable_upload_resolves_ambiguous_completion_without_resending() -> None:
+    transport = _DriveRecoveryTransport(
+        stream_outcomes=(ConnectorOutcomeUnknown("ambiguous final dispatch"),),
+        probe_outcomes=(_drive_stream_response(200, body=b'{"id":"file-1"}'),),
+    )
+
+    result = GoogleConnectorAdapter().execute(
+        _operation("google_drive", "files.create"),
+        {"content_base64": "aGVsbG8=", "mime_type": "text/plain", "name": "note.txt"},
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        write_idempotency_key="confirmed-upload",
+    )
+
+    assert result.payload == {"id": "file-1"}
+    assert [call["kind"] for call in transport.calls] == ["request", "stream", "probe"]
+    assert transport.calls[-1]["total_length"] == 5
+
+
+def test_drive_resumable_upload_probes_after_server_failure() -> None:
+    transport = _DriveRecoveryTransport(
+        stream_outcomes=(ConnectorProviderError(origin=ConnectorOrigin.GOOGLE, status=500),),
+        probe_outcomes=(_drive_stream_response(200, body=b'{"id":"file-1"}'),),
+    )
+
+    result = GoogleConnectorAdapter().execute(
+        _operation("google_drive", "files.create"),
+        {"content_base64": "aGVsbG8=", "mime_type": "text/plain", "name": "note.txt"},
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        write_idempotency_key="confirmed-upload",
+    )
+
+    assert result.payload == {"id": "file-1"}
+    assert [call["kind"] for call in transport.calls] == ["request", "stream", "probe"]
+
+
+def test_drive_resumable_upload_keeps_malformed_probe_failures_outcome_unknown() -> None:
+    transport = _DriveRecoveryTransport(
+        stream_outcomes=(ConnectorOutcomeUnknown("ambiguous final dispatch"),),
+        probe_outcomes=(ValidationError("provider response contains a duplicate safety header"),),
+    )
+
+    with pytest.raises(ConnectorOutcomeUnknown, match="status could not be resolved"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.create"),
+            {"content_base64": "aGVsbG8=", "mime_type": "text/plain", "name": "note.txt"},
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-upload",
+        )
+
+    assert [call["kind"] for call in transport.calls] == ["request", "stream", "probe"]
+    assert transport.sessions == 1
+
+
+def test_drive_resumable_upload_does_not_probe_after_definite_client_error() -> None:
+    error = ConnectorProviderError(origin=ConnectorOrigin.GOOGLE, status=400)
+    transport = _DriveRecoveryTransport(stream_outcomes=(error,))
+
+    with pytest.raises(ConnectorProviderError) as raised:
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.create"),
+            {"content_base64": "aGVsbG8=", "mime_type": "text/plain", "name": "note.txt"},
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-upload",
+        )
+
+    assert raised.value is error
+    assert [call["kind"] for call in transport.calls] == ["request", "stream"]
+
+
+def test_drive_resumable_upload_never_restarts_after_ambiguous_session_loss() -> None:
+    transport = _DriveRecoveryTransport(
+        stream_outcomes=(ConnectorOutcomeUnknown("ambiguous final dispatch"),),
+        probe_outcomes=(_drive_stream_response(404),),
+    )
+
+    with pytest.raises(ConnectorOutcomeUnknown, match="was not restarted"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.create"),
+            {
+                "content_base64": "aGVsbG8=",
+                "mime_type": "text/plain",
+                "name": "note.txt",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-upload",
+        )
+
+    assert [call["kind"] for call in transport.calls] == ["request", "stream", "probe"]
+    assert transport.sessions == 1
+
+
+def test_drive_resumable_upload_preserves_ambiguity_after_full_acknowledgement() -> None:
+    transport = _DriveRecoveryTransport(
+        stream_outcomes=(_drive_stream_response(308, next_offset=5),),
+        probe_outcomes=(_drive_stream_response(404),),
+    )
+
+    with pytest.raises(ConnectorOutcomeUnknown, match="was not restarted"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.create"),
+            {
+                "content_base64": "aGVsbG8=",
+                "mime_type": "text/plain",
+                "name": "note.txt",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-upload",
+        )
+
+    assert [call["kind"] for call in transport.calls] == ["request", "stream", "probe"]
+    assert transport.sessions == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "match"),
+    (
+        (
+            ConnectorProviderError(origin=ConnectorOrigin.GOOGLE, status=202),
+            "unsupported success status",
+        ),
+        (_drive_stream_response(200, body=b"not-json"), "result could not be decoded"),
+        (_drive_stream_response(200), "result could not be decoded"),
+    ),
+)
+def test_drive_resumable_upload_never_replays_uncertain_success_response(
+    outcome: ConnectorStreamResponse | Exception,
+    match: str,
+) -> None:
+    transport = _DriveRecoveryTransport(stream_outcomes=(outcome,))
+
+    with pytest.raises(ConnectorOutcomeUnknown, match=match):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.create"),
+            {"content_base64": "aGVsbG8=", "mime_type": "text/plain", "name": "note.txt"},
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-upload",
+        )
+
+    assert [call["kind"] for call in transport.calls] == ["request", "stream"]
+    assert transport.sessions == 1
+
+
+def test_drive_resumable_upload_restarts_one_cleanly_expired_session_only(
+    tmp_path: Path,
+) -> None:
+    upload = _prepared_upload(tmp_path)
+    expired = ConnectorProviderError(origin=ConnectorOrigin.GOOGLE, status=404)
+    transport = _DriveRecoveryTransport(stream_outcomes=(expired, expired))
+    try:
+        with pytest.raises(ConnectorOutcomeUnknown, match="expired more than once"):
+            GoogleConnectorAdapter().execute(
+                _operation("google_drive", "files.update"),
+                {
+                    "file_id": "file-1",
+                    "local_file": {"grant_id": "grant", "relative_path": "note.txt"},
+                    "mime_type": "application/octet-stream",
+                },
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+                write_idempotency_key="confirmed-upload",
+                transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+            )
+    finally:
+        upload.close()
+
+    assert [call["kind"] for call in transport.calls] == [
+        "request",
+        "stream",
+        "request",
+        "stream",
+    ]
+    assert transport.calls[1]["source"] is upload
+    assert transport.calls[3]["source"] is upload
+    assert transport.calls[1]["location"].endswith("/1")
+    assert transport.calls[3]["location"].endswith("/2")
+    assert transport.sessions == 2
+
+
+def test_drive_resumable_upload_bounds_repeated_no_progress(
+    tmp_path: Path,
+) -> None:
+    upload = _prepared_upload(tmp_path)
+    no_progress = _DriveRecoveryTransport(
+        stream_outcomes=(
+            _drive_stream_response(308, next_offset=0),
+            _drive_stream_response(308, next_offset=0),
+        )
+    )
+    try:
+        with pytest.raises(ConnectorOutcomeUnknown, match="made no progress"):
+            GoogleConnectorAdapter().execute(
+                _operation("google_drive", "files.create"),
+                {
+                    "local_file": {"grant_id": "grant", "relative_path": "note.txt"},
+                    "mime_type": "application/octet-stream",
+                    "name": "note.txt",
+                },
+                continuation=None,
+                credential=_credential(),
+                transport=no_progress,
+                write_idempotency_key="confirmed-upload",
+                transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+            )
+    finally:
+        upload.close()
+    assert [call["kind"] for call in no_progress.calls] == ["request", "stream", "stream"]
+
+
+def test_drive_inline_upload_replays_only_when_no_bytes_were_acknowledged() -> None:
+    transport = _DriveRecoveryTransport(
+        stream_outcomes=(
+            _drive_stream_response(308, next_offset=0),
+            _drive_stream_response(200, body=b'{"id":"file-1"}'),
+        )
+    )
+
+    result = GoogleConnectorAdapter().execute(
+        _operation("google_drive", "files.create"),
+        {"content_base64": "aGVsbG8=", "mime_type": "text/plain", "name": "note.txt"},
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        write_idempotency_key="confirmed-upload",
+    )
+
+    assert result.payload == {"id": "file-1"}
+    assert [call["kind"] for call in transport.calls] == ["request", "stream", "stream"]
+    assert transport.calls[1]["sent_body"] == b"hello"
+    assert transport.calls[2]["sent_body"] == b"hello"
+
+
+def test_drive_zero_byte_prepared_upload_can_retry_one_incomplete_dispatch(
+    tmp_path: Path,
+) -> None:
+    upload = _prepared_upload(tmp_path, b"")
+    transport = _DriveRecoveryTransport(
+        stream_outcomes=(
+            _drive_stream_response(308, next_offset=0),
+            _drive_stream_response(200, body=b'{"id":"file-1"}'),
+        )
+    )
+    try:
+        result = GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.create"),
+            {
+                "local_file": {"grant_id": "grant", "relative_path": "empty.bin"},
+                "mime_type": "application/octet-stream",
+                "name": "empty.bin",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-upload",
+            transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+        )
+    finally:
+        upload.close()
+
+    assert result.payload == {"id": "file-1"}
+    assert [call["kind"] for call in transport.calls] == ["request", "stream", "stream"]
+    assert transport.calls[1]["content_length"] == 0
+    assert transport.calls[1]["total_length"] is None
+    assert transport.calls[2]["content_length"] == 0
+    assert transport.calls[2]["total_length"] is None
+
+
+def test_drive_inline_upload_requires_fresh_confirmation_after_partial_recovery() -> None:
+    inline = _DriveRecoveryTransport(
+        stream_outcomes=(ConnectorOutcomeUnknown("ambiguous final dispatch"),),
+        probe_outcomes=(_drive_stream_response(308, next_offset=2),),
+    )
+    with pytest.raises(ConnectorOutcomeUnknown, match="fresh confirmation"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.create"),
+            {"content_base64": "aGVsbG8=", "mime_type": "text/plain", "name": "note.txt"},
+            continuation=None,
+            credential=_credential(),
+            transport=inline,
+            write_idempotency_key="confirmed-upload",
+        )
+    assert [call["kind"] for call in inline.calls] == ["request", "stream", "probe"]
 
 
 def test_drive_artifact_download_uses_streaming_receipt_without_path_payload(

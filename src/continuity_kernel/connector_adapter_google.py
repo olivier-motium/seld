@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.policy import SMTP
@@ -32,10 +32,13 @@ from continuity_kernel.connector_transfer import (
 from continuity_kernel.connector_transport import (
     ConnectorMethod,
     ConnectorOrigin,
+    ConnectorOutcomeUnknown,
+    ConnectorProviderError,
     ConnectorResponse,
+    ConnectorStreamResponse,
     ConnectorTransport,
 )
-from continuity_kernel.errors import ValidationError
+from continuity_kernel.errors import ContinuityError, ValidationError
 
 _GOOGLE_PROVIDERS: Final = frozenset({"gmail", "google_calendar", "google_drive"})
 _GOOGLE_BY_KEY: Final = {operation.key: operation for operation in GOOGLE_OPERATIONS}
@@ -48,6 +51,12 @@ _GMAIL_LOCAL_UPLOAD_OPERATIONS: Final = frozenset({"drafts.create", "drafts.upda
 _DRIVE_LOCAL_UPLOAD_OPERATIONS: Final = frozenset({"files.create", "files.update"})
 _GMAIL_MAX_RAW_ATTACHMENT_BYTES: Final = (GMAIL_UPLOAD_MAX_BYTES * 3) // 4
 _DRIVE_MAX_LOCAL_FILE_BYTES: Final = 5 * 1024**4
+_DRIVE_RESUMABLE_INIT_STATUSES: Final = frozenset({200})
+_DRIVE_RESUMABLE_FINAL_STATUSES: Final = frozenset({200, 201})
+_DRIVE_RESUMABLE_STREAM_STATUSES: Final = _DRIVE_RESUMABLE_FINAL_STATUSES | frozenset({308})
+_DRIVE_RESUMABLE_MAX_ATTEMPTS: Final = 8
+_DRIVE_RESUMABLE_MAX_NO_PROGRESS: Final = 2
+_DRIVE_RESUMABLE_MAX_RESTARTS: Final = 1
 _CONTENT_RANGE: Final = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
 _MESSAGE_ID: Final = re.compile(r"^<[^<>\s]+@[^<>\s]+>$")
 _MESSAGE_ID_REFERENCE: Final = re.compile(r"<[^<>\s]+@[^<>\s]+>")
@@ -1267,40 +1276,180 @@ def _drive_resumable_upload(
 ) -> ConnectorAdapterResult:
     if (content_base64 is None) == (upload is None):
         raise ValidationError("Google Drive upload requires exactly one binary source")
-    initiated = transport.request(
-        origin=ConnectorOrigin.GOOGLE,
-        method=method,
-        path=path,
-        credential=credential.credential,
-        query=query,
-        json_body=metadata,
-        expected_statuses=_JSON_STATUSES,
+    inline_content = None if content_base64 is None else _decode_base64(content_base64)
+    total_length = upload.size if upload is not None else len(cast(bytes, inline_content))
+    media_type = (
+        _mime_type(upload.media_type or mime_type) if upload is not None else _mime_type(mime_type)
     )
-    location = _response_location(initiated.headers)
-    if upload is not None:
-        streamed = transport.request_stream(
+
+    def initiate() -> str:
+        initiated = transport.request(
             origin=ConnectorOrigin.GOOGLE,
-            method=ConnectorMethod.PUT,
-            source=upload,
-            content_length=upload.size,
-            location=location,
-            credential=None,
-            content_type=_mime_type(upload.media_type or mime_type),
-            expected_statuses=_JSON_STATUSES,
+            method=method,
+            path=path,
+            credential=credential.credential,
+            query=query,
+            json_body=metadata,
+            headers={
+                "X-Upload-Content-Length": str(total_length),
+                "X-Upload-Content-Type": media_type,
+            },
+            expected_statuses=_DRIVE_RESUMABLE_INIT_STATUSES,
         )
-        return _json_result(streamed.json(), strip_upload_location=True)
-    else:
-        assert content_base64 is not None
-        uploaded = transport.request_provider_location(
+        return _response_location(initiated.headers)
+
+    location = initiate()
+    offset = 0
+    attempts = 0
+    no_progress = 0
+    restarts = 0
+    unresolved_final_dispatch = False
+    while True:
+        attempts = _drive_resumable_attempt(attempts)
+        try:
+            if upload is not None:
+                response = transport.request_stream(
+                    origin=ConnectorOrigin.GOOGLE,
+                    method=ConnectorMethod.PUT,
+                    source=upload,
+                    content_length=total_length - offset,
+                    location=location,
+                    credential=None,
+                    content_type=media_type,
+                    byte_offset=offset,
+                    total_length=None if total_length == 0 else total_length,
+                    expected_statuses=_DRIVE_RESUMABLE_STREAM_STATUSES,
+                )
+            else:
+                assert inline_content is not None
+                response = transport.request_stream(
+                    origin=ConnectorOrigin.GOOGLE,
+                    method=ConnectorMethod.PUT,
+                    source=(inline_content,),
+                    content_length=total_length,
+                    location=location,
+                    credential=None,
+                    content_type=media_type,
+                    total_length=None if total_length == 0 else total_length,
+                    expected_statuses=_DRIVE_RESUMABLE_STREAM_STATUSES,
+                )
+            unresolved_final_dispatch = False
+        except ConnectorProviderError as exc:
+            if exc.status == 404:
+                location, restarts = _drive_resumable_restart(
+                    initiate,
+                    restarts=restarts,
+                    unresolved_final_dispatch=unresolved_final_dispatch,
+                )
+                offset = 0
+                no_progress = 0
+                continue
+            if 200 <= exc.status < 300:
+                raise ConnectorOutcomeUnknown(
+                    "Google Drive upload returned an unsupported success status; "
+                    "upload outcome is unknown"
+                ) from exc
+            if exc.status < 500:
+                raise
+            unresolved_final_dispatch = True
+            attempts = _drive_resumable_attempt(attempts)
+            response = _drive_resumable_probe(transport, location, total_length)
+        except ConnectorOutcomeUnknown:
+            unresolved_final_dispatch = True
+            attempts = _drive_resumable_attempt(attempts)
+            response = _drive_resumable_probe(transport, location, total_length)
+
+        while True:
+            if response.status in _DRIVE_RESUMABLE_FINAL_STATUSES:
+                try:
+                    payload = response.json()
+                except ConnectorProviderError as exc:
+                    raise ConnectorOutcomeUnknown(
+                        "Google Drive upload completed but its result could not be decoded; "
+                        "the upload was not retried"
+                    ) from exc
+                if not isinstance(payload, Mapping):
+                    raise ConnectorOutcomeUnknown(
+                        "Google Drive upload completed but its result could not be decoded; "
+                        "the upload was not retried"
+                    )
+                return _json_result(payload, strip_upload_location=True)
+            if response.status == 404:
+                raise ConnectorOutcomeUnknown(
+                    "Google Drive upload session disappeared after an ambiguous final dispatch; "
+                    "the upload was not restarted"
+                )
+            if response.status != 308 or response.next_offset is None:
+                raise ConnectorOutcomeUnknown(
+                    "Google Drive resumable upload returned invalid recovery state; "
+                    "upload outcome is unknown"
+                )
+            next_offset = response.next_offset
+            if not offset <= next_offset <= total_length:
+                raise ConnectorOutcomeUnknown(
+                    "Google Drive resumable upload acknowledgement regressed; "
+                    "upload outcome is unknown"
+                )
+            if upload is None and 0 < next_offset < total_length:
+                raise ConnectorOutcomeUnknown(
+                    "Google Drive inline upload was not finalized; retry with a fresh confirmation"
+                )
+            if next_offset == offset:
+                no_progress += 1
+                if no_progress >= _DRIVE_RESUMABLE_MAX_NO_PROGRESS:
+                    raise ConnectorOutcomeUnknown(
+                        "Google Drive resumable upload made no progress within its retry bound"
+                    )
+            else:
+                offset = next_offset
+                no_progress = 0
+            if offset < total_length or total_length == 0:
+                unresolved_final_dispatch = False
+                break
+            unresolved_final_dispatch = True
+            attempts = _drive_resumable_attempt(attempts)
+            response = _drive_resumable_probe(transport, location, total_length)
+
+
+def _drive_resumable_attempt(attempts: int) -> int:
+    if attempts >= _DRIVE_RESUMABLE_MAX_ATTEMPTS:
+        raise ConnectorOutcomeUnknown(
+            "Google Drive resumable upload exceeded its bounded recovery attempts"
+        )
+    return attempts + 1
+
+
+def _drive_resumable_probe(
+    transport: ConnectorTransport,
+    location: str,
+    total_length: int,
+) -> ConnectorStreamResponse:
+    try:
+        return transport.probe_resumable_upload(
             origin=ConnectorOrigin.GOOGLE,
-            method=ConnectorMethod.PUT,
             location=location,
-            credential=None,
-            body=_decode_base64(content_base64),
-            content_type=_mime_type(mime_type),
-            expected_statuses=_JSON_STATUSES,
+            total_length=total_length,
         )
-        return _json_result(uploaded.json(), strip_upload_location=True)
+    except ContinuityError as exc:
+        raise ConnectorOutcomeUnknown(
+            "Google Drive upload status could not be resolved; upload outcome remains unknown"
+        ) from exc
+
+
+def _drive_resumable_restart(
+    initiate: Callable[[], str],
+    *,
+    restarts: int,
+    unresolved_final_dispatch: bool,
+) -> tuple[str, int]:
+    if unresolved_final_dispatch:
+        raise ConnectorOutcomeUnknown(
+            "Google Drive upload session disappeared after an ambiguous final dispatch; "
+            "the upload was not restarted"
+        )
+    if restarts >= _DRIVE_RESUMABLE_MAX_RESTARTS:
+        raise ConnectorOutcomeUnknown("Google Drive upload session expired more than once")
+    return initiate(), restarts + 1
 
 
 def _json_result(payload: object, *, strip_upload_location: bool = False) -> ConnectorAdapterResult:

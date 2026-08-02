@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock, Thread, local
+from typing import Protocol, cast
 from urllib.request import Request
 
 import pytest
@@ -65,6 +66,10 @@ from continuity_kernel.local_files import (
 from continuity_kernel.vault import Vault
 
 CONNECTION_ID = parse_connection_id("con-" + "r" * 32)
+
+
+class _BodyReader(Protocol):
+    def read(self, amount: int = -1) -> bytes: ...
 
 
 class _Adapter:
@@ -519,6 +524,7 @@ def test_drive_inline_upload_requires_bound_confirmation_and_dispatches_once(
     tmp_path: Path,
 ) -> None:
     captured: list[Request] = []
+    uploaded_bodies: list[bytes] = []
 
     def open_request(request: Request, timeout: float) -> ResponseLike:
         assert timeout == 30.0
@@ -529,6 +535,11 @@ def test_drive_inline_upload_requires_bound_confirmation_and_dispatches_once(
                 headers={"Location": "https://www.googleapis.com/upload/session/one"},
             )
         assert request.get_method() == ConnectorMethod.PUT.value
+        reader = cast(_BodyReader, request.data)
+        body = bytearray()
+        while block := reader.read(4):
+            body.extend(block)
+        uploaded_bodies.append(bytes(body))
         return _HttpResponse(b'{"id":"file-1","name":"note.txt"}')
 
     _vault, _manager, _adapter, runtime = _prepared(tmp_path)
@@ -578,9 +589,13 @@ def test_drive_inline_upload_requires_bound_confirmation_and_dispatches_once(
     assert len(captured) == 2
     assert captured[0].get_method() == ConnectorMethod.POST.value
     assert captured[0].get_header("Authorization") == "Bearer runtime-access-token"
+    assert captured[0].get_header("X-upload-content-length") == "14"
+    assert captured[0].get_header("X-upload-content-type") == "text/plain"
     assert captured[1].get_method() == ConnectorMethod.PUT.value
-    assert captured[1].data == b"reviewed bytes"
     assert captured[1].get_header("Authorization") is None
+    assert captured[1].get_header("Content-length") == "14"
+    assert captured[1].get_header("Content-range") == "bytes 0-13/14"
+    assert uploaded_bodies == [b"reviewed bytes"]
 
     with pytest.raises(ConflictError, match="already been consumed"):
         runtime.call_tool(
