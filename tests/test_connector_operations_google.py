@@ -46,7 +46,7 @@ _EXPECTED_NAMES = {
         "threads.purge",
         "labels.create",
         "labels.update",
-        "labels.delete",
+        "labels.purge",
         "settings.auto_forwarding.get",
         "settings.filters.create",
         "settings.filters.delete",
@@ -199,7 +199,7 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
         ("gmail", "threads.purge"): ConnectorEffect.PERMANENT,
         ("gmail", "labels.create"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "labels.update"): ConnectorEffect.SAFE_MUTATION,
-        ("gmail", "labels.delete"): ConnectorEffect.PERMANENT,
+        ("gmail", "labels.purge"): ConnectorEffect.PERMANENT,
         ("gmail", "settings.filters.create"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "settings.filters.delete"): ConnectorEffect.PERMANENT,
         ("gmail", "settings.imap.update"): ConnectorEffect.SAFE_MUTATION,
@@ -482,6 +482,49 @@ def test_gmail_message_and_thread_modify_accept_the_provider_label_limit() -> No
             operation.validate_input({identifier: "resource", label_field: []})
         with pytest.raises(ValidationError):
             operation.validate_input({identifier: "resource", label_field: [*label_ids, "extra"]})
+
+
+def test_gmail_label_schemas_cover_visibility_color_and_bound_purge() -> None:
+    create = _operation("gmail", ConnectorMode.WRITE, "labels.create")
+    created = create.validate_input(
+        {
+            "color": {"background_color": "#16a766", "text_color": "#ffffff"},
+            "label_list_visibility": "labelShowIfUnread",
+            "message_list_visibility": "show",
+            "name": "Projects",
+        }
+    )
+    assert isinstance(created, Mapping)
+    assert created["label_list_visibility"] == "labelShowIfUnread"
+
+    for invalid_color in (
+        {"background_color": "#16a766"},
+        {"background_color": "#16A766", "text_color": "#ffffff"},
+        {"background_color": "#16a766", "text_color": "#ffffff", "alpha": 1},
+    ):
+        with pytest.raises(ValidationError):
+            create.validate_input({"color": invalid_color, "name": "Projects"})
+
+    purge = _operation("gmail", ConnectorMode.WRITE, "labels.purge")
+    assert purge.required_scopes == (
+        frozenset({"https://www.googleapis.com/auth/gmail.modify"}),
+        frozenset({"https://mail.google.com/"}),
+    )
+    purged = purge.validate_input(
+        {
+            "expected_label": {"id": "Label_7", "name": "Projects", "type": "user"},
+            "label_id": "Label_7",
+        }
+    )
+    assert isinstance(purged, Mapping)
+    assert purged["expected_label"] == {"id": "Label_7", "name": "Projects", "type": "user"}
+    with pytest.raises(ValidationError):
+        purge.validate_input(
+            {
+                "expected_label": {"id": "INBOX", "name": "INBOX", "type": "system"},
+                "label_id": "INBOX",
+            }
+        )
 
 
 def test_gmail_send_requires_at_least_one_nonempty_recipient_group() -> None:

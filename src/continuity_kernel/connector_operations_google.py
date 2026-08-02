@@ -276,6 +276,45 @@ def _gmail_filter_snapshot() -> dict[str, object]:
     )
 
 
+def _gmail_label_color() -> dict[str, object]:
+    color = {
+        "maxLength": 7,
+        "minLength": 7,
+        "pattern": "^#[0-9a-f]{6}$",
+        "type": "string",
+    }
+    return _object(
+        {
+            "background_color": color,
+            "text_color": color,
+        },
+        required=("background_color", "text_color"),
+    )
+
+
+def _gmail_label_fields() -> dict[str, object]:
+    return {
+        "color": _gmail_label_color(),
+        "label_list_visibility": {
+            "enum": ["labelHide", "labelShow", "labelShowIfUnread"],
+            "type": "string",
+        },
+        "message_list_visibility": {"enum": ["hide", "show"], "type": "string"},
+        "name": _text(225),
+    }
+
+
+def _gmail_label_snapshot() -> dict[str, object]:
+    return _object(
+        {
+            "id": _id(),
+            "name": _text(225),
+            "type": {"const": "user", "type": "string"},
+        },
+        required=("id", "name", "type"),
+    )
+
+
 def _gmail_imap_update() -> dict[str, object]:
     return _object(
         {
@@ -1540,14 +1579,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "labels.create",
         ConnectorEffect.SAFE_MUTATION,
         _GMAIL_WRITE_SCOPES,
-        _object(
-            {
-                "label_list_visibility": {"enum": ["labelHide", "labelShow"], "type": "string"},
-                "message_list_visibility": {"enum": ["hide", "show"], "type": "string"},
-                "name": _text(225),
-            },
-            required=("name",),
-        ),
+        _object(_gmail_label_fields(), required=("name",)),
     ),
     _operation(
         "gmail",
@@ -1558,9 +1590,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _object(
             {
                 "label_id": _id(),
-                "label_list_visibility": {"enum": ["labelHide", "labelShow"], "type": "string"},
-                "message_list_visibility": {"enum": ["hide", "show"], "type": "string"},
-                "name": _text(225),
+                **_gmail_label_fields(),
             },
             required=("label_id",),
         ),
@@ -1568,10 +1598,16 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
     _operation(
         "gmail",
         ConnectorMode.WRITE,
-        "labels.delete",
+        "labels.purge",
         ConnectorEffect.PERMANENT,
         _GMAIL_WRITE_SCOPES,
-        _object({"label_id": _id()}, required=("label_id",)),
+        _object(
+            {
+                "expected_label": _gmail_label_snapshot(),
+                "label_id": _id(),
+            },
+            required=("expected_label", "label_id"),
+        ),
     ),
     _operation(
         "gmail",

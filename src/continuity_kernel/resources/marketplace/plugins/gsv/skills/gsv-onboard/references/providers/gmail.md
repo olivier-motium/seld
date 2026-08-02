@@ -64,6 +64,17 @@ permanent and confirmed.
 Trash, restore, and ordinary label moves remain one-step recoverable operations,
 including batches of up to 1,000 messages. `messages.purge`, `threads.purge`,
 and `messages.batch_purge` are permanent and require a bound confirmation.
+User-label creation and updates include the full label visibility states and a
+provider-validated text/background color pair. To remove a label from ordinary
+views without destroying it, use `labels.update` with
+`label_list_visibility=labelHide` and `message_list_visibility=hide`.
+`labels.purge` is different: it immediately
+deletes a user label and removes that label from every message and thread, with
+no provider undo. Read the label first and pass its exact `id`, `name`, and
+`type` as `expected_label`; Seld reads it again and refuses a changed or system
+label before DELETE. Gmail labels have no ETag, so a change after Seld's final
+read cannot be detected. Label purge uses ordinary Gmail Full access and does
+not require `--with-permanent-delete`.
 Before deleting a filter, read it with `settings.filters.get`, then pass the
 returned `id`, `criteria`, and `action` as `expected_filter`. The confirmation
 shows that complete reviewed rule, and Seld reads it again before deletion so a

@@ -94,6 +94,14 @@ _LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
 _OPERATION_WARNINGS: Final = {
     (
         "gmail",
+        "labels.purge",
+    ): (
+        "Gmail immediately deletes this user label and removes its assignments from every "
+        "message and thread; Gmail provides no undo. Label purge uses ordinary Gmail Full "
+        "access, not the separate mailbox-wide permanent-delete permission."
+    ),
+    (
+        "gmail",
         "settings.filters.create",
     ): "This rule will apply automatically to future matching messages.",
     (

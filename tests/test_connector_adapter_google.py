@@ -468,7 +468,14 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
             return {"draft_id": "draft"}
         if name == "labels.create":
             return {"name": "Projects"}
-        if name in {"labels.get", "labels.update", "labels.delete"}:
+        if name == "labels.update":
+            return {"label_id": "label", "name": "Renamed"}
+        if name == "labels.purge":
+            return {
+                "expected_label": {"id": "label", "name": "Projects", "type": "user"},
+                "label_id": "label",
+            }
+        if name == "labels.get":
             return {"label_id": "label"}
         if name == "settings.filters.get":
             return {"filter_id": "filter"}
@@ -746,6 +753,12 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests(tmp_pat
                 )
                 expected_requests = 2
             if operation.provider == "gmail" and operation.name in {
+                "labels.update",
+                "labels.purge",
+            }:
+                transport.body = b'{"id":"label","name":"Projects","type":"user"}'
+                expected_requests = 2
+            if operation.provider == "gmail" and operation.name in {
                 "messages.import",
                 "messages.insert",
             }:
@@ -989,6 +1002,125 @@ def test_gmail_core_read_routes_and_history_continuation_are_provider_native() -
         transport=transport,
     )
     assert ("pageToken", "next-history-page") in transport.calls[-1]["query"]
+
+
+def test_gmail_label_mutations_use_user_preflight_and_provider_shaped_color() -> None:
+    adapter = GoogleConnectorAdapter()
+    credential = _credential()
+
+    created = _Transport()
+    adapter.execute(
+        _operation("gmail", "labels.create"),
+        {
+            "color": {"background_color": "#16a766", "text_color": "#ffffff"},
+            "label_list_visibility": "labelShowIfUnread",
+            "message_list_visibility": "show",
+            "name": "Projects",
+        },
+        continuation=None,
+        credential=credential,
+        transport=created,
+    )
+    assert created.calls[0]["json_body"] == {
+        "color": {"backgroundColor": "#16a766", "textColor": "#ffffff"},
+        "labelListVisibility": "labelShowIfUnread",
+        "messageListVisibility": "show",
+        "name": "Projects",
+    }
+
+    empty = _Transport()
+    with pytest.raises(ValidationError, match="at least one changed field"):
+        adapter.execute(
+            _operation("gmail", "labels.update"),
+            {"label_id": "Label_7"},
+            continuation=None,
+            credential=credential,
+            transport=empty,
+        )
+    assert empty.calls == []
+
+    system = _Transport(body=b'{"id":"INBOX","name":"INBOX","type":"system"}')
+    with pytest.raises(ValidationError, match="system labels"):
+        adapter.execute(
+            _operation("gmail", "labels.update"),
+            {"label_id": "INBOX", "name": "Not allowed"},
+            continuation=None,
+            credential=credential,
+            transport=system,
+        )
+    assert len(system.calls) == 1
+
+    updated = _Transport(
+        bodies=(
+            b'{"id":"Label_7","name":"Projects","type":"user"}',
+            b'{"id":"Label_7","name":"Projects 2026","type":"user"}',
+        )
+    )
+    adapter.execute(
+        _operation("gmail", "labels.update"),
+        {
+            "color": {"background_color": "#16a766", "text_color": "#ffffff"},
+            "label_id": "Label_7",
+            "name": "Projects 2026",
+        },
+        continuation=None,
+        credential=credential,
+        transport=updated,
+    )
+    preflight, mutation = updated.calls
+    assert preflight["method"] is ConnectorMethod.GET
+    assert preflight["path"] == "/gmail/v1/users/me/labels/Label_7"
+    assert preflight["query"] == (("fields", "id,name,type"),)
+    assert mutation["method"] is ConnectorMethod.PATCH
+    assert mutation["json_body"] == {
+        "color": {"backgroundColor": "#16a766", "textColor": "#ffffff"},
+        "name": "Projects 2026",
+    }
+
+
+def test_gmail_label_purge_is_snapshot_bound_and_refuses_drift_before_delete() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("gmail", "labels.purge")
+    credential = _credential()
+    values = {
+        "expected_label": {"id": "Label_7", "name": "Projects", "type": "user"},
+        "label_id": "Label_7",
+    }
+
+    changed = _Transport(body=b'{"id":"Label_7","name":"Renamed","type":"user"}')
+    with pytest.raises(ConflictError, match="read it again"):
+        adapter.classify_effect(
+            operation,
+            values,
+            credential=credential,
+            transport=changed,
+        )
+    assert len(changed.calls) == 1
+    assert all(call["method"] is not ConnectorMethod.DELETE for call in changed.calls)
+
+    mismatched = _Transport()
+    with pytest.raises(ValidationError, match="does not match"):
+        adapter.execute(
+            operation,
+            {**values, "label_id": "Label_8"},
+            continuation=None,
+            credential=credential,
+            transport=mismatched,
+        )
+    assert mismatched.calls == []
+
+    purged = _Transport(bodies=(b'{"id":"Label_7","name":"Projects","type":"user"}', b"{}"))
+    adapter.execute(
+        operation,
+        values,
+        continuation=None,
+        credential=credential,
+        transport=purged,
+    )
+    preflight, mutation = purged.calls
+    assert preflight["method"] is ConnectorMethod.GET
+    assert mutation["method"] is ConnectorMethod.DELETE
+    assert mutation["path"] == "/gmail/v1/users/me/labels/Label_7"
 
 
 def test_gmail_get_repeats_metadata_headers_and_draft_list_never_sends_label_ids() -> None:

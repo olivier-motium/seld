@@ -351,6 +351,16 @@ class GoogleConnectorAdapter:
             return ConnectorEffect.OUTWARD
         if operation.provider == "gmail" and operation.name == "settings.filters.create":
             return _gmail_filter_effect(values)
+        if operation.provider == "gmail" and operation.name == "labels.update":
+            _gmail_label_body(values, require_change=True)
+            return operation.effect
+        if operation.provider == "gmail" and operation.name == "labels.purge":
+            if credential is None or transport is None:
+                raise ValidationError(
+                    "Gmail label purge preflight requires credential and transport"
+                )
+            _gmail_label_purge_snapshot(values, credential, transport)
+            return operation.effect
         if operation.provider == "gmail" and operation.name == "settings.filters.delete":
             if credential is None or transport is None:
                 raise ValidationError(
@@ -994,34 +1004,23 @@ def _execute_gmail(
             method=ConnectorMethod.POST,
             path=f"{base}/labels",
             credential=credential,
-            json_body=_selected(
-                values,
-                {
-                    "label_list_visibility": "labelListVisibility",
-                    "message_list_visibility": "messageListVisibility",
-                    "name": "name",
-                },
-            ),
+            json_body=_gmail_label_body(values, require_change=False),
             expected_statuses=_JSON_STATUSES,
         )
     if name == "labels.update":
+        body = _gmail_label_body(values, require_change=True)
+        _gmail_user_label(values, credential, transport, context="Gmail label update preflight")
         return _json_request(
             transport,
             origin=ConnectorOrigin.GMAIL,
             method=ConnectorMethod.PATCH,
             path=f"{base}/labels/{_segment(_required(values, 'label_id'))}",
             credential=credential,
-            json_body=_selected(
-                values,
-                {
-                    "label_list_visibility": "labelListVisibility",
-                    "message_list_visibility": "messageListVisibility",
-                    "name": "name",
-                },
-            ),
+            json_body=body,
             expected_statuses=_JSON_STATUSES,
         )
-    if name == "labels.delete":
+    if name == "labels.purge":
+        _gmail_label_purge_snapshot(values, credential, transport)
         return _json_request(
             transport,
             origin=ConnectorOrigin.GMAIL,
@@ -1192,6 +1191,94 @@ def _gmail_filter_effect(values: Mapping[str, object]) -> ConnectorEffect:
     if "forward" in action:
         return ConnectorEffect.OUTWARD
     return ConnectorEffect.SAFE_MUTATION
+
+
+def _gmail_label_body(values: Mapping[str, object], *, require_change: bool) -> dict[str, object]:
+    body = _selected(
+        values,
+        {
+            "label_list_visibility": "labelListVisibility",
+            "message_list_visibility": "messageListVisibility",
+            "name": "name",
+        },
+    )
+    if "color" in values:
+        body["color"] = _selected(
+            _mapping(values["color"]),
+            {
+                "background_color": "backgroundColor",
+                "text_color": "textColor",
+            },
+        )
+    if require_change and not body:
+        raise ValidationError("Gmail label update requires at least one changed field")
+    return body
+
+
+def _gmail_user_label(
+    values: Mapping[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+    *,
+    context: str,
+) -> dict[str, str]:
+    label_id = _required(values, "label_id")
+    current = _gmail_label_snapshot_resource(
+        _provider_mapping(
+            _json_request(
+                transport,
+                origin=ConnectorOrigin.GMAIL,
+                method=ConnectorMethod.GET,
+                path=f"{_GMAIL_USERS_ME_BASE}/labels/{_segment(label_id)}",
+                credential=credential,
+                query=(("fields", "id,name,type"),),
+            ),
+            context=context,
+        ),
+        context=context,
+    )
+    if current["id"] != label_id:
+        raise ValidationError(f"{context} returned a different label")
+    if current["type"] != "user":
+        raise ValidationError("Gmail system labels cannot be changed or purged")
+    return current
+
+
+def _gmail_label_purge_snapshot(
+    values: Mapping[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> None:
+    label_id = _required(values, "label_id")
+    expected = _gmail_label_snapshot_resource(
+        values.get("expected_label"),
+        context="Gmail expected label",
+    )
+    if expected["id"] != label_id:
+        raise ValidationError("Gmail expected label ID does not match the purge target")
+    if expected["type"] != "user":
+        raise ValidationError("Gmail system labels cannot be changed or purged")
+    current = _gmail_user_label(
+        values,
+        credential,
+        transport,
+        context="Gmail label purge preflight",
+    )
+    if current != expected:
+        raise ConflictError("Gmail label changed; read it again before purging it")
+
+
+def _gmail_label_snapshot_resource(value: object, *, context: str) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise ValidationError(f"{context} is invalid")
+    label_type = _provider_text(value, "type", context=context)
+    if label_type not in {"system", "user"}:
+        raise ValidationError(f"{context} has an invalid label type")
+    return {
+        "id": _provider_text(value, "id", context=context),
+        "name": _provider_text(value, "name", context=context),
+        "type": label_type,
+    }
 
 
 def _gmail_filter_delete_snapshot(

@@ -31,6 +31,9 @@ decision loop.
 - Manage Gmail-generated Calendar events through their existing read, bounded
   update, RSVP, and delete paths while refusing provider-owned create and move
   operations.
+- Complete Gmail user-label lifecycle control with every visibility state,
+  provider-owned color validation, system-label refusal, reversible hiding,
+  and snapshot-bound permanent purge.
 - Remove unused deterministic onboarding, Pulse-controller,
   scheduler-planning, and migration modules. The shipped skills own semantic
   orchestration; legacy backup marker recognition remains for safe restore.

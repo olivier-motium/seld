@@ -147,6 +147,21 @@ class _GmailFilterDeleteTransport(ConnectorTransport):
         return ConnectorResponse(kwargs["origin"], 200, {}, body)
 
 
+class _GmailLabelPurgeTransport(ConnectorTransport):
+    def __init__(self, label_resources: tuple[dict[str, object], ...]) -> None:
+        self.label_resources = list(label_resources)
+        self.requests: list[dict[str, Any]] = []
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.requests.append(kwargs)
+        body = b"{}"
+        if kwargs["method"] is ConnectorMethod.GET:
+            if not self.label_resources:
+                raise AssertionError("unexpected Gmail label preflight")
+            body = json.dumps(self.label_resources.pop(0)).encode()
+        return ConnectorResponse(kwargs["origin"], 200, {}, body)
+
+
 class _AmbiguousGmailSendTransport(_GmailModifyTransport):
     def request(self, **kwargs: Any) -> ConnectorResponse:
         self.requests.append(kwargs)
@@ -887,6 +902,92 @@ def test_gmail_filter_delete_preview_shows_and_rechecks_the_exact_rule(
         assert {request["path"] for request in transport.requests} == {
             "/gmail/v1/users/me/settings/filters/filter-1"
         }
+    finally:
+        runtime.close()
+
+
+def test_gmail_label_purge_preview_rechecks_at_execution_and_never_deletes_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    expected_label: dict[str, object] = {
+        "id": "Label_7",
+        "name": "Projects",
+        "type": "user",
+    }
+    input_value = {"expected_label": expected_label, "label_id": "Label_7"}
+    success = _GmailLabelPurgeTransport((expected_label, expected_label, expected_label))
+    runtime.transport = success
+    try:
+        preview = runtime.call_tool(
+            "gsv_gmail_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "labels.purge",
+            },
+        )
+        assert preview["status"] == "confirmation_required"
+        assert preview["effect"] == ConnectorEffect.PERMANENT.value
+        assert preview["preview"] == input_value
+        warning = str(preview["warning"])
+        for phrase in (
+            "cannot be undone",
+            "every message and thread",
+            "no undo",
+            "ordinary Gmail Full",
+        ):
+            assert phrase in warning
+        assert [request["method"] for request in success.requests] == [ConnectorMethod.GET]
+
+        completed = runtime.call_tool(
+            "gsv_gmail_write",
+            {
+                "confirmation_token": preview["confirmation_token"],
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "labels.purge",
+            },
+        )
+        assert completed["status"] == "ok"
+        assert [request["method"] for request in success.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.DELETE,
+        ]
+        assert {request["path"] for request in success.requests} == {
+            "/gmail/v1/users/me/labels/Label_7"
+        }
+
+        changed_label = {**expected_label, "name": "Renamed elsewhere"}
+        raced = _GmailLabelPurgeTransport((expected_label, expected_label, changed_label))
+        runtime.transport = raced
+        raced_preview = runtime.call_tool(
+            "gsv_gmail_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "labels.purge",
+            },
+        )
+        with pytest.raises(ConflictError, match="read it again"):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {
+                    "confirmation_token": raced_preview["confirmation_token"],
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": input_value,
+                    "operation": "labels.purge",
+                },
+            )
+        assert [request["method"] for request in raced.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+        ]
+        assert all(request["method"] is not ConnectorMethod.DELETE for request in raced.requests)
     finally:
         runtime.close()
 
