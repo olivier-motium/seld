@@ -63,25 +63,27 @@ Use one setup wave:
    `gsv --vault <exact-root>` CLI against the same vault; absence from one task
    is not evidence that the Mind was uninstalled or lost. Then show one
    combined checklist for the selected ChatGPT apps, custom MCP apps, local
-   read tools, and required macOS permissions.
+   read tools, and required host-OS permissions.
 2. Let the person complete OAuth, credentials, 2FA, legal terms, administrator
    approval, and OS privacy prompts personally. A host-owned app keeps its own
    non-portable authentication. For Gmail, Google Calendar, Google Drive,
-   Outlook mail, Outlook Calendar, or Slack, prefer the guided Seld flow:
-   `gsv connectors connect <logical-source> --access read|full`. Add
-   `--browser firefox` when requested, or `--no-browser` to print the exact
-   sign-in URL. Seld opens the provider page, waits on a loopback callback,
-   verifies the returned provider identity, shows the exact account in human
-   terms, and asks `Use this account? [y/N]` before publishing anything. The
-   default is no. A Read connection remains ready until a Full upgrade for the
-   same account is verified and published. If sign-in is unavailable in the
-   installed build, report that no public client registration is bundled and
-   nothing was saved; do not fall back to an ambient browser or AI-host login.
-   Discord uses `gsv connectors connect discord --access full`; its bot token
-   is accepted only through hidden interactive input and is never a command
-   argument. The agent may explain and wait for redacted status, but it must
-   not consent, enter or reuse credentials or second factors, or change an
-   account, application, access, permission, or security setting. Never copy
+   Outlook mail, Outlook Calendar, or Slack, first run `gsv connectors
+   readiness` and `gsv connectors list`. If the exact build reports a missing
+   or invalid public registration, sign-in is unavailable and nothing is saved;
+   do not send an ordinary user to a provider developer console. Otherwise use
+   `gsv connectors connect <logical-source> --access read|full --alias
+   '<recognizable label>'`. The default browser opens the provider page; add
+   `--browser firefox` only when requested. With `--no-browser`, the person must
+   open the printed URL on the same computer while the command remains running.
+   Seld waits on a loopback callback, verifies the provider identity, shows the
+   exact account in human terms, and asks `Use this account? [y/N]` before
+   publishing. The default is no. A Read connection remains ready until a Full
+   upgrade for the same account is verified and published. Discord uses `gsv
+   connectors connect discord --access full --alias '<recognizable label>'`;
+   its bot token is accepted only through hidden interactive input and is never
+   a command argument. The agent may explain and wait for redacted status, but
+   it must not consent, enter or reuse credentials or second factors, or change
+   an account, application, access, permission, or security setting. Never copy
    or reuse a ChatGPT, OpenAI, browser, Codex, OpenCode, or Open Interpreter
    session.
 3. After the person confirms the set, call `gsv_source_select` against the exact
@@ -127,14 +129,15 @@ Never import existing message history merely to establish a baseline.
 For selected Discord, read [Discord setup](references/providers/discord.md)
 before asking the person to enable anything. Discord is bot-only: never accept,
 copy, or use a normal-user token. The person creates and authorizes the bot,
-then runs `gsv connectors connect discord --access full` and enters the token
-through hidden local input. The onboarding agent may explain those steps and
-read redacted status, but it must not consent, enter or reuse credentials,
-change account or application settings, or alter permissions. The narrow Pulse
-delivery remains a separate forward-only source with a host-private channel
-allowlist and its existing status, poll, record, and acknowledge order. The
-interactive `gsv_connectors` MCP server separately exposes Discord's typed bot
-read/write operations; it never accepts a user token or broadens Pulse.
+then runs `gsv connectors connect discord --access full --alias '<label>'` and
+enters the token through hidden local input. The onboarding agent
+may explain those steps and read redacted status, but it must not consent, enter
+or reuse credentials, change account or application settings, or alter
+permissions. The standard `gsv_connectors` MCP server exposes Discord's typed
+bot read/write operations; it never accepts a user token. This build does not
+package or recommend a Discord Pulse companion. Leave Discord unselected for
+Pulse unless an exact separate companion runtime, bot binding, and host-private
+channel allowlist have been independently audited, installed, and verified.
 
 For a selected Seld-managed Google, Microsoft, or Slack source, read its
 provider note and inspect `gsv connectors status` or `gsv_connection_list`,
@@ -142,12 +145,12 @@ which expose only redacted portable state. Each logical source has its own
 least-authority Read and Full grants; connecting Gmail does not silently grant
 Calendar or Drive, and connecting Outlook mail does not silently grant
 Calendar. Use `gsv_connector_source_read` only for the narrow, bounded Pulse
-verification described here. The separately installed `gsv_connectors` MCP
-server exposes exactly one read and one write tool per logical connector. Read
-access permits the typed read catalog. Full access adds user-content create,
-update, send/share, recoverable delete, and separately classified permanent
-delete operations. Calls still fail closed against the exact connection,
-granted scopes, provider routes, and closed input schema. Outward,
+verification described here. Standard setup registers the isolated
+`gsv_connectors` MCP server, which exposes exactly one read and one write tool
+per logical connector. Read access permits the typed read catalog. Full access
+adds user-content create, update, send/share, recoverable delete, and separately
+classified permanent delete operations. Calls still fail closed against the
+exact connection, granted scopes, provider routes, and closed input schema. Outward,
 destructive, and permanent operations return a bound preview and short-lived
 confirmation token before execution; permanent purge is a distinct operation
 and permission. A wrong identity is a setup gap, never permission to fall back
@@ -196,15 +199,20 @@ Computer Use. Seld's MCP server does not expose it, although a separately
 installed Computer Use plugin may still be visible in the ordinary ChatGPT
 task; explain that host boundary before registration.
 
-Install and verify the separate mechanical sense sweep before presenting
-autonomy as ready. It may wake on a fixed cadence and append content-free
-source-due or WorkThread-recheck evidence. It never runs semantic recall, reads
-provider bodies, or decides meaning. Optional QMD setup and refresh remain
-explicit recall operations outside this five-second mechanical path. Use the
-supported scheduler plan, install, status, and asynchronous canary surfaces;
-require the exact owned receipt revision for mutation and refuse a foreign job
-or plist. The AI Pulse remains the only layer that interprets those delivered
-facts.
+On macOS, install and verify the separate mechanical sense sweep before
+presenting autonomy as ready. It may wake on a fixed cadence and append
+content-free source-due or WorkThread-recheck evidence. It never runs semantic
+recall, reads provider bodies, or decides meaning. Optional QMD setup and
+refresh remain explicit recall operations outside this five-second mechanical
+path. Use the supported scheduler plan, install, status, and asynchronous canary
+surfaces; require the exact owned receipt revision for mutation and refuse a
+foreign job or plist.
+
+On Windows, Codex Automations can own the intelligent Pulse. Public Seld does
+not yet ship the Windows prebuilt, native Bridge, or OS mechanical scheduler,
+so report that mechanical coverage gap instead of pretending the macOS sweep is
+installed. On every host, the AI Pulse remains the only layer that interprets
+delivered facts.
 
 ## Finish with a useful first view
 

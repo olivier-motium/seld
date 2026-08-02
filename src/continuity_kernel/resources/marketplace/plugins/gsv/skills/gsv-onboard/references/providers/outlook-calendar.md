@@ -6,9 +6,9 @@ logical Calendar connection and never borrows another host session.
 
 ## Connect
 
-```text
-gsv connectors connect outlook_calendar --access read --browser firefox
-gsv connectors connect outlook_calendar --access full --browser firefox
+```bash
+gsv connectors connect outlook_calendar --access read --alias 'Work Calendar'
+gsv connectors connect outlook_calendar --access full --alias 'Work Calendar'
 ```
 
 Read grants calendar, event, window, instance, free/busy, and attachment reads.

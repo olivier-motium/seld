@@ -7,7 +7,8 @@ instead of hard-coding a marketplace label.
 For a listed source, open only its linked connection note after the person
 selects it. A host-owned ChatGPT app is installed separately and owns its
 non-portable OAuth. A Seld-managed connector instead uses `gsv connectors
-connect`, provider OAuth with PKCE and loopback, and OS-keyring custody; it
+readiness` followed by `gsv connectors connect`, provider OAuth with PKCE and
+loopback, and OS-keyring custody; it
 never imports the host app's session. The person chooses Read or Full per
 logical source and confirms the verified account before Seld publishes the
 connection. The Seld note adds identity checks, a bounded Pulse read, recovery,
@@ -34,7 +35,7 @@ and the separate interactive CRUD surface where implemented.
 | [Local files](local-files.md) | Seld's host-local grant and `gsv_local_file_read` | Approve one exact root; read only named regular files without hydrating cloud placeholders. |
 | Apple Messages | Seld's read-only local adapter | Confirm the local profile and macOS permission. Check staged status first and adopt a verified imported prefix when present; create a forward-only baseline only when there is no staged checkpoint or prior receipt, then verify one bounded replay-safe delta. |
 | WhatsApp | Seld's read-only `wacli` companion | Confirm the account and companion health. Check staged status first and adopt a verified imported prefix when present; create a forward-only baseline only when there is no staged checkpoint or prior receipt, then verify one bounded replay-safe delta without sending or reacting. |
-| [Discord](providers/discord.md) | One bot-only Seld Full connection; narrow Pulse delivery and interactive CRUD remain separate | The person authorizes the bot and enters its token through hidden `gsv connectors connect` input. Confirm the bot identity. Pulse keeps its host-private allowlist and forward-only bounded delivery; interactive bot actions use the separate typed connector server and normal confirmation policy. Never accept a user token or persist raw Discord identifiers in the vault. |
+| [Discord](providers/discord.md) | One bot-only Seld Full connection for interactive CRUD; no packaged Pulse companion | The person authorizes the bot and enters its token through hidden `gsv connectors connect` input. Confirm the bot identity. Leave Discord unselected for Pulse unless an exact separate companion runtime, bot binding, and host-private channel allowlist have been independently audited, installed, and verified. Never accept a user token or persist raw Discord identifiers in the vault. |
 | Shopify | A Shopify app or custom read-only MCP app | Confirm the store; read a bounded recent order/customer window. |
 | Instagram | A Meta/Instagram app or custom read-only MCP app | Confirm the account; read a bounded recent activity or message window within granted scopes. |
 | Screen context | Optional local derived-context tool | Ask for a fresh per-flow approval; retain derived signals, never frames. |
@@ -43,8 +44,11 @@ If a listed first-party app is unavailable for the person's plan, region, or
 workspace, a custom MCP app or implemented Seld-managed connector may satisfy
 the same recipe. Do not claim that auth metadata alone implements a provider
 reader. For Seld-managed Gmail, Google Calendar, Google Drive, Outlook mail,
-Outlook Calendar, Slack, and Discord, installation also registers the isolated
+Outlook Calendar, Slack, and Discord, standard setup registers the isolated
 `gsv_connectors` MCP server: one read and one write tool per logical source,
 with closed typed operations and confirmation-bound outward or destructive
-effects. Do not substitute browser scraping, ask for credentials in chat,
-reuse an AI-host login, or weaken the read-only Pulse boundary.
+effects. OAuth sign-in is still unavailable unless `gsv connectors readiness`
+confirms valid packaged registrations. Discord interactive CRUD does not imply
+Discord Pulse readiness. Do not substitute browser scraping, ask for
+credentials in chat, reuse an AI-host login, or weaken the read-only Pulse
+boundary.

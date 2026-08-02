@@ -3,20 +3,25 @@
 Seld's connectors are the read-capable ChatGPT apps, custom MCP apps,
 Seld-managed connector implementations, and local tools the person chooses. A
 host-owned app keeps provider access and OAuth in that host account. A
-A Seld-managed connector uses `gsv connectors connect`, its packaged public
+Seld-managed connector uses `gsv connectors connect`, its packaged public
 client registration, provider OAuth with PKCE and a loopback callback, and
 OS-keyring custody. It never copies a ChatGPT, OpenAI, browser, Codex, OpenCode,
 or Open Interpreter session. If the installed build has no registration for
 that provider, sign-in stops before OAuth and saves nothing. Neither path moves
 semantic judgment into deterministic code.
 
-`gsv connectors list` and `gsv connectors status` are the ordinary redacted
-status surfaces. The person chooses Read or Full per logical source, performs
-OAuth consent, and confirms the exact verified provider identity. Discord is
-Full-only and accepts a bot token through hidden input. The agent may explain
-the flow and read redacted status, but it never consents, enters or reuses
-credentials or second factors, or changes provider applications, accounts,
-permissions, access, or security settings.
+Run `gsv connectors readiness` before OAuth, then use `gsv connectors list` and
+`gsv connectors status` as the ordinary redacted status surfaces. The person
+chooses Read or Full per logical source, supplies a recognizable privacy-safe
+`--alias`, performs OAuth consent, and confirms the exact verified provider
+identity. The default browser is sufficient; `--browser firefox` is optional.
+With `--no-browser`, open the printed URL on the same computer while the command
+remains running. Discord is Full-only and accepts a bot token through hidden
+input. The agent may explain the flow and read redacted status, but it never
+consents, enters or reuses credentials or second factors, or changes provider
+applications, accounts, permissions, access, or security settings. Use `gsv
+connectors alias <connection-id> --alias '<label>'` to change only the local
+label without repeating OAuth.
 
 For every selected source in the fresh setup task:
 
@@ -52,7 +57,10 @@ coverage visible as `needs_revalidation` until a new bounded read succeeds.
 For a Seld-managed connector, `gsv_connection_list` may confirm only the
 portable connection ID and redacted host availability. It cannot reveal or
 mutate a credential. A restored age-encrypted credential remains `unverified`
-until the identity check and bounded read above succeed.
+until `gsv --vault <restored-root> connectors resume <connection-id> --alias
+'<label>'` confirms the exact provider identity. That check moves the connection
+to `ready`. Historical source coverage remains `needs_revalidation` until the
+bounded read above succeeds on this host.
 
 Use `gsv_connector_source_read` with the exact portable connection ID for the
 narrow Pulse verification of Gmail, Google Calendar, Google Drive, Outlook

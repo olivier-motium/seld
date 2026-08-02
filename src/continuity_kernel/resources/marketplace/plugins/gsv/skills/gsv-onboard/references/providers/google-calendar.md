@@ -6,9 +6,9 @@ Calendar connection and never borrows another host's session.
 
 ## Connect
 
-```text
-gsv connectors connect google_calendar --access read --browser firefox
-gsv connectors connect google_calendar --access full --browser firefox
+```bash
+gsv connectors connect google_calendar --access read --alias 'Family Calendar'
+gsv connectors connect google_calendar --access full --alias 'Family Calendar'
 ```
 
 Read grants calendar, event, instance, and free/busy reads. Full adds calendar

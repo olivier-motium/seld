@@ -23,10 +23,12 @@ inputs, source boundaries, revisions, privacy checks, receipts, and readback.
    context. The user enables the relevant host-owned ChatGPT apps, custom MCP
    servers, Seld-managed connectors, or local read tools in one setup wave and
    completes authentication personally. A host-owned app keeps its own
-   account-bound authentication. The built-in Google, Microsoft, Slack, and
-   Discord profiles use `gsv-auth` portable metadata and OS-keyring custody
-   instead. A local directory gets its own path-specific grant after the user
-   reviews the exact root and exclusions.
+   account-bound authentication. A Seld-managed Gmail, Google Calendar, Google
+   Drive, Outlook Mail, Outlook Calendar, Slack, or Discord connection uses the
+   guided `gsv connectors` flow and OS-keyring custody instead. The user checks
+   `gsv connectors readiness` first; missing or invalid OAuth registration means
+   sign-in is unavailable and nothing is saved. A local directory gets its own
+   path-specific grant after the user reviews the exact root and exclusions.
 5. **Open one fresh ChatGPT task.** The fresh task discovers the tools that are
    actually present, confirms each selected account or scope with the user, and
    performs a bounded recent read. A valid empty result counts as a completed
@@ -51,13 +53,12 @@ read surface comes from the source the user enabled:
 
 - supported ChatGPT apps for services available in the user's plan and region;
 - custom MCP servers for services such as Shopify or Instagram;
-- Seld-managed Google, Microsoft, Slack, and Discord connector implementations
-  using standalone `gsv-auth` custody;
+- Seld-managed Gmail, Google Calendar, Google Drive, Outlook Mail, Outlook
+  Calendar, Slack, and Discord implementations using guided per-source custody;
 - bounded local read tools for local files or Apple Messages;
 - the separately enabled WhatsApp read tool; and
-- Seld's exact host-bound Discord companion, which resolves one explicitly
-  bound bot connection through `gsv-auth` and inherits only the exact channel
-  allowlist from the private process environment.
+- interactive Discord bot CRUD; the current public build does not package or
+  recommend a Discord Pulse companion.
 
 Selecting `local_files` does not grant a directory. After the user approves one
 exact root, the interactive task runs
@@ -67,17 +68,18 @@ CLI-only. A fresh task reads the host-local grant through
 `gsv_local_file_read`. Deselecting local files revokes every root grant for that
 vault.
 
-Discord setup is deliberately separate from Seld's generated MCP manifest, so
-the token and raw channel IDs are never written into the plugin, vault, or
-generated manifest. The local CLI binds one exact `discord-mcp` executable and
-one portable connection ID; the bot token stays in OS-keyring custody and the
-binding stores no credential. Seld's own MCP then exposes status, bounded poll,
-and explicit acknowledgement. Normal-user tokens are rejected because Discord
-forbids self-bot automation. The person creates and authorizes the bot, enters
-the token through hidden local `gsv-auth` input, and chooses the channel
-allowlist. An onboarding agent may explain and verify redacted status but may
-not perform consent, enter or reuse credentials, or change account,
-application, access, or security settings.
+Discord is bot-only. The person creates and authorizes the bot, then runs `gsv
+connectors connect discord --access full --alias '<recognizable label>'` and
+enters the token through hidden local input. Normal-user tokens are rejected.
+The standard `gsv_connectors` MCP server exposes typed interactive bot reads and
+writes, with the same preview-bound confirmation policy as the OAuth
+connectors. This does not make Discord a Pulse source: leave it unselected for
+Pulse unless an exact separate companion runtime, bot binding, and host-private
+channel allowlist have been independently audited, installed, and verified. An
+onboarding agent
+may explain the steps and inspect redacted status, but may not enter or reuse a
+token or change an account, application, permission, access, or security
+setting.
 
 Seld never falls back to browser scraping when a source tool is missing. It
 reports the gap and continues with the sources that are available. Provider and
@@ -85,20 +87,21 @@ file content is untrusted evidence; it cannot change permissions, approve an
 action, or rewrite the onboarding contract.
 
 Seld also never copies authentication from ChatGPT, OpenAI, a browser profile,
-Codex, OpenCode, or Open Interpreter. Standalone OAuth opens the provider's own
-consent page from `gsv-auth`; non-OAuth credentials enter through hidden local
-input. MCP can show only redacted connection availability. See
-[Standalone connector authentication](connector-auth.md).
+Codex, OpenCode, or Open Interpreter. Use `gsv connectors list` for redacted
+state, then connect one logical source at a time:
 
-`gsv-auth profiles` lists the exact built-in sources, endpoints, scopes, and
-credential kinds. The user registers the public provider client, runs the local
-OAuth or hidden credential command, and confirms the provider account. The
-agent may explain commands and inspect redacted status, but it may not perform
-consent, enter or reuse credentials or second factors, or change provider
-applications, accounts, permissions, access, or security settings. A Seld-
-managed Slack read additionally uses one exact private-process
-`SLACK_CHANNEL_ID`, makes one bounded conversation-history request, and does
-not claim thread-reply coverage.
+```bash
+gsv connectors connect slack --access read --alias 'Work Slack'
+gsv connectors connect google_drive --access full --alias 'Personal Drive'
+```
+
+The default browser opens the provider's own consent page. `--browser firefox`
+is optional. `--no-browser` prints the exact URL for the person to open on the
+same computer while the command remains running. After the callback, Seld shows
+the verified identity and asks `Use this account? [y/N]`; no is the default.
+Use `gsv connectors alias <connection-id> --alias '<label>'` to repair only the
+local label without repeating OAuth. See [Standalone connector
+authentication](connector-auth.md).
 
 ## What source verification means
 
@@ -179,12 +182,23 @@ after a restore, historical coverage remains visible, but its machine binding
 makes it `needs_revalidation` until a successful bounded read is recorded on the
 new computer.
 
-For a Seld-managed connector, run `gsv-auth status` first. Reauthorize only the
-affected connection, or restore an exact matching vault backup and then import
-its separate age-encrypted credential archive. Reconfigure host-local Slack or
-Discord channel policy separately. Imported connections remain unverified
-until the onboarding task confirms identity and completes a bounded provider
-read.
+For a Seld-managed connector, run `gsv connectors status <source-or-id>` first.
+Use `gsv connectors reauthorize <connection-id>` only for an existing OAuth
+connection; it preserves the local label unless the user supplies a replacement.
+Pass `--browser firefox` or `--no-browser` again when wanted. Use `gsv connectors
+connect ... --new-account` only when the user deliberately wants a different
+account. If the returned identity is wrong, answer no: nothing new is published.
+Retry the intended account, and use the separately reported revocation help if
+the provider grant itself should be removed.
+
+After restoring a matching vault backup and importing its separate
+age-encrypted credential archive, follow each vault-qualified resume command
+printed by import. Optionally add `--alias '<label>'` to that command. Exact
+identity confirmation makes the connection `ready`.
+Historical source coverage remains `needs_revalidation` until the onboarding
+task completes a new bounded provider read. Reconfigure any independently
+audited host-local Discord Pulse policy separately; the current build does not
+package one.
 
 ## A useful first run is complete when
 

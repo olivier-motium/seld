@@ -6,9 +6,9 @@ Drive connection and never copies an AI-host or browser session.
 
 ## Connect
 
-```text
-gsv connectors connect google_drive --access read --browser firefox
-gsv connectors connect google_drive --access full --browser firefox
+```bash
+gsv connectors connect google_drive --access read --alias 'Personal Drive'
+gsv connectors connect google_drive --access full --alias 'Personal Drive'
 ```
 
 Read grants typed My Drive and shared-drive metadata, content, permission,

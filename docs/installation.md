@@ -35,8 +35,10 @@ directory, returned a healthy `gsv doctor` result, and completed `gsv demo` with
 fresh-process resume, stale-write rejection, interrupted-write recovery, and
 backup/restore equivalence.
 
-The current consumer surface is the ChatGPT desktop app on macOS. Windows and
-Claude support are coming.
+The current consumer install, Bridge, and native mechanical scheduler target
+macOS. Codex Automations are available on Windows and can own the intelligent
+Pulse there, but public Seld does not yet ship a Windows prebuilt, native
+Bridge, or OS mechanical scheduler. Claude support is still pending.
 
 ## Agent-led install
 
@@ -57,39 +59,68 @@ GitHub release contains the matching platform artifact and `.sha256` file. The
 installer verifies that checksum before replacement and preserves the vault;
 the supported public source path above does not depend on a prebuilt asset.
 
-## Standalone connector authentication
+## Connector sign-in
 
-The standard source install includes the Python `keyring` adapter so connector
-custody survives the same exact-SHA install and self-update path as `gsv`.
-Verify the entrypoint and the selected operating-system backend before adding a
-credential:
+The standard source install includes guided connector onboarding and the Python
+`keyring` adapter. Start with the redacted readiness and account surfaces:
 
 ```bash
-gsv-auth status
-gsv-auth profiles
+gsv connectors readiness
+gsv connectors list
 ```
 
-The adapter is loaded only when connector custody is inspected or changed. An
-unavailable, disabled, or unapproved keyring backend fails closed without
-affecting the rest of the local record.
+`readiness` reports whether this exact build packages valid public OAuth
+registrations for Google, Microsoft, and Slack without exposing their client
+identifiers. A missing or invalid registration stops before OAuth and saves
+nothing. Do not ask the person to create a developer application as an ordinary
+installation step.
 
-The `gsv-auth` flow is independent of the ChatGPT, OpenAI, Codex, OpenCode, or
-Open Interpreter login. It never imports an existing browser or AI-host
-session. A provider-specific connector still needs its own public OAuth client
-registration or credential, granted by the user through that provider's normal
-consent flow.
+When the provider is ready, connect each logical source separately and give it
+a recognizable privacy-safe local label:
 
-The built-in profiles cover Gmail, Google Calendar, Google Drive metadata,
-Outlook mail, Outlook Calendar, one exact Slack conversation, and the Discord
-bot companion. Their profile-owned endpoints, scopes, source IDs, and
-credential kinds cannot be replaced from the CLI. Catalog-only sources continue
-to use a host-owned app or custom MCP server until an audited Seld reader exists.
+```bash
+gsv connectors connect gmail --access read --alias 'Personal Gmail'
+gsv connectors connect google_calendar --access full --alias 'Family Calendar'
+gsv connectors status gmail
+```
 
-Encrypted credential transfer additionally requires the open-source `age`
-executable. On macOS it can be installed separately with `brew install age`.
-Keep the age identity outside the vault and its backups. See
-[Standalone connector authentication](connector-auth.md) for setup, transfer,
-and recovery commands.
+The default browser opens the provider's own consent page. Use `--browser
+firefox` when desired. `--no-browser` prints the URL for the person to open on
+the same computer while the command remains running. Seld verifies the returned
+identity, shows it in human terms, and defaults `Use this account?` to no. The
+person owns account selection, consent, administrator approval, second factors,
+and any provider permission or security setting.
+
+Read enables the typed read catalog. Full adds the connector's typed create,
+update, send/share, recoverable-delete, and separately classified permanent
+operations. Gmail's irreversible purge permission is excluded from ordinary
+Full access and requires the explicit `--with-permanent-delete` flag. A Read
+connection remains usable while a same-account Full upgrade is in progress.
+
+Discord is bot-only and Full-only:
+
+```bash
+gsv connectors connect discord --access full --alias 'Household bot'
+```
+
+Its token is accepted only through hidden terminal input. The interactive bot
+CRUD surface is included; the current build does not package or recommend a
+Discord Pulse companion. Leave Discord unselected for Pulse unless an exact
+separate companion runtime, bot binding, and host-private channel allowlist have
+been independently audited, installed, and verified.
+
+The custody adapter loads only when connector custody is inspected or changed.
+An unavailable, disabled, or unapproved keyring backend fails closed without
+affecting the local record. Connector custody is independent of ChatGPT,
+OpenAI, Codex, OpenCode, Open Interpreter, and browser sessions; Seld never
+imports one of those sessions.
+
+The lower-level `gsv-auth` command remains for age-encrypted credential
+export/import and audited contributor compatibility, not ordinary sign-in.
+Encrypted transfer requires the open-source `age` executable; on macOS it can
+be installed with `brew install age`. Keep the age identity outside the vault
+and its backups. See [Standalone connector authentication](connector-auth.md)
+for transfer and recovery commands.
 
 ## What setup changes
 
@@ -317,6 +348,18 @@ gsv --vault /path/to/restored-vault setup
 
 The first command must verify and stop the currently owned Bridge. The second
 configures the restored vault and rebinds the Codex integration and Bridge.
+
+If a matching age-encrypted connector archive was imported for this restored
+vault, follow the vault-qualified resume commands printed by the import, for
+example:
+
+```bash
+gsv --vault /path/to/restored-vault connectors resume con-REPLACE --alias 'Personal Gmail'
+```
+
+Exact identity confirmation moves the connection to `ready`. Historical source
+coverage remains `needs_revalidation` until `$gsv-onboard` completes a new
+bounded read on this computer.
 
 ## Contributor setup
 

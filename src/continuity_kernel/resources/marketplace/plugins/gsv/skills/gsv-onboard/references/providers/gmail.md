@@ -6,9 +6,9 @@ Gmail connection; it never imports an AI-host or browser session.
 
 ## Connect
 
-```text
-gsv connectors connect gmail --access read --browser firefox
-gsv connectors connect gmail --access full --browser firefox
+```bash
+gsv connectors connect gmail --access read --alias 'Personal Gmail'
+gsv connectors connect gmail --access full --alias 'Personal Gmail'
 ```
 
 Choose one command. Read grants the typed Gmail read catalog. Full adds drafts,
@@ -19,6 +19,9 @@ loopback callback, verifies the returned Google identity, shows the account,
 and asks `Use this account? [y/N]` before anything is published. The default is
 no. During a Read-to-Full upgrade, the old Read connection stays ready until
 the same-account Full connection is verified and published.
+
+Gmail Full excludes irreversible purge unless the person deliberately adds
+`--with-permanent-delete`.
 
 The person owns account selection, consent, Workspace policy, administrator
 approval, and second factors. The agent must not enter or reuse credentials,

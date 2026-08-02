@@ -6,9 +6,9 @@ logical mail connection and never reuses an AI-host or browser session.
 
 ## Connect
 
-```text
-gsv connectors connect outlook_mail --access read --browser firefox
-gsv connectors connect outlook_mail --access full --browser firefox
+```bash
+gsv connectors connect outlook_mail --access read --alias 'Work Mail'
+gsv connectors connect outlook_mail --access full --alias 'Work Mail'
 ```
 
 Read grants folder, message, MIME, and attachment reads. Full adds folder and

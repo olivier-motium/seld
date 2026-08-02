@@ -6,9 +6,9 @@ connection and never copies a ChatGPT cookie, browser session, or ambient token.
 
 ## Connect
 
-```text
-gsv connectors connect slack --access read --browser firefox
-gsv connectors connect slack --access full --browser firefox
+```bash
+gsv connectors connect slack --access read --alias 'Work Slack'
+gsv connectors connect slack --access full --alias 'Work Slack'
 ```
 
 Read grants the typed identity, user, conversation, message, thread, file, and

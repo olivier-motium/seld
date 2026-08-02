@@ -1,195 +1,158 @@
 # Standalone Connector Authentication
 
-Seld-managed connectors can authenticate independently of the account used to
-run ChatGPT, Codex, OpenCode, Open Interpreter, or another AI host. Changing the
-reasoning host does not change connector custody. Seld never discovers, copies,
-or converts an existing AI-host or browser session.
+Seld-managed connectors authenticate independently of ChatGPT, Codex,
+OpenCode, Open Interpreter, a browser profile, or another AI host. Changing the
+reasoning host does not change connector custody, and Seld never discovers,
+copies, or converts an existing host session.
 
-This is the authentication boundary for connector implementations. It does not
-turn metadata into a provider reader: each connector still supplies its own
-read adapter and, for OAuth, a provider-issued public client registration.
+The ordinary user surface is `gsv connectors`. The lower-level `gsv-auth`
+command exists for encrypted transfer and audited contributor compatibility;
+it is not the normal onboarding path.
 
-## Verify the custody adapter
+## Check this build first
 
-The standard Seld source install includes the open-source OS-keyring adapter so
-the same package and self-update path own both `gsv` and `gsv-auth`:
-
-```bash
-gsv-auth status
-```
-
-Seld accepts the native macOS Keychain, Windows Credential Manager, Secret
-Service, and KWallet backends exposed by `keyring`. An unavailable, disabled,
-or unapproved backend fails closed when a secret operation is requested.
-
-## Built-in profiles
-
-List the finite provider profiles shipped by this Seld version:
+Run the content-free readiness and account checks against the intended vault:
 
 ```bash
-gsv-auth profiles
+gsv connectors readiness
+gsv connectors list
 ```
 
-The current standalone reader surface is:
+`readiness` reports whether the installed build contains valid public OAuth
+registrations for Google, Microsoft, and Slack. It never prints a client
+identifier. Missing and invalid registrations are distinct failures, but both
+stop before OAuth and save nothing. Provider implementation alone is not
+sign-in readiness, and an ordinary user should not have to create a developer
+application to repair the distribution.
 
-| Profile | Logical sources | Credential |
-| --- | --- | --- |
-| `google` | Gmail, Google Calendar, Google Drive metadata | Public desktop OAuth with offline refresh |
-| `microsoft` | Outlook mail and Outlook Calendar | Public desktop OAuth |
-| `slack` | One exact Slack conversation per read | Slack user OAuth with PKCE |
-| `discord` | The dedicated Discord companion | Bot bearer token |
+`list` shows the finite connector catalog and redacted local state. It never
+returns a token, OAuth endpoint, raw account identifier, client identifier,
+scope secret, keyring reference, or account fingerprint.
 
-Profile-owned providers, source IDs, endpoints, scopes, and credential kinds
-cannot be overridden. Catalog entries without a profile still require their
-host-owned app, custom MCP server, or a future audited Seld reader; portable
-metadata alone does not implement one.
+## Connect one logical source
 
-## Add a built-in connection
-
-The person first registers the public client or bot in the provider and reviews
-the requested permissions. The agent may explain the steps and later inspect
-redacted status. It must not create or change the provider application, choose
-an account, consent, enter or reuse credentials, handle a second factor, or
-change account, access, or security settings.
-
-For Google, create a **Desktop app** OAuth client, configure its consent screen,
-and enable the Gmail, Calendar, and Drive APIs. Google desktop clients use a
-loopback IP at the root; port `0` lets Seld bind a fresh local port. The profile
-requests offline access and requires a refresh token:
+Each source gets its own least-authority grant and a recognizable local label:
 
 ```bash
-gsv-auth add \
-  --profile google \
-  --client-id GOOGLE_DESKTOP_CLIENT_ID \
-  --redirect-uri 'http://127.0.0.1:0' \
-  --label 'Personal Google'
-
-gsv-auth oauth con-REPLACE_WITH_RETURNED_IDENTIFIER
+gsv connectors connect gmail --access read --alias 'Personal Gmail'
+gsv connectors connect google_calendar --access full --alias 'Family Calendar'
+gsv connectors connect google_drive --access full --alias 'Work Drive'
+gsv connectors connect outlook_mail --access full --alias 'Work Mail'
+gsv connectors connect outlook_calendar --access read --alias 'Work Calendar'
+gsv connectors connect slack --access full --alias 'Motium Slack'
 ```
 
-One Google connection grants the three fixed read-only scopes. Gmail, Calendar,
-and Drive remain separate logical source reads and receive separate coverage
-receipts.
+Connecting Gmail never silently grants Calendar or Drive. Outlook Mail never
+silently grants Outlook Calendar. The supported logical names are `gmail`,
+`google_calendar`, `google_drive`, `outlook_mail`, `outlook_calendar`, `slack`,
+and bot-only `discord`.
 
-For Microsoft, register a public **Mobile and desktop application** that accepts
-personal and/or organizational accounts as intended. Register
-`http://localhost/oauth/callback`; Microsoft ignores the ephemeral port when
-matching a localhost redirect, so Seld can bind one at runtime:
+The command opens the provider's consent page in the default browser, uses
+authorization code with PKCE and a one-shot loopback callback, verifies the
+returned provider identity, and shows that identity in human terms. It then
+asks `Use this account? [y/N]`; no is the default. Only yes publishes
+privacy-safe metadata and OS-keyring custody.
+
+Use `--browser firefox` when Firefox is preferred. Use `--no-browser` to print
+the exact URL, open it on the same computer, and keep the command running for
+the callback. The person—not the agent—chooses the account, consents, completes
+second factors, accepts legal terms, and obtains any administrator approval.
+
+The local label is not provider identity. It is safe to change without OAuth:
 
 ```bash
-gsv-auth add \
-  --profile microsoft \
-  --client-id MICROSOFT_APPLICATION_CLIENT_ID \
-  --redirect-uri 'http://localhost:0/oauth/callback' \
-  --label 'Personal Microsoft'
-
-gsv-auth oauth con-REPLACE_WITH_RETURNED_IDENTIFIER
+gsv connectors alias con-REPLACE --alias 'Personal Gmail'
 ```
 
-The profile requests `offline_access`, `User.Read`, `Mail.Read`, and
-`Calendars.Read`. Outlook mail and calendar remain separate logical reads.
+## Read and Full access
 
-For Slack, create a Slack app. This Seld profile requires PKCE, and Slack
-documents that enabling it is one-way without support intervention, so the
-person—not an agent—must make that change. Add exactly the four user-token
-history scopes shown by `gsv-auth profiles` and register one exact callback
-using a fixed free port. Use that same URI in Seld:
+Read enables the connector's closed typed read catalog. Full adds the closed
+typed create, update, send/share, recoverable-delete, and permanent-operation
+catalog within the provider grant. The interactive `gsv_connectors` MCP server
+exposes exactly one read and one write tool per logical source; it does not
+expose a generic URL, method, header, token, or provider proxy.
+
+Outward and destructive calls first return an exact preview and short-lived
+confirmation token. Execution rebinds that token to the connection, operation,
+input, scopes, and credential version. Recoverable delete and permanent purge
+are separate operations. Gmail's broad irreversible-purge scope is omitted
+from normal Full access and must be requested deliberately:
 
 ```bash
-gsv-auth add \
-  --profile slack \
-  --client-id SLACK_CLIENT_ID \
-  --redirect-uri 'http://localhost:49152/oauth/callback' \
-  --label 'Work Slack'
-
-gsv-auth oauth con-REPLACE_WITH_RETURNED_IDENTIFIER
+gsv connectors connect gmail --access full \
+  --with-permanent-delete \
+  --alias 'Personal Gmail'
 ```
 
-Launch the Seld MCP process with one exact `SLACK_CHANNEL_ID` (`C…`, `D…`, or
-`G…`). The reader validates it before resolving the OAuth token, calls only
-`auth.test` and one `conversations.history` request, returns at most 15 items,
-and does not expand thread replies. Keep the channel ID in the private process
-environment, not the vault, generated plugin, chat, or a credential archive.
+A same-account Read connection stays ready until a Full upgrade is verified
+and published. Pulse remains a separate bounded read-only lane; the small read
+used to prove source coverage does not limit the interactive connector.
 
-For Discord, create the portable bot connection, then enter the bot token at
-the hidden prompt and bind that connection ID through the dedicated Discord
-setup flow:
+## Discord bot onboarding
+
+Discord is Full-only because the bot token is the authority boundary:
 
 ```bash
-gsv-auth add --profile discord --label 'Personal Discord bot'
-gsv-auth credential con-REPLACE_WITH_RETURNED_IDENTIFIER
+gsv connectors connect discord --access full --alias 'Household bot'
 ```
 
-Normal-user Discord tokens are rejected. The Discord channel allowlist remains
-host-local and is not part of portable authentication.
+Seld accepts the bot token only through hidden terminal input, verifies it with
+Discord's fixed bot identity route, rejects a normal-user token, and defaults
+the final identity prompt to no. Never put the token in chat, an argument, an
+environment variable, a file, a log, or the vault.
 
-## Add a manual connection
+The typed interactive Discord read/write catalog is available after a verified
+connection. The current build does not package or recommend a Discord Pulse
+companion. Leave Discord unselected for Pulse unless an exact separate companion
+runtime, bot binding, and host-private channel allowlist have been independently
+audited, installed, and verified.
 
-The low-level form remains available for an audited connector implementation
-that is not yet a built-in profile. Create portable metadata first, then enter a
-non-OAuth credential through hidden input:
+## Inspect, retry, and recover
+
+Inspect one logical source or exact connection without exposing credentials:
 
 ```bash
-gsv-auth add \
-  --provider provider-slug \
-  --source source-recipe \
-  --kind bearer \
-  --label 'Named account'
-
-gsv-auth credential con-REPLACE_WITH_RETURNED_IDENTIFIER
+gsv connectors status gmail
+gsv connectors status con-REPLACE
 ```
 
-The credential is never accepted as a command-line argument. The shipped
-manual form is non-OAuth only. OAuth connections must use one of the finite
-built-in profiles so their endpoints and read-only scopes cannot be widened.
-
-The OAuth command opens the provider's consent page, binds a one-shot loopback
-listener, verifies exact state, exchanges the code with PKCE, and stores the
-result in the OS keyring. Seld supports public-client authorization code plus
-refresh tokens. Confidential-client secrets, OIDC identity, and device flow are
-not implemented.
-
-## Inspect and use it safely
+If OAuth returns the wrong account, answer no. Nothing new is published. Retry
+the intended account; use `--new-account` only when the person deliberately
+wants to retain a different account too. Reauthorize an existing OAuth
+connection without changing its portable identity:
 
 ```bash
-gsv-auth status
+gsv connectors reauthorize con-REPLACE
 ```
 
-Status combines portable metadata with one of `available`, `missing`,
-`backend_unavailable`, or `invalid`. It never includes a secret, token, keyring
-reference, OAuth endpoint, client identifier, scope, or account fingerprint.
-The read-only `gsv_connection_list` MCP tool exposes the same redacted view and
-has no mutation or resolution method.
+Reauthorization preserves the prior local alias unless the person supplies a
+replacement. Pass `--browser firefox` or `--no-browser` again when wanted.
+Provider `invalid_grant` or Slack
+`invalid_refresh_token` marks the connection as requiring reauthorization
+without deleting the last credential.
 
-Connector runtime code resolves credentials inside the local process through
-`ConnectorAuthManager.resolve_credential` or
-`ConnectorAuthManager.resolve_oauth_access_token`. OAuth refresh is serialized
-per connection and publishes one compare-and-swap token version. Provider
-`invalid_grant` or Slack `invalid_refresh_token` marks the connection
-`reauthorization_required` without deleting the last credential.
+To forget local custody, confirm an exact disconnect:
 
-The read-only `gsv_connector_source_read` MCP tool accepts only an explicit
-connection ID, one of the finite implemented source IDs, and a bounded limit.
-Google, Microsoft, and Slack calls use a fixed internal timeout and
-fixed-destination HTTPS GETs;
-redirects, write endpoints, arbitrary URLs, ambient provider tokens, and
-provider response bodies in error receipts are rejected. The connection,
-credential version, and source selection are rechecked after each provider
-call. Returned items are transient model input; the durable `SOURCES.md`
-receipt contains only hashes, coverage, completeness, and fixed error codes.
+```bash
+gsv connectors disconnect con-REPLACE
+gsv connectors revocation-help con-REPLACE
+```
 
-## Move to another host
+Disconnect does not claim provider-side revocation. `revocation-help` explains
+the separate provider step without taking it.
+
+## Move credentials to another host
 
 Portability has two deliberate parts:
 
-1. a normal Seld backup carries `CONNECTIONS.md`, which has metadata but no
-   secrets; and
-2. a separate age-encrypted export carries the credentials for that exact
-   vault ID and exact connection revision.
+1. a normal Seld backup carries `CONNECTIONS.md`, which contains metadata but
+   no secrets; and
+2. a separate age-encrypted archive carries credentials for that exact vault
+   ID and exact connection revision.
 
-Install `age` and create or select an age identity. Keep the private identity
-outside the vault, backup, shell history, and repository. Pass only its public
-recipient to export:
+Install `age`, create or select an age identity, and keep its private file
+outside the vault, backup, repository, and shell history. Export only to its
+public recipient:
 
 ```bash
 gsv backup create
@@ -198,58 +161,62 @@ gsv-auth export \
   --recipient age1REPLACE_WITH_PUBLIC_RECIPIENT
 ```
 
-On the destination, restore the matching vault backup first. The destination
-must not contain different credential slots for those connection IDs; an exact
-derived unverified state whose already-published credentials match byte for byte
-is resumed:
+On the destination, restore the matching vault backup before importing the
+credential archive:
 
 ```bash
 gsv backup restore /safe/path/gsv-backup.zip /path/to/restored-vault
 gsv-auth --vault /path/to/restored-vault import \
   /safe/path/seld-auth.age \
   --identity /safe/private/path/seld-auth.agekey
-gsv-auth --vault /path/to/restored-vault status
 ```
 
-Export writes only ciphertext and refuses to replace an existing destination.
-Import refuses a different vault, unrelated `CONNECTIONS.md` revision,
-malformed archive, or different destination credential. It marks every
-connection `unverified` before publishing credentials and can resume after an
-ambiguous or interrupted publication. Confirm the provider identity and
-complete one bounded read before marking the source ready.
-
-Host-local source policy is configured again on the destination. In particular,
-the encrypted auth archive does not carry Slack's `SLACK_CHANNEL_ID` or the
-Discord companion's channel allowlist.
-
-## Remove or reauthorize
-
-Use the current status revision when removing a connection so a stale operator
-cannot delete newer metadata:
+Import validates the archive and destination custody before mutating portable
+state. It refuses a different vault, unrelated `CONNECTIONS.md` revision,
+malformed archive, or conflicting destination credential. Its receipt contains
+ordered connection IDs but no host path; the CLI prints vault-qualified next
+commands. Follow each one, optionally restoring a privacy-safe alias:
 
 ```bash
-gsv-auth remove con-REPLACE_WITH_RETURNED_IDENTIFIER \
-  --expected-revision REPLACE_WITH_STATUS_REVISION
+gsv --vault /path/to/restored-vault connectors resume con-REPLACE \
+  --alias 'Personal Gmail'
 ```
 
-Removal first compare-and-swap marks the connection revoked, then deletes both
-bounded keyring rotation slots, then removes portable metadata. If cleanup is
-interrupted, reload status and rerun removal with the current revision. To
-rotate a non-OAuth credential, run `gsv-auth credential
-<connection-id> --replace`. To repair OAuth, rerun `gsv-auth oauth
-<connection-id>` and then perform a bounded provider identity/read check.
+Resume verifies the exact provider identity before the imported connection
+becomes `ready`. Historical source coverage remains `needs_revalidation` until
+`$gsv-onboard` performs a successful bounded read on the destination. Host-local
+source policy is configured again; an auth archive never carries a Discord
+channel allowlist or another host-private source boundary.
+
+## Low-level contributor compatibility
+
+`gsv-auth profiles`, `add`, `oauth`, `credential`, `status`, and `remove`
+remain available for an audited connector implementation or migration test.
+They expose the legacy finite-profile boundary and must not be presented as the
+consumer setup path. Manual credentials enter only through hidden input. The
+manual form is non-OAuth; OAuth endpoints and scopes remain profile-owned and
+cannot be widened from the CLI.
+
+Runtime code resolves credentials inside the local process. OAuth refresh is
+serialized per connection and publishes one compare-and-swap token version.
+The narrow `gsv_connector_source_read` Pulse tool accepts an exact connection
+ID and a bounded implemented source. The separate interactive connector server
+uses fixed provider destinations, closed schemas, sealed continuations, and
+the confirmation boundary described above.
 
 ## Boundaries
 
 - `CONNECTIONS.md`, ordinary backups, status, Bridge, logs, and MCP never carry
   credential bytes.
+- The native macOS Keychain, Windows Credential Manager, Secret Service, and
+  KWallet backends exposed by `keyring` are accepted; unavailable or unapproved
+  custody fails closed.
 - Host-local pointer files contain only a vault-bound opaque keyring reference,
   version, and timestamp.
 - The local OS user is trusted. The keyring does not isolate credentials from
-  hostile code already running as that same user.
+  hostile code already running as that user.
 - Transfer confidentiality depends on the age identity remaining private.
-- Auth is not account creation, provider client registration, connector
-  implementation, or authorization for external writes.
-- The built-in providers still require the person to register the application,
-  review scopes, complete consent, enter a bot credential, and satisfy any
-  administrator policy. Blanket agent approval cannot perform those acts.
+- Auth is not account creation, provider registration, administrator consent,
+  or authorization for an external action.
+- Account, permission, security, billing, and other administrative APIs remain
+  outside both the Pulse and interactive connector lanes.
