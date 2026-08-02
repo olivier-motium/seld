@@ -30,6 +30,7 @@ from continuity_kernel.connector_session import ConnectorSession
 from continuity_kernel.connector_transfer import ArtifactStore
 from continuity_kernel.connector_transport import (
     ConnectorMethod,
+    ConnectorOutcomeUnknown,
     ConnectorResponse,
     ConnectorStreamResponse,
     ConnectorTransport,
@@ -124,15 +125,27 @@ class _GmailModifyTransport(ConnectorTransport):
         )
 
 
+class _AmbiguousGmailSendTransport(_GmailModifyTransport):
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.requests.append(kwargs)
+        raise ConnectorOutcomeUnknown("Gmail send outcome is unknown")
+
+
 def _runtime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    include_permanent_delete: bool = False,
 ) -> tuple[Vault, ConnectorRuntime, _NoProviderHttp]:
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host-data"))
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Google transfer runtime")
     profile = get_profile("google")
     now = datetime.now(UTC)
-    full_scopes = profile.scopes_for("full")
+    full_scopes = profile.scopes_for(
+        "full",
+        include_supplemental=include_permanent_delete,
+    )
     connection = ConnectionMetadata(
         connection_id=_CONNECTION_ID,
         provider="google",
@@ -198,7 +211,7 @@ def _fail_confirmation_issue(*args: object, **kwargs: object) -> str:
     raise AssertionError("confirmation must not be issued for an oversized Gmail MIME upload")
 
 
-def test_gmail_near_limit_local_attachment_fails_before_confirmation_or_provider_http(
+def test_gmail_send_near_limit_attachment_fails_before_confirmation_or_provider_http(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -231,8 +244,9 @@ def test_gmail_near_limit_local_attachment_fails_before_confirmation_or_provider
                             }
                         ],
                         "text_body": "Draft body",
+                        "to": ["recipient@example.test"],
                     },
-                    "operation": "drafts.create",
+                    "operation": "messages.send",
                 },
             )
         assert transport.call_count == 0
@@ -409,7 +423,7 @@ def test_google_transfer_previews_reach_confirmation_without_provider_http(
         runtime.close()
 
 
-def test_gmail_destructive_modify_requires_one_bound_confirmation(
+def test_gmail_recoverable_modify_executes_without_confirmation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -422,11 +436,57 @@ def test_gmail_destructive_modify_requires_one_bound_confirmation(
         "operation": "messages.modify",
     }
     try:
+        completed = runtime.call_tool(
+            "gsv_gmail_write",
+            values,
+        )
+        assert completed["status"] == "ok"
+        assert completed["effect"] == ConnectorEffect.SAFE_MUTATION.value
+        assert len(transport.requests) == 1
+        assert transport.requests[0]["method"] is ConnectorMethod.POST
+        assert transport.requests[0]["path"] == ("/gmail/v1/users/me/messages/message-1/modify")
+        assert transport.requests[0]["json_body"] == {"addLabelIds": ["TRASH"]}
+    finally:
+        runtime.close()
+
+
+def test_gmail_send_confirmation_binds_exact_message_and_is_single_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _unused = _runtime(tmp_path, monkeypatch)
+    transport = _GmailModifyTransport()
+    runtime.transport = transport
+    values = {
+        "connection_id": str(_CONNECTION_ID),
+        "input": {
+            "subject": "Bound send",
+            "text_body": "Hello",
+            "to": ["recipient@example.test"],
+        },
+        "operation": "messages.send",
+    }
+    try:
         preview = runtime.call_tool("gsv_gmail_write", values)
         token = preview["confirmation_token"]
         assert preview["status"] == "confirmation_required"
-        assert preview["effect"] == ConnectorEffect.DESTRUCTIVE.value
+        assert preview["effect"] == ConnectorEffect.OUTWARD.value
         assert isinstance(token, str)
+        assert transport.requests == []
+
+        with pytest.raises(ConflictError, match="confirmation binding does not match"):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {
+                    **values,
+                    "confirmation_token": token,
+                    "input": {
+                        "subject": "Bound send",
+                        "text_body": "Hello",
+                        "to": ["recipient@example.test", "other@example.test"],
+                    },
+                },
+            )
         assert transport.requests == []
 
         completed = runtime.call_tool(
@@ -434,11 +494,9 @@ def test_gmail_destructive_modify_requires_one_bound_confirmation(
             {**values, "confirmation_token": token},
         )
         assert completed["status"] == "ok"
-        assert completed["effect"] == ConnectorEffect.DESTRUCTIVE.value
+        assert completed["effect"] == ConnectorEffect.OUTWARD.value
         assert len(transport.requests) == 1
-        assert transport.requests[0]["method"] is ConnectorMethod.POST
-        assert transport.requests[0]["path"] == ("/gmail/v1/users/me/messages/message-1/modify")
-        assert transport.requests[0]["json_body"] == {"addLabelIds": ["TRASH"]}
+        assert transport.requests[0]["path"] == "/gmail/v1/users/me/messages/send"
 
         with pytest.raises(ConflictError, match=r"consumed|unavailable|expired|replayed"):
             runtime.call_tool(
@@ -446,6 +504,142 @@ def test_gmail_destructive_modify_requires_one_bound_confirmation(
                 {**values, "confirmation_token": token},
             )
         assert len(transport.requests) == 1
+    finally:
+        runtime.close()
+
+
+def test_gmail_invalid_send_fails_before_confirmation_is_issued(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, transport = _runtime(tmp_path, monkeypatch)
+    confirmation_issued = False
+
+    def issue_confirmation(*args: object, **kwargs: object) -> str:
+        nonlocal confirmation_issued
+        confirmation_issued = True
+        del args, kwargs
+        raise AssertionError("invalid send must not issue confirmation")
+
+    monkeypatch.setattr(runtime.session, "issue_confirmation", issue_confirmation)
+    try:
+        for input_value in (
+            {"text_body": "No recipient"},
+            {
+                "text_body": "Invalid thread",
+                "thread_id": "caller-supplied-thread",
+                "to": ["recipient@example.test"],
+            },
+        ):
+            with pytest.raises(ValidationError):
+                runtime.call_tool(
+                    "gsv_gmail_write",
+                    {
+                        "connection_id": str(_CONNECTION_ID),
+                        "input": input_value,
+                        "operation": "messages.send",
+                    },
+                )
+        assert confirmation_issued is False
+        assert transport.call_count == 0
+    finally:
+        runtime.close()
+
+
+def test_gmail_ambiguous_send_is_not_retried_and_spends_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _unused = _runtime(tmp_path, monkeypatch)
+    transport = _AmbiguousGmailSendTransport()
+    runtime.transport = transport
+    values = {
+        "connection_id": str(_CONNECTION_ID),
+        "input": {"text_body": "Hello", "to": ["recipient@example.test"]},
+        "operation": "messages.send",
+    }
+    try:
+        preview = runtime.call_tool("gsv_gmail_write", values)
+        token = preview["confirmation_token"]
+        assert isinstance(token, str)
+        with pytest.raises(ConnectorOutcomeUnknown):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {**values, "confirmation_token": token},
+            )
+        assert len(transport.requests) == 1
+
+        with pytest.raises(ConflictError, match=r"consumed|unavailable|expired|replayed"):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {**values, "confirmation_token": token},
+            )
+        assert len(transport.requests) == 1
+    finally:
+        runtime.close()
+
+
+def test_gmail_batch_purge_requires_separate_permanent_delete_permission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, transport = _runtime(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(ValidationError, match="permanent delete is not enabled"):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": {"message_ids": ["message-1"]},
+                    "operation": "messages.batch_purge",
+                },
+            )
+        assert transport.call_count == 0
+    finally:
+        runtime.close()
+
+
+def test_gmail_batch_purge_confirmation_binds_exact_message_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _unused = _runtime(
+        tmp_path,
+        monkeypatch,
+        include_permanent_delete=True,
+    )
+    transport = _GmailModifyTransport()
+    runtime.transport = transport
+    values = {
+        "connection_id": str(_CONNECTION_ID),
+        "input": {"message_ids": ["message-1", "message-2"]},
+        "operation": "messages.batch_purge",
+    }
+    try:
+        preview = runtime.call_tool("gsv_gmail_write", values)
+        token = preview["confirmation_token"]
+        assert preview["effect"] == ConnectorEffect.PERMANENT.value
+        assert isinstance(token, str)
+
+        with pytest.raises(ConflictError, match="confirmation binding does not match"):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {
+                    **values,
+                    "confirmation_token": token,
+                    "input": {"message_ids": ["message-1"]},
+                },
+            )
+        assert transport.requests == []
+
+        completed = runtime.call_tool(
+            "gsv_gmail_write",
+            {**values, "confirmation_token": token},
+        )
+        assert completed["effect"] == ConnectorEffect.PERMANENT.value
+        assert len(transport.requests) == 1
+        assert transport.requests[0]["path"] == "/gmail/v1/users/me/messages/batchDelete"
+        assert transport.requests[0]["json_body"] == {"ids": ["message-1", "message-2"]}
     finally:
         runtime.close()
 

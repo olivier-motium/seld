@@ -38,9 +38,10 @@ interactive connector.
 
 The separate `gsv_connectors` MCP server exposes `gsv_gmail_read` and
 `gsv_gmail_write`. Their closed schemas cover message, thread, attachment,
-draft, and label operations. Sends are outward; trash is recoverable;
-`messages.purge` and `threads.purge` are permanent. Those effects require the
-appropriate bound preview and short-lived confirmation before execution.
+draft, and label operations. Sends are outward and confirmed. Trash, restore,
+and label moves are one-step recoverable operations, including batches of up
+to 1,000 messages. `messages.purge`, `threads.purge`, and
+`messages.batch_purge` are permanent and require a bound confirmation.
 
 Return the verified identity basis, bounded-read result, tool shape, coverage
 horizon, and stable references to `$gsv-onboard`. Record no raw mail bodies,

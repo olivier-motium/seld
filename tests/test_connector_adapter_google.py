@@ -287,6 +287,14 @@ def test_google_local_file_limit_hook_allows_only_sanitized_provider_shapes() ->
         )
         == (GMAIL_UPLOAD_MAX_BYTES * 3) // 4
     )
+    assert (
+        adapter.max_local_file_bytes(
+            _operation("gmail", "messages.send"),
+            gmail_input,
+            path=("attachments", 0, "local_file"),
+        )
+        == (GMAIL_UPLOAD_MAX_BYTES * 3) // 4
+    )
 
     drive_operation = _operation("google_drive", "files.update")
     drive_input = {
@@ -349,21 +357,27 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
             }
         if name in {
             "messages.get",
-            "messages.modify",
             "messages.trash",
             "messages.restore",
             "messages.purge",
         }:
             return {"message_id": "message"}
+        if name == "messages.modify":
+            return {"add_label_ids": ["INBOX"], "message_id": "message"}
+        if name == "messages.batch_modify":
+            return {"add_label_ids": ["INBOX"], "message_ids": ["message"]}
+        if name == "messages.batch_purge":
+            return {"message_ids": ["message"]}
         if name in {
             "threads.get",
-            "threads.modify",
             "threads.trash",
             "threads.restore",
             "threads.purge",
         }:
             return {"thread_id": "thread"}
-        if name == "drafts.create":
+        if name == "threads.modify":
+            return {"remove_label_ids": ["INBOX"], "thread_id": "thread"}
+        if name in {"drafts.create", "messages.send"}:
             return {"text_body": "hello", "to": ["recipient@example.test"]}
         if name in {"drafts.get", "drafts.update", "drafts.delete", "drafts.send"}:
             return {"draft_id": "draft"}
@@ -691,49 +705,69 @@ def test_gmail_get_repeats_metadata_headers_and_draft_list_never_sends_label_ids
     }
 
 
-def test_gmail_modify_effects_escalate_mailbox_removal_and_require_confirmation() -> None:
+def test_gmail_recoverable_moves_remain_one_step() -> None:
     adapter = GoogleConnectorAdapter()
     operation = _operation("gmail", "messages.modify")
-    assert (
-        adapter.classify_effect(operation, {"add_label_ids": ["TRASH"], "message_id": "m"})
-        is ConnectorEffect.DESTRUCTIVE
-    )
-    assert (
-        adapter.classify_effect(operation, {"add_label_ids": ["SPAM"], "message_id": "m"})
-        is ConnectorEffect.DESTRUCTIVE
-    )
-    assert (
-        adapter.classify_effect(operation, {"message_id": "m", "remove_label_ids": ["INBOX"]})
-        is ConnectorEffect.DESTRUCTIVE
-    )
-    assert (
-        adapter.classify_effect(operation, {"message_id": "m", "remove_label_ids": ["TRASH"]})
-        is ConnectorEffect.SAFE_MUTATION
-    )
-
-    destructive = {"add_label_ids": ["TRASH"], "message_id": "message"}
-    blocked_transport = _Transport()
-    with pytest.raises(ValidationError):
+    for mutation in (
+        {"add_label_ids": ["TRASH"], "message_id": "message"},
+        {"add_label_ids": ["SPAM"], "message_id": "message"},
+        {"message_id": "message", "remove_label_ids": ["INBOX"]},
+    ):
+        assert adapter.classify_effect(operation, mutation) is ConnectorEffect.SAFE_MUTATION
+        transport = _Transport()
         adapter.execute(
             operation,
-            destructive,
+            mutation,
             continuation=None,
             credential=_credential(),
-            transport=blocked_transport,
+            transport=transport,
         )
-    assert blocked_transport.calls == []
+        assert transport.calls[-1]["path"] == "/gmail/v1/users/me/messages/message/modify"
 
-    confirmed_transport = _Transport()
+    for name, identifier in (
+        ("messages.trash", {"message_id": "message"}),
+        ("threads.trash", {"thread_id": "thread"}),
+    ):
+        assert (
+            adapter.classify_effect(_operation("gmail", name), identifier)
+            is ConnectorEffect.SAFE_MUTATION
+        )
+
+
+def test_gmail_batch_modify_and_purge_use_fixed_provider_routes() -> None:
+    adapter = GoogleConnectorAdapter()
+    transport = _Transport()
     adapter.execute(
-        operation,
-        destructive,
+        _operation("gmail", "messages.batch_modify"),
+        {
+            "add_label_ids": ["TRASH"],
+            "message_ids": ["message-1", "message-2"],
+            "remove_label_ids": ["INBOX"],
+        },
         continuation=None,
         credential=_credential(),
-        transport=confirmed_transport,
-        write_idempotency_key="confirmed-modify",
+        transport=transport,
     )
-    assert confirmed_transport.calls[-1]["path"] == "/gmail/v1/users/me/messages/message/modify"
-    assert confirmed_transport.calls[-1]["json_body"] == {"addLabelIds": ["TRASH"]}
+    modify = transport.calls[-1]
+    assert modify["path"] == "/gmail/v1/users/me/messages/batchModify"
+    assert modify["json_body"] == {
+        "addLabelIds": ["TRASH"],
+        "ids": ["message-1", "message-2"],
+        "removeLabelIds": ["INBOX"],
+    }
+    assert 204 in modify["expected_statuses"]
+
+    adapter.execute(
+        _operation("gmail", "messages.batch_purge"),
+        {"message_ids": ["message-1", "message-2"]},
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    purge = transport.calls[-1]
+    assert purge["path"] == "/gmail/v1/users/me/messages/batchDelete"
+    assert purge["json_body"] == {"ids": ["message-1", "message-2"]}
+    assert 204 in purge["expected_statuses"]
 
 
 def test_only_expired_gmail_history_maps_to_full_sync_required() -> None:
@@ -843,6 +877,67 @@ def test_gmail_drafts_use_safe_mime_and_draft_then_send() -> None:
             credential=_credential(),
             transport=transport,
         )
+
+
+def test_gmail_structured_message_send_uses_safe_mime() -> None:
+    transport = _Transport()
+    result = GoogleConnectorAdapter().execute(
+        _operation("gmail", "messages.send"),
+        {
+            "bcc": ["audit@example.test"],
+            "subject": "Direct send",
+            "text_body": "Hello",
+            "to": ["recipient@example.test"],
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    assert result.payload == {}
+    call = transport.calls[-1]
+    assert call["path"] == "/gmail/v1/users/me/messages/send"
+    encoded = call["json_body"]["raw"]
+    raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    assert message["To"] == "recipient@example.test"
+    assert message["Bcc"] == "audit@example.test"
+    assert message["Subject"] == "Direct send"
+
+
+def test_gmail_structured_message_send_preserves_verified_reply_threading() -> None:
+    metadata = json.dumps(
+        {
+            "payload": {
+                "headers": [
+                    {"name": "Message-ID", "value": "<original@example.test>"},
+                    {"name": "Subject", "value": "Planning"},
+                ]
+            },
+            "threadId": "provider-thread-7",
+        }
+    ).encode()
+    transport = _Transport(bodies=(metadata, b"{}"))
+    GoogleConnectorAdapter().execute(
+        _operation("gmail", "messages.send"),
+        {
+            "reply_to_message_id": "gmail-resource-42",
+            "text_body": "Reply body",
+            "thread_id": "provider-thread-7",
+            "to": ["recipient@example.test"],
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    sent = transport.calls[-1]
+    assert sent["path"] == "/gmail/v1/users/me/messages/send"
+    assert sent["json_body"]["threadId"] == "provider-thread-7"
+    encoded = sent["json_body"]["raw"]
+    message = BytesParser(policy=policy.default).parsebytes(
+        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    )
+    assert message["In-Reply-To"] == "<original@example.test>"
+    assert message["Subject"] == "Planning"
 
 
 def test_gmail_reply_preflights_rfc_headers_and_provider_thread() -> None:
@@ -960,6 +1055,36 @@ def test_gmail_attachment_defaults_to_a_private_streaming_artifact(tmp_path: Pat
         store.close()
 
 
+def test_gmail_raw_message_streams_to_a_private_rfc822_artifact(tmp_path: Path) -> None:
+    content = b"From: sender@example.test\r\nTo: owner@example.test\r\n\r\nHello"
+    encoded = base64.urlsafe_b64encode(content).decode("ascii").rstrip("=")
+    body = json.dumps({"raw": encoded}).encode("utf-8")
+    store = ArtifactStore(tmp_path / "artifacts")
+    scope = ConnectorArtifactScope(store)
+    transfer = ConnectorTransferContext(_artifact_scope_factory=lambda: scope)
+    transport = _Transport(download_body=body)
+    result = GoogleConnectorAdapter().execute(
+        _operation("gmail", "messages.get"),
+        {"format": "raw", "message_id": "message"},
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        transfer=transfer,
+    )
+    try:
+        assert result.payload == {"bytes": len(content), "delivery": "artifact"}
+        assert result.artifact is not None
+        assert result.artifact.media_type == "message/rfc822"
+        assert result.artifact.path.read_bytes() == content
+        call = transport.calls[-1]
+        assert call["path"] == "/gmail/v1/users/me/messages/message"
+        assert call["query"] == (("format", "raw"), ("fields", "raw"))
+    finally:
+        if result.artifact is not None:
+            scope.complete(result.artifact)
+        store.close()
+
+
 def test_gmail_attachment_inline_compatibility_decodes_base64url_without_artifact(
     tmp_path: Path,
 ) -> None:
@@ -984,14 +1109,28 @@ def test_gmail_attachment_inline_compatibility_decodes_base64url_without_artifac
 
 
 @pytest.mark.parametrize(
-    ("name", "method", "draft_path", "extra"),
+    ("name", "method", "draft_path", "extra", "metadata"),
     (
-        ("drafts.create", ConnectorMethod.POST, "/upload/gmail/v1/users/me/drafts", {}),
+        (
+            "drafts.create",
+            ConnectorMethod.POST,
+            "/upload/gmail/v1/users/me/drafts",
+            {},
+            {"message": {}},
+        ),
         (
             "drafts.update",
             ConnectorMethod.PUT,
             "/upload/gmail/v1/users/me/drafts/draft",
             {"draft_id": "draft"},
+            {"message": {}},
+        ),
+        (
+            "messages.send",
+            ConnectorMethod.POST,
+            "/upload/gmail/v1/users/me/messages/send",
+            {"to": ["recipient@example.test"]},
+            {},
         ),
     ),
 )
@@ -1001,6 +1140,7 @@ def test_gmail_local_file_attachment_uses_resumable_rfc822_upload(
     method: ConnectorMethod,
     draft_path: str,
     extra: dict[str, object],
+    metadata: dict[str, object],
 ) -> None:
     upload = _prepared_upload(tmp_path)
     transfer = ConnectorTransferContext(uploads={("attachments", 0, "local_file"): upload})
@@ -1028,7 +1168,7 @@ def test_gmail_local_file_attachment_uses_resumable_rfc822_upload(
             "X-Upload-Content-Length": str(sent["content_length"]),
             "X-Upload-Content-Type": "message/rfc822",
         }
-        assert initiated["json_body"] == {"message": {}}
+        assert initiated["json_body"] == metadata
         assert sent["credential"] is None
         assert sent["content_type"] == "message/rfc822"
         serialized = b"".join(sent["source"])
@@ -1044,8 +1184,17 @@ def test_gmail_local_file_attachment_uses_resumable_rfc822_upload(
         upload.close()
 
 
+@pytest.mark.parametrize(
+    ("name", "expected_metadata"),
+    (
+        ("drafts.create", {"message": {"threadId": "provider-thread-7"}}),
+        ("messages.send", {"threadId": "provider-thread-7"}),
+    ),
+)
 def test_gmail_local_file_reply_preserves_verified_headers_and_thread_metadata(
     tmp_path: Path,
+    name: str,
+    expected_metadata: dict[str, object],
 ) -> None:
     metadata = json.dumps(
         {
@@ -1064,12 +1213,13 @@ def test_gmail_local_file_reply_preserves_verified_headers_and_thread_metadata(
     transport = _Transport(bodies=(metadata, b"{}"))
     try:
         GoogleConnectorAdapter().execute(
-            _operation("gmail", "drafts.create"),
+            _operation("gmail", name),
             {
                 "attachments": [{"filename": "reply.txt", "mime_type": "text/plain"}],
                 "reply_to_message_id": "gmail-resource-42",
                 "text_body": "Reply body",
                 "thread_id": "provider-thread-7",
+                "to": ["recipient@example.test"],
             },
             continuation=None,
             credential=_credential(),
@@ -1078,7 +1228,7 @@ def test_gmail_local_file_reply_preserves_verified_headers_and_thread_metadata(
         )
         preflight, initiated, sent = transport.calls
         assert preflight["path"] == "/gmail/v1/users/me/messages/gmail-resource-42"
-        assert initiated["json_body"] == {"message": {"threadId": "provider-thread-7"}}
+        assert initiated["json_body"] == expected_metadata
         message = BytesParser(policy=policy.default).parsebytes(b"".join(sent["source"]))
         assert message["In-Reply-To"] == "<original@example.test>"
         assert message["References"] == "<root@example.test> <original@example.test>"

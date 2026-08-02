@@ -57,6 +57,11 @@ def _message_part_body(content: bytes, *, padded: bool = False) -> bytes:
     ).encode("utf-8")
 
 
+def _raw_message(content: bytes) -> bytes:
+    encoded = base64.urlsafe_b64encode(content).decode("ascii").rstrip("=")
+    return json.dumps({"raw": encoded}).encode("utf-8")
+
+
 def test_message_part_body_decodes_chunk_split_base64url_into_a_stream() -> None:
     content = bytes(range(256)) * 64
     writer = _RecordingWriter()
@@ -85,6 +90,46 @@ def test_message_part_body_accepts_padded_data_and_bounded_inline_content() -> N
     assert decoder.inline_content == content
 
 
+def test_raw_message_decodes_chunk_split_base64url_into_an_artifact() -> None:
+    content = bytes(range(256)) * 64
+    writer = _RecordingWriter()
+    decoder = GmailMessagePartBodyDecoder(writer=writer, encoded_field="raw")
+    body = _raw_message(content)
+    for offset in range(0, len(body), 5):
+        decoder.write(body[offset : offset + 5])
+    receipt = decoder.finish()
+
+    assert receipt is not None
+    assert bytes(writer.content) == content
+    assert decoder.decoded_size == len(content)
+    assert decoder.declared_size is None
+    assert writer.finished is True
+    assert writer.aborted is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        b'{"raw":"YQ=="',
+        b'{"raw":"bad*"}',
+        b'{"raw":"YQ==","size":1}',
+        b'{"raw":"YQ==","sizeEstimate":1}',
+        b'{"raw":"YQ==","raw":"Yg=="}',
+    ),
+)
+def test_raw_message_rejects_malformed_truncated_or_unknown_fields_without_a_receipt(
+    body: bytes,
+) -> None:
+    writer = _RecordingWriter()
+    decoder = GmailMessagePartBodyDecoder(writer=writer, encoded_field="raw")
+    with pytest.raises(ValidationError, match="Gmail raw-message"):
+        decoder.write(body)
+        decoder.finish()
+
+    assert writer.aborted is True
+    assert writer.finished is False
+
+
 def test_message_part_body_aborts_after_partial_artifact_output() -> None:
     content = b"x" * 5_000
     encoded = base64.urlsafe_b64encode(content).decode("ascii").rstrip("=")
@@ -93,6 +138,19 @@ def test_message_part_body_aborts_after_partial_artifact_output() -> None:
     with pytest.raises(ValidationError):
         decoder.write(b'{"data":"' + encoded.encode("ascii") + b'!","size":5000}')
     assert writer.content
+    assert writer.aborted is True
+    assert writer.finished is False
+
+
+def test_message_part_body_keeps_exact_declared_size_validation() -> None:
+    writer = _RecordingWriter()
+    decoder = GmailMessagePartBodyDecoder(writer=writer)
+    decoder.write(b'{"data":"YQ==","size":2}')
+
+    with pytest.raises(ValidationError, match="size does not match decoded data"):
+        decoder.finish()
+
+    assert bytes(writer.content) == b"a"
     assert writer.aborted is True
     assert writer.finished is False
 

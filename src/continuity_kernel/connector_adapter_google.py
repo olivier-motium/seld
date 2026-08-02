@@ -44,14 +44,14 @@ from continuity_kernel.errors import ContinuityError, ValidationError
 _GOOGLE_PROVIDERS: Final = frozenset({"gmail", "google_calendar", "google_drive"})
 _GOOGLE_BY_KEY: Final = {operation.key: operation for operation in GOOGLE_OPERATIONS}
 _GMAIL_PURGE_SCOPE: Final = "https://mail.google.com/"
-_GMAIL_DESTRUCTIVE_ADD_LABELS: Final = frozenset({"SPAM", "TRASH"})
-_GMAIL_DESTRUCTIVE_REMOVE_LABELS: Final = frozenset({"INBOX"})
 _GMAIL_MAX_HISTORY_ID: Final = 2**64 - 1
 _JSON_STATUSES: Final = frozenset({200, 201, 202})
 _DELETE_STATUSES: Final = frozenset({200, 202, 204})
 _MAX_CONTENT_BYTES: Final = 180_000
 _LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
-_GMAIL_LOCAL_UPLOAD_OPERATIONS: Final = frozenset({"drafts.create", "drafts.update"})
+_GMAIL_LOCAL_UPLOAD_OPERATIONS: Final = frozenset(
+    {"drafts.create", "drafts.update", "messages.send"}
+)
 _DRIVE_LOCAL_UPLOAD_OPERATIONS: Final = frozenset({"files.create", "files.update"})
 _GMAIL_MAX_RAW_ATTACHMENT_BYTES: Final = (GMAIL_UPLOAD_MAX_BYTES * 3) // 4
 _DRIVE_MAX_LOCAL_FILE_BYTES: Final = 5 * 1024**4
@@ -173,6 +173,17 @@ class GoogleConnectorAdapter:
         )
         if (credential is None) is not (transport is None):
             raise ValidationError("Google effect preflight requires credential and transport")
+        if operation.provider == "gmail" and operation.name == "messages.send":
+            reply_context = None
+            if "reply_to_message_id" in values or "thread_id" in values:
+                if credential is None or transport is None:
+                    raise ValidationError(
+                        "Google effect preflight requires credential and transport"
+                    )
+                reply_context = _gmail_reply_context(values, credential, transport)
+            if transfer is not None and _gmail_has_local_attachment(values, transfer):
+                _gmail_mime_upload(values, transfer, reply_context=reply_context)
+            return operation.effect
         if (
             operation.provider == "gmail"
             and operation.name in _GMAIL_LOCAL_UPLOAD_OPERATIONS
@@ -188,11 +199,6 @@ class GoogleConnectorAdapter:
                 reply_context = _gmail_reply_context(values, credential, transport)
             _gmail_mime_upload(values, transfer, reply_context=reply_context)
             return operation.effect
-        if operation.provider == "gmail" and operation.name in {
-            "messages.modify",
-            "threads.modify",
-        }:
-            return _gmail_modify_effect(values)
         if (
             operation.provider == "google_drive"
             and operation.name in _DRIVE_LOCAL_UPLOAD_OPERATIONS
@@ -233,15 +239,6 @@ class GoogleConnectorAdapter:
         operation, values = _known_operation(operation, input_value, transfer=transfer)
         if not isinstance(credential, ConnectorRuntimeCredential):
             raise ValidationError("connector runtime credential is invalid")
-        if (
-            operation.provider == "gmail"
-            and operation.name in {"messages.modify", "threads.modify"}
-            and _gmail_modify_effect(values) is ConnectorEffect.DESTRUCTIVE
-            and not write_idempotency_key
-        ):
-            raise ValidationError(
-                "destructive Gmail label changes require a fresh confirmation preview"
-            )
         if (
             operation.provider == "google_drive"
             and operation.name in _DRIVE_LOCAL_UPLOAD_OPERATIONS
@@ -319,7 +316,7 @@ def _gmail_prepared_validation_input(
 ) -> object:
     if (
         operation.provider != "gmail"
-        or operation.name not in {"drafts.create", "drafts.update"}
+        or operation.name not in _GMAIL_LOCAL_UPLOAD_OPERATIONS
         or not isinstance(input_value, Mapping)
     ):
         return input_value
@@ -439,6 +436,13 @@ def _execute_gmail(
             path=f"{base}/profile",
             credential=credential,
         )
+    if name == "messages.get" and values.get("format") == "raw":
+        return _gmail_raw_message_request(
+            transport,
+            credential=credential,
+            values=values,
+            transfer=transfer,
+        )
     if name == "messages.get":
         return _json_request(
             transport,
@@ -489,32 +493,47 @@ def _execute_gmail(
             path=f"{base}/labels/{_segment(_required(values, 'label_id'))}",
             credential=credential,
         )
-    if name in {"drafts.create", "drafts.update"}:
+    if name in {"drafts.create", "drafts.update", "messages.send"}:
         draft_path = f"{base}/drafts"
         method = ConnectorMethod.POST
         if name == "drafts.update":
             method = ConnectorMethod.PUT
             draft_path += f"/{_segment(_required(values, 'draft_id'))}"
+        elif name == "messages.send":
+            draft_path = f"{base}/messages/send"
         reply_context = _gmail_reply_context(values, credential, transport)
         if _gmail_has_local_attachment(values, transfer):
             if transfer is None:
                 raise ValidationError("Gmail local-file upload requires transfer context")
-            return _gmail_resumable_draft_upload(
+            metadata: dict[str, object]
+            if name == "messages.send":
+                metadata = {}
+                if reply_context is not None:
+                    metadata["threadId"] = reply_context.thread_id
+            else:
+                message_metadata: dict[str, object] = {}
+                if reply_context is not None:
+                    message_metadata["threadId"] = reply_context.thread_id
+                metadata = {"message": message_metadata}
+            return _gmail_resumable_message_upload(
                 transport,
                 method=method,
-                draft_path=draft_path,
+                upload_path=draft_path,
                 credential=credential,
                 values=values,
                 reply_context=reply_context,
                 transfer=transfer,
+                metadata=metadata,
             )
+        message = _gmail_message(values, reply_context=reply_context)
+        json_body = message if name == "messages.send" else {"message": message}
         return _json_request(
             transport,
             origin=ConnectorOrigin.GMAIL,
             method=method,
             path=draft_path,
             credential=credential,
-            json_body={"message": _gmail_message(values, reply_context=reply_context)},
+            json_body=json_body,
             expected_statuses=_JSON_STATUSES,
         )
     if name == "drafts.delete":
@@ -549,6 +568,35 @@ def _execute_gmail(
                 {"add_label_ids": "addLabelIds", "remove_label_ids": "removeLabelIds"},
             ),
             expected_statuses=_JSON_STATUSES,
+        )
+    if name == "messages.batch_modify":
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.POST,
+            path=f"{base}/messages/batchModify",
+            credential=credential,
+            json_body=_selected(
+                values,
+                {
+                    "add_label_ids": "addLabelIds",
+                    "message_ids": "ids",
+                    "remove_label_ids": "removeLabelIds",
+                },
+            ),
+            expected_statuses=_DELETE_STATUSES,
+        )
+    if name == "messages.batch_purge":
+        if operation.required_scopes != (frozenset({_GMAIL_PURGE_SCOPE}),):
+            raise ValidationError("Gmail batch purge must require the full Gmail scope")
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.POST,
+            path=f"{base}/messages/batchDelete",
+            credential=credential,
+            json_body={"ids": values["message_ids"]},
+            expected_statuses=_DELETE_STATUSES,
         )
     if name in {
         "messages.trash",
@@ -2612,6 +2660,38 @@ def _gmail_attachment_request(
     )
 
 
+def _gmail_raw_message_request(
+    transport: ConnectorTransport,
+    *,
+    credential: ConnectorRuntimeCredential,
+    values: Mapping[str, object],
+    transfer: ConnectorTransferContext | None,
+) -> ConnectorAdapterResult:
+    if transfer is None:
+        raise ValidationError("Gmail raw-message artifact delivery requires transfer context")
+    writer = transfer.artifacts.start("gmail-message.eml", media_type="message/rfc822")
+    decoder = GmailMessagePartBodyDecoder(writer=writer, encoded_field="raw")
+    try:
+        response = transport.download_stream(
+            origin=ConnectorOrigin.GMAIL,
+            sink=decoder,
+            path=(f"/gmail/v1/users/me/messages/{_segment(_required(values, 'message_id'))}"),
+            query=(("format", "raw"), ("fields", "raw")),
+            credential=credential.credential,
+            max_bytes=MAX_ARTIFACT_BYTES,
+        )
+    except Exception:
+        decoder.abort()
+        raise
+    if response.artifact is None:
+        decoder.abort()
+        raise ValidationError("Gmail raw-message artifact delivery produced no receipt")
+    return ConnectorAdapterResult(
+        {"bytes": decoder.decoded_size, "delivery": "artifact"},
+        artifact=response.artifact,
+    )
+
+
 def _gmail_has_local_attachment(
     values: Mapping[str, object], transfer: ConnectorTransferContext | None
 ) -> bool:
@@ -2671,27 +2751,25 @@ def _gmail_mime_upload(
     )
 
 
-def _gmail_resumable_draft_upload(
+def _gmail_resumable_message_upload(
     transport: ConnectorTransport,
     *,
     method: ConnectorMethod,
-    draft_path: str,
+    upload_path: str,
     credential: ConnectorRuntimeCredential,
     values: Mapping[str, object],
     reply_context: _GmailReplyContext | None,
     transfer: ConnectorTransferContext,
+    metadata: Mapping[str, object],
 ) -> ConnectorAdapterResult:
     mime = _gmail_mime_upload(values, transfer, reply_context=reply_context)
-    metadata: dict[str, object] = {"message": {}}
-    if reply_context is not None:
-        metadata["message"] = {"threadId": reply_context.thread_id}
     initiated = transport.request(
         origin=ConnectorOrigin.GMAIL,
         method=method,
-        path=f"/upload{draft_path}",
+        path=f"/upload{upload_path}",
         credential=credential.credential,
         query=(("uploadType", "resumable"),),
-        json_body=metadata,
+        json_body=dict(metadata),
         headers={
             "X-Upload-Content-Length": str(mime.size),
             "X-Upload-Content-Type": "message/rfc822",
@@ -2765,14 +2843,6 @@ def _gmail_resource_identifier(values: dict[str, object], name: str) -> tuple[st
     if name.startswith("messages."):
         return "messages", _required(values, "message_id")
     return "threads", _required(values, "thread_id")
-
-
-def _gmail_modify_effect(values: Mapping[str, object]) -> ConnectorEffect:
-    added = set(_strings(values.get("add_label_ids", [])))
-    removed = set(_strings(values.get("remove_label_ids", [])))
-    if added & _GMAIL_DESTRUCTIVE_ADD_LABELS or removed & _GMAIL_DESTRUCTIVE_REMOVE_LABELS:
-        return ConnectorEffect.DESTRUCTIVE
-    return ConnectorEffect.SAFE_MUTATION
 
 
 def _etag_headers(values: Mapping[str, object]) -> dict[str, str]:

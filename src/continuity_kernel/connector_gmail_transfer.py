@@ -10,7 +10,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.policy import SMTP
-from typing import Final, Protocol
+from typing import Final, Literal, Protocol
 
 from continuity_kernel.connector_transfer import (
     MAX_ARTIFACT_BYTES,
@@ -155,9 +155,7 @@ class GmailMimeUpload:
         self._parts = parts
         self.size = size
         if self.size > GMAIL_UPLOAD_MAX_BYTES:
-            raise ValidationError(
-                "Gmail draft MIME upload exceeds the documented provider upload limit"
-            )
+            raise ValidationError("Gmail MIME upload exceeds the documented provider upload limit")
 
     def __repr__(self) -> str:
         return f"GmailMimeUpload(size={self.size!r}, attachments=<{len(self._parts)} redacted>)"
@@ -181,14 +179,24 @@ class GmailMimeUpload:
 
 
 class GmailMessagePartBodyDecoder:
-    """Incrementally parse one Gmail MessagePartBody and decode its data field."""
+    """Incrementally parse one Gmail response and decode one base64url field."""
 
     def __init__(
         self,
         *,
         writer: _ArtifactWriter | None = None,
+        encoded_field: Literal["data", "raw"] = "data",
     ) -> None:
+        if encoded_field not in {"data", "raw"}:
+            raise ValidationError("Gmail encoded response field is invalid")
         self._writer = writer
+        self._encoded_field = encoded_field
+        self._response_kind = "attachment" if encoded_field == "data" else "raw-message"
+        self._allowed_fields = (
+            frozenset({"attachmentId", "data", "size"})
+            if encoded_field == "data"
+            else frozenset({"raw"})
+        )
         self._state = "start"
         self._closed = False
         self._finished = False
@@ -219,14 +227,14 @@ class GmailMessagePartBodyDecoder:
         if self._writer is not None:
             raise ValidationError("Gmail inline content is unavailable for artifact delivery")
         if not self._finished:
-            raise ValidationError("Gmail attachment content is not complete")
+            raise self._error("content is not complete")
         return bytes(self._inline_content)
 
     def write(self, content: bytes) -> int:
         if self._closed:
-            raise ValidationError("Gmail attachment decoder is closed")
+            raise self._error("decoder is closed")
         if not isinstance(content, bytes):
-            raise ValidationError("Gmail attachment response returned a non-binary chunk")
+            raise self._error("response returned a non-binary chunk")
         try:
             for byte in content:
                 self._consume(byte)
@@ -234,21 +242,21 @@ class GmailMessagePartBodyDecoder:
             self.abort()
             if isinstance(exc, ValidationError):
                 raise
-            raise ValidationError("Gmail attachment response is malformed") from exc
+            raise self._error("response is malformed") from exc
         return len(content)
 
     def finish(self) -> ArtifactReceipt | None:
         if self._closed:
-            raise ValidationError("Gmail attachment decoder is closed")
+            raise self._error("decoder is closed")
         try:
             if self._state != "done" or not self._saw_data:
-                raise ValidationError("Gmail attachment response is truncated")
+                raise self._error("response is truncated")
             if self._declared_size is not None and self._declared_size != self._decoded_size:
-                raise ValidationError("Gmail attachment size does not match decoded data")
+                raise self._error("size does not match decoded data")
             if self._writer is not None:
                 receipt = self._writer.finish()
                 if not isinstance(receipt, ArtifactReceipt):
-                    raise ValidationError("Gmail attachment artifact receipt is invalid")
+                    raise self._error("artifact receipt is invalid")
             else:
                 receipt = None
             self._closed = True
@@ -264,6 +272,9 @@ class GmailMessagePartBodyDecoder:
         self._closed = True
         if self._writer is not None:
             self._writer.abort()
+
+    def _error(self, detail: str) -> ValidationError:
+        return ValidationError(f"Gmail {self._response_kind} {detail}")
 
     def _consume(self, byte: int) -> None:
         if self._state in {
@@ -286,14 +297,14 @@ class GmailMessagePartBodyDecoder:
         if self._state == "size":
             self._consume_size(byte)
             return
-        raise ValidationError("Gmail attachment response is malformed")
+        raise self._error("response is malformed")
 
     def _consume_structure(self, byte: int) -> None:
         if self._state == "start":
             if byte in _JSON_WHITESPACE:
                 return
             if byte != ord("{"):
-                raise ValidationError("Gmail attachment response is malformed")
+                raise self._error("response is malformed")
             self._state = "key_or_end"
             return
         if self._state == "key_or_end":
@@ -303,33 +314,33 @@ class GmailMessagePartBodyDecoder:
                 self._state = "done"
                 return
             if byte != ord('"'):
-                raise ValidationError("Gmail attachment response is malformed")
+                raise self._error("response is malformed")
             self._begin_small_string("key")
             return
         if self._state == "after_key":
             if byte in _JSON_WHITESPACE:
                 return
             if byte != ord(":"):
-                raise ValidationError("Gmail attachment response is malformed")
+                raise self._error("response is malformed")
             self._state = "value"
             return
         if self._state == "value":
             if byte in _JSON_WHITESPACE:
                 return
             key = self._pending_key
-            if key not in {"attachmentId", "data", "size"}:
-                raise ValidationError("Gmail attachment response contains an unknown field")
-            if key in {"attachmentId", "data"}:
+            if key not in self._allowed_fields:
+                raise self._error("response contains an unknown field")
+            if key in {"attachmentId", self._encoded_field}:
                 if byte != ord('"'):
-                    raise ValidationError("Gmail attachment response is malformed")
+                    raise self._error("response is malformed")
                 self._begin_small_string("attachment_id" if key == "attachmentId" else "data")
-                if key == "data":
+                if key == self._encoded_field:
                     self._string_token.clear()
                     self._string_kind = None
                     self._state = "data"
                 return
             if not 48 <= byte <= 57:
-                raise ValidationError("Gmail attachment response is malformed")
+                raise self._error("response is malformed")
             self._size_digits = bytearray((byte,))
             self._state = "size"
             return
@@ -337,16 +348,16 @@ class GmailMessagePartBodyDecoder:
             if byte in _JSON_WHITESPACE:
                 return
             if self._state == "size_end" and byte not in {ord(","), ord("}")}:
-                raise ValidationError("Gmail attachment response is malformed")
+                raise self._error("response is malformed")
             if byte == ord(","):
                 self._state = "key_or_end"
                 return
             if byte == ord("}"):
                 self._state = "done"
                 return
-            raise ValidationError("Gmail attachment response is malformed")
+            raise self._error("response is malformed")
         if self._state == "done" and byte not in _JSON_WHITESPACE:
-            raise ValidationError("Gmail attachment response has trailing data")
+            raise self._error("response has trailing data")
 
     def _begin_small_string(self, kind: str) -> None:
         self._string_token = bytearray(b'"')
@@ -356,10 +367,10 @@ class GmailMessagePartBodyDecoder:
 
     def _consume_small_string(self, byte: int) -> None:
         if byte < 0x20:
-            raise ValidationError("Gmail attachment response contains an invalid string")
+            raise self._error("response contains an invalid string")
         self._string_token.append(byte)
         if len(self._string_token) > _MAX_SMALL_STRING_BYTES:
-            raise ValidationError("Gmail attachment response string exceeds its bound")
+            raise self._error("response string exceeds its bound")
         if self._string_escape:
             self._string_escape = False
             return
@@ -371,13 +382,13 @@ class GmailMessagePartBodyDecoder:
         try:
             value = json.loads(self._string_token.decode("utf-8"))
         except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValidationError("Gmail attachment response contains an invalid string") from exc
+            raise self._error("response contains an invalid string") from exc
         if not isinstance(value, str):
-            raise ValidationError("Gmail attachment response contains an invalid string")
+            raise self._error("response contains an invalid string")
         kind = self._string_kind
         if kind == "key":
             if value in self._seen:
-                raise ValidationError("Gmail attachment response contains a duplicate field")
+                raise self._error("response contains a duplicate field")
             self._seen.add(value)
             self._pending_key = value
             self._state = "after_key"
@@ -385,7 +396,7 @@ class GmailMessagePartBodyDecoder:
         if kind == "attachment_id":
             self._state = "after_value"
             return
-        raise ValidationError("Gmail attachment response is malformed")
+        raise self._error("response is malformed")
 
     def _consume_data(self, byte: int) -> None:
         if byte == ord('"'):
@@ -393,24 +404,24 @@ class GmailMessagePartBodyDecoder:
                 self._finish_data()
                 return
             if "=" in self._base64_pending or len(self._base64_pending) not in {2, 3}:
-                raise ValidationError("Gmail attachment base64url data is invalid")
+                raise self._error("base64url data is invalid")
             self._emit_base64(self._base64_pending + "=" * (4 - len(self._base64_pending)))
             self._base64_pending = ""
             self._finish_data()
             return
         if byte == ord("\\") or byte < 0x20:
-            raise ValidationError("Gmail attachment base64url data is invalid")
+            raise self._error("base64url data is invalid")
         character = chr(byte)
         if character == "=":
             if self._base64_padding_complete or len(self._base64_pending) < 2:
-                raise ValidationError("Gmail attachment base64url data is invalid")
+                raise self._error("base64url data is invalid")
             self._base64_pending += character
         elif character in _BASE64URL:
             if self._base64_padding_complete:
-                raise ValidationError("Gmail attachment base64url data is invalid")
+                raise self._error("base64url data is invalid")
             self._base64_pending += character
         else:
-            raise ValidationError("Gmail attachment base64url data is invalid")
+            raise self._error("base64url data is invalid")
         if len(self._base64_pending) == 4:
             self._emit_base64(self._base64_pending)
             self._base64_padding_complete = "=" in self._base64_pending
@@ -433,7 +444,7 @@ class GmailMessagePartBodyDecoder:
         try:
             decoded = base64.b64decode(bytes(self._base64_encoded), altchars=b"-_", validate=True)
         except (binascii.Error, UnicodeError, ValueError) as exc:
-            raise ValidationError("Gmail attachment base64url data is invalid") from exc
+            raise self._error("base64url data is invalid") from exc
         self._base64_encoded.clear()
         if decoded:
             self._emit(decoded)
@@ -441,22 +452,22 @@ class GmailMessagePartBodyDecoder:
     def _emit(self, decoded: bytes) -> None:
         self._decoded_size += len(decoded)
         if self._decoded_size > MAX_ARTIFACT_BYTES:
-            raise ValidationError("Gmail attachment exceeds the local artifact bound")
+            raise self._error("exceeds the local artifact bound")
         if self._writer is not None:
             written = self._writer.write(decoded)
             if written != len(decoded):
-                raise ValidationError("Gmail attachment artifact wrote an unexpected byte count")
+                raise self._error("artifact wrote an unexpected byte count")
             return
         if self._decoded_size > GMAIL_INLINE_MAX_BYTES:
-            raise ValidationError("Gmail inline attachment exceeds its bounded compatibility limit")
+            raise self._error("inline content exceeds its bounded compatibility limit")
         self._inline_content.extend(decoded)
 
     def _consume_size(self, byte: int) -> None:
         if 48 <= byte <= 57:
             if self._size_digits == bytearray(b"0"):
-                raise ValidationError("Gmail attachment response size is invalid")
+                raise self._error("response size is invalid")
             if len(self._size_digits) >= 20:
-                raise ValidationError("Gmail attachment response size is invalid")
+                raise self._error("response size is invalid")
             self._size_digits.append(byte)
             return
         if byte in _JSON_WHITESPACE:
@@ -468,15 +479,15 @@ class GmailMessagePartBodyDecoder:
             self._state = "after_value"
             self._consume_structure(byte)
             return
-        raise ValidationError("Gmail attachment response size is invalid")
+        raise self._error("response size is invalid")
 
     def _finish_size(self) -> None:
         try:
             value = int(self._size_digits.decode("ascii"))
         except (UnicodeError, ValueError) as exc:
-            raise ValidationError("Gmail attachment response size is invalid") from exc
+            raise self._error("response size is invalid") from exc
         if value > MAX_ARTIFACT_BYTES:
-            raise ValidationError("Gmail attachment response size exceeds its bound")
+            raise self._error("response size exceeds its bound")
         self._declared_size = value
 
 

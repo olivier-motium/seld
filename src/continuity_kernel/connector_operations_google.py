@@ -81,7 +81,7 @@ def _operation(
 
 
 def _email_addresses() -> dict[str, object]:
-    return _array(_text(512), maximum=64)
+    return _array(_text(512), maximum=64, minimum=1)
 
 
 def _attachment() -> dict[str, object]:
@@ -146,6 +146,23 @@ def _mail_fields() -> dict[str, object]:
     }
 
 
+def _gmail_send() -> dict[str, object]:
+    fields = _mail_fields()
+    schema = _object(fields)
+    schema["oneOf"] = [
+        _object(fields, required=("to",)),
+        _object(
+            {name: field for name, field in fields.items() if name != "to"},
+            required=("cc",),
+        ),
+        _object(
+            {name: field for name, field in fields.items() if name not in {"cc", "to"}},
+            required=("bcc",),
+        ),
+    ]
+    return schema
+
+
 def _mail_list() -> dict[str, object]:
     return _object(
         {
@@ -172,7 +189,7 @@ def _gmail_message_get() -> dict[str, object]:
     schema = _object(
         {
             **identifier,
-            "format": {"enum": ["full", "metadata", "minimal"], "type": "string"},
+            "format": {"enum": ["full", "metadata", "minimal", "raw"], "type": "string"},
             "metadata_header_names": _array(_text(998), maximum=_GMAIL_MAX_METADATA_HEADER_NAMES),
         },
         required=("message_id",),
@@ -181,7 +198,7 @@ def _gmail_message_get() -> dict[str, object]:
         _object(
             {
                 **identifier,
-                "format": {"enum": ["full", "minimal"], "type": "string"},
+                "format": {"enum": ["full", "minimal", "raw"], "type": "string"},
             },
             required=("message_id",),
         ),
@@ -194,6 +211,23 @@ def _gmail_message_get() -> dict[str, object]:
                 ),
             },
             required=("format", "message_id"),
+        ),
+    ]
+    return schema
+
+
+def _gmail_modify(identifier_name: str, identifier: dict[str, object]) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "add_label_ids": _array(_id(), maximum=100, minimum=1),
+        identifier_name: identifier,
+        "remove_label_ids": _array(_id(), maximum=100, minimum=1),
+    }
+    schema = _object(properties, required=(identifier_name,))
+    schema["oneOf"] = [
+        _object(properties, required=("add_label_ids", identifier_name)),
+        _object(
+            {name: field for name, field in properties.items() if name != "add_label_ids"},
+            required=(identifier_name, "remove_label_ids"),
         ),
     ]
     return schema
@@ -888,23 +922,43 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
     _operation(
         "gmail",
         ConnectorMode.WRITE,
+        "messages.send",
+        ConnectorEffect.OUTWARD,
+        _GMAIL_WRITE_SCOPES,
+        _gmail_send(),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
         "messages.modify",
         ConnectorEffect.SAFE_MUTATION,
         _GMAIL_WRITE_SCOPES,
+        _gmail_modify("message_id", _id()),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "messages.batch_modify",
+        ConnectorEffect.SAFE_MUTATION,
+        _GMAIL_WRITE_SCOPES,
+        _gmail_modify("message_ids", _array(_id(), maximum=1_000, minimum=1)),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "messages.batch_purge",
+        ConnectorEffect.PERMANENT,
+        _GMAIL_PURGE_SCOPES,
         _object(
-            {
-                "add_label_ids": _array(_id(), maximum=100),
-                "message_id": _id(),
-                "remove_label_ids": _array(_id(), maximum=100),
-            },
-            required=("message_id",),
+            {"message_ids": _array(_id(), maximum=1_000, minimum=1)},
+            required=("message_ids",),
         ),
     ),
     _operation(
         "gmail",
         ConnectorMode.WRITE,
         "messages.trash",
-        ConnectorEffect.DESTRUCTIVE,
+        ConnectorEffect.SAFE_MUTATION,
         _GMAIL_WRITE_SCOPES,
         _object({"message_id": _id()}, required=("message_id",)),
     ),
@@ -930,20 +984,13 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "threads.modify",
         ConnectorEffect.SAFE_MUTATION,
         _GMAIL_WRITE_SCOPES,
-        _object(
-            {
-                "add_label_ids": _array(_id(), maximum=100),
-                "remove_label_ids": _array(_id(), maximum=100),
-                "thread_id": _id(),
-            },
-            required=("thread_id",),
-        ),
+        _gmail_modify("thread_id", _id()),
     ),
     _operation(
         "gmail",
         ConnectorMode.WRITE,
         "threads.trash",
-        ConnectorEffect.DESTRUCTIVE,
+        ConnectorEffect.SAFE_MUTATION,
         _GMAIL_WRITE_SCOPES,
         _object({"thread_id": _id()}, required=("thread_id",)),
     ),

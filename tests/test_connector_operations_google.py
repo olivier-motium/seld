@@ -31,7 +31,10 @@ _EXPECTED_NAMES = {
         "drafts.update",
         "drafts.delete",
         "drafts.send",
+        "messages.send",
         "messages.modify",
+        "messages.batch_modify",
+        "messages.batch_purge",
         "messages.trash",
         "messages.restore",
         "messages.purge",
@@ -121,11 +124,11 @@ def test_google_provider_mode_partitions_and_exact_operation_surface() -> None:
         for provider in _EXPECTED_NAMES
     }
     assert names == _EXPECTED_NAMES
-    assert len(GOOGLE_OPERATIONS) == 69
+    assert len(GOOGLE_OPERATIONS) == 72
     assert {
         provider: sum(item.provider == provider for item in GOOGLE_OPERATIONS) for provider in names
     } == {
-        "gmail": 26,
+        "gmail": 29,
         "google_calendar": 14,
         "google_drive": 29,
     }
@@ -138,12 +141,15 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
         ("gmail", "drafts.update"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "drafts.delete"): ConnectorEffect.PERMANENT,
         ("gmail", "drafts.send"): ConnectorEffect.OUTWARD,
+        ("gmail", "messages.send"): ConnectorEffect.OUTWARD,
         ("gmail", "messages.modify"): ConnectorEffect.SAFE_MUTATION,
-        ("gmail", "messages.trash"): ConnectorEffect.DESTRUCTIVE,
+        ("gmail", "messages.batch_modify"): ConnectorEffect.SAFE_MUTATION,
+        ("gmail", "messages.batch_purge"): ConnectorEffect.PERMANENT,
+        ("gmail", "messages.trash"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "messages.restore"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "messages.purge"): ConnectorEffect.PERMANENT,
         ("gmail", "threads.modify"): ConnectorEffect.SAFE_MUTATION,
-        ("gmail", "threads.trash"): ConnectorEffect.DESTRUCTIVE,
+        ("gmail", "threads.trash"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "threads.restore"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "threads.purge"): ConnectorEffect.PERMANENT,
         ("gmail", "labels.create"): ConnectorEffect.SAFE_MUTATION,
@@ -188,7 +194,7 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
         if item.mode is ConnectorMode.READ
     )
 
-    for name in ("messages.purge", "threads.purge"):
+    for name in ("messages.batch_purge", "messages.purge", "threads.purge"):
         purge = _operation("gmail", ConnectorMode.WRITE, name)
         assert purge.required_scopes == (frozenset({"https://mail.google.com/"}),)
         assert purge.scope_grant_satisfies(["https://mail.google.com/"])
@@ -241,6 +247,35 @@ def test_gmail_metadata_headers_require_metadata_format_and_drafts_reject_label_
     with pytest.raises(ValidationError):
         drafts.validate_input({"label_ids": ["INBOX"]})
 
+    messages = _operation("gmail", ConnectorMode.READ, "messages.get")
+    assert messages.validate_input({"format": "raw", "message_id": "message"}) == {
+        "format": "raw",
+        "message_id": "message",
+    }
+
+
+def test_gmail_batch_operations_enforce_provider_bounds() -> None:
+    modify = _operation("gmail", ConnectorMode.WRITE, "messages.batch_modify")
+    purge = _operation("gmail", ConnectorMode.WRITE, "messages.batch_purge")
+    maximum = [f"message-{index}" for index in range(1_000)]
+    assert modify.validate_input({"add_label_ids": ["TRASH"], "message_ids": maximum}) == {
+        "add_label_ids": ["TRASH"],
+        "message_ids": maximum,
+    }
+    assert purge.validate_input({"message_ids": maximum}) == {"message_ids": maximum}
+
+    with pytest.raises(ValidationError):
+        modify.validate_input({"message_ids": ["message"]})
+    for label_field in ("add_label_ids", "remove_label_ids"):
+        with pytest.raises(ValidationError):
+            modify.validate_input({label_field: [], "message_ids": ["message"]})
+
+    for operation in (modify, purge):
+        with pytest.raises(ValidationError):
+            operation.validate_input({"message_ids": []})
+        with pytest.raises(ValidationError):
+            operation.validate_input({"message_ids": [*maximum, "one-too-many"]})
+
 
 def test_gmail_message_and_thread_modify_accept_the_provider_label_limit() -> None:
     label_ids = [f"Label_{index}" for index in range(100)]
@@ -253,7 +288,34 @@ def test_gmail_message_and_thread_modify_accept_the_provider_label_limit() -> No
         maximum = {identifier: "resource", label_field: label_ids}
         assert operation.validate_input(maximum) == maximum
         with pytest.raises(ValidationError):
+            operation.validate_input({identifier: "resource"})
+        with pytest.raises(ValidationError):
+            operation.validate_input({identifier: "resource", label_field: []})
+        with pytest.raises(ValidationError):
             operation.validate_input({identifier: "resource", label_field: [*label_ids, "extra"]})
+
+
+def test_gmail_send_requires_at_least_one_nonempty_recipient_group() -> None:
+    send = _operation("gmail", ConnectorMode.WRITE, "messages.send")
+    for recipients in (
+        {"to": ["to@example.test"]},
+        {"cc": ["cc@example.test"]},
+        {"bcc": ["bcc@example.test"]},
+        {"bcc": ["bcc@example.test"], "cc": ["cc@example.test"]},
+        {"cc": ["cc@example.test"], "to": ["to@example.test"]},
+    ):
+        values = {**recipients, "text_body": "Hello"}
+        assert send.validate_input(values) == values
+
+    for invalid in (
+        {},
+        {"text_body": "Hello"},
+        {"text_body": "Hello", "to": []},
+        {"cc": [], "text_body": "Hello"},
+        {"bcc": [], "text_body": "Hello"},
+    ):
+        with pytest.raises(ValidationError):
+            send.validate_input(invalid)
 
 
 def test_google_catalog_validates_representative_rich_inputs() -> None:

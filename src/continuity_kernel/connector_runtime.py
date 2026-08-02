@@ -1153,7 +1153,11 @@ def _promote_prepared_upload_effect(
 
 
 def _scope_error(provider: str, operation: str) -> str:
-    if provider == "gmail" and operation in {"messages.purge", "threads.purge"}:
+    if provider == "gmail" and operation in {
+        "messages.batch_purge",
+        "messages.purge",
+        "threads.purge",
+    }:
         return (
             "Gmail permanent delete is not enabled; reconnect Full access with the separate "
             "permanent-delete permission"
