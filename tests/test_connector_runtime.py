@@ -214,6 +214,10 @@ class _OutlookAdapter(_Adapter):
     providers = frozenset({"outlook_calendar"})
 
 
+class _GoogleCalendarAdapter(_Adapter):
+    providers = frozenset({"google_calendar"})
+
+
 class _HttpResponse:
     def __init__(
         self,
@@ -709,6 +713,100 @@ def test_outlook_event_delete_and_cancel_previews_disclose_attendee_cancellation
         assert "cancellation" in warning
     assert adapter.calls == []
     assert adapter.classifications == list(inputs.values())
+
+
+def test_google_calendar_previews_disclose_patch_notification_and_recovery_semantics(
+    tmp_path: Path,
+) -> None:
+    adapter = _GoogleCalendarAdapter()
+    adapter.effect = ConnectorEffect.PERMANENT
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    expected_event = {
+        "end": None,
+        "etag": "event-etag",
+        "eventType": "default",
+        "id": "event-1",
+        "organizer": None,
+        "start": None,
+        "status": "confirmed",
+        "summary": "Reviewed event",
+    }
+    inputs = {
+        "calendars.delete": {
+            "calendar_id": "secondary",
+            "etag": "calendar-etag",
+            "expected_calendar": {
+                "accessRole": "owner",
+                "id": "secondary",
+                "primary": False,
+                "summary": "Reviewed calendar",
+            },
+        },
+        "events.delete": {
+            "calendar_id": "primary",
+            "etag": "event-etag",
+            "event_id": "event-1",
+            "expected_event": expected_event,
+            "send_updates": "none",
+        },
+        "events.create": {
+            "attendee_emails": ["guest@example.test"],
+            "calendar_id": "primary",
+            "end": {"date_time": "2026-08-02T10:00:00+02:00"},
+            "send_updates": "none",
+            "start": {"date_time": "2026-08-02T09:00:00+02:00"},
+        },
+        "events.move": {
+            "calendar_id": "primary",
+            "destination_calendar_id": "destination",
+            "etag": "event-etag",
+            "event_id": "event-1",
+            "expected_destination_calendar": {
+                "accessRole": "owner",
+                "id": "destination",
+                "primary": False,
+                "summary": "Destination calendar",
+            },
+            "expected_event": expected_event,
+            "send_updates": "none",
+        },
+        "events.respond": {
+            "calendar_id": "primary",
+            "etag": "event-etag",
+            "event_id": "event-1",
+            "expected_event": expected_event,
+            "response_status": "accepted",
+        },
+        "events.update": {
+            "calendar_id": "primary",
+            "etag": "event-etag",
+            "event_id": "event-1",
+            "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=2"],
+        },
+    }
+    expected_phrases = {
+        "calendars.delete": ("permanently", "everyone"),
+        "events.create": ("attendees", "invitations", "external calendars", "email"),
+        "events.delete": ("Trash", "external calendars", "email"),
+        "events.move": ("organizer", "external calendars", "email"),
+        "events.respond": ("organizer", "RSVP"),
+        "events.update": ("replaces", "complete array", "external calendars"),
+    }
+
+    for operation, input_value in inputs.items():
+        preview = runtime.call_tool(
+            "gsv_google_calendar_write",
+            {
+                "connection_id": str(CONNECTION_ID),
+                "input": input_value,
+                "operation": operation,
+            },
+        )
+        assert preview["status"] == "confirmation_required"
+        warning = str(preview["warning"])
+        for phrase in expected_phrases[operation]:
+            assert phrase in warning
+    assert adapter.calls == []
 
 
 def test_confirmation_is_bound_to_exact_mutation_and_adapter_cannot_downgrade(

@@ -6,11 +6,11 @@ import base64
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date, datetime
 from email.message import EmailMessage
 from email.policy import SMTP
 from io import BytesIO
 from typing import Final, NoReturn, cast
-from urllib.parse import urlsplit
 
 from continuity_kernel.connector_adapter import (
     ConnectorAdapterResult,
@@ -147,14 +147,15 @@ _MESSAGE_ID_REFERENCE: Final = re.compile(r"<[^<>\s]+@[^<>\s]+>")
 _PAGINATION_FIELDS: Final = frozenset({"nextPageToken", "nextSyncToken", "nextLink", "nextPage"})
 _UPLOAD_LOCATION_FIELDS: Final = frozenset({"location"})
 _UNRESERVED: Final = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-_DRIVE_ATTACHMENT_SCOPES: Final = frozenset(
-    {
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/drive.file",
-        "https://www.googleapis.com/auth/drive.readonly",
-    }
+_EXISTING_CALENDAR_EVENT_MUTATIONS: Final = frozenset(
+    {"events.delete", "events.move", "events.respond", "events.update"}
 )
-_EXISTING_CALENDAR_EVENT_MUTATIONS: Final = frozenset({"events.move", "events.update"})
+_CALENDAR_RECURRENCE_LINE: Final = re.compile(
+    r"^(?:RRULE|EXRULE|RDATE|EXDATE)(?:;[^:\r\n]*)?:[^\r\n]+$"
+)
+_CALENDAR_RFC3339: Final = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})?$"
+)
 _DRIVE_COMMENT_RESOURCE_FIELDS: Final = (
     "id,kind,createdTime,modifiedTime,author(displayName,emailAddress,kind,me,"
     "permissionId,photoLink),content,htmlContent,deleted,resolved,anchor,"
@@ -354,22 +355,40 @@ class GoogleConnectorAdapter:
             return operation.effect
         if operation.provider != "google_calendar":
             return operation.effect
-        if operation.name == "calendars.update" and values.get("calendar_id") != "primary":
+        if operation.name == "calendars.update":
+            _calendar_body(values, require_change=True)
             return ConnectorEffect.OUTWARD
+        if operation.name == "calendars.delete":
+            _validate_secondary_calendar_target(values)
+            if credential is not None and transport is not None:
+                _calendar_delete_preflight(values, credential, transport)
+            return operation.effect
         if operation.name == "events.create":
+            _calendar_event_body(values, include_client_id=True, require_change=False)
             return (
                 ConnectorEffect.OUTWARD
                 if _calendar_has_external_effect(values)
                 else operation.effect
             )
+        if operation.name == "events.move":
+            _validate_calendar_move(values)
         if operation.name in _EXISTING_CALENDAR_EVENT_MUTATIONS:
-            if _calendar_has_external_effect(values):
-                return ConnectorEffect.OUTWARD
+            if operation.name == "events.update":
+                _calendar_event_body(values, include_client_id=False, require_change=True)
             if credential is None or transport is None:
-                return ConnectorEffect.OUTWARD
-            event = _calendar_event_effect_preflight(values, credential, transport)
-            if _calendar_event_is_shared(event):
-                return ConnectorEffect.OUTWARD
+                return _calendar_event_effect(
+                    operation.name,
+                    values,
+                    None,
+                    catalog_effect=operation.effect,
+                )
+            event = _calendar_event_mutation_preflight(values, credential, transport)
+            return _calendar_event_effect(
+                operation.name,
+                values,
+                event,
+                catalog_effect=operation.effect,
+            )
         return operation.effect
 
     def execute(
@@ -412,11 +431,23 @@ class GoogleConnectorAdapter:
             operation.provider == "google_calendar"
             and operation.name in _EXISTING_CALENDAR_EVENT_MUTATIONS
         ):
-            event = _calendar_event_effect_preflight(values, credential, transport)
-            if _calendar_event_is_shared(event) and write_idempotency_key is None:
+            if operation.name == "events.move":
+                _validate_calendar_move(values)
+            if operation.name == "events.update":
+                _calendar_event_body(values, include_client_id=False, require_change=True)
+            event = None
+            if operation.name != "events.respond":
+                event = _calendar_event_mutation_preflight(values, credential, transport)
+            effect = _calendar_event_effect(
+                operation.name,
+                values,
+                event,
+                catalog_effect=operation.effect,
+            )
+            if effect is not ConnectorEffect.SAFE_MUTATION and write_idempotency_key is None:
                 raise ValidationError(
-                    "the Google Calendar event is shared; request a fresh outward "
-                    "confirmation preview"
+                    "the Google Calendar event changed or affects other people; request a "
+                    "fresh confirmation preview"
                 )
         if operation.provider == "gmail":
             return _execute_gmail(
@@ -1332,22 +1363,24 @@ def _execute_calendar(
     base = "/calendar/v3"
     name = operation.name
     if name == "calendars.list":
-        return _json_request(
+        return _calendar_sync_request(
             transport,
-            origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.GET,
             path=f"{base}/users/me/calendarList",
             credential=credential,
             query=_calendar_list_query(values, continuation),
+            continuation=continuation,
+            allow_sync_cursor=_calendar_list_sync_compatible(values),
         )
     if name == "events.list":
-        return _json_request(
+        return _calendar_sync_request(
             transport,
-            origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.GET,
             path=f"{base}/calendars/{_segment(_required(values, 'calendar_id'))}/events",
             credential=credential,
             query=_calendar_event_list_query(values, continuation),
+            continuation=continuation,
+            allow_sync_cursor=_calendar_event_sync_compatible(values),
         )
     if name == "events.instances":
         return _json_request(
@@ -1360,16 +1393,35 @@ def _execute_calendar(
             ),
             credential=credential,
             query=_calendar_instance_query(values, continuation),
+            allow_sync_cursor=False,
         )
     _reject_continuation(continuation)
     if name == "calendars.get":
-        return _json_request(
+        calendar_id = _required(values, "calendar_id")
+        result = _json_request(
             transport,
             origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.GET,
-            path=f"{base}/calendars/{_segment(_required(values, 'calendar_id'))}",
+            path=f"{base}/calendars/{_segment(calendar_id)}",
             credential=credential,
+            query=(
+                (
+                    "fields",
+                    "conferenceProperties,description,etag,id,kind,location,summary,timeZone",
+                ),
+            ),
         )
+        calendar = _provider_mapping(result, context="Google Calendar metadata read")
+        if calendar.get("kind") != "calendar#calendar":
+            raise ValidationError("Google Calendar metadata read returned a different resource")
+        if (
+            calendar_id != "primary"
+            and _provider_text(calendar, "id", context="Google Calendar metadata read")
+            != calendar_id
+        ):
+            raise ValidationError("Google Calendar metadata read returned a different calendar")
+        _safe_header(_provider_text(calendar, "etag", context="Google Calendar metadata read"))
+        return result
     if name == "events.get":
         return _json_request(
             transport,
@@ -1382,19 +1434,24 @@ def _execute_calendar(
             credential=credential,
         )
     if name == "freebusy.query":
-        body = {
-            "items": [{"id": value} for value in _strings(_required_value(values, "calendar_ids"))],
+        _validate_calendar_time_range(values, context="Google Calendar free/busy")
+        calendar_ids = _strings(_required_value(values, "calendar_ids"))
+        if len(set(calendar_ids)) != len(calendar_ids):
+            raise ValidationError("Google Calendar free/busy calendar IDs must be unique")
+        freebusy_body: dict[str, object] = {
+            "items": [{"id": value} for value in calendar_ids],
             "timeMax": _required(values, "time_max"),
             "timeMin": _required(values, "time_min"),
-            "timeZone": _required(values, "time_zone"),
         }
+        if "time_zone" in values:
+            freebusy_body["timeZone"] = _required(values, "time_zone")
         return _json_request(
             transport,
             origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.POST,
             path=f"{base}/freeBusy",
             credential=credential,
-            json_body=body,
+            json_body=freebusy_body,
             expected_statuses=_JSON_STATUSES,
         )
     if name in {"calendars.create", "calendars.update"}:
@@ -1405,20 +1462,21 @@ def _execute_calendar(
             method = ConnectorMethod.PATCH
             path += f"/{_segment(_required(values, 'calendar_id'))}"
             headers = _etag_headers(values)
-        return _json_request(
+        body = _calendar_body(values, require_change=name == "calendars.update")
+        return _calendar_write_request(
             transport,
-            origin=ConnectorOrigin.GOOGLE,
             method=method,
             path=path,
             credential=credential,
-            json_body=_calendar_fields(values),
+            json_body=body,
             headers=headers,
             expected_statuses=_JSON_STATUSES,
         )
     if name == "calendars.delete":
-        return _json_request(
+        _validate_secondary_calendar_target(values)
+        _calendar_delete_preflight(values, credential, transport)
+        return _calendar_write_request(
             transport,
-            origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.DELETE,
             path=f"{base}/calendars/{_segment(_required(values, 'calendar_id'))}",
             credential=credential,
@@ -1433,12 +1491,14 @@ def _execute_calendar(
             method = ConnectorMethod.PATCH
             path += f"/{_segment(_required(values, 'event_id'))}"
             headers = _etag_headers(values)
-        event_body = _calendar_event_body(values, include_client_id=name == "events.create")
+        event_body = _calendar_event_body(
+            values,
+            include_client_id=name == "events.create",
+            require_change=name == "events.update",
+        )
         query = list(_optional_query(values, {"send_updates": "sendUpdates"}))
-        if "drive_attachments" in values:
-            event_body["attachments"] = _calendar_drive_attachments(values, credential, transport)
-            query.append(("supportsAttachments", "true"))
-        return _json_request(
+        request = _calendar_write_request if name == "events.update" else _json_request
+        return request(
             transport,
             origin=ConnectorOrigin.GOOGLE,
             method=method,
@@ -1450,9 +1510,9 @@ def _execute_calendar(
             expected_statuses=_JSON_STATUSES,
         )
     if name == "events.move":
-        return _json_request(
+        _validate_calendar_move(values)
+        return _calendar_write_request(
             transport,
-            origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.POST,
             path=(
                 f"{base}/calendars/{_segment(_required(values, 'calendar_id'))}/events/"
@@ -1460,7 +1520,7 @@ def _execute_calendar(
             ),
             credential=credential,
             query=_calendar_move_query(values),
-            headers=_etag_headers(values) if "etag" in values else None,
+            headers=_etag_headers(values),
             expected_statuses=_JSON_STATUSES,
         )
     if name == "events.respond":
@@ -1468,21 +1528,10 @@ def _execute_calendar(
             f"{base}/calendars/{_segment(_required(values, 'calendar_id'))}/events/"
             f"{_segment(_required(values, 'event_id'))}"
         )
-        event = _provider_mapping(
-            _json_request(
-                transport,
-                origin=ConnectorOrigin.GOOGLE,
-                method=ConnectorMethod.GET,
-                path=event_path,
-                credential=credential,
-                query=(("maxAttendees", "1"), ("fields", "attendees,etag")),
-            ),
-            context="Google Calendar RSVP preflight",
-        )
+        event = _calendar_event_mutation_preflight(values, credential, transport)
         attendee, etag = _calendar_self_attendee(event, values)
-        return _json_request(
+        return _calendar_write_request(
             transport,
-            origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.PATCH,
             path=event_path,
             credential=credential,
@@ -1492,9 +1541,8 @@ def _execute_calendar(
             expected_statuses=_JSON_STATUSES,
         )
     if name == "events.delete":
-        return _json_request(
+        return _calendar_write_request(
             transport,
-            origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.DELETE,
             path=(
                 f"{base}/calendars/{_segment(_required(values, 'calendar_id'))}/events/"
@@ -1886,6 +1934,7 @@ def _json_request(
     json_body: object | None = None,
     headers: Mapping[str, str] | None = None,
     expected_statuses: frozenset[int] = frozenset({200}),
+    allow_sync_cursor: bool = True,
 ) -> ConnectorAdapterResult:
     response = transport.request(
         origin=origin,
@@ -1897,7 +1946,77 @@ def _json_request(
         headers=headers,
         expected_statuses=expected_statuses,
     )
-    return _json_result(response.json())
+    return _json_result(response.json(), allow_sync_cursor=allow_sync_cursor)
+
+
+def _calendar_sync_request(
+    transport: ConnectorTransport,
+    *,
+    method: ConnectorMethod,
+    path: str,
+    credential: ConnectorRuntimeCredential,
+    query: Sequence[tuple[str, str]],
+    continuation: object | None,
+    allow_sync_cursor: bool,
+) -> ConnectorAdapterResult:
+    try:
+        response = transport.request(
+            origin=ConnectorOrigin.GOOGLE,
+            method=method,
+            path=path,
+            credential=credential.credential,
+            query=query,
+            expected_statuses=frozenset({200}),
+        )
+    except ConnectorProviderError as exc:
+        if exc.origin is ConnectorOrigin.GOOGLE and exc.status == 410:
+            raise ConnectorProviderError(
+                origin=exc.origin,
+                status=exc.status,
+                code="full_sync_required",
+                retry_after=exc.retry_after,
+            ) from exc
+        raise
+    return _json_result(
+        response.json(),
+        active_sync_token=_calendar_sync_token(continuation),
+        allow_sync_cursor=allow_sync_cursor,
+    )
+
+
+def _calendar_write_request(
+    transport: ConnectorTransport,
+    *,
+    method: ConnectorMethod,
+    path: str,
+    credential: ConnectorRuntimeCredential,
+    query: Sequence[tuple[str, str]] = (),
+    json_body: object | None = None,
+    headers: Mapping[str, str] | None = None,
+    expected_statuses: frozenset[int] = frozenset({200}),
+    origin: ConnectorOrigin = ConnectorOrigin.GOOGLE,
+) -> ConnectorAdapterResult:
+    try:
+        return _json_request(
+            transport,
+            origin=origin,
+            method=method,
+            path=path,
+            credential=credential,
+            query=query,
+            json_body=json_body,
+            headers=headers,
+            expected_statuses=expected_statuses,
+        )
+    except ConnectorProviderError as exc:
+        if exc.origin is ConnectorOrigin.GOOGLE and exc.status == 412:
+            raise ConnectorProviderError(
+                origin=exc.origin,
+                status=exc.status,
+                code="resource_changed_reread_required",
+                retry_after=exc.retry_after,
+            ) from exc
+        raise
 
 
 def _drive_delivery(values: Mapping[str, object]) -> str:
@@ -2547,13 +2666,26 @@ def _drive_resumable_restart(
     return initiate(), restarts + 1
 
 
-def _json_result(payload: object, *, strip_upload_location: bool = False) -> ConnectorAdapterResult:
+def _json_result(
+    payload: object,
+    *,
+    strip_upload_location: bool = False,
+    active_sync_token: str | None = None,
+    allow_sync_cursor: bool = True,
+) -> ConnectorAdapterResult:
     if not isinstance(payload, Mapping):
         return ConnectorAdapterResult(payload)
     continuation: object | None = None
     if isinstance(payload.get("nextPageToken"), str):
-        continuation = payload["nextPageToken"]
-    elif isinstance(payload.get("nextSyncToken"), str):
+        continuation = (
+            {
+                "pageToken": payload["nextPageToken"],
+                "syncToken": active_sync_token,
+            }
+            if active_sync_token is not None
+            else payload["nextPageToken"]
+        )
+    elif allow_sync_cursor and isinstance(payload.get("nextSyncToken"), str):
         continuation = {"syncToken": payload["nextSyncToken"]}
     return ConnectorAdapterResult(
         _strip_provider_state(payload, strip_upload_location=strip_upload_location),
@@ -2682,8 +2814,8 @@ def _gmail_history_query(
 def _calendar_list_query(
     values: dict[str, object], continuation: object | None
 ) -> tuple[tuple[str, str], ...]:
-    continuation_query = _continuation_query(continuation)
-    if continuation_query and continuation_query[0][0] == "syncToken":
+    continuation_query = _calendar_continuation_query(continuation)
+    if _calendar_sync_token(continuation) is not None:
         if any(field in values for field in ("min_access_role", "show_own_organization_only")):
             raise ValidationError("Google Calendar sync cannot combine calendar list filters")
         visibility_flags = ("show_deleted", "show_hidden")
@@ -2710,18 +2842,17 @@ def _calendar_event_list_query(
 ) -> tuple[tuple[str, str], ...]:
     if values.get("order_by") == "startTime" and values.get("single_events") is not True:
         raise ValidationError("Google Calendar start-time ordering requires single events")
-    continuation_query = _continuation_query(continuation)
-    if continuation_query and continuation_query[0][0] == "syncToken":
+    _validate_calendar_time_range(values, context="Google Calendar event list")
+    if "updated_min" in values:
+        _calendar_rfc3339(values["updated_min"], context="Google Calendar updated-min")
+    continuation_query = _calendar_continuation_query(continuation)
+    if _calendar_sync_token(continuation) is not None:
         filters = {
-            "event_types",
             "i_cal_uid",
-            "max_attendees",
             "order_by",
             "query",
-            "single_events",
             "time_max",
             "time_min",
-            "time_zone",
             "updated_min",
         }
         if any(field in values for field in filters):
@@ -2758,6 +2889,7 @@ def _calendar_instance_query(
     continuation_query = _continuation_query(continuation)
     if continuation_query and continuation_query[0][0] == "syncToken":
         raise ValidationError("Google Calendar event instances do not support sync tokens")
+    _validate_calendar_time_range(values, context="Google Calendar event instances")
     query = list(
         _optional_query(
             values,
@@ -2913,13 +3045,59 @@ def _continuation_query(continuation: object | None) -> tuple[tuple[str, str], .
     raise ValidationError("connector continuation is invalid")
 
 
+def _calendar_continuation_query(
+    continuation: object | None,
+) -> tuple[tuple[str, str], ...]:
+    if (
+        isinstance(continuation, Mapping)
+        and set(continuation) == {"pageToken", "syncToken"}
+        and isinstance(continuation["pageToken"], str)
+        and continuation["pageToken"]
+        and isinstance(continuation["syncToken"], str)
+        and continuation["syncToken"]
+    ):
+        return (
+            ("syncToken", continuation["syncToken"]),
+            ("pageToken", continuation["pageToken"]),
+        )
+    return _continuation_query(continuation)
+
+
+def _calendar_sync_token(continuation: object | None) -> str | None:
+    if isinstance(continuation, Mapping):
+        value = continuation.get("syncToken")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _calendar_list_sync_compatible(values: Mapping[str, object]) -> bool:
+    if any(field in values for field in ("min_access_role", "show_own_organization_only")):
+        return False
+    return not any(values.get(field) is False for field in ("show_deleted", "show_hidden"))
+
+
+def _calendar_event_sync_compatible(values: Mapping[str, object]) -> bool:
+    prohibited = {
+        "i_cal_uid",
+        "order_by",
+        "query",
+        "time_max",
+        "time_min",
+        "updated_min",
+    }
+    return (
+        not any(field in values for field in prohibited) and values.get("show_deleted") is not False
+    )
+
+
 def _reject_continuation(continuation: object | None) -> None:
     if continuation is not None:
         raise ValidationError("connector operation does not accept a continuation")
 
 
-def _calendar_fields(values: dict[str, object]) -> dict[str, object]:
-    return _selected(
+def _calendar_body(values: Mapping[str, object], *, require_change: bool) -> dict[str, object]:
+    body = _selected(
         values,
         {
             "description": "description",
@@ -2928,84 +3106,13 @@ def _calendar_fields(values: dict[str, object]) -> dict[str, object]:
             "time_zone": "timeZone",
         },
     )
-
-
-def _calendar_drive_attachments(
-    values: dict[str, object],
-    credential: ConnectorRuntimeCredential,
-    transport: ConnectorTransport,
-) -> list[dict[str, str]]:
-    references = _mappings(_required_value(values, "drive_attachments"))
-    if references and not _DRIVE_ATTACHMENT_SCOPES.intersection(credential.granted_scopes):
-        raise ValidationError(
-            "Google Calendar Drive attachments require Drive access on this Google connection"
-        )
-    attachments: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for reference in references:
-        file_id = _required(reference, "file_id")
-        if file_id in seen:
-            raise ValidationError("Google Calendar Drive attachment IDs must be unique")
-        seen.add(file_id)
-        file = _provider_mapping(
-            _json_request(
-                transport,
-                origin=ConnectorOrigin.GOOGLE,
-                method=ConnectorMethod.GET,
-                path=f"/drive/v3/files/{_segment(file_id)}",
-                credential=credential,
-                query=(
-                    ("fields", "id,mimeType,name,webViewLink"),
-                    ("supportsAllDrives", "true"),
-                ),
-            ),
-            context="Google Drive attachment preflight",
-        )
-        if _provider_text(file, "id", context="Google Drive attachment preflight") != file_id:
-            raise ValidationError("Google Drive attachment preflight returned a different file")
-        attachments.append(
-            {
-                "fileUrl": _drive_web_view_link(file),
-                "mimeType": _mime_type(
-                    _provider_text(file, "mimeType", context="Google Drive attachment preflight")
-                ),
-                "title": _provider_text(
-                    file,
-                    "name",
-                    context="Google Drive attachment preflight",
-                    allow_empty=True,
-                ),
-            }
-        )
-    return attachments
-
-
-def _drive_web_view_link(file: Mapping[str, object]) -> str:
-    link = _provider_text(file, "webViewLink", context="Google Drive attachment preflight")
-    if len(link) > 8_192:
-        raise ValidationError("Google Drive attachment preflight returned an invalid web link")
-    try:
-        parsed = urlsplit(link)
-        port = parsed.port
-    except ValueError as exc:
-        raise ValidationError(
-            "Google Drive attachment preflight returned an invalid web link"
-        ) from exc
-    hostname = parsed.hostname
-    if (
-        parsed.scheme != "https"
-        or hostname is None
-        or not (hostname == "google.com" or hostname.endswith(".google.com"))
-        or parsed.username is not None
-        or parsed.password is not None
-        or port not in {None, 443}
-    ):
-        raise ValidationError("Google Drive attachment preflight returned an invalid web link")
-    return link
+    if require_change and not body:
+        raise ValidationError("Google Calendar update requires at least one changed field")
+    return body
 
 
 def _calendar_event_body(
-    values: dict[str, object], *, include_client_id: bool
+    values: Mapping[str, object], *, include_client_id: bool, require_change: bool
 ) -> dict[str, object]:
     body = _selected(
         values,
@@ -3025,8 +3132,14 @@ def _calendar_event_body(
     if "attendee_emails" in values and "attendees" in values:
         raise ValidationError("Google Calendar attendees are specified twice")
     if "attendee_emails" in values:
-        body["attendees"] = [{"email": value} for value in _strings(values["attendee_emails"])]
+        emails = _strings(values["attendee_emails"])
+        _validate_unique_calendar_attendees(emails)
+        body["attendees"] = [{"email": value} for value in emails]
     if "attendees" in values:
+        attendees = _mappings(values["attendees"])
+        _validate_unique_calendar_attendees(
+            [_required(attendee, "email") for attendee in attendees]
+        )
         body["attendees"] = [
             _selected(
                 attendee,
@@ -3034,16 +3147,30 @@ def _calendar_event_body(
                     "display_name": "displayName",
                     "email": "email",
                     "optional": "optional",
-                    "response_status": "responseStatus",
                 },
             )
-            for attendee in _mappings(values["attendees"])
+            for attendee in attendees
         ]
+    if "attendees" in body and "send_updates" not in values:
+        raise ValidationError(
+            "Google Calendar attendee changes require an explicit send-updates choice"
+        )
+    if "recurrence" in values:
+        recurrence = _strings(values["recurrence"])
+        if len(set(recurrence)) != len(recurrence):
+            raise ValidationError("Google Calendar recurrence lines must be unique")
+        if any(_CALENDAR_RECURRENCE_LINE.fullmatch(line) is None for line in recurrence):
+            raise ValidationError(
+                "Google Calendar recurrence must use RRULE, EXRULE, RDATE, or EXDATE lines"
+            )
     if "reminders" in values:
         body["reminders"] = _calendar_reminders(values["reminders"])
     for source, target in (("start", "start"), ("end", "end")):
         if source in values:
             body[target] = _calendar_time(values[source])
+    _validate_calendar_event_times(values)
+    if require_change and not body:
+        raise ValidationError("Google Calendar event update requires at least one changed field")
     return body
 
 
@@ -3075,8 +3202,111 @@ def _calendar_time(value: object) -> dict[str, str]:
     if not isinstance(value, Mapping):
         raise ValidationError("Google Calendar event time is invalid")
     if "date_time" in value:
-        return {"dateTime": _text(value["date_time"]), "timeZone": _text(value["time_zone"])}
-    return {"date": _text(value["date"]), "timeZone": _text(value["time_zone"])}
+        date_time = _text(value["date_time"])
+        _calendar_rfc3339(
+            date_time,
+            context="Google Calendar event date-time",
+            require_offset="time_zone" not in value,
+        )
+        result = {"dateTime": date_time}
+    else:
+        calendar_date = _text(value["date"])
+        _calendar_date(calendar_date, context="Google Calendar event date")
+        result = {"date": calendar_date}
+    if "time_zone" in value:
+        result["timeZone"] = _text(value["time_zone"])
+    return result
+
+
+def _validate_unique_calendar_attendees(emails: Sequence[str]) -> None:
+    normalized = [email.casefold() for email in emails]
+    if len(set(normalized)) != len(normalized):
+        raise ValidationError("Google Calendar attendee emails must be unique")
+
+
+def _calendar_date(value: object, *, context: str) -> date:
+    rendered = _text(value)
+    try:
+        parsed = date.fromisoformat(rendered)
+    except ValueError as exc:
+        raise ValidationError(f"{context} must be an ISO 8601 date") from exc
+    if parsed.isoformat() != rendered:
+        raise ValidationError(f"{context} must be an ISO 8601 date")
+    return parsed
+
+
+def _calendar_rfc3339(value: object, *, context: str, require_offset: bool = True) -> datetime:
+    rendered = _text(value)
+    if _CALENDAR_RFC3339.fullmatch(rendered) is None:
+        raise ValidationError(f"{context} must be an RFC3339 date-time")
+    normalized = f"{rendered[:-1]}+00:00" if rendered.endswith(("Z", "z")) else rendered
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValidationError(f"{context} must be an RFC3339 date-time") from exc
+    if require_offset and parsed.utcoffset() is None:
+        raise ValidationError(f"{context} must include an offset or an explicit time zone")
+    return parsed
+
+
+def _calendar_time_kind(value: object) -> str:
+    if not isinstance(value, Mapping):
+        raise ValidationError("Google Calendar event time is invalid")
+    return "date_time" if "date_time" in value else "date"
+
+
+def _validate_calendar_event_times(values: Mapping[str, object]) -> None:
+    start = values.get("start")
+    end = values.get("end")
+    if start is not None:
+        _calendar_time(start)
+    if end is not None:
+        _calendar_time(end)
+    if start is None or end is None:
+        return
+    start_kind = _calendar_time_kind(start)
+    end_kind = _calendar_time_kind(end)
+    if start_kind != end_kind:
+        raise ValidationError("Google Calendar event start and end must use the same time kind")
+    assert isinstance(start, Mapping) and isinstance(end, Mapping)
+    if values.get("recurrence"):
+        _validate_calendar_recurrence_time_zones(start, end)
+    if start_kind == "date":
+        start_value = _calendar_date(start["date"], context="Google Calendar event start")
+        end_value = _calendar_date(end["date"], context="Google Calendar event end")
+        if end_value <= start_value:
+            raise ValidationError(
+                "Google Calendar all-day end date is exclusive and must follow the start date"
+            )
+        return
+    start_value = _calendar_rfc3339(
+        start["date_time"],
+        context="Google Calendar event start",
+        require_offset="time_zone" not in start,
+    )
+    end_value = _calendar_rfc3339(
+        end["date_time"],
+        context="Google Calendar event end",
+        require_offset="time_zone" not in end,
+    )
+    comparable = (start_value.utcoffset() is not None and end_value.utcoffset() is not None) or (
+        start_value.utcoffset() is None
+        and end_value.utcoffset() is None
+        and start.get("time_zone") == end.get("time_zone")
+    )
+    if comparable and end_value <= start_value:
+        raise ValidationError("Google Calendar event end must follow its start")
+
+
+def _validate_calendar_time_range(values: Mapping[str, object], *, context: str) -> None:
+    start = values.get("time_min")
+    end = values.get("time_max")
+    start_value = (
+        _calendar_rfc3339(start, context=f"{context} time-min") if start is not None else None
+    )
+    end_value = _calendar_rfc3339(end, context=f"{context} time-max") if end is not None else None
+    if start_value is not None and end_value is not None and end_value <= start_value:
+        raise ValidationError(f"{context} time-max must follow time-min")
 
 
 def _calendar_reminders(value: object) -> dict[str, object]:
@@ -3097,18 +3327,44 @@ def _calendar_reminders(value: object) -> dict[str, object]:
 
 
 def _calendar_has_external_effect(values: Mapping[str, object]) -> bool:
-    if (
-        "attendee_emails" in values
-        or "attendees" in values
-        or "drive_attachments" in values
-        or "send_updates" in values
-    ):
+    if "attendee_emails" in values or "attendees" in values:
         return True
-    calendar_ids = [values.get("calendar_id"), values.get("destination_calendar_id")]
-    return any(isinstance(value, str) and value != "primary" for value in calendar_ids)
+    calendar_id = values.get("calendar_id")
+    return isinstance(calendar_id, str) and calendar_id != "primary"
 
 
-def _calendar_event_effect_preflight(
+def _calendar_event_effect(
+    name: str,
+    values: Mapping[str, object],
+    event: Mapping[str, object] | None,
+    *,
+    catalog_effect: ConnectorEffect,
+) -> ConnectorEffect:
+    if name in {"events.move", "events.respond"}:
+        return ConnectorEffect.OUTWARD
+    if name == "events.delete":
+        return ConnectorEffect.DESTRUCTIVE
+    if name != "events.update":
+        return catalog_effect
+    if "recurrence" in values:
+        return ConnectorEffect.DESTRUCTIVE
+    if "attendee_emails" in values or "attendees" in values:
+        if event is None:
+            return ConnectorEffect.OUTWARD
+        current, current_complete = _calendar_event_attendee_emails(event)
+        requested = _calendar_requested_attendee_emails(values)
+        if not current_complete or not current.issubset(requested):
+            return ConnectorEffect.DESTRUCTIVE
+        return ConnectorEffect.OUTWARD
+    local_fields = {"calendar_id", "etag", "event_id", "reminders", "send_updates"}
+    if set(values).issubset(local_fields):
+        return ConnectorEffect.SAFE_MUTATION
+    if event is None or _calendar_event_is_shared(event) or values.get("calendar_id") != "primary":
+        return ConnectorEffect.OUTWARD
+    return catalog_effect
+
+
+def _calendar_event_mutation_preflight(
     values: Mapping[str, object],
     credential: ConnectorRuntimeCredential,
     transport: ConnectorTransport,
@@ -3118,17 +3374,270 @@ def _calendar_event_effect_preflight(
         f"{_segment(_required(values, 'calendar_id'))}/events/"
         f"{_segment(_required(values, 'event_id'))}"
     )
-    return _provider_mapping(
+    event = _provider_mapping(
         _json_request(
             transport,
             origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.GET,
             path=path,
             credential=credential,
-            query=(("fields", "attendees,organizer"),),
+            query=(
+                (
+                    "fields",
+                    "attendees(comment,email,self),end(date,dateTime,timeZone),etag,eventType,id,"
+                    "organizer(displayName,email,self),start(date,dateTime,timeZone),status,summary",
+                ),
+            ),
         ),
         context="Google Calendar event effect preflight",
     )
+    current_etag = _safe_header(
+        _provider_text(event, "etag", context="Google Calendar event effect preflight")
+    )
+    if current_etag != _safe_header(_required(values, "etag")):
+        raise ConflictError("Google Calendar event changed; read it again before changing it")
+    if "expected_event" in values:
+        expected = _calendar_event_snapshot(
+            values["expected_event"],
+            context="Google Calendar expected event",
+        )
+        if expected["id"] != _required(values, "event_id"):
+            raise ValidationError("Google Calendar expected event ID does not match the target")
+        if expected["etag"] != _safe_header(_required(values, "etag")):
+            raise ValidationError("Google Calendar expected event ETag does not match the target")
+        current = _calendar_event_snapshot(event, context="Google Calendar current event")
+        if current != expected:
+            raise ValidationError(
+                "Google Calendar expected event snapshot does not match the current event; "
+                "normalize the reviewed read to the documented confirmation shape"
+            )
+    if values.get("recurrence"):
+        _validate_calendar_recurrence_time_zones(
+            values.get("start", event.get("start")),
+            values.get("end", event.get("end")),
+        )
+    if "response_status" in values:
+        _calendar_self_attendee(event, values)
+    if "destination_calendar_id" in values and event.get("eventType") != "default":
+        raise ValidationError("Google Calendar can move only default events")
+    if "destination_calendar_id" in values:
+        _calendar_move_destination_preflight(values, credential, transport)
+    return event
+
+
+def _validate_calendar_recurrence_time_zones(start: object, end: object) -> None:
+    if not isinstance(start, Mapping) or not isinstance(end, Mapping):
+        raise ValidationError(
+            "Google Calendar recurring events require one matching explicit time zone"
+        )
+    start_zone = start.get("time_zone", start.get("timeZone"))
+    end_zone = end.get("time_zone", end.get("timeZone"))
+    if not isinstance(start_zone, str) or not start_zone or start_zone != end_zone:
+        raise ValidationError(
+            "Google Calendar recurring events require one matching explicit time zone"
+        )
+
+
+def _calendar_event_snapshot(value: object, *, context: str) -> dict[str, object]:
+    fields = {"end", "etag", "eventType", "id", "organizer", "start", "status", "summary"}
+    if not isinstance(value, Mapping):
+        raise ValidationError(f"{context} is invalid")
+    selected = {key: value.get(key) for key in fields}
+    identifier = _provider_text(selected, "id", context=context)
+    etag = _safe_header(_provider_text(selected, "etag", context=context))
+    event_type = _provider_text(selected, "eventType", context=context)
+    status = _provider_text(selected, "status", context=context)
+    summary = selected["summary"]
+    if summary is not None and not isinstance(summary, str):
+        raise ValidationError(f"{context} has an invalid summary")
+    return {
+        "end": _calendar_provider_time_snapshot(selected["end"], context=f"{context} end"),
+        "etag": etag,
+        "eventType": event_type,
+        "id": identifier,
+        "organizer": _calendar_organizer_snapshot(
+            selected["organizer"],
+            context=f"{context} organizer",
+        ),
+        "start": _calendar_provider_time_snapshot(
+            selected["start"],
+            context=f"{context} start",
+        ),
+        "status": status,
+        "summary": summary,
+    }
+
+
+def _calendar_provider_time_snapshot(value: object, *, context: str) -> object:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValidationError(f"{context} is invalid")
+    allowed = {"date", "dateTime", "timeZone"}
+    if any(not isinstance(key, str) or key not in allowed for key in value):
+        raise ValidationError(f"{context} contains unsupported fields")
+    if ("date" in value) == ("dateTime" in value):
+        raise ValidationError(f"{context} must contain exactly one time value")
+    if "date" in value:
+        result: dict[str, object] = {
+            "date": _calendar_date(value["date"], context=context).isoformat()
+        }
+    else:
+        rendered = _text(value["dateTime"])
+        _calendar_rfc3339(
+            rendered,
+            context=context,
+            require_offset="timeZone" not in value,
+        )
+        result = {"dateTime": rendered}
+    if "timeZone" in value:
+        result["timeZone"] = _text(value["timeZone"])
+    return result
+
+
+def _calendar_organizer_snapshot(value: object, *, context: str) -> object:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValidationError(f"{context} is invalid")
+    allowed = {"displayName", "email", "self"}
+    if any(not isinstance(key, str) or key not in allowed for key in value):
+        raise ValidationError(f"{context} contains unsupported fields")
+    result: dict[str, object] = {"email": _provider_text(value, "email", context=context)}
+    display_name = value.get("displayName")
+    if display_name is not None:
+        if not isinstance(display_name, str):
+            raise ValidationError(f"{context} has an invalid display name")
+        result["displayName"] = display_name
+    self_value = value.get("self")
+    if self_value is not None:
+        if type(self_value) is not bool:
+            raise ValidationError(f"{context} has an invalid self marker")
+        result["self"] = self_value
+    return result
+
+
+def _calendar_event_attendee_emails(event: Mapping[str, object]) -> tuple[set[str], bool]:
+    attendees = event.get("attendees", [])
+    if not isinstance(attendees, list):
+        raise ValidationError("Google Calendar event preflight returned invalid attendees")
+    emails: set[str] = set()
+    complete = True
+    for attendee in attendees:
+        if not isinstance(attendee, Mapping):
+            raise ValidationError("Google Calendar event preflight returned invalid attendees")
+        email = attendee.get("email")
+        if isinstance(email, str) and email:
+            emails.add(email.casefold())
+        else:
+            complete = False
+    return emails, complete
+
+
+def _calendar_requested_attendee_emails(values: Mapping[str, object]) -> set[str]:
+    if "attendee_emails" in values:
+        return {email.casefold() for email in _strings(values["attendee_emails"])}
+    return {
+        _required(attendee, "email").casefold()
+        for attendee in _mappings(_required_value(values, "attendees"))
+    }
+
+
+def _validate_calendar_move(values: Mapping[str, object]) -> None:
+    if _required(values, "calendar_id") == _required(values, "destination_calendar_id"):
+        raise ValidationError("Google Calendar move requires a different destination calendar")
+
+
+def _validate_secondary_calendar_target(values: Mapping[str, object]) -> None:
+    if _required(values, "calendar_id") == "primary":
+        raise ValidationError("Google Calendar cannot delete the primary calendar")
+
+
+def _calendar_delete_preflight(
+    values: Mapping[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> None:
+    calendar_id = _required(values, "calendar_id")
+    calendar = _provider_mapping(
+        _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path=f"/calendar/v3/users/me/calendarList/{_segment(calendar_id)}",
+            credential=credential,
+            query=(("fields", "accessRole,id,primary,summary"),),
+        ),
+        context="Google Calendar deletion preflight",
+    )
+    if _provider_text(calendar, "id", context="Google Calendar deletion preflight") != calendar_id:
+        raise ValidationError("Google Calendar deletion preflight returned a different calendar")
+    expected = _calendar_list_entry_snapshot(
+        values["expected_calendar"],
+        context="Google Calendar expected deletion target",
+    )
+    current = _calendar_list_entry_snapshot(
+        calendar,
+        context="Google Calendar current deletion target",
+    )
+    if expected["id"] != calendar_id:
+        raise ValidationError("Google Calendar expected calendar ID does not match the target")
+    if current != expected:
+        raise ConflictError("Google Calendar changed; read it again before deleting it")
+    if calendar.get("primary") is True:
+        raise ValidationError("Google Calendar cannot delete the primary calendar")
+    if calendar.get("accessRole") != "owner":
+        raise ValidationError("Google Calendar can delete only an owned secondary calendar")
+
+
+def _calendar_move_destination_preflight(
+    values: Mapping[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> None:
+    destination = _required(values, "destination_calendar_id")
+    calendar = _provider_mapping(
+        _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path=f"/calendar/v3/users/me/calendarList/{_segment(destination)}",
+            credential=credential,
+            query=(("fields", "accessRole,id,primary,summary"),),
+        ),
+        context="Google Calendar move destination preflight",
+    )
+    expected = _calendar_list_entry_snapshot(
+        values["expected_destination_calendar"],
+        context="Google Calendar expected move destination",
+    )
+    current = _calendar_list_entry_snapshot(
+        calendar,
+        context="Google Calendar current move destination",
+    )
+    if destination != "primary" and expected["id"] != destination:
+        raise ValidationError("Google Calendar expected destination ID does not match the target")
+    if current != expected:
+        raise ConflictError("Google Calendar destination changed; read it again before moving")
+    if current["accessRole"] not in {"owner", "writer", "writerWithoutPrivateAccess"}:
+        raise ValidationError("Google Calendar move destination is not writable")
+
+
+def _calendar_list_entry_snapshot(value: object, *, context: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValidationError(f"{context} is invalid")
+    primary = value.get("primary", False)
+    if type(primary) is not bool:
+        raise ValidationError(f"{context} has an invalid primary marker")
+    summary = value.get("summary")
+    if summary is not None and not isinstance(summary, str):
+        raise ValidationError(f"{context} has an invalid summary")
+    return {
+        "accessRole": _provider_text(value, "accessRole", context=context),
+        "id": _provider_text(value, "id", context=context),
+        "primary": primary,
+        "summary": summary,
+    }
 
 
 def _calendar_event_is_shared(event: Mapping[str, object]) -> bool:
@@ -3639,7 +4148,7 @@ def _gmail_resource_identifier(values: dict[str, object], name: str) -> tuple[st
 
 
 def _etag_headers(values: Mapping[str, object]) -> dict[str, str]:
-    return {"If-Match": _required(values, "etag")}
+    return {"If-Match": _safe_header(_required(values, "etag"))}
 
 
 def _selected(values: Mapping[str, object], fields: Mapping[str, str]) -> dict[str, object]:
@@ -3722,7 +4231,7 @@ def _drive_query_literal(value: str) -> str:
 
 def _safe_header(value: str) -> str:
     if "\r" in value or "\n" in value:
-        raise ValidationError("connector mail header value is invalid")
+        raise ValidationError("connector provider header value is invalid")
     return value
 
 

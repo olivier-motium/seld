@@ -50,6 +50,7 @@ def test_builtin_connector_profiles_are_finite_and_expose_both_access_tiers() ->
         "email",
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+        "https://www.googleapis.com/auth/calendar.calendars.readonly",
         "https://www.googleapis.com/auth/calendar.events.readonly",
         "https://www.googleapis.com/auth/calendar.freebusy",
         "https://www.googleapis.com/auth/drive.metadata.readonly",
@@ -116,6 +117,21 @@ def test_builtin_connector_profiles_are_finite_and_expose_both_access_tiers() ->
 def test_access_tier_classification_preserves_legacy_read_connections() -> None:
     google = get_profile("google")
     assert google.access_for_scopes(google.legacy_read_scopes[0]) is ConnectorAccessTier.READ
+    assert (
+        google.access_for_scopes(
+            (
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+                "https://www.googleapis.com/auth/calendar.events.readonly",
+                "https://www.googleapis.com/auth/calendar.freebusy",
+                "https://www.googleapis.com/auth/drive.metadata.readonly",
+                "https://www.googleapis.com/auth/drive.readonly",
+            )
+        )
+        is ConnectorAccessTier.READ
+    )
     with pytest.raises(ValidationError, match="built-in access tier"):
         google.access_for_scopes(("https://www.googleapis.com/auth/gmail.readonly",))
     assert google.access_for_scopes(google.full_scopes) is ConnectorAccessTier.FULL
@@ -262,6 +278,19 @@ def test_logical_connector_profiles_are_finite_single_source_least_authority_pro
     assert "calendar" not in " ".join(gmail.scopes_for("read"))
     assert "drive" not in " ".join(gmail.scopes_for("full"))
 
+    calendar = get_connector_profile("google_calendar")
+    assert calendar.scopes_for("read") == (
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+        "https://www.googleapis.com/auth/calendar.calendars.readonly",
+        "https://www.googleapis.com/auth/calendar.events.readonly",
+        "https://www.googleapis.com/auth/calendar.freebusy",
+    )
+    assert "https://www.googleapis.com/auth/calendar.calendars.readonly" not in calendar.scopes_for(
+        "full"
+    )
+
     outlook_mail = get_connector_profile("outlook_mail")
     assert outlook_mail.scopes_for("read") == ("offline_access", "User.Read", "Mail.Read")
     assert outlook_mail.scopes_for("full") == (
@@ -277,6 +306,7 @@ def test_logical_connector_profiles_are_finite_single_source_least_authority_pro
 
 def test_logical_profiles_classify_current_and_legacy_single_source_scope_sets() -> None:
     gmail = get_connector_profile("gmail")
+    calendar = get_connector_profile("google_calendar")
     assert gmail.access_for_scopes(gmail.read_scopes) is ConnectorAccessTier.READ
     assert gmail.access_for_scopes(gmail.full_scopes) is ConnectorAccessTier.FULL
     assert gmail.access_for_scopes(gmail.legacy_full_scopes[0]) is ConnectorAccessTier.FULL
@@ -290,6 +320,18 @@ def test_logical_profiles_classify_current_and_legacy_single_source_scope_sets()
     )
     assert (
         get_connector_profile("outlook_mail").access_for_scopes(("Mail.Read",))
+        is ConnectorAccessTier.READ
+    )
+    assert (
+        calendar.access_for_scopes(
+            (
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+                "https://www.googleapis.com/auth/calendar.events.readonly",
+                "https://www.googleapis.com/auth/calendar.freebusy",
+            )
+        )
         is ConnectorAccessTier.READ
     )
     with pytest.raises(ValidationError, match="built-in access tier"):

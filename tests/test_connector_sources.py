@@ -511,11 +511,13 @@ def test_google_calendar_preserves_timezone_in_complete_window(
         provider="google",
         marker="j",
     )
+    requested_paths: list[str] = []
 
     def get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
         del headers, timeout
         parsed = urlsplit(url)
-        if parsed.path.endswith("/calendars/primary"):
+        requested_paths.append(parsed.path)
+        if parsed.path.endswith("/users/me/calendarList/primary"):
             return {"id": "primary@example.test"}
         if parsed.path.endswith("/calendars/primary/events"):
             query = parse_qs(parsed.query)
@@ -561,6 +563,10 @@ def test_google_calendar_preserves_timezone_in_complete_window(
     }
     record = cast(dict[str, object], delivery["record"])
     assert record["completeness"] == "complete"
+    assert requested_paths == [
+        "/calendar/v3/users/me/calendarList/primary",
+        "/calendar/v3/calendars/primary/events",
+    ]
 
 
 def test_outlook_calendar_uses_calendar_view_and_preserves_timezone(
@@ -1087,6 +1093,23 @@ def test_http_boundary_allows_the_exact_slack_history_read(
     )
 
     assert result == {"ok": True, "messages": []}
+    assert opener.request is not None
+    assert opener.request.get_method() == "GET"
+
+
+def test_http_boundary_allows_the_exact_google_calendar_primary_identity_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opener = _SuccessOpener(_JSONResponse(b'{"id":"primary-calendar"}'))
+    monkeypatch.setattr(connector_http, "build_opener", lambda *handlers: opener)
+
+    result = connector_http.get_json(
+        "https://www.googleapis.com/calendar/v3/users/me/calendarList/primary",
+        {"Accept": "application/json", "Authorization": "Bearer synthetic"},
+        3.0,
+    )
+
+    assert result == {"id": "primary-calendar"}
     assert opener.request is not None
     assert opener.request.get_method() == "GET"
 

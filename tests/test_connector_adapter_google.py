@@ -47,15 +47,20 @@ class _Transport(ConnectorTransport):
         bodies: Sequence[bytes] = (),
         headers: Mapping[str, str] | None = None,
         download_body: bytes | None = None,
+        provider_errors: Sequence[int | None] = (),
     ) -> None:
         self.body = body
         self.bodies = list(bodies)
         self.headers = dict(headers or {})
         self.download_body = body if download_body is None else download_body
+        self.provider_errors = list(provider_errors)
         self.calls: list[dict[str, Any]] = []
 
     def request(self, **kwargs: Any) -> ConnectorResponse:
         self.calls.append({"kind": "request", **kwargs})
+        provider_error = self.provider_errors.pop(0) if self.provider_errors else None
+        if provider_error is not None:
+            raise ConnectorProviderError(origin=kwargs["origin"], status=provider_error)
         body = self.bodies.pop(0) if self.bodies else self.body
         headers = dict(self.headers)
         status = 200
@@ -207,6 +212,44 @@ def _operation(provider: str, name: str) -> OperationSpec:
 
 def _event_time() -> dict[str, str]:
     return {"date_time": "2026-08-01T09:00:00+02:00", "time_zone": "Europe/Brussels"}
+
+
+def _event_end_time() -> dict[str, str]:
+    return {"date_time": "2026-08-01T10:00:00+02:00", "time_zone": "Europe/Brussels"}
+
+
+def _expected_event(
+    *,
+    etag: str = "etag",
+    event_id: str = "event",
+    event_type: str = "default",
+    organizer: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "end": None,
+        "etag": etag,
+        "eventType": event_type,
+        "id": event_id,
+        "organizer": organizer,
+        "start": None,
+        "status": "confirmed",
+        "summary": None,
+    }
+
+
+def _expected_calendar(
+    calendar_id: str,
+    *,
+    access_role: str = "owner",
+    primary: bool = False,
+    summary: str | None = "Calendar",
+) -> dict[str, object]:
+    return {
+        "accessRole": access_role,
+        "id": calendar_id,
+        "primary": primary,
+        "summary": summary,
+    }
 
 
 def _prepared_upload(
@@ -490,23 +533,58 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
         if name == "calendars.create":
             return {"summary": "Calendar", "time_zone": "Europe/Brussels"}
         if name == "calendars.update":
-            return {"calendar_id": "primary", "etag": "etag"}
+            return {"calendar_id": "primary", "etag": "etag", "summary": "Updated"}
         if name == "calendars.delete":
-            return {"calendar_id": "primary", "etag": "etag"}
+            return {
+                "calendar_id": "secondary",
+                "etag": "etag",
+                "expected_calendar": _expected_calendar("secondary", summary="Secondary"),
+            }
         if name == "events.create":
-            return {"calendar_id": "primary", "end": _event_time(), "start": _event_time()}
+            return {
+                "calendar_id": "primary",
+                "end": _event_end_time(),
+                "start": _event_time(),
+            }
         if name == "events.update":
-            return {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+            return {
+                "calendar_id": "primary",
+                "etag": "etag",
+                "event_id": "event",
+                "summary": "Updated",
+            }
         if name == "events.move":
             return {
                 "calendar_id": "primary",
-                "destination_calendar_id": "primary",
+                "destination_calendar_id": "destination",
+                "etag": "etag",
                 "event_id": "event",
+                "expected_destination_calendar": _expected_calendar("destination"),
+                "expected_event": _expected_event(
+                    organizer={"email": "owner@example.test", "self": True}
+                ),
+                "send_updates": "none",
             }
         if name == "events.respond":
-            return {"calendar_id": "primary", "event_id": "event", "response_status": "accepted"}
+            return {
+                "calendar_id": "primary",
+                "etag": "etag",
+                "event_id": "event",
+                "expected_event": _expected_event(
+                    organizer={"email": "owner@example.test", "self": True}
+                ),
+                "response_status": "accepted",
+            }
         if name == "events.delete":
-            return {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+            return {
+                "calendar_id": "primary",
+                "etag": "etag",
+                "event_id": "event",
+                "expected_event": _expected_event(
+                    organizer={"email": "owner@example.test", "self": True}
+                ),
+                "send_updates": "none",
+            }
     if operation.provider == "google_drive":
         if name in {"drives.list", "files.list"}:
             return {"page_size": 1}
@@ -594,23 +672,47 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests(tmp_pat
     try:
         for operation in GOOGLE_OPERATIONS:
             transport.body = b"{}"
+            transport.bodies = []
             before = len(transport.calls)
             expected_requests = 1
             transfer = None
             write_idempotency_key = None
+            if operation.provider == "google_calendar" and operation.name == "calendars.get":
+                transport.body = (
+                    b'{"etag":"calendar-etag","id":"calendar-id","kind":"calendar#calendar"}'
+                )
+            if operation.provider == "google_calendar" and operation.name == "calendars.delete":
+                transport.body = (
+                    b'{"accessRole":"owner","id":"secondary","primary":false,"summary":"Secondary"}'
+                )
+                expected_requests = 2
             if operation.provider == "google_calendar" and operation.name in {
+                "events.delete",
                 "events.move",
+                "events.respond",
                 "events.update",
             }:
-                expected_requests = 2
-            if operation.provider == "google_calendar" and operation.name == "events.respond":
                 transport.body = json.dumps(
                     {
                         "attendees": [{"email": "owner@example.test", "self": True}],
-                        "etag": "event-etag",
+                        "etag": "etag",
+                        "eventType": "default",
+                        "id": "event",
+                        "organizer": {"email": "owner@example.test", "self": True},
+                        "status": "confirmed",
                     }
                 ).encode()
                 expected_requests = 2
+                if operation.name == "events.move":
+                    transport.bodies = [
+                        transport.body,
+                        b'{"accessRole":"owner","id":"destination","primary":false,'
+                        b'"summary":"Calendar"}',
+                        b"{}",
+                    ]
+                    expected_requests = 3
+                if operation.name in {"events.delete", "events.move", "events.respond"}:
+                    write_idempotency_key = "confirmed-calendar-change"
             if operation.provider == "google_drive" and operation.name == "files.download":
                 transport.body = _drive_download_operation_body(
                     done=True,
@@ -660,7 +762,6 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests(tmp_pat
             assert len(transport.calls) == before + expected_requests
     finally:
         raw_upload.close()
-    assert len(transport.calls) == len(GOOGLE_OPERATIONS) + 8
     assert {call["origin"] for call in transport.calls} == {
         ConnectorOrigin.GMAIL,
         ConnectorOrigin.GOOGLE,
@@ -716,6 +817,98 @@ def test_only_top_level_pagination_is_stripped_and_replayed_as_runtime_continuat
     )
     assert ("pageToken", "provider-page") in transport.calls[-1]["query"]
     assert not any(field in transport.calls[-1]["query"] for field in ("cursor", "nextLink", "url"))
+
+
+def test_calendar_incremental_sync_preserves_paired_tokens_and_rotates_atomically() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.list")
+    values = {
+        "calendar_id": "primary",
+        "event_types": ["default"],
+        "max_attendees": 10,
+        "show_deleted": True,
+        "single_events": True,
+        "time_zone": "Europe/Brussels",
+    }
+
+    initial = adapter.execute(
+        operation,
+        values,
+        continuation=None,
+        credential=_credential(),
+        transport=_Transport(body=b'{"items":[],"nextSyncToken":"sync-1"}'),
+    )
+    assert initial.continuation == {"syncToken": "sync-1"}
+
+    page_transport = _Transport(body=b'{"items":[],"nextPageToken":"page-2"}')
+    page = adapter.execute(
+        operation,
+        values,
+        continuation=initial.continuation,
+        credential=_credential(),
+        transport=page_transport,
+    )
+    assert page.continuation == {"pageToken": "page-2", "syncToken": "sync-1"}
+    assert ("syncToken", "sync-1") in page_transport.calls[0]["query"]
+
+    final_transport = _Transport(body=b'{"items":[],"nextSyncToken":"sync-2"}')
+    final = adapter.execute(
+        operation,
+        values,
+        continuation=page.continuation,
+        credential=_credential(),
+        transport=final_transport,
+    )
+    assert final.continuation == {"syncToken": "sync-2"}
+    assert ("syncToken", "sync-1") in final_transport.calls[0]["query"]
+    assert ("pageToken", "page-2") in final_transport.calls[0]["query"]
+
+
+def test_calendar_sync_suppresses_unreplayable_cursors_and_maps_expiry() -> None:
+    adapter = GoogleConnectorAdapter()
+    credential = _credential()
+    events = _operation("google_calendar", "events.list")
+    filtered = adapter.execute(
+        events,
+        {
+            "calendar_id": "primary",
+            "time_min": "2026-08-01T00:00:00Z",
+        },
+        continuation=None,
+        credential=credential,
+        transport=_Transport(body=b'{"items":[],"nextSyncToken":"unusable"}'),
+    )
+    assert filtered.continuation is None
+
+    calendars = _operation("google_calendar", "calendars.list")
+    filtered_calendars = adapter.execute(
+        calendars,
+        {"min_access_role": "writer"},
+        continuation=None,
+        credential=credential,
+        transport=_Transport(body=b'{"items":[],"nextSyncToken":"unusable"}'),
+    )
+    assert filtered_calendars.continuation is None
+
+    instances = adapter.execute(
+        _operation("google_calendar", "events.instances"),
+        {"calendar_id": "primary", "event_id": "recurring-event"},
+        continuation=None,
+        credential=credential,
+        transport=_Transport(body=b'{"items":[],"nextSyncToken":"unusable"}'),
+    )
+    assert instances.continuation is None
+
+    expired = _Transport(provider_errors=(410,))
+    with pytest.raises(ConnectorProviderError) as exc_info:
+        adapter.execute(
+            events,
+            {"calendar_id": "primary", "show_deleted": True},
+            continuation={"syncToken": "expired"},
+            credential=credential,
+            transport=expired,
+        )
+    assert exc_info.value.code == "full_sync_required"
 
 
 def test_gmail_core_read_routes_and_history_continuation_are_provider_native() -> None:
@@ -2386,33 +2579,380 @@ def test_gmail_local_file_reply_preserves_verified_headers_and_thread_metadata(
         upload.close()
 
 
-def test_calendar_effect_escalates_shared_or_notified_event_changes() -> None:
+def test_calendar_effect_escalates_attendees_or_non_primary_event_changes() -> None:
     adapter = GoogleConnectorAdapter()
     operation = _operation("google_calendar", "events.create")
-    safe = {"calendar_id": "primary", "end": _event_time(), "start": _event_time()}
+    safe = {"calendar_id": "primary", "end": _event_end_time(), "start": _event_time()}
     assert adapter.classify_effect(operation, safe) is ConnectorEffect.SAFE_MUTATION
     assert (
-        adapter.classify_effect(operation, {**safe, "attendee_emails": ["guest@example.test"]})
+        adapter.classify_effect(
+            operation,
+            {
+                **safe,
+                "attendee_emails": ["guest@example.test"],
+                "send_updates": "all",
+            },
+        )
         is ConnectorEffect.OUTWARD
     )
     assert (
         adapter.classify_effect(
             operation,
-            {**safe, "attendees": [{"email": "guest@example.test"}]},
+            {
+                **safe,
+                "attendees": [{"email": "guest@example.test"}],
+                "send_updates": "none",
+            },
         )
         is ConnectorEffect.OUTWARD
     )
     assert (
         adapter.classify_effect(operation, {**safe, "send_updates": "none"})
-        is ConnectorEffect.OUTWARD
+        is ConnectorEffect.SAFE_MUTATION
     )
     assert (
         adapter.classify_effect(operation, {**safe, "calendar_id": "team"})
         is ConnectorEffect.OUTWARD
     )
+    with pytest.raises(ValidationError, match="unknown field"):
+        adapter.classify_effect(
+            operation,
+            {**safe, "drive_attachments": [{"file_id": "file"}]},
+        )
+
+
+def test_calendar_validation_fails_before_confirmation_or_provider_dispatch() -> None:
+    adapter = GoogleConnectorAdapter()
+    transport = _Transport()
+    update = _operation("google_calendar", "events.update")
+    with pytest.raises(ValidationError, match="at least one changed field"):
+        adapter.classify_effect(
+            update,
+            {"calendar_id": "primary", "etag": "etag", "event_id": "event"},
+            credential=_credential(),
+            transport=transport,
+        )
+
+    create = _operation("google_calendar", "events.create")
+    invalid_cases = (
+        {
+            "attendee_emails": ["guest@example.test", "GUEST@example.test"],
+            "calendar_id": "primary",
+            "end": _event_end_time(),
+            "send_updates": "all",
+            "start": _event_time(),
+        },
+        {
+            "calendar_id": "primary",
+            "end": _event_time(),
+            "start": _event_time(),
+        },
+        {
+            "calendar_id": "primary",
+            "end": {"date": "2026-08-02"},
+            "start": _event_time(),
+        },
+        {
+            "calendar_id": "primary",
+            "end": _event_end_time(),
+            "recurrence": ["DTSTART:20260801T090000Z"],
+            "start": _event_time(),
+        },
+        {
+            "calendar_id": "primary",
+            "end": _event_end_time(),
+            "start": {"date_time": "2026-08-01T09:00+02:00"},
+        },
+        {
+            "calendar_id": "primary",
+            "end": {"date": "2026-08-03"},
+            "recurrence": ["RRULE:FREQ=DAILY;COUNT=2"],
+            "start": {"date": "2026-08-01"},
+        },
+    )
+    for invalid in invalid_cases:
+        with pytest.raises(ValidationError):
+            adapter.classify_effect(create, invalid)
+
+    with pytest.raises(ValidationError, match="header value is invalid"):
+        adapter.execute(
+            _operation("google_calendar", "calendars.update"),
+            {"calendar_id": "primary", "etag": "bad\nheader", "summary": "Updated"},
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-calendar-update",
+        )
     assert (
-        adapter.classify_effect(operation, {**safe, "drive_attachments": [{"file_id": "file"}]})
+        adapter.classify_effect(
+            create,
+            {
+                "calendar_id": "primary",
+                "end": {"date": "2026-08-03", "time_zone": "Europe/Brussels"},
+                "recurrence": ["RRULE:FREQ=DAILY;COUNT=2"],
+                "start": {"date": "2026-08-01", "time_zone": "Europe/Brussels"},
+            },
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert transport.calls == []
+
+
+def test_calendar_event_patch_distinguishes_local_outward_and_destructive_changes() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    shared = {
+        "attendees": [
+            {"email": "owner@example.test", "self": True},
+            {"email": "guest@example.test"},
+        ],
+        "end": {"dateTime": "2026-08-01T10:00:00+02:00", "timeZone": "Europe/Brussels"},
+        "etag": "etag",
+        "eventType": "default",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "start": {"dateTime": "2026-08-01T09:00:00+02:00", "timeZone": "Europe/Brussels"},
+    }
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    private_team_event = {
+        "attendees": [],
+        "etag": "etag",
+        "eventType": "default",
+        "organizer": {"email": "team@example.test", "self": True},
+    }
+
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "reminders": {"use_default": True}},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(shared).encode()),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "calendar_id": "team", "reminders": {"use_default": True}},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(private_team_event).encode()),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "calendar_id": "team", "summary": "Visible team change"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(private_team_event).encode()),
+        )
         is ConnectorEffect.OUTWARD
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "attendee_emails": ["owner@example.test"],
+                "send_updates": "all",
+            },
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(shared).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+    recurrence_without_zone = {
+        **shared,
+        "end": {"dateTime": "2026-08-01T10:00:00+02:00"},
+        "start": {"dateTime": "2026-08-01T09:00:00+02:00"},
+    }
+    with pytest.raises(ValidationError, match="matching explicit time zone"):
+        adapter.classify_effect(
+            operation,
+            {**common, "recurrence": ["RRULE:FREQ=DAILY;COUNT=2"]},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(recurrence_without_zone).encode()),
+        )
+    email_less_attendee = {
+        "attendees": [{"self": True}],
+        "etag": "etag",
+        "eventType": "default",
+        "organizer": {"email": "owner@example.test", "self": True},
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "attendee_emails": ["owner@example.test"],
+                "send_updates": "all",
+            },
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(email_less_attendee).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "recurrence": ["RRULE:FREQ=DAILY;COUNT=2"]},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(shared).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "recurrence": []},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(recurrence_without_zone).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+
+
+def test_calendar_move_and_etag_preconditions_fail_closed_and_map_provider_races() -> None:
+    adapter = GoogleConnectorAdapter()
+    move = _operation("google_calendar", "events.move")
+    common_move = {
+        "calendar_id": "source",
+        "destination_calendar_id": "destination",
+        "etag": "etag",
+        "event_id": "event",
+        "expected_destination_calendar": _expected_calendar("destination"),
+        "expected_event": _expected_event(),
+        "send_updates": "all",
+    }
+    with pytest.raises(ValidationError, match="different destination"):
+        adapter.classify_effect(
+            move,
+            {**common_move, "destination_calendar_id": "source"},
+        )
+
+    non_default = (
+        b'{"attendees":[],"etag":"etag","eventType":"birthday","id":"event","status":"confirmed"}'
+    )
+    with pytest.raises(ValidationError, match="only default events"):
+        adapter.classify_effect(
+            move,
+            {**common_move, "expected_event": _expected_event(event_type="birthday")},
+            credential=_credential(),
+            transport=_Transport(body=non_default),
+        )
+
+    changed = b'{"attendees":[],"etag":"new-etag","eventType":"default"}'
+    with pytest.raises(ConflictError, match="read it again"):
+        adapter.classify_effect(
+            move,
+            common_move,
+            credential=_credential(),
+            transport=_Transport(body=changed),
+        )
+
+    private = b'{"attendees":[],"etag":"etag","eventType":"default","organizer":{"self":true}}'
+    raced = _Transport(bodies=(private,), provider_errors=(None, 412))
+    with pytest.raises(ConnectorProviderError) as exc_info:
+        adapter.execute(
+            _operation("google_calendar", "events.update"),
+            {
+                "calendar_id": "primary",
+                "etag": "etag",
+                "event_id": "event",
+                "summary": "Changed",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=raced,
+        )
+    assert exc_info.value.code == "resource_changed_reread_required"
+
+
+def test_calendar_delete_rejects_primary_alias_and_actual_primary_id() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "calendars.delete")
+    with pytest.raises(ValidationError, match="primary calendar"):
+        adapter.classify_effect(
+            operation,
+            {
+                "calendar_id": "primary",
+                "etag": "etag",
+                "expected_calendar": _expected_calendar("primary", primary=True),
+            },
+        )
+
+    actual_primary = b'{"accessRole":"owner","id":"actual-id","primary":true,"summary":"Primary"}'
+    with pytest.raises(ValidationError, match="primary calendar"):
+        adapter.classify_effect(
+            operation,
+            {
+                "calendar_id": "actual-id",
+                "etag": "etag",
+                "expected_calendar": _expected_calendar(
+                    "actual-id", primary=True, summary="Primary"
+                ),
+            },
+            credential=_credential(),
+            transport=_Transport(body=actual_primary),
+        )
+
+    assert (
+        adapter.classify_effect(
+            _operation("google_calendar", "calendars.update"),
+            {"calendar_id": "primary", "etag": "etag", "summary": "Renamed"},
+        )
+        is ConnectorEffect.OUTWARD
+    )
+
+
+def test_calendar_human_target_snapshots_are_rechecked_before_confirmation() -> None:
+    adapter = GoogleConnectorAdapter()
+    event = (
+        b'{"attendees":[],"etag":"etag","eventType":"default","id":"event",'
+        b'"status":"confirmed","summary":"Changed event"}'
+    )
+    move = {
+        "calendar_id": "source",
+        "destination_calendar_id": "destination",
+        "etag": "etag",
+        "event_id": "event",
+        "expected_destination_calendar": _expected_calendar("destination"),
+        "expected_event": _expected_event(),
+        "send_updates": "all",
+    }
+    with pytest.raises(ValidationError, match="normalize the reviewed read"):
+        adapter.classify_effect(
+            _operation("google_calendar", "events.move"),
+            move,
+            credential=_credential(),
+            transport=_Transport(body=event),
+        )
+
+    calendar = b'{"accessRole":"owner","id":"secondary","summary":"Changed calendar"}'
+    with pytest.raises(ConflictError, match="Calendar changed"):
+        adapter.classify_effect(
+            _operation("google_calendar", "calendars.delete"),
+            {
+                "calendar_id": "secondary",
+                "etag": "etag",
+                "expected_calendar": _expected_calendar("secondary"),
+            },
+            credential=_credential(),
+            transport=_Transport(body=calendar),
+        )
+
+    missing_summary = b'{"accessRole":"owner","id":"secondary"}'
+    assert (
+        adapter.classify_effect(
+            _operation("google_calendar", "calendars.delete"),
+            {
+                "calendar_id": "secondary",
+                "etag": "etag",
+                "expected_calendar": _expected_calendar("secondary", summary=None),
+            },
+            credential=_credential(),
+            transport=_Transport(body=missing_summary),
+        )
+        is ConnectorEffect.PERMANENT
     )
 
 
@@ -2428,6 +2968,8 @@ def test_existing_calendar_event_effect_uses_live_sharing_state_and_rechecks_exe
     private = json.dumps(
         {
             "attendees": [{"email": "owner@example.test", "self": True}],
+            "etag": "event-version-1",
+            "eventType": "default",
             "organizer": {"email": "owner@example.test", "self": True},
         }
     ).encode()
@@ -2437,6 +2979,8 @@ def test_existing_calendar_event_effect_uses_live_sharing_state_and_rechecks_exe
                 {"email": "owner@example.test", "self": True},
                 {"email": "guest@example.test"},
             ],
+            "etag": "event-version-1",
+            "eventType": "default",
             "organizer": {"email": "owner@example.test", "self": True},
         }
     ).encode()
@@ -2451,7 +2995,8 @@ def test_existing_calendar_event_effect_uses_live_sharing_state_and_rechecks_exe
         )
         is ConnectorEffect.SAFE_MUTATION
     )
-    assert private_transport.calls[0]["query"] == (("fields", "attendees,organizer"),)
+    preflight_fields = dict(private_transport.calls[0]["query"])["fields"]
+    assert all(field in preflight_fields for field in ("attendees", "etag", "organizer"))
     assert adapter.classify_effect(operation, mutation) is ConnectorEffect.OUTWARD
 
     shared_transport = _Transport(body=shared)
@@ -2464,7 +3009,7 @@ def test_existing_calendar_event_effect_uses_live_sharing_state_and_rechecks_exe
         )
         is ConnectorEffect.OUTWARD
     )
-    with pytest.raises(ValidationError, match="fresh outward confirmation"):
+    with pytest.raises(ValidationError, match="fresh confirmation"):
         adapter.execute(
             operation,
             mutation,
@@ -2483,7 +3028,7 @@ def test_existing_calendar_event_effect_uses_live_sharing_state_and_rechecks_exe
         )
         is ConnectorEffect.SAFE_MUTATION
     )
-    with pytest.raises(ValidationError, match="fresh outward confirmation"):
+    with pytest.raises(ValidationError, match="fresh confirmation"):
         adapter.execute(
             operation,
             mutation,
@@ -2498,6 +3043,8 @@ def test_confirmed_shared_calendar_event_update_rechecks_then_writes() -> None:
     shared = json.dumps(
         {
             "attendees": [{"email": "guest@example.test"}],
+            "etag": "event-version-1",
+            "eventType": "default",
             "organizer": {"email": "owner@example.test", "self": True},
         }
     ).encode()
@@ -2537,6 +3084,9 @@ def test_calendar_rsvp_preflights_self_attendee_and_etag() -> None:
                 },
             ],
             "etag": '"event-version-4"',
+            "eventType": "default",
+            "id": "event-1",
+            "status": "confirmed",
         }
     ).encode()
     transport = _Transport(bodies=(event, b"{}"))
@@ -2545,19 +3095,28 @@ def test_calendar_rsvp_preflights_self_attendee_and_etag() -> None:
         {
             "calendar_id": "primary",
             "comment": "See you there",
+            "etag": '"event-version-4"',
             "event_id": "event-1",
+            "expected_event": _expected_event(etag='"event-version-4"', event_id="event-1"),
             "response_status": "tentative",
             "send_updates": "all",
         },
         continuation=None,
         credential=_credential(),
         transport=transport,
+        write_idempotency_key="confirmed-rsvp",
     )
 
     preflight, response = transport.calls
     assert preflight["method"] is ConnectorMethod.GET
     assert preflight["path"] == "/calendar/v3/calendars/primary/events/event-1"
-    assert preflight["query"] == (("maxAttendees", "1"), ("fields", "attendees,etag"))
+    assert preflight["query"] == (
+        (
+            "fields",
+            "attendees(comment,email,self),end(date,dateTime,timeZone),etag,eventType,id,"
+            "organizer(displayName,email,self),start(date,dateTime,timeZone),status,summary",
+        ),
+    )
     assert response["method"] is ConnectorMethod.PATCH
     assert response["headers"] == {"If-Match": '"event-version-4"'}
     assert response["query"] == (("sendUpdates", "all"),)
@@ -2573,25 +3132,90 @@ def test_calendar_rsvp_preflights_self_attendee_and_etag() -> None:
     }
 
 
+def test_calendar_rsvp_preserves_existing_comment_when_no_replacement_is_supplied() -> None:
+    event = json.dumps(
+        {
+            "attendees": [
+                {
+                    "comment": "Earlier note",
+                    "email": "owner@example.test",
+                    "self": True,
+                }
+            ],
+            "etag": '"event-version-4"',
+            "eventType": "default",
+            "id": "event-1",
+            "status": "confirmed",
+        }
+    ).encode()
+    transport = _Transport(bodies=(event, b"{}"))
+    GoogleConnectorAdapter().execute(
+        _operation("google_calendar", "events.respond"),
+        {
+            "calendar_id": "primary",
+            "etag": '"event-version-4"',
+            "event_id": "event-1",
+            "expected_event": _expected_event(etag='"event-version-4"', event_id="event-1"),
+            "response_status": "accepted",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        write_idempotency_key="confirmed-rsvp",
+    )
+
+    assert transport.calls[-1]["json_body"] == {
+        "attendees": [
+            {
+                "comment": "Earlier note",
+                "email": "owner@example.test",
+                "responseStatus": "accepted",
+            }
+        ],
+        "attendeesOmitted": True,
+    }
+
+
 def test_calendar_rsvp_fails_closed_without_one_self_attendee() -> None:
     event = json.dumps(
-        {"attendees": [{"email": "guest@example.test"}], "etag": '"event-version-4"'}
+        {
+            "attendees": [{"email": "guest@example.test"}],
+            "etag": '"event-version-4"',
+            "eventType": "default",
+            "id": "event-1",
+            "status": "confirmed",
+        }
     ).encode()
     transport = _Transport(body=event)
     with pytest.raises(ValidationError, match="one self attendee"):
         GoogleConnectorAdapter().execute(
             _operation("google_calendar", "events.respond"),
-            {"calendar_id": "primary", "event_id": "event-1", "response_status": "accepted"},
+            {
+                "calendar_id": "primary",
+                "etag": '"event-version-4"',
+                "event_id": "event-1",
+                "expected_event": _expected_event(etag='"event-version-4"', event_id="event-1"),
+                "response_status": "accepted",
+            },
             continuation=None,
             credential=_credential(),
             transport=transport,
+            write_idempotency_key="confirmed-rsvp",
         )
     assert len(transport.calls) == 1
 
 
 def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -> None:
     adapter = GoogleConnectorAdapter()
-    transport = _Transport()
+    event = json.dumps(
+        {
+            "attendees": [{"email": "guest@example.test"}],
+            "etag": "calendar-etag",
+            "eventType": "default",
+            "organizer": {"email": "owner@example.test", "self": True},
+        }
+    ).encode()
+    transport = _Transport(bodies=(event, b"{}"))
     calendar = _operation("google_calendar", "events.update")
     adapter.execute(
         calendar,
@@ -2601,7 +3225,6 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
                     "display_name": "Guest",
                     "email": "guest@example.test",
                     "optional": True,
-                    "response_status": "accepted",
                 }
             ],
             "calendar_id": "primary",
@@ -2614,11 +3237,13 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
                 "overrides": [{"delivery": "popup", "minutes": 15}],
                 "use_default": False,
             },
+            "send_updates": "all",
             "summary": "Updated",
         },
         continuation=None,
         credential=_credential(),
         transport=transport,
+        write_idempotency_key="confirmed-attendee-update",
     )
     calendar_call = transport.calls[-1]
     assert calendar_call["headers"] == {"If-Match": "calendar-etag"}
@@ -2628,7 +3253,6 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
                 "displayName": "Guest",
                 "email": "guest@example.test",
                 "optional": True,
-                "responseStatus": "accepted",
             }
         ],
         "guestsCanInviteOthers": False,
@@ -3399,89 +4023,6 @@ def test_drive_transfer_delivery_requires_a_transfer_context() -> None:
             transport=_Transport(),
             write_idempotency_key="confirmed-upload",
         )
-
-
-def test_calendar_resolves_typed_drive_attachments_and_enables_support() -> None:
-    first_file = json.dumps(
-        {
-            "id": "file-1",
-            "mimeType": "application/vnd.google-apps.document",
-            "name": "Plan",
-            "webViewLink": "https://docs.google.com/document/d/file-1/edit",
-        }
-    ).encode()
-    second_file = json.dumps(
-        {
-            "id": "file-2",
-            "mimeType": "application/pdf",
-            "name": "Brief.pdf",
-            "webViewLink": "https://drive.google.com/file/d/file-2/view",
-        }
-    ).encode()
-    transport = _Transport(bodies=(first_file, second_file, b"{}"))
-    GoogleConnectorAdapter().execute(
-        _operation("google_calendar", "events.create"),
-        {
-            "calendar_id": "primary",
-            "drive_attachments": [{"file_id": "file-1"}, {"file_id": "file-2"}],
-            "end": _event_time(),
-            "start": _event_time(),
-        },
-        continuation=None,
-        credential=_credential(),
-        transport=transport,
-    )
-
-    first_preflight, second_preflight, create = transport.calls
-    assert first_preflight["path"] == "/drive/v3/files/file-1"
-    assert second_preflight["path"] == "/drive/v3/files/file-2"
-    assert first_preflight["query"] == (
-        ("fields", "id,mimeType,name,webViewLink"),
-        ("supportsAllDrives", "true"),
-    )
-    assert create["path"] == "/calendar/v3/calendars/primary/events"
-    assert create["query"] == (("supportsAttachments", "true"),)
-    assert create["json_body"]["attachments"] == [
-        {
-            "fileUrl": "https://docs.google.com/document/d/file-1/edit",
-            "mimeType": "application/vnd.google-apps.document",
-            "title": "Plan",
-        },
-        {
-            "fileUrl": "https://drive.google.com/file/d/file-2/view",
-            "mimeType": "application/pdf",
-            "title": "Brief.pdf",
-        },
-    ]
-
-
-def test_calendar_drive_attachments_reject_untrusted_provider_link() -> None:
-    file = json.dumps(
-        {
-            "id": "file-1",
-            "mimeType": "application/pdf",
-            "name": "Brief.pdf",
-            "webViewLink": "https://attacker.example/file-1",
-        }
-    ).encode()
-    transport = _Transport(body=file)
-    with pytest.raises(ValidationError, match="invalid web link"):
-        GoogleConnectorAdapter().execute(
-            _operation("google_calendar", "events.update"),
-            {
-                "calendar_id": "primary",
-                "drive_attachments": [{"file_id": "file-1"}],
-                "etag": "event-etag",
-                "event_id": "event-1",
-            },
-            continuation=None,
-            credential=_credential(),
-            transport=transport,
-        )
-    assert [call["path"] for call in transport.calls] == [
-        "/calendar/v3/calendars/primary/events/event-1",
-        "/drive/v3/files/file-1",
-    ]
 
 
 def test_drive_metadata_scope_and_preconditions_remain_fixed() -> None:

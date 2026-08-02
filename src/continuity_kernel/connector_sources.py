@@ -538,7 +538,7 @@ def _read_google_calendar(
 ) -> _ReadResult:
     primary = _request_json(
         getter,
-        f"{_GOOGLE_CALENDAR_BASE}/calendars/primary",
+        f"{_GOOGLE_CALENDAR_BASE}/users/me/calendarList/primary",
         access_token=access_token,
         timeout_seconds=timeout_seconds,
     )

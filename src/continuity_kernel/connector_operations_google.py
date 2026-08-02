@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Final
 
-from continuity_kernel.connector_contract import ConnectorEffect, ConnectorMode, OperationSpec
+from continuity_kernel.connector_contract import (
+    MAX_STRING_LENGTH,
+    ConnectorEffect,
+    ConnectorMode,
+    OperationSpec,
+)
 
 _GMAIL_READONLY: Final = "https://www.googleapis.com/auth/gmail.readonly"
 _GMAIL_MODIFY: Final = "https://www.googleapis.com/auth/gmail.modify"
@@ -12,9 +17,11 @@ _GMAIL_SETTINGS_BASIC: Final = "https://www.googleapis.com/auth/gmail.settings.b
 _MAIL: Final = "https://mail.google.com/"
 
 _CALENDAR_LIST_READONLY: Final = "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
+_CALENDAR_READONLY: Final = "https://www.googleapis.com/auth/calendar.readonly"
 _CALENDAR_EVENTS_READONLY: Final = "https://www.googleapis.com/auth/calendar.events.readonly"
 _CALENDAR_EVENTS: Final = "https://www.googleapis.com/auth/calendar.events"
 _CALENDAR_FREEBUSY: Final = "https://www.googleapis.com/auth/calendar.freebusy"
+_CALENDAR_CALENDARS_READONLY: Final = "https://www.googleapis.com/auth/calendar.calendars.readonly"
 _CALENDAR_CALENDARS: Final = "https://www.googleapis.com/auth/calendar.calendars"
 _CALENDAR: Final = "https://www.googleapis.com/auth/calendar"
 
@@ -24,6 +31,8 @@ _DRIVE_MEET_READONLY: Final = "https://www.googleapis.com/auth/drive.meet.readon
 _DRIVE_FILE: Final = "https://www.googleapis.com/auth/drive.file"
 _DRIVE: Final = "https://www.googleapis.com/auth/drive"
 _MAX_DRIVE_BYTE_OFFSET: Final = 5 * 1024**4
+# Snapshots may retain any provider text the bounded connector contract can carry.
+_MAX_PROVIDER_SNAPSHOT_TEXT: Final = MAX_STRING_LENGTH
 # The fixed transport permits 128 query items; metadata reads also send `format`.
 _GMAIL_MAX_METADATA_HEADER_NAMES: Final = 127
 
@@ -43,6 +52,19 @@ def _text(maximum: int = 4_096, *, minimum: int = 1) -> dict[str, object]:
 
 def _id() -> dict[str, object]:
     return _text(512)
+
+
+def _calendar_event_id() -> dict[str, object]:
+    return _text(1_024)
+
+
+def _calendar_client_event_id() -> dict[str, object]:
+    return {
+        "maxLength": 1_024,
+        "minLength": 5,
+        "pattern": "^[0-9a-v]+$",
+        "type": "string",
+    }
 
 
 def _drive_resource_key() -> dict[str, object]:
@@ -432,14 +454,89 @@ def _event_time() -> dict[str, object]:
         "oneOf": [
             _object(
                 {"date": _text(32), "time_zone": _text(128)},
-                required=("date", "time_zone"),
+                required=("date",),
             ),
             _object(
                 {"date_time": _text(64), "time_zone": _text(128)},
-                required=("date_time", "time_zone"),
+                required=("date_time",),
             ),
         ]
     }
+
+
+def _nullable(schema: dict[str, object]) -> dict[str, object]:
+    return {"oneOf": [schema, {"type": "null"}]}
+
+
+def _expected_event_time() -> dict[str, object]:
+    return {
+        "oneOf": [
+            _object(
+                {"date": _text(32), "timeZone": _text(128)},
+                required=("date",),
+            ),
+            _object(
+                {"dateTime": _text(64), "timeZone": _text(128)},
+                required=("dateTime",),
+            ),
+        ]
+    }
+
+
+def _expected_event() -> dict[str, object]:
+    return _object(
+        {
+            "end": _nullable(_expected_event_time()),
+            "etag": _text(1_024),
+            "eventType": {
+                "enum": [
+                    "birthday",
+                    "default",
+                    "focusTime",
+                    "fromGmail",
+                    "outOfOffice",
+                    "workingLocation",
+                ],
+                "type": "string",
+            },
+            "id": _calendar_event_id(),
+            "organizer": _nullable(
+                _object(
+                    {
+                        "displayName": _text(1_024, minimum=0),
+                        "email": _text(512),
+                        "self": {"type": "boolean"},
+                    },
+                    required=("email",),
+                )
+            ),
+            "start": _nullable(_expected_event_time()),
+            "status": {"enum": ["cancelled", "confirmed", "tentative"], "type": "string"},
+            "summary": _nullable(_text(_MAX_PROVIDER_SNAPSHOT_TEXT, minimum=0)),
+        },
+        required=("end", "etag", "eventType", "id", "organizer", "start", "status", "summary"),
+    )
+
+
+def _expected_calendar_list_entry() -> dict[str, object]:
+    return _object(
+        {
+            "accessRole": {
+                "enum": [
+                    "freeBusyReader",
+                    "owner",
+                    "reader",
+                    "writer",
+                    "writerWithoutPrivateAccess",
+                ],
+                "type": "string",
+            },
+            "id": _id(),
+            "primary": {"type": "boolean"},
+            "summary": _nullable(_text(_MAX_PROVIDER_SNAPSHOT_TEXT, minimum=0)),
+        },
+        required=("accessRole", "id", "primary", "summary"),
+    )
 
 
 def _event_attendee() -> dict[str, object]:
@@ -448,17 +545,9 @@ def _event_attendee() -> dict[str, object]:
             "display_name": _text(1_024, minimum=0),
             "email": _text(512),
             "optional": {"type": "boolean"},
-            "response_status": {
-                "enum": ["accepted", "declined", "needsAction", "tentative"],
-                "type": "string",
-            },
         },
         required=("email",),
     )
-
-
-def _drive_attachment_reference() -> dict[str, object]:
-    return _object({"file_id": _id()}, required=("file_id",))
 
 
 def _local_file() -> dict[str, object]:
@@ -504,9 +593,8 @@ def _event_fields() -> dict[str, object]:
         "attendee_emails": _email_addresses(),
         "attendees": _array(_event_attendee(), maximum=64),
         "description": _text(200_000, minimum=0),
-        "drive_attachments": _array(_drive_attachment_reference(), maximum=25),
         "end": _event_time(),
-        "event_id": _id(),
+        "event_id": _calendar_event_id(),
         "guests_can_invite_others": {"type": "boolean"},
         "guests_can_modify": {"type": "boolean"},
         "guests_can_see_other_guests": {"type": "boolean"},
@@ -595,7 +683,7 @@ def _calendar_instance_list() -> dict[str, object]:
     return _object(
         {
             "calendar_id": _id(),
-            "event_id": _id(),
+            "event_id": _calendar_event_id(),
             "max_attendees": {"maximum": 1_000, "minimum": 1, "type": "integer"},
             "page_size": {"maximum": 2_500, "minimum": 1, "type": "integer"},
             "time_max": _text(64),
@@ -906,13 +994,28 @@ _GMAIL_READ_SCOPES: Final = _scopes(_GMAIL_READONLY, _GMAIL_MODIFY, _MAIL)
 _GMAIL_WRITE_SCOPES: Final = _scopes(_GMAIL_MODIFY, _MAIL)
 _GMAIL_SETTINGS_WRITE_SCOPES: Final = _scopes(_GMAIL_SETTINGS_BASIC)
 _GMAIL_PURGE_SCOPES: Final = _scopes(_MAIL)
-_CALENDAR_LIST_SCOPES: Final = _scopes(_CALENDAR_LIST_READONLY, _CALENDAR)
+_CALENDAR_LIST_SCOPES: Final = _scopes(
+    _CALENDAR_LIST_READONLY,
+    _CALENDAR_READONLY,
+    _CALENDAR,
+)
+_CALENDAR_RESOURCE_READ_SCOPES: Final = _scopes(
+    _CALENDAR_CALENDARS_READONLY,
+    _CALENDAR_CALENDARS,
+    _CALENDAR_READONLY,
+    _CALENDAR,
+)
 _CALENDAR_EVENT_READ_SCOPES: Final = _scopes(
     _CALENDAR_EVENTS_READONLY,
     _CALENDAR_EVENTS,
+    _CALENDAR_READONLY,
     _CALENDAR,
 )
-_CALENDAR_FREEBUSY_SCOPES: Final = _scopes(_CALENDAR_FREEBUSY, _CALENDAR)
+_CALENDAR_FREEBUSY_SCOPES: Final = _scopes(
+    _CALENDAR_FREEBUSY,
+    _CALENDAR_READONLY,
+    _CALENDAR,
+)
 _CALENDAR_WRITE_SCOPES: Final = _scopes(_CALENDAR_CALENDARS, _CALENDAR)
 _CALENDAR_EVENT_WRITE_SCOPES: Final = _scopes(_CALENDAR_EVENTS, _CALENDAR)
 _DRIVE_METADATA_SCOPES: Final = _scopes(
@@ -1391,7 +1494,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorMode.READ,
         "calendars.get",
         ConnectorEffect.READ,
-        _CALENDAR_LIST_SCOPES,
+        _CALENDAR_RESOURCE_READ_SCOPES,
         _object({"calendar_id": _id()}, required=("calendar_id",)),
     ),
     _operation(
@@ -1408,7 +1511,10 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "events.get",
         ConnectorEffect.READ,
         _CALENDAR_EVENT_READ_SCOPES,
-        _object({"calendar_id": _id(), "event_id": _id()}, required=("calendar_id", "event_id")),
+        _object(
+            {"calendar_id": _id(), "event_id": _calendar_event_id()},
+            required=("calendar_id", "event_id"),
+        ),
     ),
     _operation(
         "google_calendar",
@@ -1426,12 +1532,12 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _CALENDAR_FREEBUSY_SCOPES,
         _object(
             {
-                "calendar_ids": _array(_id(), maximum=64, minimum=1),
+                "calendar_ids": _array(_id(), maximum=50, minimum=1),
                 "time_max": _text(64),
                 "time_min": _text(64),
                 "time_zone": _text(128),
             },
-            required=("calendar_ids", "time_max", "time_min", "time_zone"),
+            required=("calendar_ids", "time_max", "time_min"),
         ),
     ),
     _operation(
@@ -1440,7 +1546,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "calendars.create",
         ConnectorEffect.SAFE_MUTATION,
         _CALENDAR_WRITE_SCOPES,
-        _object(_calendar_fields(), required=("summary", "time_zone")),
+        _object(_calendar_fields(), required=("summary",)),
     ),
     _operation(
         "google_calendar",
@@ -1459,7 +1565,14 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "calendars.delete",
         ConnectorEffect.PERMANENT,
         _CALENDAR_WRITE_SCOPES,
-        _object({"calendar_id": _id(), "etag": _text(1_024)}, required=("calendar_id", "etag")),
+        _object(
+            {
+                "calendar_id": _id(),
+                "etag": _text(1_024),
+                "expected_calendar": _expected_calendar_list_entry(),
+            },
+            required=("calendar_id", "etag", "expected_calendar"),
+        ),
     ),
     _operation(
         "google_calendar",
@@ -1468,7 +1581,12 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.SAFE_MUTATION,
         _CALENDAR_EVENT_WRITE_SCOPES,
         _object(
-            {"calendar_id": _id(), **_event_fields()}, required=("calendar_id", "start", "end")
+            {
+                "calendar_id": _id(),
+                **_event_fields(),
+                "event_id": _calendar_client_event_id(),
+            },
+            required=("calendar_id", "start", "end"),
         ),
     ),
     _operation(
@@ -1492,11 +1610,21 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
             {
                 "calendar_id": _id(),
                 "destination_calendar_id": _id(),
-                "event_id": _id(),
+                "event_id": _calendar_event_id(),
                 "etag": _text(1_024),
+                "expected_destination_calendar": _expected_calendar_list_entry(),
+                "expected_event": _expected_event(),
                 "send_updates": {"enum": ["all", "externalOnly", "none"], "type": "string"},
             },
-            required=("calendar_id", "destination_calendar_id", "event_id"),
+            required=(
+                "calendar_id",
+                "destination_calendar_id",
+                "etag",
+                "event_id",
+                "expected_destination_calendar",
+                "expected_event",
+                "send_updates",
+            ),
         ),
     ),
     _operation(
@@ -1509,14 +1637,16 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
             {
                 "calendar_id": _id(),
                 "comment": _text(16_384, minimum=0),
-                "event_id": _id(),
+                "etag": _text(1_024),
+                "event_id": _calendar_event_id(),
+                "expected_event": _expected_event(),
                 "response_status": {
                     "enum": ["accepted", "declined", "tentative"],
                     "type": "string",
                 },
                 "send_updates": {"enum": ["all", "externalOnly", "none"], "type": "string"},
             },
-            required=("calendar_id", "event_id", "response_status"),
+            required=("calendar_id", "etag", "event_id", "expected_event", "response_status"),
         ),
     ),
     _operation(
@@ -1529,10 +1659,17 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
             {
                 "calendar_id": _id(),
                 "etag": _text(1_024),
-                "event_id": _id(),
+                "event_id": _calendar_event_id(),
+                "expected_event": _expected_event(),
                 "send_updates": {"enum": ["all", "externalOnly", "none"], "type": "string"},
             },
-            required=("calendar_id", "event_id", "etag"),
+            required=(
+                "calendar_id",
+                "event_id",
+                "etag",
+                "expected_event",
+                "send_updates",
+            ),
         ),
     ),
     _operation(

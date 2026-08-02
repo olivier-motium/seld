@@ -124,6 +124,28 @@ def _operation(provider: str, mode: ConnectorMode, name: str) -> OperationSpec:
     return _catalog().lookup(provider, mode, name)
 
 
+def _expected_event() -> dict[str, object]:
+    return {
+        "end": None,
+        "etag": "etag",
+        "eventType": "default",
+        "id": "event",
+        "organizer": None,
+        "start": None,
+        "status": "confirmed",
+        "summary": None,
+    }
+
+
+def _expected_calendar(calendar_id: str) -> dict[str, object]:
+    return {
+        "accessRole": "owner",
+        "id": calendar_id,
+        "primary": False,
+        "summary": "Calendar",
+    }
+
+
 def test_google_provider_mode_partitions_and_exact_operation_surface() -> None:
     partitions = {(item.provider, item.mode) for item in GOOGLE_OPERATIONS}
     assert partitions == {
@@ -241,6 +263,27 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
             assert not item.scope_grant_satisfies(
                 ["https://mail.google.com/", "https://www.googleapis.com/auth/gmail.modify"]
             )
+
+
+def test_calendar_reads_accept_legacy_readonly_and_metadata_uses_resource_scope() -> None:
+    legacy = ["https://www.googleapis.com/auth/calendar.readonly"]
+    for name in (
+        "calendars.list",
+        "calendars.get",
+        "events.list",
+        "events.get",
+        "events.instances",
+        "freebusy.query",
+    ):
+        assert _operation("google_calendar", ConnectorMode.READ, name).scope_grant_satisfies(legacy)
+
+    metadata = _operation("google_calendar", ConnectorMode.READ, "calendars.get")
+    assert metadata.scope_grant_satisfies(
+        ["https://www.googleapis.com/auth/calendar.calendars.readonly"]
+    )
+    assert not metadata.scope_grant_satisfies(
+        ["https://www.googleapis.com/auth/calendar.calendarlist.readonly"]
+    )
 
 
 def test_gmail_settings_schemas_are_closed_and_require_explicit_final_states() -> None:
@@ -527,14 +570,12 @@ def test_google_catalog_validates_representative_rich_inputs() -> None:
                 "display_name": "Guest",
                 "email": "guest@example.test",
                 "optional": True,
-                "response_status": "needsAction",
             }
         ],
         "calendar_id": "primary",
         "description": "Planning meeting",
-        "drive_attachments": [{"file_id": "drive-file-1"}],
         "end": {"date_time": "2026-08-01T10:00:00+02:00", "time_zone": "Europe/Brussels"},
-        "event_id": "client-event-01",
+        "event_id": "123e4567e89b12d3a456426614174000",
         "guests_can_invite_others": False,
         "guests_can_modify": False,
         "guests_can_see_other_guests": True,
@@ -576,6 +617,96 @@ def test_google_catalog_validates_representative_rich_inputs() -> None:
     }
     assert (
         catalog.validate_input("google_drive", ConnectorMode.WRITE, "files.create", drive) == drive
+    )
+
+
+def test_calendar_schemas_match_provider_time_id_and_notification_contracts() -> None:
+    catalog = _catalog()
+    all_day = {
+        "calendar_id": "primary",
+        "end": {"date": "2026-08-03"},
+        "start": {"date": "2026-08-02"},
+    }
+    assert (
+        catalog.validate_input("google_calendar", ConnectorMode.WRITE, "events.create", all_day)
+        == all_day
+    )
+
+    offset_timed = {
+        "calendar_id": "primary",
+        "end": {"date_time": "2026-08-02T11:00:00+02:00"},
+        "event_id": "123e4567e89b12d3a456426614174000",
+        "start": {"date_time": "2026-08-02T10:00:00+02:00"},
+    }
+    assert (
+        catalog.validate_input(
+            "google_calendar", ConnectorMode.WRITE, "events.create", offset_timed
+        )
+        == offset_timed
+    )
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "google_calendar",
+            ConnectorMode.WRITE,
+            "events.create",
+            {**offset_timed, "event_id": "client-event-01"},
+        )
+
+    freebusy = {
+        "calendar_ids": [f"calendar-{index}" for index in range(50)],
+        "time_max": "2026-08-03T00:00:00Z",
+        "time_min": "2026-08-02T00:00:00Z",
+    }
+    assert (
+        catalog.validate_input("google_calendar", ConnectorMode.READ, "freebusy.query", freebusy)
+        == freebusy
+    )
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "google_calendar",
+            ConnectorMode.READ,
+            "freebusy.query",
+            {**freebusy, "calendar_ids": [*freebusy["calendar_ids"], "one-too-many"]},
+        )
+
+    move = {
+        "calendar_id": "source",
+        "destination_calendar_id": "destination",
+        "etag": "etag",
+        "event_id": "event",
+        "expected_destination_calendar": _expected_calendar("destination"),
+        "expected_event": _expected_event(),
+        "send_updates": "all",
+    }
+    assert (
+        catalog.validate_input("google_calendar", ConnectorMode.WRITE, "events.move", move) == move
+    )
+    for missing in ("etag", "expected_destination_calendar", "expected_event", "send_updates"):
+        with pytest.raises(ValidationError):
+            catalog.validate_input(
+                "google_calendar",
+                ConnectorMode.WRITE,
+                "events.move",
+                {key: value for key, value in move.items() if key != missing},
+            )
+
+    long_summary = "s" * 5_000
+    bounded_provider_snapshot = {
+        **move,
+        "expected_destination_calendar": {
+            **_expected_calendar("destination"),
+            "summary": None,
+        },
+        "expected_event": {**_expected_event(), "summary": long_summary},
+    }
+    assert (
+        catalog.validate_input(
+            "google_calendar",
+            ConnectorMode.WRITE,
+            "events.move",
+            bounded_provider_snapshot,
+        )
+        == bounded_provider_snapshot
     )
 
 
@@ -1056,25 +1187,12 @@ def test_gmail_normal_message_bodies_allow_the_documented_bound() -> None:
         operation.validate_input({"text_body": body + "x"})
 
 
-def test_calendar_drive_attachment_references_are_closed_and_bounded() -> None:
+def test_separate_calendar_connection_does_not_advertise_unreachable_drive_attachments() -> None:
     operation = _operation("google_calendar", ConnectorMode.WRITE, "events.create")
     event_time = {
         "date_time": "2026-08-01T09:00:00+02:00",
         "time_zone": "Europe/Brussels",
     }
     base = {"calendar_id": "primary", "end": event_time, "start": event_time}
-    attachments = [{"file_id": f"file-{index}"} for index in range(25)]
-    assert operation.validate_input({**base, "drive_attachments": attachments}) == {
-        **base,
-        "drive_attachments": attachments,
-    }
-    with pytest.raises(ValidationError):
-        operation.validate_input(
-            {**base, "drive_attachments": [*attachments, {"file_id": "file-26"}]}
-        )
-    for untrusted in (
-        {"file_id": "file", "file_url": "https://attacker.example/file"},
-        {"file_id": "file", "title": "caller-controlled"},
-    ):
-        with pytest.raises(ValidationError):
-            operation.validate_input({**base, "drive_attachments": [untrusted]})
+    with pytest.raises(ValidationError, match="unknown field"):
+        operation.validate_input({**base, "drive_attachments": [{"file_id": "file"}]})

@@ -120,6 +120,47 @@ _OPERATION_WARNINGS: Final = {
         "settings.vacation.update",
     ): "Gmail will send this reply automatically to future qualifying messages.",
     (
+        "google_calendar",
+        "calendars.delete",
+    ): "Deleting an owned secondary calendar permanently removes it for everyone.",
+    (
+        "google_calendar",
+        "calendars.update",
+    ): "Calendar metadata can be visible to people who share this calendar.",
+    (
+        "google_calendar",
+        "events.delete",
+    ): (
+        "Deleting an organized event cancels it for guests. Google usually keeps deleted "
+        "events in Trash temporarily, but recurring-event recovery differs; send_updates=none "
+        "can leave external calendars stale and may not suppress every email."
+    ),
+    (
+        "google_calendar",
+        "events.create",
+    ): (
+        "If attendees are included, Google may send invitations; send_updates=none can leave "
+        "external calendars stale and may not suppress every email."
+    ),
+    (
+        "google_calendar",
+        "events.move",
+    ): (
+        "Moving an event changes its organizer; send_updates=none can leave external calendars "
+        "stale and may not suppress every email."
+    ),
+    (
+        "google_calendar",
+        "events.respond",
+    ): "The organizer can see this RSVP even when notification emails are suppressed.",
+    (
+        "google_calendar",
+        "events.update",
+    ): (
+        "Supplying attendees or recurrence replaces that complete array; send_updates=none can "
+        "leave external calendars stale and may not suppress every email."
+    ),
+    (
         "outlook_calendar",
         "events.cancel",
     ): "Outlook will email event attendees a cancellation notice.",
