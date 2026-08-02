@@ -7,6 +7,7 @@ import os
 import stat
 from collections.abc import Callable
 from email.message import Message
+from http.client import BadStatusLine, IncompleteRead
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.error import HTTPError
@@ -66,6 +67,18 @@ class _Response:
 
 class _BodyReader(Protocol):
     def read(self, amount: int = -1) -> bytes: ...
+
+
+class _FailingBody(io.BytesIO):
+    def __init__(self, *, http_exception: bool) -> None:
+        super().__init__()
+        self._http_exception = http_exception
+
+    def read(self, amount: int | None = -1) -> bytes:
+        del amount
+        if self._http_exception:
+            raise IncompleteRead(b"", 1)
+        raise OSError("response body failed")
 
 
 class _Scheduled:
@@ -604,9 +617,13 @@ def test_prepared_upload_resumes_exact_snapshot_slice(
     artifacts.close()
 
 
-@pytest.mark.parametrize("acknowledgement", [None, "bytes=0-1", "bytes=2-4"])
-def test_resumable_upload_rejects_missing_or_mismatched_acknowledgement(
+@pytest.mark.parametrize(
+    ("acknowledgement", "next_offset"),
+    ((None, 0), ("bytes=0-1", 2)),
+)
+def test_resumable_upload_accepts_initial_zero_progress_and_partial_acknowledgement(
     acknowledgement: str | None,
+    next_offset: int,
 ) -> None:
     def upload(request: Request, timeout: float) -> ResponseLike:
         del timeout
@@ -615,7 +632,28 @@ def test_resumable_upload_rejects_missing_or_mismatched_acknowledgement(
         headers = {} if acknowledgement is None else {"Range": acknowledgement}
         return _Response(b"", status=308, headers=headers)
 
-    with pytest.raises(ValidationError, match="acknowledgement"):
+    result = ConnectorTransport(opener=upload).request_stream(
+        origin=ConnectorOrigin.GOOGLE,
+        method=ConnectorMethod.PUT,
+        path="/upload/drive/v3/files/file",
+        credential=_credential(),
+        source=(b"abc",),
+        content_length=3,
+    )
+    assert result.next_offset == next_offset
+
+
+@pytest.mark.parametrize("acknowledgement", ["bytes=1-2", "bytes=0-3", "invalid"])
+def test_resumable_upload_marks_invalid_post_dispatch_acknowledgement_unknown(
+    acknowledgement: str,
+) -> None:
+    def upload(request: Request, timeout: float) -> ResponseLike:
+        del timeout
+        reader = cast(_BodyReader, request.data)
+        assert reader.read() == b"abc"
+        return _Response(b"", status=308, headers={"Range": acknowledgement})
+
+    with pytest.raises(ConnectorOutcomeUnknown, match="acknowledgement"):
         ConnectorTransport(opener=upload).request_stream(
             origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.PUT,
@@ -623,6 +661,139 @@ def test_resumable_upload_rejects_missing_or_mismatched_acknowledgement(
             credential=_credential(),
             source=(b"abc",),
             content_length=3,
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
+def test_resumed_upload_marks_missing_post_dispatch_acknowledgement_unknown(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "snapshot.bin"
+    path.write_bytes(b"abcdef")
+    descriptor = os.open(path, os.O_RDONLY)
+    prepared = PreparedUpload(
+        filename="snapshot.bin",
+        media_type="application/octet-stream",
+        size=6,
+        sha256=hashlib.sha256(b"abcdef").hexdigest(),
+        descriptor=descriptor,
+    )
+
+    def upload(request: Request, timeout: float) -> ResponseLike:
+        del timeout
+        reader = cast(_BodyReader, request.data)
+        assert reader.read() == b"def"
+        return _Response(b"", status=308)
+
+    try:
+        with pytest.raises(ConnectorOutcomeUnknown, match="missing after progress"):
+            ConnectorTransport(opener=upload).request_stream(
+                origin=ConnectorOrigin.GOOGLE,
+                method=ConnectorMethod.PUT,
+                path="/upload/drive/v3/files/file",
+                credential=_credential(),
+                source=prepared,
+                content_length=3,
+                byte_offset=3,
+                total_length=6,
+            )
+    finally:
+        prepared.close()
+
+
+def test_resumable_probe_is_credentialless_bounded_and_provider_locked() -> None:
+    captured: list[Request] = []
+
+    def probe(request: Request, timeout: float) -> ResponseLike:
+        assert timeout == 30.0
+        captured.append(request)
+        return _Response(b'{"state":"active"}', status=308, headers={"Range": "bytes=0-1"})
+
+    transport = ConnectorTransport(opener=probe)
+    result = transport.probe_resumable_upload(
+        origin=ConnectorOrigin.GOOGLE,
+        location="https://www.googleapis.com/upload/session/opaque",
+        total_length=3,
+    )
+
+    assert result.status == 308
+    assert result.next_offset == 2
+    assert result.body == b'{"state":"active"}'
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.full_url == "https://www.googleapis.com/upload/session/opaque"
+    assert request.get_method() == ConnectorMethod.PUT.value
+    assert request.data == b""
+    assert request.get_header("Authorization") is None
+    assert request.get_header("Content-length") == "0"
+    assert request.get_header("Content-range") == "bytes */3"
+
+    with pytest.raises(ValidationError, match="pinned origin"):
+        transport.probe_resumable_upload(
+            origin=ConnectorOrigin.GOOGLE,
+            location="https://attacker.invalid/upload/session/opaque",
+            total_length=3,
+        )
+    assert len(captured) == 1
+
+
+@pytest.mark.parametrize("http_exception", [False, True])
+def test_expected_http_error_body_failure_is_unknown_for_stream_and_probe(
+    http_exception: bool,
+) -> None:
+    def failed_response(request: Request, timeout: float) -> ResponseLike:
+        del timeout
+        headers = Message()
+        is_probe = request.get_header("Content-range") == "bytes */3"
+        status = 404 if is_probe else 308
+        if not is_probe:
+            headers["Range"] = "bytes=0-1"
+        raise HTTPError(
+            request.full_url,
+            status,
+            "Expected provider status",
+            headers,
+            _FailingBody(http_exception=http_exception),
+        )
+
+    transport = ConnectorTransport(opener=failed_response)
+    with pytest.raises(ConnectorOutcomeUnknown, match="response failed after dispatch"):
+        transport.request_stream(
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.PUT,
+            path="/upload/drive/v3/files/file",
+            credential=_credential(),
+            source=(b"abc",),
+            content_length=3,
+        )
+    with pytest.raises(ConnectorOutcomeUnknown, match="response failed after dispatch"):
+        transport.probe_resumable_upload(
+            origin=ConnectorOrigin.GOOGLE,
+            location="https://www.googleapis.com/upload/session/opaque",
+            total_length=3,
+        )
+
+
+def test_malformed_http_response_is_unknown_for_stream_and_probe() -> None:
+    def malformed_response(request: Request, timeout: float) -> ResponseLike:
+        del request, timeout
+        raise BadStatusLine("malformed provider response")
+
+    transport = ConnectorTransport(opener=malformed_response)
+    with pytest.raises(ConnectorOutcomeUnknown, match="outcome is unknown"):
+        transport.request_stream(
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.PUT,
+            path="/upload/drive/v3/files/file",
+            credential=_credential(),
+            source=(b"abc",),
+            content_length=3,
+        )
+    with pytest.raises(ConnectorOutcomeUnknown, match="outcome remains unknown"):
+        transport.probe_resumable_upload(
+            origin=ConnectorOrigin.GOOGLE,
+            location="https://www.googleapis.com/upload/session/opaque",
+            total_length=3,
         )
 
 
@@ -658,6 +829,20 @@ def test_stream_upload_does_not_count_unread_source_as_transferred() -> None:
 
     with pytest.raises(ConnectorOutcomeUnknown, match="outcome is unknown"):
         ConnectorTransport(opener=early_response).request_stream(
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.PUT,
+            path="/upload/drive/v3/files/file",
+            credential=_credential(),
+            source=(b"abcdef",),
+            content_length=6,
+        )
+
+    def response_without_reading(request: Request, timeout: float) -> ResponseLike:
+        del request, timeout
+        return _Response(b"ok")
+
+    with pytest.raises(ConnectorOutcomeUnknown, match="after dispatch"):
+        ConnectorTransport(opener=response_without_reading).request_stream(
             origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.PUT,
             path="/upload/drive/v3/files/file",

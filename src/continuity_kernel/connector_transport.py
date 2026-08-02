@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
+from http.client import HTTPException
 from types import MappingProxyType
 from typing import IO, Final, Protocol, cast
 from urllib.error import HTTPError, URLError
@@ -433,8 +434,7 @@ class ConnectorTransport:
         except HTTPError as exc:
             if exc.code in expected:
                 status = exc.code
-                response_headers = _safe_headers(exc.headers)
-                control_body = _bounded_read(cast(ResponseLike, exc), MAX_RESPONSE_BODY_BYTES)
+                response_headers, control_body = _expected_http_error_response(exc)
                 try:
                     body.verify_complete()
                 except ValidationError as verification_error:
@@ -448,13 +448,13 @@ class ConnectorTransport:
                     code=_provider_error_code(_bounded_error_read(exc)),
                     retry_after=_header(exc.headers, "Retry-After"),
                 ) from exc
-        except ValidationError as exc:
-            if body.total:
-                raise ConnectorOutcomeUnknown(
-                    "provider stream source failed after dispatch; outcome is unknown"
-                ) from exc
+        except ConnectorProviderError:
             raise
-        except (OSError, TimeoutError, URLError) as exc:
+        except ContinuityError as exc:
+            raise ConnectorOutcomeUnknown(
+                "provider stream validation failed after dispatch; outcome is unknown"
+            ) from exc
+        except (HTTPException, OSError, TimeoutError, URLError) as exc:
             raise ConnectorOutcomeUnknown(
                 "provider stream transport failed; outcome is unknown and was not retried"
             ) from exc
@@ -470,6 +470,84 @@ class ConnectorTransport:
             headers=MappingProxyType(response_headers),
             bytes_transferred=body.total,
             sha256=body.hexdigest,
+            next_offset=next_offset,
+            control_body=control_body,
+        )
+
+    def probe_resumable_upload(
+        self,
+        *,
+        origin: ConnectorOrigin,
+        location: str,
+        total_length: int,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> ConnectorStreamResponse:
+        """Query one response-derived resumable session without sending credentials."""
+
+        target = _provider_location(origin, location)
+        _validate_request_policy(origin, ConnectorMethod.PUT, None)
+        total = _stream_length_value(total_length, label="upload total length")
+        expected = frozenset({200, 201, 308, 404})
+        timeout = _timeout(timeout_seconds)
+        request = Request(
+            target,
+            data=b"",
+            headers={
+                "Accept": "application/json",
+                "Content-Length": "0",
+                "Content-Range": f"bytes */{total}",
+            },
+            method=ConnectorMethod.PUT.value,
+        )
+        response_headers: dict[str, str] = {}
+        control_body = b""
+        status = 0
+        try:
+            with self._opener(request, timeout) as response:
+                status = _response_status(response)
+                response_headers = _safe_headers(response.headers)
+                if status not in expected:
+                    error_body = _bounded_stream_error_read(response)
+                    raise ConnectorProviderError(
+                        origin=origin,
+                        status=status,
+                        code=_provider_error_code(error_body),
+                        retry_after=response_headers.get("retry-after"),
+                    )
+                control_body = _bounded_read(response, MAX_RESPONSE_BODY_BYTES)
+        except HTTPError as exc:
+            if exc.code in expected:
+                status = exc.code
+                response_headers, control_body = _expected_http_error_response(exc)
+            else:
+                raise ConnectorProviderError(
+                    origin=origin,
+                    status=exc.code,
+                    code=_provider_error_code(_bounded_error_read(exc)),
+                    retry_after=_header(exc.headers, "Retry-After"),
+                ) from exc
+        except ConnectorProviderError:
+            raise
+        except ContinuityError as exc:
+            raise ConnectorOutcomeUnknown(
+                "provider upload status probe failed; upload outcome remains unknown"
+            ) from exc
+        except (HTTPException, OSError, TimeoutError, URLError) as exc:
+            raise ConnectorOutcomeUnknown(
+                "provider upload status probe failed; upload outcome remains unknown"
+            ) from exc
+        next_offset = _resume_next_offset(
+            status=status,
+            headers=response_headers,
+            byte_offset=0,
+            content_length=total,
+        )
+        return ConnectorStreamResponse(
+            origin=origin,
+            status=status,
+            headers=MappingProxyType(response_headers),
+            bytes_transferred=0,
+            sha256=None,
             next_offset=next_offset,
             control_body=control_body,
         )
@@ -879,16 +957,27 @@ def _resume_next_offset(
     if status != 308:
         return None
     acknowledged = headers.get("range")
-    match = _RANGE.fullmatch(acknowledged) if acknowledged is not None else None
-    expected_end = byte_offset + content_length - 1
-    if (
-        content_length == 0
-        or match is None
-        or int(match.group(1)) != 0
-        or int(match.group(2)) != expected_end
-    ):
-        raise ValidationError("provider resumable acknowledgement does not match the sent range")
-    return expected_end + 1
+    if acknowledged is None:
+        if byte_offset == 0:
+            return 0
+        raise ConnectorOutcomeUnknown(
+            "provider resumable acknowledgement is missing after progress; "
+            "upload outcome is unknown"
+        )
+    match = _RANGE.fullmatch(acknowledged)
+    if content_length == 0 or match is None or int(match.group(1)) != 0:
+        raise ConnectorOutcomeUnknown(
+            "provider resumable acknowledgement does not match the sent range; "
+            "upload outcome is unknown"
+        )
+    next_offset = int(match.group(2)) + 1
+    sent_end = byte_offset + content_length
+    if not byte_offset <= next_offset <= sent_end:
+        raise ConnectorOutcomeUnknown(
+            "provider resumable acknowledgement does not match the sent range; "
+            "upload outcome is unknown"
+        )
+    return next_offset
 
 
 def _stream_length_value(value: object, *, label: str) -> int:
@@ -1005,7 +1094,7 @@ def _response_status(response: ResponseLike) -> int:
 def _bounded_stream_error_read(response: ResponseLike) -> bytes:
     try:
         return response.read(MAX_ERROR_BODY_BYTES + 1)[:MAX_ERROR_BODY_BYTES]
-    except OSError:
+    except (HTTPException, OSError):
         return b""
 
 
@@ -1249,8 +1338,20 @@ def _bounded_read(response: ResponseLike, bound: int) -> bytes:
 def _bounded_error_read(response: HTTPError) -> bytes:
     try:
         return response.read(MAX_ERROR_BODY_BYTES + 1)[:MAX_ERROR_BODY_BYTES]
-    except OSError:
+    except (HTTPException, OSError):
         return b""
+
+
+def _expected_http_error_response(error: HTTPError) -> tuple[dict[str, str], bytes]:
+    try:
+        return (
+            _safe_headers(error.headers),
+            _bounded_read(cast(ResponseLike, error), MAX_RESPONSE_BODY_BYTES),
+        )
+    except (ContinuityError, HTTPException, OSError, ValueError) as exc:
+        raise ConnectorOutcomeUnknown(
+            "provider response failed after dispatch; outcome is unknown"
+        ) from exc
 
 
 def _safe_headers(values: object) -> dict[str, str]:
