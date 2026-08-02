@@ -42,6 +42,8 @@ SLACK_AUTH_FAILURE_CODES: Final = frozenset(
 _PATH = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$")
 _HEADER_VALUE = re.compile(r"^[^\x00-\x1f\x7f]{0,8192}$")
 _RANGE = re.compile(r"^bytes=([0-9]+)-([0-9]+)$")
+_GOOGLE_DRIVE_RESOURCE_COMPONENT = re.compile(r"^[A-Za-z0-9_-]{1,512}$")
+_GOOGLE_DRIVE_RESOURCE_KEYS = re.compile(r"^[A-Za-z0-9_-]{1,512}/[A-Za-z0-9_-]{1,512}$")
 _ALLOWED_HEADERS: Final = frozenset(
     {
         "accept",
@@ -54,6 +56,7 @@ _ALLOWED_HEADERS: Final = frozenset(
         "x-upload-content-type",
         "x-goog-if-generation-match",
         "x-goog-if-metageneration-match",
+        "x-goog-drive-resource-keys",
     }
 )
 _SAFE_RESPONSE_HEADERS: Final = frozenset(
@@ -109,7 +112,9 @@ _ORIGIN_BASES: Final[Mapping[ConnectorOrigin, str]] = MappingProxyType(
 _DYNAMIC_HOSTS: Final[Mapping[ConnectorOrigin, frozenset[str]]] = MappingProxyType(
     {
         ConnectorOrigin.GMAIL: frozenset({"gmail.googleapis.com"}),
-        ConnectorOrigin.GOOGLE: frozenset({"www.googleapis.com", "content.googleapis.com"}),
+        ConnectorOrigin.GOOGLE: frozenset(
+            {"www.googleapis.com", "content.googleapis.com", "drive.usercontent.google.com"}
+        ),
         ConnectorOrigin.GOOGLE_OIDC: frozenset({"openidconnect.googleapis.com"}),
         ConnectorOrigin.MICROSOFT_GRAPH: frozenset({"graph.microsoft.com", "outlook.office.com"}),
         ConnectorOrigin.SLACK: frozenset({"files.slack.com", "slack.com"}),
@@ -567,6 +572,7 @@ class ConnectorTransport:
         expected_statuses: frozenset[int] = frozenset({200, 206}),
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_bytes: int = MAX_STREAM_BODY_BYTES,
+        google_drive_resource_key: tuple[str, str] | None = None,
     ) -> ConnectorStreamResponse:
         """Stream a provider response into an adapter-owned sink.
 
@@ -587,14 +593,20 @@ class ConnectorTransport:
         _stream_bound(max_bytes)
         expected = _expected_statuses(expected_statuses)
         request_headers: dict[str, str] = {"Accept": "application/octet-stream"}
-        expected_from_range = _download_range_header(
+        if google_drive_resource_key is not None:
+            if origin is not ConnectorOrigin.GOOGLE:
+                raise ValidationError("Drive resource keys require the Google origin")
+            request_headers["X-Goog-Drive-Resource-Keys"] = _google_drive_resource_key(
+                google_drive_resource_key
+            )
+        requested_count = _download_range_header(
             request_headers,
             range_start=range_start,
             range_end=range_end,
         )
+        if requested_count is not None and requested_count > max_bytes:
+            raise ValidationError("requested download range exceeds its operation bound")
         expected_count = expected_length
-        if expected_count is None:
-            expected_count = expected_from_range
         if expected_count is not None:
             _stream_length_value(expected_count, label="expected download length")
             if expected_count > max_bytes:
@@ -616,7 +628,6 @@ class ConnectorTransport:
                     redirect_headers = _safe_headers(exc.headers)
                     redirected_target = _credentialless_download_redirect(
                         origin,
-                        from_fixed_path=path is not None,
                         already_redirected=redirected,
                         status=exc.code,
                         headers=redirect_headers,
@@ -645,6 +656,15 @@ class ConnectorTransport:
                     status,
                     range_requested=range_start is not None,
                 )
+                ranged_count = _validate_download_content_range(
+                    response_headers,
+                    range_start=range_start,
+                    range_end=range_end,
+                )
+                if ranged_count is not None:
+                    if expected_count is not None and ranged_count != expected_count:
+                        raise ValidationError("provider download byte range is unexpected")
+                    expected_count = ranged_count
                 declared = _declared_content_length(response_headers)
                 if declared is not None:
                     if declared > max_bytes:
@@ -654,12 +674,6 @@ class ConnectorTransport:
                     if expected_count is not None and declared != expected_count:
                         raise ValidationError("provider download Content-Length is unexpected")
                     expected_count = declared
-                _validate_download_content_range(
-                    response_headers,
-                    range_start=range_start,
-                    range_end=range_end,
-                    expected_count=expected_count,
-                )
                 while True:
                     block = response.read(MAX_STREAM_CHUNK_BYTES)
                     if not isinstance(block, bytes):
@@ -684,7 +698,7 @@ class ConnectorTransport:
                 code=_provider_error_code(_bounded_error_read(exc)),
                 retry_after=_header(exc.headers, "Retry-After"),
             ) from exc
-        except (OSError, TimeoutError, URLError) as exc:
+        except (HTTPException, OSError, TimeoutError, URLError) as exc:
             _abort_sink(sink)
             raise ContinuityError(f"provider {origin.value} download transport failed") from exc
         except Exception:
@@ -726,6 +740,8 @@ class ConnectorTransport:
             content_type=content_type,
             headers=headers,
         )
+        if "X-Goog-Drive-Resource-Keys" in request_headers and origin is not ConnectorOrigin.GOOGLE:
+            raise ValidationError("Drive resource keys require the Google origin")
         if credential is not None:
             request_headers["Authorization"] = f"{credential.scheme.value} {credential.secret}"
         request_headers.setdefault("Accept", "application/json")
@@ -746,7 +762,7 @@ class ConnectorTransport:
                 code=_provider_error_code(error_body),
                 retry_after=_header(exc.headers, "Retry-After"),
             ) from exc
-        except (OSError, TimeoutError, URLError) as exc:
+        except (HTTPException, OSError, TimeoutError, URLError) as exc:
             if method is ConnectorMethod.GET:
                 raise ContinuityError(f"provider {origin.value} transport failed") from exc
             raise ConnectorOutcomeUnknown(
@@ -1061,11 +1077,10 @@ def _validate_download_content_range(
     *,
     range_start: int | None,
     range_end: int | None,
-    expected_count: int | None,
-) -> None:
+) -> int | None:
     value = headers.get("content-range")
     if range_start is None or range_end is None:
-        return
+        return None
     if value is None:
         raise ValidationError("provider ranged download has no Content-Range")
     match = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", value)
@@ -1076,12 +1091,14 @@ def _validate_download_content_range(
     end_value = int(end)
     if (
         start_value != range_start
-        or end_value != range_end
         or end_value < start_value
-        or (expected_count is not None and end_value - start_value + 1 != expected_count)
+        or end_value > range_end
         or (total != "*" and int(total) <= end_value)
     ):
         raise ValidationError("provider Content-Range does not match the requested range")
+    if end_value < range_end and (total == "*" or int(total) != end_value + 1):
+        raise ValidationError("provider shortened a download range before end of file")
+    return end_value - start_value + 1
 
 
 def _response_status(response: ResponseLike) -> int:
@@ -1179,14 +1196,12 @@ def _provider_location(origin: ConnectorOrigin, value: object) -> str:
 def _credentialless_download_redirect(
     origin: ConnectorOrigin,
     *,
-    from_fixed_path: bool,
     already_redirected: bool,
     status: int,
     headers: Mapping[str, str],
 ) -> str | None:
     if (
-        not from_fixed_path
-        or already_redirected
+        already_redirected
         or status not in {302, 303, 307, 308}
         or origin not in {ConnectorOrigin.GOOGLE, ConnectorOrigin.MICROSOFT_GRAPH}
     ):
@@ -1195,6 +1210,20 @@ def _credentialless_download_redirect(
     if location is None:
         raise ValidationError("provider download redirect has no safe Location")
     return _provider_location(origin, location)
+
+
+def _google_drive_resource_key(value: object) -> str:
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 2
+        or any(
+            not isinstance(component, str)
+            or _GOOGLE_DRIVE_RESOURCE_COMPONENT.fullmatch(component) is None
+            for component in value
+        )
+    ):
+        raise ValidationError("Google Drive resource key binding is invalid")
+    return f"{value[0]}/{value[1]}"
 
 
 def _validate_request_policy(
@@ -1291,6 +1320,11 @@ def _headers(values: Mapping[str, str]) -> dict[str, str]:
             match = _RANGE.fullmatch(value)
             if match is None or int(match.group(1)) > int(match.group(2)):
                 raise ValidationError("connector range header is invalid")
+        if (
+            normalized_name == "x-goog-drive-resource-keys"
+            and _GOOGLE_DRIVE_RESOURCE_KEYS.fullmatch(value) is None
+        ):
+            raise ValidationError("Google Drive resource key header is invalid")
         canonical = "-".join(part.capitalize() for part in name.split("-"))
         result[canonical] = value
     return result

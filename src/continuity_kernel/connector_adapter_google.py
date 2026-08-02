@@ -8,7 +8,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.policy import SMTP
-from typing import Final, cast
+from io import BytesIO
+from typing import Final, NoReturn, cast
 from urllib.parse import urlsplit
 
 from continuity_kernel.connector_adapter import (
@@ -58,6 +59,30 @@ _DRIVE_RESUMABLE_MAX_ATTEMPTS: Final = 8
 _DRIVE_RESUMABLE_MAX_NO_PROGRESS: Final = 2
 _DRIVE_RESUMABLE_MAX_RESTARTS: Final = 1
 _CONTENT_RANGE: Final = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
+_DRIVE_DOWNLOAD_OPERATION_NAME: Final = re.compile(r"^(?:operations/)?([A-Za-z0-9._~-]{1,480})$")
+_DRIVE_RESOURCE_COMPONENT: Final = re.compile(r"^[A-Za-z0-9_-]{1,512}$")
+_DRIVE_DOWNLOAD_RESPONSE_TYPE: Final = (
+    "type.googleapis.com/google.apps.drive.v3.DownloadFileResponse"
+)
+_DRIVE_DOWNLOAD_RETRY_SECONDS: Final = 10
+_DRIVE_DOWNLOAD_ERROR_STATUS: Final = {
+    1: (499, "cancelled"),
+    2: (500, "unknown"),
+    3: (400, "invalid_argument"),
+    4: (504, "deadline_exceeded"),
+    5: (404, "not_found"),
+    6: (409, "already_exists"),
+    7: (403, "permission_denied"),
+    8: (429, "resource_exhausted"),
+    9: (400, "failed_precondition"),
+    10: (409, "aborted"),
+    11: (400, "out_of_range"),
+    12: (501, "unimplemented"),
+    13: (500, "internal"),
+    14: (503, "unavailable"),
+    15: (500, "data_loss"),
+    16: (401, "unauthenticated"),
+}
 _MESSAGE_ID: Final = re.compile(r"^<[^<>\s]+@[^<>\s]+>$")
 _MESSAGE_ID_REFERENCE: Final = re.compile(r"<[^<>\s]+@[^<>\s]+>")
 _PAGINATION_FIELDS: Final = frozenset({"nextPageToken", "nextSyncToken", "nextLink", "nextPage"})
@@ -799,6 +824,14 @@ def _execute_drive(
                 fields=_DRIVE_REPLY_LIST_FIELDS,
             ),
         )
+    if name == "files.download":
+        return _drive_download(
+            transport,
+            credential=credential,
+            continuation=continuation,
+            values=values,
+            transfer=transfer,
+        )
     _reject_continuation(continuation)
     if name == "files.get":
         return _json_request(
@@ -809,7 +842,7 @@ def _execute_drive(
             credential=credential,
             query=_with_supports_all_drives(values),
         )
-    if name in {"files.download", "revisions.download"}:
+    if name in {"files.content", "revisions.download"}:
         path = f"{base}/files/{_segment(_required(values, 'file_id'))}"
         if name == "revisions.download":
             path += f"/revisions/{_segment(_required(values, 'revision_id'))}"
@@ -1136,11 +1169,15 @@ def _drive_artifact_filename(values: Mapping[str, object], *, export: bool) -> s
     suffix = {
         "application/json": ".json",
         "application/pdf": ".pdf",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
         "application/zip": ".zip",
         "image/jpeg": ".jpg",
         "image/png": ".png",
         "text/csv": ".csv",
         "text/plain": ".txt",
+        "video/mp4": ".mp4",
     }.get(media_type, "")
     if export:
         return f"drive-export-{file_id}{suffix}"
@@ -1148,6 +1185,289 @@ def _drive_artifact_filename(values: Mapping[str, object], *, export: bool) -> s
     if revision_id is not None:
         return f"drive-file-{file_id}-revision-{_text(revision_id)}{suffix}"
     return f"drive-file-{file_id}{suffix}"
+
+
+def _drive_download(
+    transport: ConnectorTransport,
+    *,
+    credential: ConnectorRuntimeCredential,
+    continuation: object | None,
+    values: dict[str, object],
+    transfer: ConnectorTransferContext | None,
+) -> ConnectorAdapterResult:
+    if _drive_delivery(values) == "artifact" and transfer is None:
+        raise ValidationError("Google Drive artifact delivery requires transfer context")
+    operation_name: str | None = None
+    resource_key = _drive_input_resource_key(values)
+    if continuation is not None:
+        operation_name, continued_resource_key = _drive_download_continuation(continuation)
+        if (
+            resource_key is not None
+            and continued_resource_key is not None
+            and resource_key != continued_resource_key
+        ):
+            raise ValidationError("Google Drive download continuation does not match its input")
+        resource_key = continued_resource_key or resource_key
+        try:
+            operation = transport.request(
+                origin=ConnectorOrigin.GOOGLE,
+                method=ConnectorMethod.GET,
+                path=f"/drive/v3/operations/{_segment(operation_name)}",
+                credential=credential.credential,
+                headers=_drive_resource_key_headers(values, resource_key),
+            ).json()
+        except ConnectorProviderError as exc:
+            if exc.status in {403, 404}:
+                raise ContinuityError(
+                    "Google Drive download operation is no longer pollable; "
+                    "start files.download again"
+                ) from exc
+            raise
+    else:
+        try:
+            operation = transport.request(
+                origin=ConnectorOrigin.GOOGLE,
+                method=ConnectorMethod.POST,
+                path=f"/drive/v3/files/{_segment(_required(values, 'file_id'))}/download",
+                credential=credential.credential,
+                query=_optional_query(
+                    values,
+                    {"mime_type": "mimeType", "revision_id": "revisionId"},
+                ),
+                body=b"",
+                headers=_drive_resource_key_headers(values, resource_key),
+                expected_statuses=frozenset({200}),
+            ).json()
+        except ConnectorOutcomeUnknown as exc:
+            raise ContinuityError(
+                "Google Drive download operation start failed; retrying is safe"
+            ) from exc
+    return _drive_download_operation_result(
+        operation,
+        expected_name=operation_name,
+        resource_key=resource_key,
+        transport=transport,
+        transfer=transfer,
+        values=values,
+    )
+
+
+def _drive_download_operation_result(
+    operation: object,
+    *,
+    expected_name: str | None,
+    resource_key: str | None,
+    transport: ConnectorTransport,
+    transfer: ConnectorTransferContext | None,
+    values: dict[str, object],
+) -> ConnectorAdapterResult:
+    if not isinstance(operation, Mapping):
+        raise ContinuityError("Google Drive returned an invalid download operation")
+    name = _drive_download_operation_name(operation.get("name"))
+    if expected_name is not None and name != expected_name:
+        raise ContinuityError("Google Drive download operation identity changed")
+    resource_key = _drive_download_resource_key(
+        operation.get("metadata"),
+        current=resource_key,
+    )
+    done = operation.get("done")
+    if done is not None and not isinstance(done, bool):
+        raise ContinuityError("Google Drive returned an invalid download operation state")
+    has_error = "error" in operation
+    has_response = "response" in operation
+    if done is not True:
+        if has_error or has_response:
+            raise ContinuityError("Google Drive returned an invalid pending download operation")
+        continuation: dict[str, object] = {"operation_name": name}
+        if resource_key is not None:
+            continuation["resource_key"] = resource_key
+        return ConnectorAdapterResult(
+            {"retry_after_seconds": _DRIVE_DOWNLOAD_RETRY_SECONDS, "status": "pending"},
+            continuation=continuation,
+        )
+    if has_error == has_response:
+        raise ContinuityError("Google Drive returned an invalid completed download operation")
+    if has_error:
+        _raise_drive_download_error(operation["error"])
+    response = operation["response"]
+    if not isinstance(response, Mapping):
+        raise ContinuityError("Google Drive returned an invalid download response")
+    if response.get("@type") != _DRIVE_DOWNLOAD_RESPONSE_TYPE:
+        raise ContinuityError("Google Drive returned an unexpected download response type")
+    location = response.get("downloadUri")
+    partial_allowed = response.get("partialDownloadAllowed", False)
+    if not isinstance(location, str) or not location or len(location) > 16_384:
+        raise ContinuityError("Google Drive download response omitted its content location")
+    if not isinstance(partial_allowed, bool):
+        raise ContinuityError("Google Drive returned an invalid partial-download state")
+    return _drive_download_location(
+        transport,
+        location=location,
+        partial_allowed=partial_allowed,
+        resource_key=resource_key,
+        transfer=transfer,
+        values=values,
+    )
+
+
+def _drive_download_location(
+    transport: ConnectorTransport,
+    *,
+    location: str,
+    partial_allowed: bool,
+    resource_key: str | None,
+    transfer: ConnectorTransferContext | None,
+    values: dict[str, object],
+) -> ConnectorAdapterResult:
+    resource_binding = _drive_resource_key_binding(values, resource_key)
+    if _drive_delivery(values) == "artifact":
+        if transfer is None:
+            raise ValidationError("Google Drive artifact delivery requires transfer context")
+        writer = transfer.artifacts.start(
+            _drive_artifact_filename(values, export=False),
+            media_type=_drive_artifact_media_type(values, export=False),
+        )
+        downloaded = transport.download_stream(
+            origin=ConnectorOrigin.GOOGLE,
+            sink=writer,
+            location=location,
+            credential=None,
+            max_bytes=MAX_ARTIFACT_BYTES,
+            google_drive_resource_key=resource_binding,
+        )
+        if downloaded.artifact is None:
+            raise ValidationError("Google Drive artifact delivery produced no receipt")
+        return ConnectorAdapterResult(
+            {"bytes": downloaded.bytes_transferred, "delivery": "artifact"},
+            artifact=downloaded.artifact,
+        )
+    if not partial_allowed:
+        raise ValidationError(
+            "Google Drive download does not support inline chunks; use artifact delivery"
+        )
+    byte_offset = _integer(values.get("byte_offset", 0))
+    maximum = _integer(values.get("max_chunk_size", _MAX_CONTENT_BYTES))
+    if maximum < 1:
+        raise ValidationError("Google Drive content chunk bound is invalid")
+    sink = BytesIO()
+    downloaded = transport.download_stream(
+        origin=ConnectorOrigin.GOOGLE,
+        sink=sink,
+        location=location,
+        credential=None,
+        range_start=byte_offset,
+        range_end=byte_offset + maximum - 1,
+        expected_statuses=frozenset({206}),
+        max_bytes=maximum,
+        google_drive_resource_key=resource_binding,
+    )
+    content_range, next_byte_offset = _drive_stream_content_range(
+        downloaded,
+        byte_offset=byte_offset,
+    )
+    return ConnectorAdapterResult(
+        {
+            "byte_offset": byte_offset,
+            "content_base64": base64.b64encode(sink.getvalue()).decode("ascii"),
+            "content_range": content_range,
+            "next_byte_offset": next_byte_offset,
+        }
+    )
+
+
+def _drive_download_continuation(value: object) -> tuple[str, str | None]:
+    if not isinstance(value, Mapping) or set(value) not in (
+        {"operation_name"},
+        {"operation_name", "resource_key"},
+    ):
+        raise ValidationError("Google Drive download continuation is invalid")
+    try:
+        name = _drive_download_operation_name(value.get("operation_name"))
+    except ContinuityError as exc:
+        raise ValidationError("Google Drive download continuation is invalid") from exc
+    resource_key = value.get("resource_key")
+    if resource_key is not None:
+        resource_key = _drive_resource_component(resource_key, label="resource key")
+    return name, resource_key
+
+
+def _drive_download_operation_name(value: object) -> str:
+    if not isinstance(value, str):
+        raise ContinuityError("Google Drive download operation omitted its identity")
+    match = _DRIVE_DOWNLOAD_OPERATION_NAME.fullmatch(value)
+    if match is None:
+        raise ContinuityError("Google Drive download operation identity is invalid")
+    return match.group(1)
+
+
+def _drive_input_resource_key(values: Mapping[str, object]) -> str | None:
+    value = values.get("resource_key")
+    if value is None:
+        return None
+    return _drive_resource_component(value, label="resource key")
+
+
+def _drive_download_resource_key(
+    metadata: object,
+    *,
+    current: str | None,
+) -> str | None:
+    if metadata is None:
+        return current
+    if not isinstance(metadata, Mapping):
+        raise ContinuityError("Google Drive download operation metadata is invalid")
+    returned = metadata.get("resourceKey")
+    if returned is None:
+        return current
+    try:
+        returned_key = _drive_resource_component(returned, label="provider resource key")
+    except ValidationError as exc:
+        raise ContinuityError("Google Drive download resource key is invalid") from exc
+    if current is not None and returned_key != current:
+        raise ContinuityError("Google Drive download resource key changed")
+    return returned_key
+
+
+def _drive_resource_component(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or _DRIVE_RESOURCE_COMPONENT.fullmatch(value) is None:
+        raise ValidationError(f"Google Drive {label} is invalid")
+    return value
+
+
+def _drive_resource_key_binding(
+    values: Mapping[str, object],
+    resource_key: str | None,
+) -> tuple[str, str] | None:
+    if resource_key is None:
+        return None
+    return (
+        _drive_resource_component(_required(values, "file_id"), label="file ID"),
+        _drive_resource_component(resource_key, label="resource key"),
+    )
+
+
+def _drive_resource_key_headers(
+    values: Mapping[str, object],
+    resource_key: str | None,
+) -> dict[str, str] | None:
+    binding = _drive_resource_key_binding(values, resource_key)
+    if binding is None:
+        return None
+    return {"X-Goog-Drive-Resource-Keys": f"{binding[0]}/{binding[1]}"}
+
+
+def _raise_drive_download_error(value: object) -> NoReturn:
+    if not isinstance(value, Mapping):
+        raise ContinuityError("Google Drive returned an invalid download error")
+    code = value.get("code")
+    if type(code) is not int or code not in _DRIVE_DOWNLOAD_ERROR_STATUS:
+        raise ContinuityError("Google Drive returned an invalid download error code")
+    status, label = _DRIVE_DOWNLOAD_ERROR_STATUS[code]
+    raise ConnectorProviderError(
+        origin=ConnectorOrigin.GOOGLE,
+        status=status,
+        code=f"download_{label}",
+    )
 
 
 def _drive_content_request(
@@ -1218,6 +1538,25 @@ def _drive_content_request(
         payload["content_range"] = content_range
         payload["next_byte_offset"] = next_byte_offset
     return ConnectorAdapterResult(payload)
+
+
+def _drive_stream_content_range(
+    response: ConnectorStreamResponse,
+    *,
+    byte_offset: int,
+) -> tuple[str, int]:
+    if response.status != 206:
+        raise ValidationError("Google Drive ranged download did not return partial content")
+    content_range = _response_header(response.headers, "content-range")
+    if content_range is None:
+        raise ValidationError("Google Drive ranged download has no content range")
+    match = _CONTENT_RANGE.fullmatch(content_range)
+    if match is None:
+        raise ValidationError("Google Drive ranged download content range is invalid")
+    start, end, _total = (int(part) for part in match.groups())
+    if start != byte_offset or end < start:
+        raise ValidationError("Google Drive ranged download does not match its requested offset")
+    return content_range, end + 1
 
 
 def _drive_content_range(

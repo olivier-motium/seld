@@ -33,7 +33,7 @@ from continuity_kernel.connector_transport import (
     ConnectorStreamResponse,
     ConnectorTransport,
 )
-from continuity_kernel.errors import ValidationError
+from continuity_kernel.errors import ContinuityError, ValidationError
 
 
 class _Transport(ConnectorTransport):
@@ -95,14 +95,25 @@ class _Transport(ConnectorTransport):
         self.calls.append({"kind": "download_stream", **kwargs})
         sink = kwargs["sink"]
         body = self.download_body
-        if kwargs["path"].startswith("/gmail/v1/users/me/messages/") and body == b"{}":
+        path = kwargs.get("path")
+        if (
+            isinstance(path, str)
+            and path.startswith("/gmail/v1/users/me/messages/")
+            and body == b"{}"
+        ):
             body = b'{"data":"","size":0}'
         sink.write(body)
-        artifact = sink.finish()
+        finish = getattr(sink, "finish", None)
+        artifact = finish() if callable(finish) else None
+        status = 206 if kwargs.get("range_start") is not None else 200
+        headers = dict(self.headers)
+        if status == 206 and "content-range" not in headers:
+            start = kwargs["range_start"]
+            headers["content-range"] = f"bytes {start}-{start + len(body) - 1}/{start + len(body)}"
         return ConnectorStreamResponse(
             kwargs["origin"],
-            200,
-            self.headers,
+            status,
+            headers,
             len(body),
             hashlib.sha256(body).hexdigest(),
             artifact=artifact,
@@ -209,6 +220,40 @@ def _drive_stream_response(
         next_offset=next_offset,
         control_body=body,
     )
+
+
+def _drive_download_operation_body(
+    *,
+    done: bool | None,
+    name: str = "operations/download-1",
+    resource_key: str | None = None,
+    response: Mapping[str, object] | None = None,
+    error: Mapping[str, object] | None = None,
+) -> bytes:
+    operation: dict[str, object] = {"name": name}
+    if done is not None:
+        operation["done"] = done
+    if resource_key is not None:
+        operation["metadata"] = {"resourceKey": resource_key}
+    if response is not None:
+        operation["response"] = dict(response)
+    if error is not None:
+        operation["error"] = dict(error)
+    return json.dumps(operation).encode()
+
+
+def _drive_download_response(
+    *,
+    partial: bool | None,
+    location: str = "https://drive.usercontent.google.com/download?ticket=one",
+) -> dict[str, object]:
+    response: dict[str, object] = {
+        "@type": "type.googleapis.com/google.apps.drive.v3.DownloadFileResponse",
+        "downloadUri": location,
+    }
+    if partial is not None:
+        response["partialDownloadAllowed"] = partial
+    return response
 
 
 def test_google_local_file_limit_hook_allows_only_sanitized_provider_shapes() -> None:
@@ -359,7 +404,7 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
             return {"comment_id": "comment", "file_id": "file", "page_size": 1}
         if name == "files.get":
             return {"file_id": "file"}
-        if name == "files.download":
+        if name in {"files.content", "files.download"}:
             return {"delivery": "inline_chunk", "file_id": "file"}
         if name == "files.export":
             return {
@@ -427,6 +472,7 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests() -> No
     transport = _Transport()
     credential = _credential()
     for operation in GOOGLE_OPERATIONS:
+        transport.body = b"{}"
         before = len(transport.calls)
         expected_requests = 1
         if operation.provider == "google_calendar" and operation.name in {
@@ -442,6 +488,12 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests() -> No
                 }
             ).encode()
             expected_requests = 2
+        if operation.provider == "google_drive" and operation.name == "files.download":
+            transport.body = _drive_download_operation_body(
+                done=True,
+                response=_drive_download_response(partial=True),
+            )
+            expected_requests = 2
         adapter.execute(
             operation,
             _sample(operation),
@@ -450,12 +502,19 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests() -> No
             transport=transport,
         )
         assert len(transport.calls) == before + expected_requests
-    assert len(transport.calls) == len(GOOGLE_OPERATIONS) + 3
+    assert len(transport.calls) == len(GOOGLE_OPERATIONS) + 4
     assert {call["origin"] for call in transport.calls} == {
         ConnectorOrigin.GMAIL,
         ConnectorOrigin.GOOGLE,
     }
-    assert all(call["path"].startswith("/") for call in transport.calls)
+    assert all(
+        ("path" not in call or call["path"].startswith("/"))
+        and (
+            "location" not in call
+            or call["location"].startswith("https://drive.usercontent.google.com/")
+        )
+        for call in transport.calls
+    )
     assert all("url" not in call and "token" not in call for call in transport.calls)
 
 
@@ -1520,7 +1579,7 @@ def test_drive_artifact_download_uses_streaming_receipt_without_path_payload(
     transfer = ConnectorTransferContext(_artifact_scope_factory=lambda: scope)
     transport = _Transport(download_body=b"provider-bytes")
     result = GoogleConnectorAdapter().execute(
-        _operation("google_drive", "files.download"),
+        _operation("google_drive", "files.content"),
         {
             "delivery": "artifact",
             "file_id": "file",
@@ -1549,16 +1608,267 @@ def test_drive_artifact_download_uses_streaming_receipt_without_path_payload(
         store.close()
 
 
+def test_drive_lro_download_pends_once_then_polls_and_streams_artifact(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "lro-artifacts")
+    scope = ConnectorArtifactScope(store)
+    transfer = ConnectorTransferContext(_artifact_scope_factory=lambda: scope)
+    transport = _Transport(
+        bodies=(
+            _drive_download_operation_body(done=None, resource_key="resource_key-1"),
+            _drive_download_operation_body(
+                done=True,
+                resource_key="resource_key-1",
+                response=_drive_download_response(partial=False),
+            ),
+        ),
+        download_body=b"video-bytes",
+    )
+    values = {
+        "delivery": "artifact",
+        "file_id": "file_1",
+        "filename": "clip.mp4",
+        "mime_type": "video/mp4",
+        "resource_key": "resource_key-1",
+        "revision_id": "revision-1",
+    }
+    adapter = GoogleConnectorAdapter()
+    pending = adapter.execute(
+        _operation("google_drive", "files.download"),
+        values,
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        transfer=transfer,
+    )
+    assert pending.payload == {"retry_after_seconds": 10, "status": "pending"}
+    assert pending.artifact is None
+    assert pending.continuation == {
+        "operation_name": "download-1",
+        "resource_key": "resource_key-1",
+    }
+    assert len(transport.calls) == 1
+    start = transport.calls[0]
+    assert start["method"] is ConnectorMethod.POST
+    assert start["path"] == "/drive/v3/files/file_1/download"
+    assert start["query"] == (("mimeType", "video/mp4"), ("revisionId", "revision-1"))
+    assert start["body"] == b""
+    assert start["headers"] == {"X-Goog-Drive-Resource-Keys": "file_1/resource_key-1"}
+
+    completed = adapter.execute(
+        _operation("google_drive", "files.download"),
+        values,
+        continuation=pending.continuation,
+        credential=_credential(),
+        transport=transport,
+        transfer=transfer,
+    )
+    try:
+        assert completed.payload == {"bytes": len(b"video-bytes"), "delivery": "artifact"}
+        assert completed.continuation is None
+        assert completed.artifact is not None
+        assert completed.artifact.filename == "clip.mp4"
+        assert completed.artifact.media_type == "video/mp4"
+        assert [call["kind"] for call in transport.calls] == [
+            "request",
+            "request",
+            "download_stream",
+        ]
+        poll = transport.calls[1]
+        assert poll["method"] is ConnectorMethod.GET
+        assert poll["path"] == "/drive/v3/operations/download-1"
+        assert poll["headers"] == {"X-Goog-Drive-Resource-Keys": "file_1/resource_key-1"}
+        download = transport.calls[2]
+        assert download["location"] == ("https://drive.usercontent.google.com/download?ticket=one")
+        assert download["credential"] is None
+        assert download["google_drive_resource_key"] == ("file_1", "resource_key-1")
+        assert download["max_bytes"] == 5 * 1024**4
+        assert "downloadUri" not in repr(completed.payload)
+        assert "resource_key-1" not in repr(completed.payload)
+    finally:
+        if completed.artifact is not None:
+            scope.complete(completed.artifact)
+        store.close()
+
+
+def test_drive_lro_initial_completion_is_never_polled_and_carries_provider_resource_key(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "initial-artifacts")
+    scope = ConnectorArtifactScope(store)
+    transfer = ConnectorTransferContext(_artifact_scope_factory=lambda: scope)
+    transport = _Transport(
+        body=_drive_download_operation_body(
+            done=True,
+            resource_key="provider-key",
+            response=_drive_download_response(partial=None),
+        ),
+        download_body=b"ready",
+    )
+    result = GoogleConnectorAdapter().execute(
+        _operation("google_drive", "files.download"),
+        {"delivery": "artifact", "file_id": "file_1", "mime_type": "video/mp4"},
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        transfer=transfer,
+    )
+    try:
+        assert result.continuation is None
+        assert [call["kind"] for call in transport.calls] == ["request", "download_stream"]
+        assert transport.calls[0]["headers"] is None
+        assert transport.calls[1]["google_drive_resource_key"] == (
+            "file_1",
+            "provider-key",
+        )
+    finally:
+        if result.artifact is not None:
+            scope.complete(result.artifact)
+        store.close()
+
+
+def test_drive_lro_inline_delivery_requires_provider_partial_support() -> None:
+    values = {
+        "byte_offset": 5,
+        "delivery": "inline_chunk",
+        "file_id": "file_1",
+        "max_chunk_size": 3,
+    }
+    allowed = _Transport(
+        body=_drive_download_operation_body(
+            done=True,
+            response=_drive_download_response(partial=True),
+        ),
+        download_body=b"cde",
+        headers={"content-range": "bytes 5-7/8"},
+    )
+    result = GoogleConnectorAdapter().execute(
+        _operation("google_drive", "files.download"),
+        values,
+        continuation=None,
+        credential=_credential(),
+        transport=allowed,
+    )
+    assert result.payload == {
+        "byte_offset": 5,
+        "content_base64": "Y2Rl",
+        "content_range": "bytes 5-7/8",
+        "next_byte_offset": 8,
+    }
+    assert allowed.calls[-1]["range_start"] == 5
+    assert allowed.calls[-1]["range_end"] == 7
+    assert allowed.calls[-1]["max_bytes"] == 3
+
+    forbidden = _Transport(
+        body=_drive_download_operation_body(
+            done=True,
+            response=_drive_download_response(partial=None),
+        )
+    )
+    with pytest.raises(ValidationError, match="use artifact delivery"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.download"),
+            values,
+            continuation=None,
+            credential=_credential(),
+            transport=forbidden,
+        )
+    assert [call["kind"] for call in forbidden.calls] == ["request"]
+
+
+def test_drive_lro_failures_are_bounded_and_restartable() -> None:
+    provider_error = _Transport(
+        body=_drive_download_operation_body(done=True, error={"code": 16, "message": "secret"})
+    )
+    with pytest.raises(ConnectorProviderError) as caught:
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.download"),
+            {"delivery": "inline_chunk", "file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=provider_error,
+        )
+    assert caught.value.status == 401
+    assert caught.value.code == "download_unauthenticated"
+    assert "secret" not in str(caught.value)
+
+    class _StartUnknown(_Transport):
+        def request(self, **kwargs: Any) -> ConnectorResponse:
+            del kwargs
+            raise ConnectorOutcomeUnknown("ambiguous POST")
+
+    with pytest.raises(ContinuityError, match="retrying is safe"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.download"),
+            {"delivery": "inline_chunk", "file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=_StartUnknown(),
+        )
+
+    class _CompletedPoll(_Transport):
+        def request(self, **kwargs: Any) -> ConnectorResponse:
+            del kwargs
+            raise ConnectorProviderError(
+                origin=ConnectorOrigin.GOOGLE,
+                status=403,
+                code="permission_denied",
+            )
+
+    with pytest.raises(ContinuityError, match=r"start files\.download again"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.download"),
+            {"delivery": "inline_chunk", "file_id": "file"},
+            continuation={"operation_name": "download-1"},
+            credential=_credential(),
+            transport=_CompletedPoll(),
+        )
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        b"[]",
+        _drive_download_operation_body(done=False, response={}),
+        _drive_download_operation_body(done=True),
+        _drive_download_operation_body(done=True, response={}, error={"code": 13}),
+        _drive_download_operation_body(
+            done=True,
+            response={"downloadUri": "https://drive.usercontent.google.com/file"},
+        ),
+        _drive_download_operation_body(
+            done=True,
+            response={
+                **_drive_download_response(partial=None),
+                "partialDownloadAllowed": "true",
+            },
+        ),
+    ),
+)
+def test_drive_lro_rejects_malformed_operation_states(body: bytes) -> None:
+    with pytest.raises(ContinuityError, match="Google Drive"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.download"),
+            {"delivery": "inline_chunk", "file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=_Transport(body=body),
+        )
+
+
 def test_drive_transfer_delivery_requires_a_transfer_context() -> None:
     adapter = GoogleConnectorAdapter()
+    transport = _Transport()
     with pytest.raises(ValidationError, match="transfer context"):
         adapter.execute(
             _operation("google_drive", "files.download"),
             {"file_id": "file"},
             continuation=None,
             credential=_credential(),
-            transport=_Transport(),
+            transport=transport,
         )
+    assert transport.calls == []
     with pytest.raises(ValidationError, match="transfer context"):
         adapter.execute(
             _operation("google_drive", "files.create"),
@@ -1914,7 +2224,7 @@ def test_drive_downloads_construct_ranges_and_return_provider_offsets() -> None:
     transport = _Transport(body=b"cde", headers={"content-range": "bytes 5-7/12"})
     credential = _credential()
     requests = (
-        ("files.download", {"file_id": "file"}, "/drive/v3/files/file"),
+        ("files.content", {"file_id": "file"}, "/drive/v3/files/file"),
         (
             "revisions.download",
             {"file_id": "file", "revision_id": "revision"},
@@ -1948,7 +2258,7 @@ def test_drive_downloads_construct_ranges_and_return_provider_offsets() -> None:
     malformed = _Transport(body=b"cde", headers={"content-range": "bytes 0-2/3"})
     with pytest.raises(ValidationError, match="does not match"):
         adapter.execute(
-            _operation("google_drive", "files.download"),
+            _operation("google_drive", "files.content"),
             {
                 "byte_offset": 1,
                 "delivery": "inline_chunk",

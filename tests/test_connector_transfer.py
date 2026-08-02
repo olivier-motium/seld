@@ -34,7 +34,7 @@ from continuity_kernel.connector_transport import (
     ConnectorTransport,
     ResponseLike,
 )
-from continuity_kernel.errors import ConflictError, NotFoundError, ValidationError
+from continuity_kernel.errors import ConflictError, ContinuityError, NotFoundError, ValidationError
 from continuity_kernel.local_files import MAX_FILE_TRANSFER_BYTES, LocalFileGrantStore
 from continuity_kernel.vault import Vault
 
@@ -899,6 +899,104 @@ def test_download_redirect_drops_bearer_and_range_status_is_coherent(
             range_end=2,
         )
     artifacts.close()
+
+
+def test_google_signed_download_keeps_resource_key_across_one_pinned_redirect_and_eof_tail() -> (
+    None
+):
+    calls: list[Request] = []
+
+    def redirect_then_tail(request: Request, timeout: float) -> ResponseLike:
+        del timeout
+        calls.append(request)
+        assert request.get_header("Authorization") is None
+        assert request.get_header("X-goog-drive-resource-keys") == "file_1/resource_key-1"
+        assert request.get_header("Range") == "bytes=5-9"
+        if len(calls) == 1:
+            headers = Message()
+            headers["Location"] = "https://content.googleapis.com/download/final?ticket=two"
+            raise HTTPError(request.full_url, 302, "Found", headers, io.BytesIO())
+        assert request.full_url == ("https://content.googleapis.com/download/final?ticket=two")
+        return _Response(
+            b"abc",
+            status=206,
+            headers={"Content-Length": "3", "Content-Range": "bytes 5-7/8"},
+        )
+
+    sink = io.BytesIO()
+    result = ConnectorTransport(opener=redirect_then_tail).download_stream(
+        origin=ConnectorOrigin.GOOGLE,
+        location="https://drive.usercontent.google.com/download?ticket=one",
+        credential=None,
+        sink=sink,
+        range_start=5,
+        range_end=9,
+        max_bytes=5,
+        google_drive_resource_key=("file_1", "resource_key-1"),
+    )
+    assert len(calls) == 2
+    assert result.status == 206
+    assert result.bytes_received == 3
+    assert sink.getvalue() == b"abc"
+
+
+def test_google_signed_download_rejects_resource_key_injection_and_foreign_redirect() -> None:
+    transport = ConnectorTransport(opener=lambda request, timeout: _Response(b"ignored"))
+    with pytest.raises(ValidationError, match="resource key binding"):
+        transport.download_stream(
+            origin=ConnectorOrigin.GOOGLE,
+            location="https://drive.usercontent.google.com/download?ticket=one",
+            credential=None,
+            sink=io.BytesIO(),
+            google_drive_resource_key=("file", "key,other/key"),
+        )
+
+    def attacker_redirect(request: Request, timeout: float) -> ResponseLike:
+        del timeout
+        headers = Message()
+        headers["Location"] = "https://attacker.invalid/steal"
+        raise HTTPError(request.full_url, 302, "Found", headers, io.BytesIO())
+
+    with pytest.raises(ValidationError, match="pinned origin"):
+        ConnectorTransport(opener=attacker_redirect).download_stream(
+            origin=ConnectorOrigin.GOOGLE,
+            location="https://drive.usercontent.google.com/download?ticket=one",
+            credential=None,
+            sink=io.BytesIO(),
+            google_drive_resource_key=("file", "key"),
+        )
+
+    with pytest.raises(ValidationError, match="resource key header"):
+        transport.request(
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path="/drive/v3/operations/one",
+            credential=_credential(),
+            headers={"X-Goog-Drive-Resource-Keys": "file/key,other/key"},
+        )
+
+
+def test_provider_http_protocol_failures_keep_read_and_post_retry_semantics() -> None:
+    def malformed(request: Request, timeout: float) -> ResponseLike:
+        del request, timeout
+        raise BadStatusLine("malformed provider response")
+
+    transport = ConnectorTransport(opener=malformed)
+    with pytest.raises(ContinuityError, match="download transport failed"):
+        transport.download_stream(
+            origin=ConnectorOrigin.GOOGLE,
+            location="https://drive.usercontent.google.com/download?ticket=one",
+            credential=None,
+            sink=io.BytesIO(),
+        )
+    with pytest.raises(ConnectorOutcomeUnknown, match="outcome is unknown"):
+        transport.request(
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.POST,
+            path="/drive/v3/files/file/download",
+            credential=_credential(),
+            body=b"",
+        )
 
 
 def test_stream_policies_reject_wrong_credentials_and_duplicate_safety_headers(

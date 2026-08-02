@@ -58,6 +58,7 @@ _EXPECTED_NAMES = {
     },
     "google_drive": {
         "drives.list",
+        "files.content",
         "files.list",
         "files.get",
         "files.download",
@@ -117,13 +118,13 @@ def test_google_provider_mode_partitions_and_exact_operation_surface() -> None:
         for provider in _EXPECTED_NAMES
     }
     assert names == _EXPECTED_NAMES
-    assert len(GOOGLE_OPERATIONS) == 65
+    assert len(GOOGLE_OPERATIONS) == 66
     assert {
         provider: sum(item.provider == provider for item in GOOGLE_OPERATIONS) for provider in names
     } == {
         "gmail": 23,
         "google_calendar": 14,
-        "google_drive": 28,
+        "google_drive": 29,
     }
     assert all(item.endpoint == item.name for item in GOOGLE_OPERATIONS)
 
@@ -430,7 +431,7 @@ def test_google_catalog_uses_provider_page_limits_and_drive_capacity() -> None:
         assert isinstance(page_size, Mapping)
         assert page_size["maximum"] == limit
 
-    for name in ("files.download", "revisions.download"):
+    for name in ("files.content", "files.download", "revisions.download"):
         schema = _operation("google_drive", ConnectorMode.READ, name).input_schema
         properties = schema["properties"]
         assert isinstance(properties, Mapping)
@@ -634,6 +635,7 @@ def test_drive_closed_comment_reply_permission_and_move_shapes() -> None:
 
 def test_drive_content_delivery_defaults_to_artifact_and_inline_is_explicitly_bounded() -> None:
     for name, base in (
+        ("files.content", {"file_id": "file"}),
         ("files.download", {"file_id": "file"}),
         ("revisions.download", {"file_id": "file", "revision_id": "revision"}),
         ("files.export", {"export_mime_type": "text/plain", "file_id": "file"}),
@@ -661,6 +663,25 @@ def test_drive_content_delivery_defaults_to_artifact_and_inline_is_explicitly_bo
         download.validate_input({"delivery": "inline_chunk", "file_id": "file", "filename": "x"})
     with pytest.raises(ValidationError):
         download.validate_input({"byte_offset": 1, "file_id": "file"})
+
+
+def test_drive_lro_download_exposes_only_documented_safe_inputs() -> None:
+    download = _operation("google_drive", ConnectorMode.READ, "files.download")
+    value = {
+        "delivery": "artifact",
+        "file_id": "file_1",
+        "filename": "clip.mp4",
+        "mime_type": "video/mp4",
+        "resource_key": "0-safe_key",
+        "revision_id": "revision-1",
+    }
+    assert download.validate_input(value) == value
+    properties = download.input_schema["properties"]
+    assert isinstance(properties, Mapping)
+    assert "supports_all_drives" not in properties
+    for resource_key in ("key,other/secret", "key/other", "key value", "key\nvalue"):
+        with pytest.raises(ValidationError):
+            download.validate_input({"file_id": "file", "resource_key": resource_key})
 
 
 def test_drive_shared_drive_inputs_are_finite_without_admin_or_ownership_transfer() -> None:

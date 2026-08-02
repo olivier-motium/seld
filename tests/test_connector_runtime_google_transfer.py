@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -64,6 +66,47 @@ class _NoProviderHttp(ConnectorTransport):
         del kwargs
         self._fail()
         raise AssertionError("unreachable")
+
+
+class _DriveLroTransport(ConnectorTransport):
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._responses = [
+            {
+                "name": "operations/download-1",
+                "metadata": {"resourceKey": "provider-key"},
+            },
+            {
+                "done": True,
+                "name": "operations/download-1",
+                "metadata": {"resourceKey": "provider-key"},
+                "response": {
+                    "@type": "type.googleapis.com/google.apps.drive.v3.DownloadFileResponse",
+                    "downloadUri": ("https://drive.usercontent.google.com/download?ticket=runtime"),
+                    "partialDownloadAllowed": False,
+                },
+            },
+        ]
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.calls.append({"kind": "request", **kwargs})
+        body = json.dumps(self._responses.pop(0)).encode()
+        return ConnectorResponse(kwargs["origin"], 200, {}, body)
+
+    def download_stream(self, **kwargs: Any) -> ConnectorStreamResponse:
+        self.calls.append({"kind": "download_stream", **kwargs})
+        body = b"runtime-video"
+        sink = kwargs["sink"]
+        sink.write(body)
+        artifact = sink.finish()
+        return ConnectorStreamResponse(
+            kwargs["origin"],
+            200,
+            {},
+            len(body),
+            hashlib.sha256(body).hexdigest(),
+            artifact=artifact,
+        )
 
 
 def _runtime(
@@ -347,5 +390,61 @@ def test_google_transfer_previews_reach_confirmation_without_provider_http(
         assert drive["effect"] == ConnectorEffect.OUTWARD.value
         assert drive["provider"] == "google_drive"
         assert transport.call_count == 0
+    finally:
+        runtime.close()
+
+
+def test_drive_lro_runtime_hides_provider_state_and_resumes_into_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _unused = _runtime(tmp_path, monkeypatch)
+    transport = _DriveLroTransport()
+    runtime.transport = transport
+    envelope = {
+        "connection_id": str(_CONNECTION_ID),
+        "input": {
+            "delivery": "artifact",
+            "file_id": "file_1",
+            "filename": "clip.mp4",
+            "mime_type": "video/mp4",
+        },
+        "operation": "files.download",
+    }
+    try:
+        pending = runtime.call_tool("gsv_google_drive_read", envelope)
+        assert pending["result"] == {"retry_after_seconds": 10, "status": "pending"}
+        cursor = pending["cursor"]
+        assert isinstance(cursor, str)
+        assert "download-1" not in cursor
+        assert "provider-key" not in cursor
+        assert "artifact" not in pending
+        assert [call["kind"] for call in transport.calls] == ["request"]
+
+        completed = runtime.call_tool(
+            "gsv_google_drive_read",
+            {**envelope, "cursor": cursor},
+        )
+        assert completed["result"] == {
+            "bytes": len(b"runtime-video"),
+            "delivery": "artifact",
+        }
+        assert "cursor" not in completed
+        artifact = completed["artifact"]
+        assert isinstance(artifact, dict)
+        assert Path(str(artifact["path"])).read_bytes() == b"runtime-video"
+        assert [call["kind"] for call in transport.calls] == [
+            "request",
+            "request",
+            "download_stream",
+        ]
+        assert transport.calls[1]["headers"] == {
+            "X-Goog-Drive-Resource-Keys": "file_1/provider-key"
+        }
+        assert transport.calls[2]["credential"] is None
+        assert transport.calls[2]["google_drive_resource_key"] == (
+            "file_1",
+            "provider-key",
+        )
     finally:
         runtime.close()

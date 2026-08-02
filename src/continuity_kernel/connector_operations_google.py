@@ -42,6 +42,15 @@ def _id() -> dict[str, object]:
     return _text(512)
 
 
+def _drive_resource_key() -> dict[str, object]:
+    return {
+        "maxLength": 512,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9_-]+$",
+        "type": "string",
+    }
+
+
 def _array(items: dict[str, object], *, maximum: int = 32, minimum: int = 0) -> dict[str, object]:
     return {"items": items, "maxItems": maximum, "minItems": minimum, "type": "array"}
 
@@ -1068,13 +1077,37 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
     _operation(
         "google_drive",
         ConnectorMode.READ,
-        "files.download",
+        "files.content",
         ConnectorEffect.READ,
         _DRIVE_CONTENT_SCOPES,
         _drive_content_schema(
             {
                 "file_id": _id(),
                 "supports_all_drives": {"type": "boolean"},
+            },
+            ("file_id",),
+            inline_fields={
+                "byte_offset": {
+                    "maximum": _MAX_DRIVE_BYTE_OFFSET,
+                    "minimum": 0,
+                    "type": "integer",
+                },
+                "max_chunk_size": {"maximum": 240_000, "minimum": 1, "type": "integer"},
+            },
+        ),
+    ),
+    _operation(
+        "google_drive",
+        ConnectorMode.READ,
+        "files.download",
+        ConnectorEffect.READ,
+        _DRIVE_CONTENT_SCOPES,
+        _drive_content_schema(
+            {
+                "file_id": _id(),
+                "mime_type": _text(256),
+                "resource_key": _drive_resource_key(),
+                "revision_id": _id(),
             },
             ("file_id",),
             inline_fields={
