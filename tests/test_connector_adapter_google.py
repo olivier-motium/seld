@@ -167,7 +167,6 @@ def test_google_local_file_limit_hook_allows_only_sanitized_provider_shapes() ->
 
     drive_operation = _operation("google_drive", "files.update")
     drive_input = {
-        "etag": "etag",
         "file_id": "file",
         "local_file": "opaque-local-file",
         "mime_type": "text/plain",
@@ -309,46 +308,49 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
         if name == "files.create":
             return {"mime_type": "text/plain", "name": "plan.txt"}
         if name == "files.update":
-            return {"etag": "etag", "file_id": "file"}
+            return {"file_id": "file", "name": "renamed.txt"}
         if name == "files.copy":
             return {"file_id": "file"}
         if name == "files.move":
-            return {"file_id": "file"}
+            return {"add_parent_ids": ["parent"], "file_id": "file"}
         if name in {"files.trash", "files.restore", "files.purge"}:
-            return {"etag": "etag", "file_id": "file"}
+            return {"file_id": "file"}
         if name == "permissions.create":
-            return {"file_id": "file", "permission_type": "user", "role": "reader"}
+            return {
+                "email_address": "person@example.test",
+                "file_id": "file",
+                "permission_type": "user",
+                "role": "reader",
+            }
         if name == "permissions.update":
             return {
-                "etag": "etag",
                 "file_id": "file",
                 "permission_id": "permission",
                 "role": "reader",
             }
         if name == "permissions.delete":
-            return {"etag": "etag", "file_id": "file", "permission_id": "permission"}
+            return {"file_id": "file", "permission_id": "permission"}
         if name == "comments.create":
             return {"content": "note", "file_id": "file"}
         if name == "comments.update":
-            return {"comment_id": "comment", "content": "note", "etag": "etag", "file_id": "file"}
+            return {"comment_id": "comment", "content": "note", "file_id": "file"}
         if name == "comments.delete":
-            return {"comment_id": "comment", "etag": "etag", "file_id": "file"}
+            return {"comment_id": "comment", "file_id": "file"}
         if name == "replies.create":
             return {"comment_id": "comment", "content": "note", "file_id": "file"}
         if name == "replies.update":
             return {
                 "comment_id": "comment",
                 "content": "note",
-                "etag": "etag",
                 "file_id": "file",
                 "reply_id": "reply",
             }
         if name == "replies.delete":
-            return {"comment_id": "comment", "etag": "etag", "file_id": "file", "reply_id": "reply"}
+            return {"comment_id": "comment", "file_id": "file", "reply_id": "reply"}
         if name == "revisions.keep":
             return {"file_id": "file", "keep_forever": True, "revision_id": "revision"}
         if name == "revisions.delete":
-            return {"etag": "etag", "file_id": "file", "revision_id": "revision"}
+            return {"file_id": "file", "revision_id": "revision"}
     raise AssertionError(f"no sample for {operation.provider}:{name}")
 
 
@@ -389,10 +391,12 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests() -> No
     assert all("url" not in call and "token" not in call for call in transport.calls)
 
 
-def test_pagination_is_stripped_from_payload_and_replayed_only_as_runtime_continuation() -> None:
+def test_only_top_level_pagination_is_stripped_and_replayed_as_runtime_continuation() -> None:
     body = json.dumps(
         {
+            "appProperties": {"location": "HQ", "nextPageToken": "business-value"},
             "items": [{"id": "one"}],
+            "location": "Brussels",
             "nextLink": "https://provider.example/next",
             "nextPageToken": "provider-page",
             "uploadUrl": "https://provider.example/upload",
@@ -408,7 +412,12 @@ def test_pagination_is_stripped_from_payload_and_replayed_only_as_runtime_contin
         credential=_credential(),
         transport=transport,
     )
-    assert first.payload == {"items": [{"id": "one"}]}
+    assert first.payload == {
+        "appProperties": {"location": "HQ", "nextPageToken": "business-value"},
+        "items": [{"id": "one"}],
+        "location": "Brussels",
+        "uploadUrl": "https://provider.example/upload",
+    }
     assert first.continuation == "provider-page"
 
     adapter.execute(
@@ -420,6 +429,29 @@ def test_pagination_is_stripped_from_payload_and_replayed_only_as_runtime_contin
     )
     assert ("pageToken", "provider-page") in transport.calls[-1]["query"]
     assert not any(field in transport.calls[-1]["query"] for field in ("cursor", "nextLink", "url"))
+
+
+def test_calendar_location_and_nested_drive_properties_survive_response_sanitization() -> None:
+    adapter = GoogleConnectorAdapter()
+    calendar = adapter.execute(
+        _operation("google_calendar", "events.get"),
+        {"calendar_id": "primary", "event_id": "event"},
+        continuation=None,
+        credential=_credential(),
+        transport=_Transport(body=b'{"id":"event","location":"Room 3"}'),
+    )
+    drive = adapter.execute(
+        _operation("google_drive", "files.get"),
+        {"file_id": "file"},
+        continuation=None,
+        credential=_credential(),
+        transport=_Transport(
+            body=b'{"appProperties":{"location":"HQ","uploadUrl":"business-value"}}'
+        ),
+    )
+
+    assert calendar.payload == {"id": "event", "location": "Room 3"}
+    assert drive.payload == {"appProperties": {"location": "HQ", "uploadUrl": "business-value"}}
 
 
 def test_gmail_drafts_use_safe_mime_and_draft_then_send() -> None:
@@ -972,6 +1004,7 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
         continuation=None,
         credential=_credential(),
         transport=transport,
+        write_idempotency_key="confirmed-upload",
     )
     initiated, sent = transport.calls[-2:]
     assert initiated["path"] == "/upload/drive/v3/files"
@@ -979,6 +1012,7 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
     assert sent["kind"] == "provider_location"
     assert sent["location"] == "https://www.googleapis.com/upload/session/one"
     assert sent["body"] == b"hello"
+    assert sent["credential"] is None
 
 
 def test_drive_local_file_upload_uses_the_prepared_snapshot_and_fixed_routes(
@@ -995,7 +1029,7 @@ def test_drive_local_file_upload_uses_the_prepared_snapshot_and_fixed_routes(
         ),
         (
             _operation("google_drive", "files.update"),
-            {"etag": "etag", "file_id": "file", "mime_type": "text/plain"},
+            {"file_id": "file", "mime_type": "text/plain"},
             ConnectorMethod.PATCH,
             "/upload/drive/v3/files/file",
         ),
@@ -1011,6 +1045,7 @@ def test_drive_local_file_upload_uses_the_prepared_snapshot_and_fixed_routes(
                 continuation=None,
                 credential=credential,
                 transport=transport,
+                write_idempotency_key="confirmed-upload",
                 transfer=transfer,
             )
         finally:
@@ -1090,6 +1125,7 @@ def test_drive_transfer_delivery_requires_a_transfer_context() -> None:
             continuation=None,
             credential=_credential(),
             transport=_Transport(),
+            write_idempotency_key="confirmed-upload",
         )
 
 
@@ -1182,7 +1218,7 @@ def test_drive_metadata_scope_and_preconditions_remain_fixed() -> None:
     operation = _operation("google_drive", "files.update")
     adapter.execute(
         operation,
-        {"etag": "version-one", "file_id": "file", "name": "renamed.txt"},
+        {"file_id": "file", "name": "renamed.txt"},
         continuation=None,
         credential=_credential(),
         transport=transport,
@@ -1190,8 +1226,105 @@ def test_drive_metadata_scope_and_preconditions_remain_fixed() -> None:
     call = transport.calls[-1]
     assert call["method"] is ConnectorMethod.PATCH
     assert call["path"] == "/drive/v3/files/file"
-    assert call["headers"] == {"If-Match": "version-one"}
+    assert call["headers"] is None
     assert call["json_body"] == {"name": "renamed.txt"}
+
+
+def test_drive_rejects_empty_updates_and_serializes_app_property_deletion() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_drive", "files.update")
+    empty_transport = _Transport()
+    with pytest.raises(ValidationError, match="metadata or content change"):
+        adapter.execute(
+            operation,
+            {"file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=empty_transport,
+        )
+    assert empty_transport.calls == []
+
+    transport = _Transport()
+    adapter.execute(
+        operation,
+        {
+            "app_properties": [{"key": "obsolete", "value": None}],
+            "file_id": "file",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    assert transport.calls[-1]["json_body"] == {"appProperties": {"obsolete": None}}
+
+
+def test_drive_move_renders_one_distinct_parent_transition() -> None:
+    adapter = GoogleConnectorAdapter()
+    transport = _Transport()
+    operation = _operation("google_drive", "files.move")
+    adapter.execute(
+        operation,
+        {
+            "add_parent_ids": ["new-parent"],
+            "file_id": "file",
+            "remove_parent_ids": ["old-parent"],
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    assert transport.calls[-1]["query"] == (
+        ("addParents", "new-parent"),
+        ("removeParents", "old-parent"),
+    )
+
+    with pytest.raises(ValidationError, match="same parent"):
+        adapter.execute(
+            operation,
+            {
+                "add_parent_ids": ["same-parent"],
+                "file_id": "file",
+                "remove_parent_ids": ["same-parent"],
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+        )
+    assert len(transport.calls) == 1
+
+
+def test_drive_comment_requests_use_required_valid_field_projections() -> None:
+    adapter = GoogleConnectorAdapter()
+    transport = _Transport(body=b'{"comments":[]}')
+    adapter.execute(
+        _operation("google_drive", "comments.list"),
+        {"file_id": "file", "page_size": 20},
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    fields = dict(transport.calls[-1]["query"])["fields"]
+    assert "comments(" in fields
+    assert "fileId" not in fields
+
+    adapter.execute(
+        _operation("google_drive", "comments.create"),
+        {
+            "content": "note",
+            "file_id": "file",
+            "quoted_file_content": {"value": "quote"},
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        write_idempotency_key="confirmed-comment",
+    )
+    assert transport.calls[-1]["query"]
+    assert "fileId" not in dict(transport.calls[-1]["query"])["fields"]
+    assert transport.calls[-1]["json_body"] == {
+        "content": "note",
+        "quotedFileContent": {"value": "quote"},
+    }
 
 
 def test_calendar_list_and_event_filters_use_fixed_google_parameters() -> None:

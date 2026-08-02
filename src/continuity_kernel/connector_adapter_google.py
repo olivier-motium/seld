@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.policy import SMTP
-from typing import Final
+from typing import Final, cast
 from urllib.parse import urlsplit
 
 from continuity_kernel.connector_adapter import (
@@ -52,7 +52,7 @@ _CONTENT_RANGE: Final = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
 _MESSAGE_ID: Final = re.compile(r"^<[^<>\s]+@[^<>\s]+>$")
 _MESSAGE_ID_REFERENCE: Final = re.compile(r"<[^<>\s]+@[^<>\s]+>")
 _PAGINATION_FIELDS: Final = frozenset({"nextPageToken", "nextSyncToken", "nextLink", "nextPage"})
-_UPLOAD_FIELDS: Final = frozenset({"uploadUrl", "resumableUploadUrl", "location"})
+_UPLOAD_LOCATION_FIELDS: Final = frozenset({"location"})
 _UNRESERVED: Final = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 _DRIVE_ATTACHMENT_SCOPES: Final = frozenset(
     {
@@ -62,6 +62,18 @@ _DRIVE_ATTACHMENT_SCOPES: Final = frozenset(
     }
 )
 _EXISTING_CALENDAR_EVENT_MUTATIONS: Final = frozenset({"events.move", "events.update"})
+_DRIVE_COMMENT_RESOURCE_FIELDS: Final = (
+    "id,kind,createdTime,modifiedTime,author(displayName,emailAddress,kind,me,"
+    "permissionId,photoLink),content,htmlContent,deleted,resolved,anchor,"
+    "quotedFileContent(mimeType,value),mentionedEmailAddresses,assigneeEmailAddress"
+)
+_DRIVE_REPLY_RESOURCE_FIELDS: Final = (
+    "id,kind,createdTime,modifiedTime,author(displayName,emailAddress,kind,me,permissionId,"
+    "photoLink),content,htmlContent,deleted,action,mentionedEmailAddresses,"
+    "assigneeEmailAddress"
+)
+_DRIVE_COMMENT_LIST_FIELDS: Final = f"nextPageToken,comments({_DRIVE_COMMENT_RESOURCE_FIELDS})"
+_DRIVE_REPLY_LIST_FIELDS: Final = f"nextPageToken,replies({_DRIVE_REPLY_RESOURCE_FIELDS})"
 
 
 @dataclass(frozen=True)
@@ -139,6 +151,12 @@ class GoogleConnectorAdapter:
                 reply_context = _gmail_reply_context(values, credential, transport)
             _gmail_mime_upload(values, transfer, reply_context=reply_context)
             return operation.effect
+        if (
+            operation.provider == "google_drive"
+            and operation.name in _DRIVE_LOCAL_UPLOAD_OPERATIONS
+            and _drive_has_binary_upload(values, transfer)
+        ):
+            return ConnectorEffect.OUTWARD
         if operation.provider != "google_calendar":
             return operation.effect
         if operation.name == "calendars.update" and values.get("calendar_id") != "primary":
@@ -173,6 +191,15 @@ class GoogleConnectorAdapter:
         operation, values = _known_operation(operation, input_value, transfer=transfer)
         if not isinstance(credential, ConnectorRuntimeCredential):
             raise ValidationError("connector runtime credential is invalid")
+        if (
+            operation.provider == "google_drive"
+            and operation.name in _DRIVE_LOCAL_UPLOAD_OPERATIONS
+            and _drive_has_binary_upload(values, transfer)
+            and not write_idempotency_key
+        ):
+            raise ValidationError(
+                "Google Drive binary uploads require a fresh outward confirmation"
+            )
         if not operation.scope_grant_satisfies(credential.granted_scopes):
             raise ValidationError("connector credential does not satisfy the operation scope")
         if (
@@ -720,7 +747,7 @@ def _execute_drive(
             credential=credential,
             query=_drive_file_list_query(values, continuation),
         )
-    if name in {"permissions.list", "comments.list", "revisions.list"}:
+    if name in {"permissions.list", "revisions.list"}:
         resource = name.split(".", 1)[0]
         return _json_request(
             transport,
@@ -734,6 +761,19 @@ def _execute_drive(
                 else _drive_page_query(values, continuation)
             ),
         )
+    if name == "comments.list":
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path=f"{base}/files/{_segment(_required(values, 'file_id'))}/comments",
+            credential=credential,
+            query=_drive_page_query(
+                values,
+                continuation,
+                fields=_DRIVE_COMMENT_LIST_FIELDS,
+            ),
+        )
     if name == "replies.list":
         return _json_request(
             transport,
@@ -744,7 +784,11 @@ def _execute_drive(
                 f"{_segment(_required(values, 'comment_id'))}/replies"
             ),
             credential=credential,
-            query=_drive_page_query(values, continuation),
+            query=_drive_page_query(
+                values,
+                continuation,
+                fields=_DRIVE_REPLY_LIST_FIELDS,
+            ),
         )
     _reject_continuation(continuation)
     if name == "files.get":
@@ -784,16 +828,16 @@ def _execute_drive(
         method = ConnectorMethod.POST
         metadata_path = f"{base}/files"
         upload_path = "/upload/drive/v3/files"
-        headers: dict[str, str] | None = None
         if name == "files.update":
             method = ConnectorMethod.PATCH
             identifier = _segment(file_id)
             metadata_path += f"/{identifier}"
             upload_path += f"/{identifier}"
-            headers = _etag_headers(values)
         metadata = _drive_file_metadata(values)
         content = values.get("content_base64")
         upload = _drive_local_upload(values, transfer)
+        if name == "files.update" and not metadata and content is None and upload is None:
+            raise ValidationError("Google Drive file update requires a metadata or content change")
         if content is not None or upload is not None:
             return _drive_resumable_upload(
                 transport,
@@ -804,7 +848,6 @@ def _execute_drive(
                 content_base64=None if content is None else _text(content),
                 upload=upload,
                 mime_type=_text(values.get("mime_type", "application/octet-stream")),
-                headers=headers,
                 query=_with_supports_all_drives(values, (("uploadType", "resumable"),)),
             )
         return _json_request(
@@ -815,7 +858,6 @@ def _execute_drive(
             credential=credential,
             query=_with_supports_all_drives(values),
             json_body=metadata,
-            headers=headers,
             expected_statuses=_JSON_STATUSES,
         )
     if name == "files.copy":
@@ -837,7 +879,6 @@ def _execute_drive(
             path=f"{base}/files/{_segment(_required(values, 'file_id'))}",
             credential=credential,
             query=_with_supports_all_drives(values, _drive_move_query(values)),
-            headers=_etag_headers(values) if "etag" in values else None,
             expected_statuses=_JSON_STATUSES,
         )
     if name in {"files.trash", "files.restore"}:
@@ -849,7 +890,6 @@ def _execute_drive(
             credential=credential,
             query=_with_supports_all_drives(values),
             json_body={"trashed": name == "files.trash"},
-            headers=_etag_headers(values),
             expected_statuses=_JSON_STATUSES,
         )
     if name == "files.purge":
@@ -860,7 +900,6 @@ def _execute_drive(
             path=f"{base}/files/{_segment(_required(values, 'file_id'))}",
             credential=credential,
             query=_with_supports_all_drives(values),
-            headers=_etag_headers(values),
             expected_statuses=_DELETE_STATUSES,
         )
     if name in {"permissions.create", "permissions.update", "permissions.delete"}:
@@ -890,7 +929,6 @@ def _execute_drive(
             method=ConnectorMethod.DELETE,
             path=path,
             credential=credential,
-            headers=_etag_headers(values),
             expected_statuses=_DELETE_STATUSES,
         )
     raise ValidationError("Google Drive operation has no fixed route")
@@ -923,8 +961,10 @@ def _drive_permission_request(
             json_body=_selected(
                 values,
                 {
+                    "allow_file_discovery": "allowFileDiscovery",
                     "domain": "domain",
                     "email_address": "emailAddress",
+                    "expiration_time": "expirationTime",
                     "permission_type": "type",
                     "role": "role",
                 },
@@ -941,7 +981,6 @@ def _drive_permission_request(
             credential=credential,
             query=_with_supports_all_drives(values),
             json_body={"role": _required(values, "role")},
-            headers=_etag_headers(values),
             expected_statuses=_JSON_STATUSES,
         )
     return _json_request(
@@ -951,7 +990,6 @@ def _drive_permission_request(
         path=path,
         credential=credential,
         query=_with_supports_all_drives(values),
-        headers=_etag_headers(values),
         expected_statuses=_DELETE_STATUSES,
     )
 
@@ -970,7 +1008,8 @@ def _drive_comment_request(
             method=ConnectorMethod.POST,
             path=base,
             credential=credential,
-            json_body=_drive_comment_body(values),
+            query=(("fields", _DRIVE_COMMENT_RESOURCE_FIELDS),),
+            json_body=_drive_comment_create_body(values),
             expected_statuses=_JSON_STATUSES,
         )
     path = f"{base}/{_segment(_required(values, 'comment_id'))}"
@@ -981,8 +1020,8 @@ def _drive_comment_request(
             method=ConnectorMethod.PATCH,
             path=path,
             credential=credential,
-            json_body=_drive_comment_body(values),
-            headers=_etag_headers(values),
+            query=(("fields", _DRIVE_COMMENT_RESOURCE_FIELDS),),
+            json_body={"content": _required(values, "content")},
             expected_statuses=_JSON_STATUSES,
         )
     return _json_request(
@@ -991,7 +1030,6 @@ def _drive_comment_request(
         method=ConnectorMethod.DELETE,
         path=path,
         credential=credential,
-        headers=_etag_headers(values),
         expected_statuses=_DELETE_STATUSES,
     )
 
@@ -1013,7 +1051,8 @@ def _drive_reply_request(
             method=ConnectorMethod.POST,
             path=base,
             credential=credential,
-            json_body=_drive_comment_body(values),
+            query=(("fields", _DRIVE_REPLY_RESOURCE_FIELDS),),
+            json_body=_drive_reply_body(values),
             expected_statuses=_JSON_STATUSES,
         )
     path = f"{base}/{_segment(_required(values, 'reply_id'))}"
@@ -1024,8 +1063,8 @@ def _drive_reply_request(
             method=ConnectorMethod.PATCH,
             path=path,
             credential=credential,
-            json_body=_drive_comment_body(values),
-            headers=_etag_headers(values),
+            query=(("fields", _DRIVE_REPLY_RESOURCE_FIELDS),),
+            json_body={"content": _required(values, "content")},
             expected_statuses=_JSON_STATUSES,
         )
     return _json_request(
@@ -1034,7 +1073,6 @@ def _drive_reply_request(
         method=ConnectorMethod.DELETE,
         path=path,
         credential=credential,
-        headers=_etag_headers(values),
         expected_statuses=_DELETE_STATUSES,
     )
 
@@ -1205,6 +1243,16 @@ def _drive_local_upload(
     return transfer.upload(("local_file",))
 
 
+def _drive_has_binary_upload(
+    values: Mapping[str, object], transfer: ConnectorTransferContext | None
+) -> bool:
+    return (
+        "content_base64" in values
+        or "local_file" in values
+        or (transfer is not None and ("local_file",) in transfer.uploads)
+    )
+
+
 def _drive_resumable_upload(
     transport: ConnectorTransport,
     *,
@@ -1215,7 +1263,6 @@ def _drive_resumable_upload(
     content_base64: str | None,
     upload: PreparedUpload | None,
     mime_type: str,
-    headers: Mapping[str, str] | None,
     query: Sequence[tuple[str, str]],
 ) -> ConnectorAdapterResult:
     if (content_base64 is None) == (upload is None):
@@ -1227,7 +1274,6 @@ def _drive_resumable_upload(
         credential=credential.credential,
         query=query,
         json_body=metadata,
-        headers=headers,
         expected_statuses=_JSON_STATUSES,
     )
     location = _response_location(initiated.headers)
@@ -1242,23 +1288,22 @@ def _drive_resumable_upload(
             content_type=_mime_type(upload.media_type or mime_type),
             expected_statuses=_JSON_STATUSES,
         )
-        return _json_result(streamed.json())
+        return _json_result(streamed.json(), strip_upload_location=True)
     else:
         assert content_base64 is not None
         uploaded = transport.request_provider_location(
             origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.PUT,
             location=location,
-            credential=credential.credential,
+            credential=None,
             body=_decode_base64(content_base64),
             content_type=_mime_type(mime_type),
-            headers=headers,
             expected_statuses=_JSON_STATUSES,
         )
-        return _json_result(uploaded.json())
+        return _json_result(uploaded.json(), strip_upload_location=True)
 
 
-def _json_result(payload: object) -> ConnectorAdapterResult:
+def _json_result(payload: object, *, strip_upload_location: bool = False) -> ConnectorAdapterResult:
     if not isinstance(payload, Mapping):
         return ConnectorAdapterResult(payload)
     continuation: object | None = None
@@ -1266,7 +1311,10 @@ def _json_result(payload: object) -> ConnectorAdapterResult:
         continuation = payload["nextPageToken"]
     elif isinstance(payload.get("nextSyncToken"), str):
         continuation = {"syncToken": payload["nextSyncToken"]}
-    return ConnectorAdapterResult(_strip_provider_state(payload), continuation=continuation)
+    return ConnectorAdapterResult(
+        _strip_provider_state(payload, strip_upload_location=strip_upload_location),
+        continuation=continuation,
+    )
 
 
 def _provider_mapping(result: ConnectorAdapterResult, *, context: str) -> Mapping[str, object]:
@@ -1275,16 +1323,15 @@ def _provider_mapping(result: ConnectorAdapterResult, *, context: str) -> Mappin
     return result.payload
 
 
-def _strip_provider_state(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {
-            str(key): _strip_provider_state(item)
-            for key, item in value.items()
-            if isinstance(key, str) and key not in _PAGINATION_FIELDS | _UPLOAD_FIELDS
-        }
-    if isinstance(value, list):
-        return [_strip_provider_state(item) for item in value]
-    return value
+def _strip_provider_state(value: object, *, strip_upload_location: bool = False) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    blocked = _PAGINATION_FIELDS
+    if strip_upload_location:
+        blocked |= _UPLOAD_LOCATION_FIELDS
+    return {
+        str(key): item for key, item in value.items() if isinstance(key, str) and key not in blocked
+    }
 
 
 def _gmail_list_query(
@@ -1452,6 +1499,10 @@ def _validate_shared_drive_list(values: Mapping[str, object]) -> None:
         raise ValidationError("Google Drive shared-drive corpus requires a drive ID")
     if has_drive_id and corpora != "drive":
         raise ValidationError("Google Drive drive ID requires the shared-drive corpus")
+    if shared_corpora and not shared_items:
+        raise ValidationError(
+            "Google Drive shared-drive corpus requires include-items-from-all-drives"
+        )
     if (shared_corpora or shared_items) and values.get("supports_all_drives") is not True:
         raise ValidationError("Google Drive shared-drive search requires supports-all-drives")
 
@@ -1466,19 +1517,33 @@ def _with_supports_all_drives(
 
 
 def _drive_page_query(
-    values: dict[str, object], continuation: object | None
+    values: dict[str, object],
+    continuation: object | None,
+    *,
+    fields: str | None = None,
 ) -> tuple[tuple[str, str], ...]:
-    query = list(_optional_query(values, {"page_size": "pageSize"}))
+    query: list[tuple[str, str]] = []
+    if fields is not None:
+        query.append(("fields", fields))
+    query.extend(_optional_query(values, {"page_size": "pageSize"}))
     query.extend(_continuation_query(continuation))
     return tuple(query)
 
 
 def _drive_move_query(values: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    add_parent_ids = _strings(values["add_parent_ids"]) if "add_parent_ids" in values else []
+    remove_parent_ids = (
+        _strings(values["remove_parent_ids"]) if "remove_parent_ids" in values else []
+    )
+    if not add_parent_ids and not remove_parent_ids:
+        raise ValidationError("Google Drive move requires a parent change")
+    if set(add_parent_ids) & set(remove_parent_ids):
+        raise ValidationError("Google Drive move cannot add and remove the same parent")
     query: list[tuple[str, str]] = []
-    if "add_parent_ids" in values:
-        query.append(("addParents", ",".join(_strings(values["add_parent_ids"]))))
-    if "remove_parent_ids" in values:
-        query.append(("removeParents", ",".join(_strings(values["remove_parent_ids"]))))
+    if add_parent_ids:
+        query.append(("addParents", ",".join(add_parent_ids)))
+    if remove_parent_ids:
+        query.append(("removeParents", ",".join(remove_parent_ids)))
     return tuple(query)
 
 
@@ -1759,25 +1824,43 @@ def _drive_file_metadata(values: dict[str, object]) -> dict[str, object]:
             "description": "description",
             "mime_type": "mimeType",
             "name": "name",
-            "parent_ids": "parents",
         },
     )
+    if "parent_id" in values:
+        metadata["parents"] = [_required(values, "parent_id")]
     if "app_properties" in values:
-        properties: dict[str, str] = {}
+        properties: dict[str, object] = {}
         for item in _mappings(values["app_properties"]):
             key = _text(item.get("key"))
             if key in properties:
                 raise ValidationError("Google Drive app property keys must be unique")
-            properties[key] = _text(item.get("value"))
+            value = item.get("value")
+            encoded_value_length = 0
+            if value is not None:
+                value = _text(value)
+                encoded_value_length = len(value.encode("utf-8"))
+            if len(key.encode("utf-8")) + encoded_value_length > 124:
+                raise ValidationError(
+                    "Google Drive app property key and value exceed 124 UTF-8 bytes"
+                )
+            properties[key] = value
         metadata["appProperties"] = properties
     return metadata
 
 
-def _drive_comment_body(values: dict[str, object]) -> dict[str, object]:
-    return _selected(
-        values,
-        {"content": "content", "quoted_file_content": "quotedFileContent"},
-    )
+def _drive_comment_create_body(values: dict[str, object]) -> dict[str, object]:
+    body = _selected(values, {"anchor": "anchor", "content": "content"})
+    if "quoted_file_content" in values:
+        quoted = cast(Mapping[str, object], values["quoted_file_content"])
+        body["quotedFileContent"] = _selected(
+            quoted,
+            {"mime_type": "mimeType", "value": "value"},
+        )
+    return body
+
+
+def _drive_reply_body(values: dict[str, object]) -> dict[str, object]:
+    return _selected(values, {"action": "action", "content": "content"})
 
 
 def _gmail_reply_context(
@@ -2037,7 +2120,7 @@ def _gmail_resumable_draft_upload(
         content_type="message/rfc822",
         expected_statuses=_JSON_STATUSES,
     )
-    return _json_result(uploaded.json())
+    return _json_result(uploaded.json(), strip_upload_location=True)
 
 
 def _gmail_header_message(

@@ -19,6 +19,7 @@ _CALENDAR: Final = "https://www.googleapis.com/auth/calendar"
 
 _DRIVE_METADATA_READONLY: Final = "https://www.googleapis.com/auth/drive.metadata.readonly"
 _DRIVE_READONLY: Final = "https://www.googleapis.com/auth/drive.readonly"
+_DRIVE_MEET_READONLY: Final = "https://www.googleapis.com/auth/drive.meet.readonly"
 _DRIVE_FILE: Final = "https://www.googleapis.com/auth/drive.file"
 _DRIVE: Final = "https://www.googleapis.com/auth/drive"
 _MAX_DRIVE_BYTE_OFFSET: Final = 5 * 1024**4
@@ -324,29 +325,54 @@ def _calendar_instance_list() -> dict[str, object]:
     )
 
 
-def _app_property() -> dict[str, object]:
-    return _object({"key": _text(124), "value": _text(4_096)}, required=("key", "value"))
+def _app_property(*, allow_deletion: bool) -> dict[str, object]:
+    value: dict[str, object] = _text(124)
+    if allow_deletion:
+        value = {"oneOf": [value, {"type": "null"}]}
+    return _object({"key": _text(124), "value": value}, required=("key", "value"))
 
 
-def _file_fields() -> dict[str, object]:
-    return {
-        "app_properties": _array(_app_property(), maximum=64),
-        "content_base64": _text(240_000),
+def _file_metadata_fields(
+    *,
+    allow_parent_id: bool,
+    allow_property_deletion: bool,
+) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "app_properties": _array(
+            _app_property(allow_deletion=allow_property_deletion),
+            maximum=30,
+            minimum=1,
+        ),
         "description": _text(32_768, minimum=0),
         "mime_type": _text(256),
         "name": _text(1_024),
-        "parent_ids": _array(_id(), maximum=32),
         "supports_all_drives": {"type": "boolean"},
     }
+    if allow_parent_id:
+        fields["parent_id"] = _id()
+    return fields
+
+
+def _quoted_file_content() -> dict[str, object]:
+    return _object(
+        {"mime_type": _text(256), "value": _text(200_000, minimum=0)},
+    )
 
 
 def _drive_file_mutation_schema(
     required: tuple[str, ...],
     *,
     leading_fields: dict[str, object] | None = None,
+    allow_parent_id: bool,
+    allow_property_deletion: bool,
 ) -> dict[str, object]:
-    metadata_fields = {**(leading_fields or {}), **_file_fields()}
-    metadata_fields.pop("content_base64")
+    metadata_fields = {
+        **(leading_fields or {}),
+        **_file_metadata_fields(
+            allow_parent_id=allow_parent_id,
+            allow_property_deletion=allow_property_deletion,
+        ),
+    }
     source_fields = {
         **metadata_fields,
         "content_base64": _text(240_000),
@@ -467,11 +493,132 @@ def _shared_drive_list() -> dict[str, object]:
     )
 
 
-def _comment_fields() -> dict[str, object]:
-    return {
-        "content": _text(200_000),
-        "quoted_file_content": _text(32_768, minimum=0),
+def _permission_create_schema() -> dict[str, object]:
+    common: dict[str, object] = {
+        "file_id": _id(),
+        "permission_type": {
+            "enum": ["user", "group", "domain", "anyone"],
+            "type": "string",
+        },
+        "role": {
+            "enum": ["reader", "commenter", "writer", "fileOrganizer", "organizer"],
+            "type": "string",
+        },
+        "supports_all_drives": {"type": "boolean"},
     }
+    schema = _object(
+        {
+            **common,
+            "allow_file_discovery": {"type": "boolean"},
+            "domain": _text(253),
+            "email_address": _text(512),
+            "expiration_time": _text(64),
+            "notification_message": _text(16_384, minimum=0),
+            "send_notification_email": {"type": "boolean"},
+        },
+        required=("file_id", "permission_type", "role"),
+    )
+    user_group_base = {
+        **common,
+        "email_address": _text(512),
+        "expiration_time": _text(64),
+        "notification_message": _text(16_384, minimum=0),
+        "send_notification_email": {"type": "boolean"},
+    }
+    schema["oneOf"] = [
+        _object(
+            {**user_group_base, "permission_type": {"const": "user", "type": "string"}},
+            required=("email_address", "file_id", "permission_type", "role"),
+        ),
+        _object(
+            {**user_group_base, "permission_type": {"const": "group", "type": "string"}},
+            required=("email_address", "file_id", "permission_type", "role"),
+        ),
+        _object(
+            {
+                **common,
+                "allow_file_discovery": {"type": "boolean"},
+                "domain": _text(253),
+                "permission_type": {"const": "domain", "type": "string"},
+            },
+            required=("domain", "file_id", "permission_type", "role"),
+        ),
+        _object(
+            {
+                **common,
+                "allow_file_discovery": {"type": "boolean"},
+                "permission_type": {"const": "anyone", "type": "string"},
+            },
+            required=("file_id", "permission_type", "role"),
+        ),
+    ]
+    return schema
+
+
+def _comment_create_schema() -> dict[str, object]:
+    return _object(
+        {
+            "anchor": _text(32_768, minimum=0),
+            "content": _text(200_000),
+            "file_id": _id(),
+            "quoted_file_content": _quoted_file_content(),
+        },
+        required=("content", "file_id"),
+    )
+
+
+def _reply_create_schema() -> dict[str, object]:
+    identifiers: dict[str, object] = {"comment_id": _id(), "file_id": _id()}
+    content: dict[str, object] = {**identifiers, "content": _text(200_000)}
+    action: dict[str, object] = {
+        **identifiers,
+        "action": {"enum": ["reopen", "resolve"], "type": "string"},
+    }
+    both: dict[str, object] = {
+        **content,
+        "action": {"enum": ["reopen", "resolve"], "type": "string"},
+    }
+    schema = _object(
+        {
+            **identifiers,
+            "action": {"enum": ["reopen", "resolve"], "type": "string"},
+            "content": _text(200_000),
+        },
+        required=("comment_id", "file_id"),
+    )
+    schema["oneOf"] = [
+        _object(content, required=("comment_id", "content", "file_id")),
+        _object(action, required=("action", "comment_id", "file_id")),
+        _object(both, required=("action", "comment_id", "content", "file_id")),
+    ]
+    return schema
+
+
+def _drive_move_schema() -> dict[str, object]:
+    identifiers = {
+        "file_id": _id(),
+        "supports_all_drives": {"type": "boolean"},
+    }
+    add = {**identifiers, "add_parent_ids": _array(_id(), maximum=1, minimum=1)}
+    remove = {**identifiers, "remove_parent_ids": _array(_id(), maximum=1, minimum=1)}
+    both = {
+        **add,
+        "remove_parent_ids": _array(_id(), maximum=1, minimum=1),
+    }
+    schema = _object(
+        {
+            **identifiers,
+            "add_parent_ids": _array(_id(), maximum=1, minimum=1),
+            "remove_parent_ids": _array(_id(), maximum=1, minimum=1),
+        },
+        required=("file_id",),
+    )
+    schema["oneOf"] = [
+        _object(add, required=("add_parent_ids", "file_id")),
+        _object(remove, required=("file_id", "remove_parent_ids")),
+        _object(both, required=("add_parent_ids", "file_id", "remove_parent_ids")),
+    ]
+    return schema
 
 
 _GMAIL_READ_SCOPES: Final = _scopes(_GMAIL_READONLY, _GMAIL_MODIFY, _MAIL)
@@ -493,6 +640,12 @@ _DRIVE_METADATA_SCOPES: Final = _scopes(
     _DRIVE,
 )
 _DRIVE_CONTENT_SCOPES: Final = _scopes(_DRIVE_READONLY, _DRIVE_FILE, _DRIVE)
+_DRIVE_COMMENT_READ_SCOPES: Final = _scopes(
+    _DRIVE_READONLY,
+    _DRIVE_FILE,
+    _DRIVE_MEET_READONLY,
+    _DRIVE,
+)
 _DRIVE_WRITE_SCOPES: Final = _scopes(_DRIVE_FILE, _DRIVE)
 
 
@@ -890,7 +1043,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorMode.READ,
         "drives.list",
         ConnectorEffect.READ,
-        _DRIVE_METADATA_SCOPES,
+        _scopes(_DRIVE_READONLY, _DRIVE),
         _shared_drive_list(),
     ),
     _operation(
@@ -965,7 +1118,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorMode.READ,
         "comments.list",
         ConnectorEffect.READ,
-        _DRIVE_METADATA_SCOPES,
+        _DRIVE_COMMENT_READ_SCOPES,
         _object(
             {
                 "file_id": _id(),
@@ -979,7 +1132,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorMode.READ,
         "replies.list",
         ConnectorEffect.READ,
-        _DRIVE_METADATA_SCOPES,
+        _DRIVE_COMMENT_READ_SCOPES,
         _object(
             {
                 "comment_id": _id(),
@@ -1031,7 +1184,11 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.create",
         ConnectorEffect.SAFE_MUTATION,
         _DRIVE_WRITE_SCOPES,
-        _drive_file_mutation_schema(("mime_type", "name")),
+        _drive_file_mutation_schema(
+            ("mime_type", "name"),
+            allow_parent_id=True,
+            allow_property_deletion=False,
+        ),
     ),
     _operation(
         "google_drive",
@@ -1040,8 +1197,10 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.SAFE_MUTATION,
         _DRIVE_WRITE_SCOPES,
         _drive_file_mutation_schema(
-            ("etag", "file_id"),
-            leading_fields={"etag": _text(1_024), "file_id": _id()},
+            ("file_id",),
+            leading_fields={"file_id": _id()},
+            allow_parent_id=False,
+            allow_property_deletion=True,
         ),
     ),
     _operation(
@@ -1050,7 +1209,16 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.copy",
         ConnectorEffect.SAFE_MUTATION,
         _DRIVE_WRITE_SCOPES,
-        _object({"file_id": _id(), **_file_fields()}, required=("file_id",)),
+        _object(
+            {
+                "file_id": _id(),
+                **_file_metadata_fields(
+                    allow_parent_id=True,
+                    allow_property_deletion=True,
+                ),
+            },
+            required=("file_id",),
+        ),
     ),
     _operation(
         "google_drive",
@@ -1058,16 +1226,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.move",
         ConnectorEffect.SAFE_MUTATION,
         _DRIVE_WRITE_SCOPES,
-        _object(
-            {
-                "add_parent_ids": _array(_id(), maximum=32),
-                "etag": _text(1_024),
-                "file_id": _id(),
-                "remove_parent_ids": _array(_id(), maximum=32),
-                "supports_all_drives": {"type": "boolean"},
-            },
-            required=("file_id",),
-        ),
+        _drive_move_schema(),
     ),
     _operation(
         "google_drive",
@@ -1077,11 +1236,10 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _DRIVE_WRITE_SCOPES,
         _object(
             {
-                "etag": _text(1_024),
                 "file_id": _id(),
                 "supports_all_drives": {"type": "boolean"},
             },
-            required=("etag", "file_id"),
+            required=("file_id",),
         ),
     ),
     _operation(
@@ -1092,11 +1250,10 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _DRIVE_WRITE_SCOPES,
         _object(
             {
-                "etag": _text(1_024),
                 "file_id": _id(),
                 "supports_all_drives": {"type": "boolean"},
             },
-            required=("etag", "file_id"),
+            required=("file_id",),
         ),
     ),
     _operation(
@@ -1107,11 +1264,10 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _DRIVE_WRITE_SCOPES,
         _object(
             {
-                "etag": _text(1_024),
                 "file_id": _id(),
                 "supports_all_drives": {"type": "boolean"},
             },
-            required=("etag", "file_id"),
+            required=("file_id",),
         ),
     ),
     _operation(
@@ -1120,25 +1276,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "permissions.create",
         ConnectorEffect.OUTWARD,
         _DRIVE_WRITE_SCOPES,
-        _object(
-            {
-                "domain": _text(253),
-                "email_address": _text(512),
-                "file_id": _id(),
-                "notification_message": _text(16_384, minimum=0),
-                "permission_type": {
-                    "enum": ["user", "group", "domain", "anyone"],
-                    "type": "string",
-                },
-                "role": {
-                    "enum": ["reader", "commenter", "writer", "fileOrganizer", "organizer"],
-                    "type": "string",
-                },
-                "send_notification_email": {"type": "boolean"},
-                "supports_all_drives": {"type": "boolean"},
-            },
-            required=("file_id", "permission_type", "role"),
-        ),
+        _permission_create_schema(),
     ),
     _operation(
         "google_drive",
@@ -1148,7 +1286,6 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _DRIVE_WRITE_SCOPES,
         _object(
             {
-                "etag": _text(1_024),
                 "file_id": _id(),
                 "permission_id": _id(),
                 "role": {
@@ -1157,7 +1294,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
                 },
                 "supports_all_drives": {"type": "boolean"},
             },
-            required=("etag", "file_id", "permission_id", "role"),
+            required=("file_id", "permission_id", "role"),
         ),
     ),
     _operation(
@@ -1168,12 +1305,11 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _DRIVE_WRITE_SCOPES,
         _object(
             {
-                "etag": _text(1_024),
                 "file_id": _id(),
                 "permission_id": _id(),
                 "supports_all_drives": {"type": "boolean"},
             },
-            required=("etag", "file_id", "permission_id"),
+            required=("file_id", "permission_id"),
         ),
     ),
     _operation(
@@ -1182,7 +1318,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "comments.create",
         ConnectorEffect.OUTWARD,
         _DRIVE_WRITE_SCOPES,
-        _object({"file_id": _id(), **_comment_fields()}, required=("content", "file_id")),
+        _comment_create_schema(),
     ),
     _operation(
         "google_drive",
@@ -1191,8 +1327,8 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.OUTWARD,
         _DRIVE_WRITE_SCOPES,
         _object(
-            {"comment_id": _id(), "etag": _text(1_024), "file_id": _id(), **_comment_fields()},
-            required=("comment_id", "etag", "file_id", "content"),
+            {"comment_id": _id(), "content": _text(200_000), "file_id": _id()},
+            required=("comment_id", "content", "file_id"),
         ),
     ),
     _operation(
@@ -1202,8 +1338,8 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.DESTRUCTIVE,
         _DRIVE_WRITE_SCOPES,
         _object(
-            {"comment_id": _id(), "etag": _text(1_024), "file_id": _id()},
-            required=("comment_id", "etag", "file_id"),
+            {"comment_id": _id(), "file_id": _id()},
+            required=("comment_id", "file_id"),
         ),
     ),
     _operation(
@@ -1212,10 +1348,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "replies.create",
         ConnectorEffect.OUTWARD,
         _DRIVE_WRITE_SCOPES,
-        _object(
-            {"comment_id": _id(), "file_id": _id(), **_comment_fields()},
-            required=("comment_id", "content", "file_id"),
-        ),
+        _reply_create_schema(),
     ),
     _operation(
         "google_drive",
@@ -1226,12 +1359,11 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _object(
             {
                 "comment_id": _id(),
-                "etag": _text(1_024),
+                "content": _text(200_000),
                 "file_id": _id(),
                 "reply_id": _id(),
-                **_comment_fields(),
             },
-            required=("comment_id", "content", "etag", "file_id", "reply_id"),
+            required=("comment_id", "content", "file_id", "reply_id"),
         ),
     ),
     _operation(
@@ -1243,11 +1375,10 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _object(
             {
                 "comment_id": _id(),
-                "etag": _text(1_024),
                 "file_id": _id(),
                 "reply_id": _id(),
             },
-            required=("comment_id", "etag", "file_id", "reply_id"),
+            required=("comment_id", "file_id", "reply_id"),
         ),
     ),
     _operation(
@@ -1271,9 +1402,6 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "revisions.delete",
         ConnectorEffect.PERMANENT,
         _DRIVE_WRITE_SCOPES,
-        _object(
-            {"etag": _text(1_024), "file_id": _id(), "revision_id": _id()},
-            required=("etag", "file_id", "revision_id"),
-        ),
+        _object({"file_id": _id(), "revision_id": _id()}, required=("file_id", "revision_id")),
     ),
 )

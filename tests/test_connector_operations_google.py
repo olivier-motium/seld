@@ -262,7 +262,7 @@ def test_google_catalog_validates_representative_rich_inputs() -> None:
         "description": "An explicit small upload",
         "mime_type": "text/plain",
         "name": "plan.txt",
-        "parent_ids": ["folder-1"],
+        "parent_id": "folder-1",
     }
     assert (
         catalog.validate_input("google_drive", ConnectorMode.WRITE, "files.create", drive) == drive
@@ -384,6 +384,29 @@ def test_drive_metadata_scope_does_not_satisfy_content_or_write_operations() -> 
     ).scope_grant_satisfies(metadata_scope)
 
 
+def test_drive_discovery_scope_alternatives_match_provider_methods() -> None:
+    readonly = "https://www.googleapis.com/auth/drive.readonly"
+    file_scope = "https://www.googleapis.com/auth/drive.file"
+    meet_scope = "https://www.googleapis.com/auth/drive.meet.readonly"
+    drive = "https://www.googleapis.com/auth/drive"
+    metadata = "https://www.googleapis.com/auth/drive.metadata.readonly"
+
+    assert _operation("google_drive", ConnectorMode.READ, "drives.list").required_scopes == (
+        frozenset({readonly}),
+        frozenset({drive}),
+    )
+    assert not _operation("google_drive", ConnectorMode.READ, "drives.list").scope_grant_satisfies(
+        [file_scope]
+    )
+    for name in ("comments.list", "replies.list"):
+        operation = _operation("google_drive", ConnectorMode.READ, name)
+        assert operation.scope_grant_satisfies([readonly])
+        assert operation.scope_grant_satisfies([file_scope])
+        assert operation.scope_grant_satisfies([meet_scope])
+        assert operation.scope_grant_satisfies([drive])
+        assert not operation.scope_grant_satisfies([metadata])
+
+
 def test_google_catalog_uses_provider_page_limits_and_drive_capacity() -> None:
     limits = {
         ("gmail", "messages.list"): 500,
@@ -430,8 +453,9 @@ def test_google_catalog_uses_provider_page_limits_and_drive_capacity() -> None:
 def test_drive_file_sources_are_closed_while_metadata_only_mutations_remain_valid() -> None:
     create = _operation("google_drive", ConnectorMode.WRITE, "files.create")
     update = _operation("google_drive", ConnectorMode.WRITE, "files.update")
+    copy = _operation("google_drive", ConnectorMode.WRITE, "files.copy")
     create_metadata = {"mime_type": "text/plain", "name": "note.txt"}
-    update_metadata = {"etag": "etag", "file_id": "file"}
+    update_metadata = {"file_id": "file", "name": "renamed.txt"}
     local_file = {"grant_id": "grant", "relative_path": "note.txt"}
 
     assert create.validate_input(create_metadata) == create_metadata
@@ -472,6 +496,140 @@ def test_drive_file_sources_are_closed_while_metadata_only_mutations_remain_vali
         create.validate_input({**create_metadata, "local_file": {"grant_id": "grant"}})
     with pytest.raises(ValidationError):
         create.validate_input({**create_metadata, "local_file": {**local_file, "extra": "nope"}})
+    assert create.validate_input({**create_metadata, "parent_id": "folder"}) == {
+        **create_metadata,
+        "parent_id": "folder",
+    }
+    assert copy.validate_input({"file_id": "file", "parent_id": "folder"}) == {
+        "file_id": "file",
+        "parent_id": "folder",
+    }
+    for invalid in (
+        {**update_metadata, "parent_id": "folder"},
+        {**update_metadata, "parent_ids": ["folder"]},
+    ):
+        with pytest.raises(ValidationError):
+            update.validate_input(invalid)
+    for invalid_copy in (
+        {"file_id": "file", "content_base64": "aA=="},
+        {"file_id": "file", "local_file": local_file},
+    ):
+        with pytest.raises(ValidationError):
+            copy.validate_input(invalid_copy)
+
+    deleted_property = {
+        "app_properties": [{"key": "obsolete", "value": None}],
+        "file_id": "file",
+    }
+    assert update.validate_input(deleted_property) == deleted_property
+    assert copy.validate_input(deleted_property) == deleted_property
+    with pytest.raises(ValidationError):
+        update.validate_input({"app_properties": [], "file_id": "file"})
+    with pytest.raises(ValidationError):
+        create.validate_input(
+            {
+                **create_metadata,
+                "app_properties": [{"key": "obsolete", "value": None}],
+            }
+        )
+
+
+def test_drive_closed_comment_reply_permission_and_move_shapes() -> None:
+    catalog = _catalog()
+    assert catalog.validate_input(
+        "google_drive",
+        ConnectorMode.WRITE,
+        "comments.create",
+        {
+            "anchor": '{"r":{"a":1}}',
+            "content": "note",
+            "file_id": "file",
+            "quoted_file_content": {"mime_type": "text/plain", "value": "quote"},
+        },
+    )
+    for quote in (
+        {"mime_type": "text/plain"},
+        {"value": "quote"},
+        {"mime_type": "text/plain", "value": "quote"},
+    ):
+        value = {
+            "content": "note",
+            "file_id": "file",
+            "quoted_file_content": quote,
+        }
+        assert (
+            catalog.validate_input(
+                "google_drive",
+                ConnectorMode.WRITE,
+                "comments.create",
+                value,
+            )
+            == value
+        )
+    for invalid in (
+        {"comment_id": "comment", "content": "note", "etag": "invented", "file_id": "file"},
+        {
+            "content": "note",
+            "file_id": "file",
+            "quoted_file_content": {"mime_type": "text/plain"},
+        },
+    ):
+        with pytest.raises(ValidationError):
+            catalog.validate_input("google_drive", ConnectorMode.WRITE, "comments.update", invalid)
+
+    reply = _operation("google_drive", ConnectorMode.WRITE, "replies.create")
+    for reply_value in (
+        {"comment_id": "comment", "content": "note", "file_id": "file"},
+        {"action": "resolve", "comment_id": "comment", "file_id": "file"},
+        {
+            "action": "reopen",
+            "comment_id": "comment",
+            "content": "note",
+            "file_id": "file",
+        },
+    ):
+        assert reply.validate_input(reply_value) == reply_value
+    with pytest.raises(ValidationError):
+        reply.validate_input({"comment_id": "comment", "file_id": "file"})
+
+    permission = _operation("google_drive", ConnectorMode.WRITE, "permissions.create")
+    assert permission.validate_input(
+        {
+            "allow_file_discovery": True,
+            "domain": "example.test",
+            "file_id": "file",
+            "permission_type": "domain",
+            "role": "reader",
+        }
+    )
+    assert permission.validate_input(
+        {
+            "email_address": "person@example.test",
+            "expiration_time": "2026-12-31T00:00:00Z",
+            "file_id": "file",
+            "notification_message": "Review this",
+            "permission_type": "user",
+            "role": "reader",
+            "send_notification_email": True,
+        }
+    )
+    with pytest.raises(ValidationError):
+        permission.validate_input(
+            {
+                "domain": "example.test",
+                "file_id": "file",
+                "permission_type": "anyone",
+                "role": "reader",
+            }
+        )
+    for invalid_move in (
+        {"file_id": "file"},
+        {"add_parent_ids": [], "file_id": "file"},
+        {"add_parent_ids": ["one", "two"], "file_id": "file"},
+        {"file_id": "file", "remove_parent_ids": ["one", "two"]},
+    ):
+        with pytest.raises(ValidationError):
+            catalog.validate_input("google_drive", ConnectorMode.WRITE, "files.move", invalid_move)
 
 
 def test_drive_content_delivery_defaults_to_artifact_and_inline_is_explicitly_bounded() -> None:
@@ -526,12 +684,14 @@ def test_drive_shared_drive_inputs_are_finite_without_admin_or_ownership_transfe
         "permissions.create",
         {
             "file_id": "shared-drive",
+            "email_address": "owner@example.test",
             "permission_type": "user",
             "role": "organizer",
             "supports_all_drives": True,
         },
     ) == {
         "file_id": "shared-drive",
+        "email_address": "owner@example.test",
         "permission_type": "user",
         "role": "organizer",
         "supports_all_drives": True,

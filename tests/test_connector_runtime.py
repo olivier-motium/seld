@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock, Thread, local
+from urllib.request import Request
 
 import pytest
 
@@ -18,6 +20,7 @@ from continuity_kernel.connector_adapter import (
     ConnectorRuntimeCredential,
     ConnectorTransferContext,
 )
+from continuity_kernel.connector_adapter_google import GoogleConnectorAdapter
 from continuity_kernel.connector_auth import (
     AccountMetadata,
     ClientKind,
@@ -45,9 +48,11 @@ from continuity_kernel.connector_transfer import (
     PreparedUploadCache,
 )
 from continuity_kernel.connector_transport import (
+    ConnectorMethod,
     ConnectorOrigin,
     ConnectorProviderError,
     ConnectorTransport,
+    ResponseLike,
 )
 from continuity_kernel.errors import ConflictError, ValidationError
 from continuity_kernel.local_files import (
@@ -170,6 +175,28 @@ class _PreflightAdapter(_Adapter):
 
 class _OutlookAdapter(_Adapter):
     providers = frozenset({"outlook_calendar"})
+
+
+class _HttpResponse:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status = status
+        self.headers: object = dict(headers or {})
+        self._body = io.BytesIO(body)
+
+    def read(self, amount: int = -1) -> bytes:
+        return self._body.read(amount)
+
+    def __enter__(self) -> _HttpResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
 
 
 def _prepared(
@@ -484,6 +511,81 @@ def test_safe_mutation_executes_once_but_outward_effect_requires_bound_confirmat
             {**values, "confirmation_token": preview["confirmation_token"]},
         )
     assert [call[0] for call in adapter.calls] == ["drafts.create", "drafts.send"]
+
+
+def test_drive_inline_upload_requires_bound_confirmation_and_dispatches_once(
+    tmp_path: Path,
+) -> None:
+    captured: list[Request] = []
+
+    def open_request(request: Request, timeout: float) -> ResponseLike:
+        assert timeout == 30.0
+        captured.append(request)
+        if request.get_method() == ConnectorMethod.POST.value:
+            return _HttpResponse(
+                b"{}",
+                headers={"Location": "https://www.googleapis.com/upload/session/one"},
+            )
+        assert request.get_method() == ConnectorMethod.PUT.value
+        return _HttpResponse(b'{"id":"file-1","name":"note.txt"}')
+
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path)
+    runtime.adapters = ConnectorAdapterRegistry((GoogleConnectorAdapter(),))
+    runtime.transport = ConnectorTransport(opener=open_request)
+    upload_input = {
+        "content_base64": "cmV2aWV3ZWQgYnl0ZXM=",
+        "mime_type": "text/plain",
+        "name": "note.txt",
+    }
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": upload_input,
+        "operation": "files.create",
+    }
+
+    preview = runtime.call_tool("gsv_google_drive_write", values)
+    assert preview["status"] == "confirmation_required"
+    assert preview["effect"] == ConnectorEffect.OUTWARD.value
+    assert captured == []
+
+    token = str(preview["confirmation_token"])
+    wrong_token = token[:-1] + ("A" if token[-1] != "A" else "B")
+    with pytest.raises(ConflictError, match="binding"):
+        runtime.call_tool(
+            "gsv_google_drive_write",
+            {
+                **values,
+                "confirmation_token": token,
+                "input": {**upload_input, "content_base64": "dGFtcGVyZWQ="},
+            },
+        )
+    with pytest.raises(ValidationError, match="sealed token"):
+        runtime.call_tool(
+            "gsv_google_drive_write",
+            {**values, "confirmation_token": wrong_token},
+        )
+    assert captured == []
+
+    result = runtime.call_tool(
+        "gsv_google_drive_write",
+        {**values, "confirmation_token": token},
+    )
+    assert result["status"] == "ok"
+    assert result["effect"] == ConnectorEffect.OUTWARD.value
+    assert result["result"] == {"id": "file-1", "name": "note.txt"}
+    assert len(captured) == 2
+    assert captured[0].get_method() == ConnectorMethod.POST.value
+    assert captured[0].get_header("Authorization") == "Bearer runtime-access-token"
+    assert captured[1].get_method() == ConnectorMethod.PUT.value
+    assert captured[1].data == b"reviewed bytes"
+    assert captured[1].get_header("Authorization") is None
+
+    with pytest.raises(ConflictError, match="already been consumed"):
+        runtime.call_tool(
+            "gsv_google_drive_write",
+            {**values, "confirmation_token": token},
+        )
+    assert len(captured) == 2
 
 
 def test_outlook_event_delete_and_cancel_previews_disclose_attendee_cancellations(
