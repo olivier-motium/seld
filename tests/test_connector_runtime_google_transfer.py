@@ -27,7 +27,7 @@ from continuity_kernel.connector_profiles import get_profile
 from continuity_kernel.connector_runtime import ConnectorRuntime
 from continuity_kernel.connector_secrets import InMemorySecretStore
 from continuity_kernel.connector_session import ConnectorSession
-from continuity_kernel.connector_transfer import ArtifactStore
+from continuity_kernel.connector_transfer import ArtifactStore, PreparedUpload
 from continuity_kernel.connector_transport import (
     ConnectorMethod,
     ConnectorOutcomeUnknown,
@@ -129,6 +129,39 @@ class _AmbiguousGmailSendTransport(_GmailModifyTransport):
     def request(self, **kwargs: Any) -> ConnectorResponse:
         self.requests.append(kwargs)
         raise ConnectorOutcomeUnknown("Gmail send outcome is unknown")
+
+
+class _GmailRawUploadTransport(ConnectorTransport):
+    def __init__(self, *, ambiguous: bool = False) -> None:
+        self.ambiguous = ambiguous
+        self.calls: list[dict[str, Any]] = []
+        self.sent_bodies: list[bytes] = []
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.calls.append({"kind": "request", **kwargs})
+        return ConnectorResponse(
+            kwargs["origin"],
+            200,
+            {"location": "https://gmail.googleapis.com/upload/session/runtime-one"},
+            b"{}",
+        )
+
+    def request_stream(self, **kwargs: Any) -> ConnectorStreamResponse:
+        self.calls.append({"kind": "stream", **kwargs})
+        source = kwargs["source"]
+        assert isinstance(source, PreparedUpload)
+        body = b"".join(source.iter_chunks())
+        self.sent_bodies.append(body)
+        if self.ambiguous:
+            raise ConnectorOutcomeUnknown("ambiguous raw Gmail dispatch")
+        return ConnectorStreamResponse(
+            kwargs["origin"],
+            200,
+            {},
+            len(body),
+            hashlib.sha256(body).hexdigest(),
+            control_body=b'{"id":"message-raw","threadId":"thread-raw","snippet":"private"}',
+        )
 
 
 def _runtime(
@@ -419,6 +452,284 @@ def test_google_transfer_previews_reach_confirmation_without_provider_http(
         assert drive["effect"] == ConnectorEffect.OUTWARD.value
         assert drive["provider"] == "google_drive"
         assert transport.call_count == 0
+    finally:
+        runtime.close()
+
+
+def test_gmail_raw_send_preview_binds_every_recipient_and_the_immutable_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, runtime, preview_transport = _runtime(tmp_path, monkeypatch)
+    selected = tmp_path / "raw-send-root"
+    source = selected / "message.eml"
+    source.parent.mkdir()
+    reviewed = (
+        b"From: Sender <sender@example.test>\r\n"
+        b"Sender: delegate@example.test\r\n"
+        b"Reply-To: replies@example.test\r\n"
+        b"To: Alice <alice@example.test>\r\n"
+        b"To: bob@example.test\r\n"
+        b"Cc: carol@example.test\r\n"
+        b"Bcc: hidden-one@example.test\r\n"
+        b"Bcc: Hidden Two <hidden-two@example.test>\r\n"
+        b"Subject: Reviewed raw send\r\n\r\nPrivate reviewed body"
+    )
+    source.write_bytes(reviewed)
+    vault.select_sources(
+        expected_revision=vault.get_source_snapshot().revision,
+        sources=("local_files",),
+    )
+    grant_id = vault.grant_local_file_root(selected)["grant"]["grant_id"]
+    assert isinstance(grant_id, str)
+    values = {
+        "connection_id": str(_CONNECTION_ID),
+        "input": {
+            "local_file": {
+                "grant_id": grant_id,
+                "relative_path": "message.eml",
+            }
+        },
+        "operation": "messages.send",
+    }
+    try:
+        preview = runtime.call_tool("gsv_gmail_write", values)
+        assert preview["status"] == "confirmation_required"
+        assert preview["effect"] == ConnectorEffect.OUTWARD.value
+        assert preview_transport.call_count == 0
+        public_preview = preview["preview"]
+        assert isinstance(public_preview, dict)
+        prepared = public_preview["prepared_content"]
+        assert isinstance(prepared, dict)
+        raw = prepared["gmail_raw_message"]
+        assert isinstance(raw, dict)
+        assert raw["headers_parsed"] is True
+        assert raw["from"] == "Sender <sender@example.test>"
+        assert raw["sender"] == "delegate@example.test"
+        assert raw["reply_to"] == "replies@example.test"
+        assert raw["subject"] == "Reviewed raw send"
+        assert raw["to"] == ["Alice <alice@example.test>", "bob@example.test"]
+        assert raw["cc"] == ["carol@example.test"]
+        assert raw["bcc"] == [
+            "hidden-one@example.test",
+            "Hidden Two <hidden-two@example.test>",
+        ]
+        assert "Private reviewed body" not in json.dumps(preview)
+
+        source.write_bytes(
+            b"To: attacker@example.test\r\nSubject: Changed\r\n\r\nChanged after approval"
+        )
+        upload_transport = _GmailRawUploadTransport()
+        runtime.transport = upload_transport
+        completed = runtime.call_tool(
+            "gsv_gmail_write",
+            {**values, "confirmation_token": preview["confirmation_token"]},
+        )
+        assert completed["status"] == "ok"
+        assert completed["result"] == {
+            "id": "message-raw",
+            "threadId": "thread-raw",
+        }
+        assert upload_transport.sent_bodies == [reviewed]
+        assert [call["kind"] for call in upload_transport.calls] == ["request", "stream"]
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("operation", "content", "input_extra", "error"),
+    (
+        (
+            "messages.send",
+            b"Subject: No recipient\r\n\r\nBody",
+            {},
+            "at least one concrete",
+        ),
+        (
+            "messages.send",
+            b"To: recipient@example.test\nSubject: Bare LF\n\nBody",
+            {},
+            "headers are invalid",
+        ),
+        (
+            "messages.import",
+            b"From: sender@example.test\r\nTo: owner@example.test\r\n\r\nBody",
+            {},
+            "use internal_date_source=receivedTime",
+        ),
+    ),
+)
+def test_gmail_invalid_raw_message_fails_before_confirmation_or_provider_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    content: bytes,
+    input_extra: dict[str, object],
+    error: str,
+) -> None:
+    vault, runtime, transport = _runtime(tmp_path, monkeypatch)
+    selected = tmp_path / "invalid-raw-root"
+    source = selected / "message.eml"
+    source.parent.mkdir()
+    source.write_bytes(content)
+    vault.select_sources(
+        expected_revision=vault.get_source_snapshot().revision,
+        sources=("local_files",),
+    )
+    grant_id = vault.grant_local_file_root(selected)["grant"]["grant_id"]
+    issued: list[object] = []
+
+    def record_confirmation(**kwargs: object) -> str:
+        issued.append(kwargs)
+        return "unexpected-token"
+
+    monkeypatch.setattr(runtime.session, "issue_confirmation", record_confirmation)
+    try:
+        with pytest.raises(ValidationError, match=error):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": {
+                        **input_extra,
+                        "local_file": {
+                            "grant_id": grant_id,
+                            "relative_path": "message.eml",
+                        },
+                    },
+                    "operation": operation,
+                },
+            )
+        assert issued == []
+        assert transport.call_count == 0
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("operation", "input_extra", "content", "effect", "consequence"),
+    (
+        (
+            "messages.insert",
+            {"internal_date_source": "receivedTime"},
+            b"Legacy header without a colon\r\n\r\nLegacy body",
+            ConnectorEffect.OUTWARD,
+            "without sending",
+        ),
+        (
+            "messages.import",
+            {"never_mark_spam": True, "process_for_calendar": True},
+            (b"Date: Sat, 1 Aug 2026 10:00:00 +0200\r\nFrom: sender@example.test\r\n\r\nBody"),
+            ConnectorEffect.OUTWARD,
+            "Google Calendar",
+        ),
+        (
+            "messages.insert",
+            {"deleted": True, "internal_date_source": "receivedTime"},
+            b"Legacy header without a colon\r\n\r\nLegacy body",
+            ConnectorEffect.PERMANENT,
+            "permanently deleted",
+        ),
+    ),
+)
+def test_gmail_migration_preview_explains_dynamic_effects_and_legacy_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    input_extra: dict[str, object],
+    content: bytes,
+    effect: ConnectorEffect,
+    consequence: str,
+) -> None:
+    vault, runtime, transport = _runtime(tmp_path, monkeypatch)
+    selected = tmp_path / f"{operation}-root"
+    source = selected / "message.eml"
+    source.parent.mkdir()
+    source.write_bytes(content)
+    vault.select_sources(
+        expected_revision=vault.get_source_snapshot().revision,
+        sources=("local_files",),
+    )
+    grant_id = vault.grant_local_file_root(selected)["grant"]["grant_id"]
+    try:
+        preview = runtime.call_tool(
+            "gsv_gmail_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": {
+                    **input_extra,
+                    "local_file": {
+                        "grant_id": grant_id,
+                        "relative_path": "message.eml",
+                    },
+                },
+                "operation": operation,
+            },
+        )
+        assert preview["status"] == "confirmation_required"
+        assert preview["effect"] == effect.value
+        public_preview = preview["preview"]
+        assert isinstance(public_preview, dict)
+        prepared_content = public_preview["prepared_content"]
+        assert isinstance(prepared_content, dict)
+        raw = prepared_content["gmail_raw_message"]
+        assert isinstance(raw, dict)
+        assert raw["effective_internal_date_source"] == input_extra.get(
+            "internal_date_source",
+            "dateHeader" if operation == "messages.import" else "receivedTime",
+        )
+        assert any(consequence in item for item in raw["consequences"])
+        if content.startswith(b"Legacy"):
+            assert raw["headers_parsed"] is False
+            assert raw["warnings"]
+        assert transport.call_count == 0
+    finally:
+        runtime.close()
+
+
+def test_gmail_ambiguous_raw_send_spends_confirmation_and_never_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    selected = tmp_path / "ambiguous-raw-root"
+    source = selected / "message.eml"
+    source.parent.mkdir()
+    source.write_bytes(b"To: recipient@example.test\r\nSubject: One shot\r\n\r\nBody")
+    vault.select_sources(
+        expected_revision=vault.get_source_snapshot().revision,
+        sources=("local_files",),
+    )
+    grant_id = vault.grant_local_file_root(selected)["grant"]["grant_id"]
+    values = {
+        "connection_id": str(_CONNECTION_ID),
+        "input": {
+            "local_file": {
+                "grant_id": grant_id,
+                "relative_path": "message.eml",
+            }
+        },
+        "operation": "messages.send",
+    }
+    try:
+        preview = runtime.call_tool("gsv_gmail_write", values)
+        token = preview["confirmation_token"]
+        transport = _GmailRawUploadTransport(ambiguous=True)
+        runtime.transport = transport
+        with pytest.raises(ConnectorOutcomeUnknown, match="do not retry automatically"):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {**values, "confirmation_token": token},
+            )
+        assert [call["kind"] for call in transport.calls] == ["request", "stream"]
+        assert len(transport.sent_bodies) == 1
+
+        with pytest.raises(ConflictError, match=r"consumed|unavailable|expired|replayed"):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {**values, "confirmation_token": token},
+            )
+        assert [call["kind"] for call in transport.calls] == ["request", "stream"]
     finally:
         runtime.close()
 

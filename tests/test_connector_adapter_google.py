@@ -15,7 +15,10 @@ import pytest
 from continuity_kernel.connector_adapter import ConnectorRuntimeCredential, ConnectorTransferContext
 from continuity_kernel.connector_adapter_google import GoogleConnectorAdapter
 from continuity_kernel.connector_contract import ConnectorEffect, OperationSpec
-from continuity_kernel.connector_gmail_transfer import GMAIL_UPLOAD_MAX_BYTES
+from continuity_kernel.connector_gmail_transfer import (
+    GMAIL_MIGRATION_UPLOAD_MAX_BYTES,
+    GMAIL_UPLOAD_MAX_BYTES,
+)
 from continuity_kernel.connector_operations_google import GOOGLE_OPERATIONS
 from continuity_kernel.connector_transfer import (
     ArtifactStore,
@@ -128,6 +131,12 @@ class _ProviderErrorTransport(_Transport):
     def request(self, **kwargs: Any) -> ConnectorResponse:
         self.calls.append({"kind": "request", **kwargs})
         raise self.error
+
+
+class _OutcomeUnknownInitTransport(_Transport):
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.calls.append({"kind": "request", **kwargs})
+        raise ConnectorOutcomeUnknown("ambiguous upload-session initialization")
 
 
 class _DriveRecoveryTransport(ConnectorTransport):
@@ -295,6 +304,24 @@ def test_google_local_file_limit_hook_allows_only_sanitized_provider_shapes() ->
         )
         == (GMAIL_UPLOAD_MAX_BYTES * 3) // 4
     )
+    raw_input = {"local_file": "opaque-local-file"}
+    assert (
+        adapter.max_local_file_bytes(
+            _operation("gmail", "messages.send"),
+            raw_input,
+            path=("local_file",),
+        )
+        == GMAIL_UPLOAD_MAX_BYTES
+    )
+    for name in ("messages.insert", "messages.import"):
+        assert (
+            adapter.max_local_file_bytes(
+                _operation("gmail", name),
+                raw_input,
+                path=("local_file",),
+            )
+            == GMAIL_MIGRATION_UPLOAD_MAX_BYTES
+        )
 
     drive_operation = _operation("google_drive", "files.update")
     drive_input = {
@@ -308,6 +335,7 @@ def test_google_local_file_limit_hook_allows_only_sanitized_provider_shapes() ->
 
     rejected = (
         (gmail_operation, gmail_input, ("local_file",)),
+        (_operation("gmail", "messages.insert"), gmail_input, ("local_file",)),
         (
             gmail_operation,
             {"attachments": [{"mime_type": "text/plain"}]},
@@ -379,6 +407,8 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
             return {"remove_label_ids": ["INBOX"], "thread_id": "thread"}
         if name in {"drafts.create", "messages.send"}:
             return {"text_body": "hello", "to": ["recipient@example.test"]}
+        if name in {"messages.insert", "messages.import"}:
+            return {"local_file": {"grant_id": "grant", "relative_path": "message.eml"}}
         if name in {"drafts.get", "drafts.update", "drafts.delete", "drafts.send"}:
             return {"draft_id": "draft"}
         if name == "labels.create":
@@ -493,42 +523,70 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
     raise AssertionError(f"no sample for {operation.provider}:{name}")
 
 
-def test_every_google_operation_uses_only_bounded_fixed_adapter_requests() -> None:
+def test_every_google_operation_uses_only_bounded_fixed_adapter_requests(tmp_path: Path) -> None:
     adapter = GoogleConnectorAdapter()
     transport = _Transport()
     credential = _credential()
-    for operation in GOOGLE_OPERATIONS:
-        transport.body = b"{}"
-        before = len(transport.calls)
-        expected_requests = 1
-        if operation.provider == "google_calendar" and operation.name in {
-            "events.move",
-            "events.update",
-        }:
-            expected_requests = 2
-        if operation.provider == "google_calendar" and operation.name == "events.respond":
-            transport.body = json.dumps(
-                {
-                    "attendees": [{"email": "owner@example.test", "self": True}],
-                    "etag": "event-etag",
-                }
-            ).encode()
-            expected_requests = 2
-        if operation.provider == "google_drive" and operation.name == "files.download":
-            transport.body = _drive_download_operation_body(
-                done=True,
-                response=_drive_download_response(partial=True),
+    raw_upload = _prepared_upload(
+        tmp_path,
+        content=(
+            b"Date: Sat, 1 Aug 2026 10:00:00 +0200\r\n"
+            b"From: sender@example.test\r\n"
+            b"To: recipient@example.test\r\n\r\nBody"
+        ),
+    )
+    try:
+        for operation in GOOGLE_OPERATIONS:
+            transport.body = b"{}"
+            before = len(transport.calls)
+            expected_requests = 1
+            transfer = None
+            write_idempotency_key = None
+            if operation.provider == "google_calendar" and operation.name in {
+                "events.move",
+                "events.update",
+            }:
+                expected_requests = 2
+            if operation.provider == "google_calendar" and operation.name == "events.respond":
+                transport.body = json.dumps(
+                    {
+                        "attendees": [{"email": "owner@example.test", "self": True}],
+                        "etag": "event-etag",
+                    }
+                ).encode()
+                expected_requests = 2
+            if operation.provider == "google_drive" and operation.name == "files.download":
+                transport.body = _drive_download_operation_body(
+                    done=True,
+                    response=_drive_download_response(partial=True),
+                )
+                expected_requests = 2
+            if operation.provider == "gmail" and operation.name in {
+                "messages.import",
+                "messages.insert",
+                "messages.send",
+            }:
+                transport.body = b'{"id":"message"}'
+            if operation.provider == "gmail" and operation.name in {
+                "messages.import",
+                "messages.insert",
+            }:
+                transfer = ConnectorTransferContext(uploads={("local_file",): raw_upload})
+                write_idempotency_key = "confirmed-raw-upload"
+                expected_requests = 2
+            adapter.execute(
+                operation,
+                _sample(operation),
+                continuation=None,
+                credential=credential,
+                transport=transport,
+                transfer=transfer,
+                write_idempotency_key=write_idempotency_key,
             )
-            expected_requests = 2
-        adapter.execute(
-            operation,
-            _sample(operation),
-            continuation=None,
-            credential=credential,
-            transport=transport,
-        )
-        assert len(transport.calls) == before + expected_requests
-    assert len(transport.calls) == len(GOOGLE_OPERATIONS) + 4
+            assert len(transport.calls) == before + expected_requests
+    finally:
+        raw_upload.close()
+    assert len(transport.calls) == len(GOOGLE_OPERATIONS) + 6
     assert {call["origin"] for call in transport.calls} == {
         ConnectorOrigin.GMAIL,
         ConnectorOrigin.GOOGLE,
@@ -537,7 +595,9 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests() -> No
         ("path" not in call or call["path"].startswith("/"))
         and (
             "location" not in call
-            or call["location"].startswith("https://drive.usercontent.google.com/")
+            or call["location"].startswith(
+                ("https://drive.usercontent.google.com/", "https://gmail.googleapis.com/")
+            )
         )
         for call in transport.calls
     )
@@ -734,6 +794,56 @@ def test_gmail_recoverable_moves_remain_one_step() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("name", "values", "expected"),
+    (
+        (
+            "messages.insert",
+            {"internal_date_source": "receivedTime"},
+            ConnectorEffect.SAFE_MUTATION,
+        ),
+        ("messages.insert", {"deleted": True}, ConnectorEffect.PERMANENT),
+        (
+            "messages.import",
+            {"internal_date_source": "dateHeader", "process_for_calendar": True},
+            ConnectorEffect.OUTWARD,
+        ),
+        (
+            "messages.import",
+            {
+                "deleted": True,
+                "internal_date_source": "dateHeader",
+                "process_for_calendar": True,
+            },
+            ConnectorEffect.PERMANENT,
+        ),
+    ),
+)
+def test_gmail_raw_migration_effects_follow_exact_provider_consequences(
+    tmp_path: Path,
+    name: str,
+    values: dict[str, object],
+    expected: ConnectorEffect,
+) -> None:
+    upload = _prepared_upload(
+        tmp_path,
+        content=(
+            b"Date: Sat, 1 Aug 2026 10:00:00 +0200\r\n"
+            b"From: sender@example.test\r\n"
+            b"To: recipient@example.test\r\n\r\nBody"
+        ),
+    )
+    try:
+        effect = GoogleConnectorAdapter().classify_effect(
+            _operation("gmail", name),
+            values,
+            transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+        )
+        assert effect is expected
+    finally:
+        upload.close()
+
+
 def test_gmail_batch_modify_and_purge_use_fixed_provider_routes() -> None:
     adapter = GoogleConnectorAdapter()
     transport = _Transport()
@@ -880,7 +990,20 @@ def test_gmail_drafts_use_safe_mime_and_draft_then_send() -> None:
 
 
 def test_gmail_structured_message_send_uses_safe_mime() -> None:
-    transport = _Transport()
+    transport = _Transport(
+        body=json.dumps(
+            {
+                "historyId": "42",
+                "id": "message-1",
+                "labelIds": ["SENT"],
+                "payload": {"body": {"data": "private"}},
+                "raw": "private",
+                "sizeEstimate": 123,
+                "snippet": "private body preview",
+                "threadId": "thread-1",
+            }
+        ).encode()
+    )
     result = GoogleConnectorAdapter().execute(
         _operation("gmail", "messages.send"),
         {
@@ -893,7 +1016,13 @@ def test_gmail_structured_message_send_uses_safe_mime() -> None:
         credential=_credential(),
         transport=transport,
     )
-    assert result.payload == {}
+    assert result.payload == {
+        "historyId": "42",
+        "id": "message-1",
+        "labelIds": ["SENT"],
+        "sizeEstimate": 123,
+        "threadId": "thread-1",
+    }
     call = transport.calls[-1]
     assert call["path"] == "/gmail/v1/users/me/messages/send"
     encoded = call["json_body"]["raw"]
@@ -902,6 +1031,24 @@ def test_gmail_structured_message_send_uses_safe_mime() -> None:
     assert message["To"] == "recipient@example.test"
     assert message["Bcc"] == "audit@example.test"
     assert message["Subject"] == "Direct send"
+
+
+def test_gmail_structured_send_malformed_success_receipt_is_outcome_unknown() -> None:
+    transport = _Transport(body=b"{")
+
+    with pytest.raises(
+        ConnectorOutcomeUnknown,
+        match=r"returned no usable receipt;.*do not retry automatically",
+    ):
+        GoogleConnectorAdapter().execute(
+            _operation("gmail", "messages.send"),
+            {"text_body": "Hello", "to": ["recipient@example.test"]},
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+        )
+
+    assert [call["kind"] for call in transport.calls] == ["request"]
 
 
 def test_gmail_structured_message_send_preserves_verified_reply_threading() -> None:
@@ -916,7 +1063,7 @@ def test_gmail_structured_message_send_preserves_verified_reply_threading() -> N
             "threadId": "provider-thread-7",
         }
     ).encode()
-    transport = _Transport(bodies=(metadata, b"{}"))
+    transport = _Transport(bodies=(metadata, b'{"id":"message"}'))
     GoogleConnectorAdapter().execute(
         _operation("gmail", "messages.send"),
         {
@@ -1144,7 +1291,7 @@ def test_gmail_local_file_attachment_uses_resumable_rfc822_upload(
 ) -> None:
     upload = _prepared_upload(tmp_path)
     transfer = ConnectorTransferContext(uploads={("attachments", 0, "local_file"): upload})
-    transport = _Transport()
+    transport = _Transport(body=b'{"id":"message"}' if name == "messages.send" else b"{}")
     try:
         result = GoogleConnectorAdapter().execute(
             _operation("gmail", name),
@@ -1159,7 +1306,7 @@ def test_gmail_local_file_attachment_uses_resumable_rfc822_upload(
             transport=transport,
             transfer=transfer,
         )
-        assert result.payload == {}
+        assert result.payload == ({"id": "message"} if name == "messages.send" else {})
         initiated, sent = transport.calls
         assert initiated["method"] is method
         assert initiated["path"] == draft_path
@@ -1180,6 +1327,329 @@ def test_gmail_local_file_attachment_uses_resumable_rfc822_upload(
         assert attachment.get_filename() == "résumé.txt"
         assert attachment.get_payload(decode=True) == b"streamed Google Drive content"
         assert "relative_path" not in repr(sent["source"])
+    finally:
+        upload.close()
+
+
+def test_gmail_attachment_send_malformed_success_receipt_is_outcome_unknown(
+    tmp_path: Path,
+) -> None:
+    upload = _prepared_upload(tmp_path)
+    transfer = ConnectorTransferContext(uploads={("attachments", 0, "local_file"): upload})
+    transport = _Transport(body=b"{")
+    try:
+        with pytest.raises(
+            ConnectorOutcomeUnknown,
+            match=r"returned no usable receipt;.*do not retry automatically",
+        ):
+            GoogleConnectorAdapter().execute(
+                _operation("gmail", "messages.send"),
+                {
+                    "attachments": [{"filename": "note.txt", "mime_type": "text/plain"}],
+                    "text_body": "Hello",
+                    "to": ["recipient@example.test"],
+                },
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+                transfer=transfer,
+            )
+        assert [call["kind"] for call in transport.calls] == ["request", "stream"]
+    finally:
+        upload.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "values", "upload_path", "query", "metadata"),
+    (
+        (
+            "messages.send",
+            {},
+            "/upload/gmail/v1/users/me/messages/send",
+            (("uploadType", "resumable"),),
+            {},
+        ),
+        (
+            "messages.insert",
+            {
+                "deleted": False,
+                "internal_date_source": "receivedTime",
+                "label_ids": ["INBOX", "STARRED"],
+            },
+            "/upload/gmail/v1/users/me/messages",
+            (
+                ("uploadType", "resumable"),
+                ("internalDateSource", "receivedTime"),
+                ("deleted", "false"),
+            ),
+            {"labelIds": ["INBOX", "STARRED"]},
+        ),
+        (
+            "messages.import",
+            {
+                "deleted": True,
+                "internal_date_source": "dateHeader",
+                "label_ids": ["archive"],
+                "never_mark_spam": True,
+                "process_for_calendar": True,
+            },
+            "/upload/gmail/v1/users/me/messages/import",
+            (
+                ("uploadType", "resumable"),
+                ("internalDateSource", "dateHeader"),
+                ("neverMarkSpam", "true"),
+                ("processForCalendar", "true"),
+                ("deleted", "true"),
+            ),
+            {"labelIds": ["archive"]},
+        ),
+    ),
+)
+def test_gmail_raw_message_upload_uses_exact_snapshot_route_flags_and_safe_receipt(
+    tmp_path: Path,
+    name: str,
+    values: dict[str, object],
+    upload_path: str,
+    query: tuple[tuple[str, str], ...],
+    metadata: dict[str, object],
+) -> None:
+    content = (
+        b"Date: Sat, 1 Aug 2026 10:00:00 +0200\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: recipient@example.test\r\n"
+        b"Bcc: hidden@example.test\r\n"
+        b"Subject: Immutable raw message\r\n\r\nExact body bytes\x00\xff"
+    )
+    upload = _prepared_upload(tmp_path, content=content)
+    transport = _Transport(
+        body=json.dumps(
+            {
+                "historyId": "43",
+                "id": "message-2",
+                "labelIds": ["INBOX"],
+                "location": "private-upload-location",
+                "payload": {"headers": [{"name": "Subject", "value": "private"}]},
+                "raw": "private-raw",
+                "sizeEstimate": len(content),
+                "snippet": "private body preview",
+                "threadId": "thread-2",
+            }
+        ).encode()
+    )
+    try:
+        result = GoogleConnectorAdapter().execute(
+            _operation("gmail", name),
+            {
+                **values,
+                "local_file": {"grant_id": "grant", "relative_path": "message.eml"},
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+            write_idempotency_key="confirmed-raw-upload",
+        )
+
+        assert result.payload == {
+            "historyId": "43",
+            "id": "message-2",
+            "labelIds": ["INBOX"],
+            "sizeEstimate": len(content),
+            "threadId": "thread-2",
+        }
+        initiated, sent = transport.calls
+        assert initiated["kind"] == "request"
+        assert initiated["method"] is ConnectorMethod.POST
+        assert initiated["path"] == upload_path
+        assert initiated["query"] == query
+        assert initiated["json_body"] == metadata
+        assert initiated["headers"] == {
+            "X-Upload-Content-Length": str(len(content)),
+            "X-Upload-Content-Type": "message/rfc822",
+        }
+        assert initiated["expected_statuses"] == frozenset({200})
+        assert sent["kind"] == "stream"
+        assert sent["source"] is upload
+        assert b"".join(upload.iter_chunks()) == content
+        assert sent["content_length"] == len(content)
+        assert sent["content_type"] == "message/rfc822"
+        assert sent["credential"] is None
+        assert sent["expected_statuses"] == frozenset({200, 201})
+        assert "body" not in sent
+        assert "headers" not in sent
+    finally:
+        upload.close()
+
+
+def test_gmail_raw_message_upload_requires_confirmation_before_transport(tmp_path: Path) -> None:
+    upload = _prepared_upload(
+        tmp_path,
+        content=b"To: recipient@example.test\r\nSubject: One shot\r\n\r\nBody",
+    )
+    transport = _Transport()
+    try:
+        with pytest.raises(ValidationError, match="fresh confirmation"):
+            GoogleConnectorAdapter().execute(
+                _operation("gmail", "messages.send"),
+                {"local_file": {"grant_id": "grant", "relative_path": "message.eml"}},
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+                transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+            )
+        assert transport.calls == []
+    finally:
+        upload.close()
+
+
+@pytest.mark.parametrize("name", ("messages.send", "messages.insert", "messages.import"))
+def test_gmail_raw_selector_without_its_prepared_snapshot_fails_closed(
+    name: str,
+) -> None:
+    transport = _Transport()
+
+    with pytest.raises(ValidationError, match="matching prepared transfer"):
+        GoogleConnectorAdapter().execute(
+            _operation("gmail", name),
+            {"local_file": {"grant_id": "grant", "relative_path": "message.eml"}},
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-raw-upload",
+        )
+
+    assert transport.calls == []
+
+
+def test_gmail_ambiguous_raw_upload_initialization_sends_no_message_bytes(
+    tmp_path: Path,
+) -> None:
+    upload = _prepared_upload(
+        tmp_path,
+        content=b"To: recipient@example.test\r\nSubject: One shot\r\n\r\nBody",
+    )
+    transport = _OutcomeUnknownInitTransport()
+    try:
+        with pytest.raises(
+            ConnectorOutcomeUnknown,
+            match="no message bytes were sent, so request a fresh confirmation",
+        ):
+            GoogleConnectorAdapter().execute(
+                _operation("gmail", "messages.send"),
+                {"local_file": {"grant_id": "grant", "relative_path": "message.eml"}},
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+                transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+                write_idempotency_key="confirmed-raw-upload",
+            )
+        assert [call["kind"] for call in transport.calls] == ["request"]
+    finally:
+        upload.close()
+
+
+def test_gmail_malformed_success_receipt_is_outcome_unknown_and_not_replayed(
+    tmp_path: Path,
+) -> None:
+    upload = _prepared_upload(
+        tmp_path,
+        content=b"To: recipient@example.test\r\nSubject: One shot\r\n\r\nBody",
+    )
+    transport = _Transport(body=b"{")
+    try:
+        with pytest.raises(
+            ConnectorOutcomeUnknown,
+            match=r"returned no usable receipt;.*do not retry automatically",
+        ):
+            GoogleConnectorAdapter().execute(
+                _operation("gmail", "messages.send"),
+                {"local_file": {"grant_id": "grant", "relative_path": "message.eml"}},
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+                transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+                write_idempotency_key="confirmed-raw-upload",
+            )
+        assert [call["kind"] for call in transport.calls] == ["request", "stream"]
+    finally:
+        upload.close()
+
+
+def test_gmail_empty_success_receipt_is_outcome_unknown_and_not_replayed(
+    tmp_path: Path,
+) -> None:
+    upload = _prepared_upload(
+        tmp_path,
+        content=b"To: recipient@example.test\r\nSubject: One shot\r\n\r\nBody",
+    )
+    transport = _Transport(body=b"")
+    try:
+        with pytest.raises(
+            ConnectorOutcomeUnknown,
+            match=r"returned no usable receipt;.*do not retry automatically",
+        ):
+            GoogleConnectorAdapter().execute(
+                _operation("gmail", "messages.send"),
+                {"local_file": {"grant_id": "grant", "relative_path": "message.eml"}},
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+                transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+                write_idempotency_key="confirmed-raw-upload",
+            )
+        assert [call["kind"] for call in transport.calls] == ["request", "stream"]
+    finally:
+        upload.close()
+
+
+def test_gmail_identifierless_success_receipt_is_outcome_unknown_and_not_replayed(
+    tmp_path: Path,
+) -> None:
+    upload = _prepared_upload(
+        tmp_path,
+        content=b"To: recipient@example.test\r\nSubject: One shot\r\n\r\nBody",
+    )
+    transport = _Transport(body=b"{}")
+    try:
+        with pytest.raises(
+            ConnectorOutcomeUnknown,
+            match=r"returned no usable receipt;.*do not retry automatically",
+        ):
+            GoogleConnectorAdapter().execute(
+                _operation("gmail", "messages.send"),
+                {"local_file": {"grant_id": "grant", "relative_path": "message.eml"}},
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+                transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+                write_idempotency_key="confirmed-raw-upload",
+            )
+        assert [call["kind"] for call in transport.calls] == ["request", "stream"]
+    finally:
+        upload.close()
+
+
+def test_gmail_ambiguous_raw_dispatch_is_never_replayed(tmp_path: Path) -> None:
+    upload = _prepared_upload(
+        tmp_path,
+        content=b"To: recipient@example.test\r\nSubject: One shot\r\n\r\nBody",
+    )
+    transport = _DriveRecoveryTransport(
+        stream_outcomes=(ConnectorOutcomeUnknown("ambiguous final dispatch"),)
+    )
+    try:
+        with pytest.raises(ConnectorOutcomeUnknown, match="may already have been sent"):
+            GoogleConnectorAdapter().execute(
+                _operation("gmail", "messages.send"),
+                {"local_file": {"grant_id": "grant", "relative_path": "message.eml"}},
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+                transfer=ConnectorTransferContext(uploads={("local_file",): upload}),
+                write_idempotency_key="confirmed-raw-upload",
+            )
+        assert [call["kind"] for call in transport.calls] == ["request", "stream"]
+        assert transport.stream_outcomes == []
     finally:
         upload.close()
 
@@ -1210,7 +1680,8 @@ def test_gmail_local_file_reply_preserves_verified_headers_and_thread_metadata(
     ).encode()
     upload = _prepared_upload(tmp_path)
     transfer = ConnectorTransferContext(uploads={("attachments", 0, "local_file"): upload})
-    transport = _Transport(bodies=(metadata, b"{}"))
+    final_body = b'{"id":"message"}' if name == "messages.send" else b"{}"
+    transport = _Transport(body=final_body, bodies=(metadata,))
     try:
         GoogleConnectorAdapter().execute(
             _operation("gmail", name),

@@ -19,10 +19,12 @@ from continuity_kernel.connector_adapter import (
 )
 from continuity_kernel.connector_contract import ConnectorEffect, OperationSpec
 from continuity_kernel.connector_gmail_transfer import (
+    GMAIL_MIGRATION_UPLOAD_MAX_BYTES,
     GMAIL_UPLOAD_MAX_BYTES,
     GmailMessagePartBodyDecoder,
     GmailMimeAttachment,
     GmailMimeUpload,
+    gmail_raw_message_preview,
 )
 from continuity_kernel.connector_operations_google import GOOGLE_OPERATIONS
 from continuity_kernel.connector_transfer import (
@@ -49,11 +51,22 @@ _JSON_STATUSES: Final = frozenset({200, 201, 202})
 _DELETE_STATUSES: Final = frozenset({200, 202, 204})
 _MAX_CONTENT_BYTES: Final = 180_000
 _LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
-_GMAIL_LOCAL_UPLOAD_OPERATIONS: Final = frozenset(
+_GMAIL_ATTACHMENT_UPLOAD_OPERATIONS: Final = frozenset(
     {"drafts.create", "drafts.update", "messages.send"}
+)
+_GMAIL_RAW_UPLOAD_OPERATIONS: Final = frozenset(
+    {"messages.import", "messages.insert", "messages.send"}
+)
+_GMAIL_LOCAL_UPLOAD_OPERATIONS: Final = (
+    _GMAIL_ATTACHMENT_UPLOAD_OPERATIONS | _GMAIL_RAW_UPLOAD_OPERATIONS
 )
 _DRIVE_LOCAL_UPLOAD_OPERATIONS: Final = frozenset({"files.create", "files.update"})
 _GMAIL_MAX_RAW_ATTACHMENT_BYTES: Final = (GMAIL_UPLOAD_MAX_BYTES * 3) // 4
+_GMAIL_RESUMABLE_INIT_STATUSES: Final = frozenset({200})
+_GMAIL_RESUMABLE_FINAL_STATUSES: Final = frozenset({200, 201})
+_GMAIL_WRITE_RECEIPT_FIELDS: Final = frozenset(
+    {"historyId", "id", "labelIds", "sizeEstimate", "threadId"}
+)
 _DRIVE_MAX_LOCAL_FILE_BYTES: Final = 5 * 1024**4
 _DRIVE_RESUMABLE_INIT_STATUSES: Final = frozenset({200})
 _DRIVE_RESUMABLE_FINAL_STATUSES: Final = frozenset({200, 201})
@@ -144,7 +157,17 @@ class GoogleConnectorAdapter:
             raise ValidationError("Google operation is not in the Google catalog")
         if (
             operation.provider == "gmail"
-            and operation.name in _GMAIL_LOCAL_UPLOAD_OPERATIONS
+            and operation.name in _GMAIL_RAW_UPLOAD_OPERATIONS
+            and _gmail_raw_local_file_shape(input_value, path)
+        ):
+            return (
+                GMAIL_UPLOAD_MAX_BYTES
+                if operation.name == "messages.send"
+                else GMAIL_MIGRATION_UPLOAD_MAX_BYTES
+            )
+        if (
+            operation.provider == "gmail"
+            and operation.name in _GMAIL_ATTACHMENT_UPLOAD_OPERATIONS
             and _gmail_local_file_shape(input_value, path)
         ):
             return _GMAIL_MAX_RAW_ATTACHMENT_BYTES
@@ -155,6 +178,44 @@ class GoogleConnectorAdapter:
         ):
             return _DRIVE_MAX_LOCAL_FILE_BYTES
         raise ValidationError("Google local-file upload path is not permitted")
+
+    def prepared_confirmation_preview(
+        self,
+        operation: OperationSpec,
+        preview_value: object,
+        *,
+        transfer: ConnectorTransferContext,
+    ) -> object | None:
+        """Describe one immutable raw Gmail upload without provider access."""
+
+        if not isinstance(operation, OperationSpec):
+            raise ValidationError("Google operation is invalid")
+        expected = _GOOGLE_BY_KEY.get(operation.key)
+        if expected is None or operation != expected:
+            raise ValidationError("Google operation is not in the Google catalog")
+        if (
+            operation.provider != "gmail"
+            or operation.name not in _GMAIL_RAW_UPLOAD_OPERATIONS
+            or ("local_file",) not in transfer.uploads
+        ):
+            return None
+        if not isinstance(preview_value, Mapping):
+            raise ValidationError("Gmail raw-message preview input is invalid")
+
+        source = _gmail_effective_internal_date_source(operation.name, preview_value)
+        raw_message = gmail_raw_message_preview(
+            transfer.upload(("local_file",)),
+            strict_send=operation.name == "messages.send",
+            require_date=source == "dateHeader",
+        )
+        return {
+            "gmail_raw_message": {
+                **raw_message,
+                "consequences": _gmail_raw_upload_consequences(operation.name, preview_value),
+                "effective_internal_date_source": source,
+                "media_type": "message/rfc822",
+            }
+        }
 
     def classify_effect(
         self,
@@ -173,6 +234,23 @@ class GoogleConnectorAdapter:
         )
         if (credential is None) is not (transport is None):
             raise ValidationError("Google effect preflight requires credential and transport")
+        if (
+            operation.provider == "gmail"
+            and operation.name in _GMAIL_RAW_UPLOAD_OPERATIONS
+            and transfer is not None
+            and ("local_file",) in transfer.uploads
+        ):
+            source = _gmail_effective_internal_date_source(operation.name, values)
+            gmail_raw_message_preview(
+                transfer.upload(("local_file",)),
+                strict_send=operation.name == "messages.send",
+                require_date=source == "dateHeader",
+            )
+            if values.get("deleted") is True:
+                return ConnectorEffect.PERMANENT
+            if values.get("process_for_calendar") is True:
+                return ConnectorEffect.OUTWARD
+            return operation.effect
         if operation.provider == "gmail" and operation.name == "messages.send":
             reply_context = None
             if "reply_to_message_id" in values or "thread_id" in values:
@@ -186,7 +264,7 @@ class GoogleConnectorAdapter:
             return operation.effect
         if (
             operation.provider == "gmail"
-            and operation.name in _GMAIL_LOCAL_UPLOAD_OPERATIONS
+            and operation.name in _GMAIL_ATTACHMENT_UPLOAD_OPERATIONS
             and transfer is not None
             and _gmail_has_local_attachment(values, transfer)
         ):
@@ -248,6 +326,17 @@ class GoogleConnectorAdapter:
             raise ValidationError(
                 "Google Drive binary uploads require a fresh outward confirmation"
             )
+        if (
+            operation.provider == "gmail"
+            and operation.name in _GMAIL_RAW_UPLOAD_OPERATIONS
+            and "local_file" in values
+        ):
+            if transfer is None or ("local_file",) not in transfer.uploads:
+                raise ValidationError(
+                    "Gmail raw-message local_file requires its matching prepared transfer"
+                )
+            if not write_idempotency_key:
+                raise ValidationError("Gmail raw-message uploads require a fresh confirmation")
         if not operation.scope_grant_satisfies(credential.granted_scopes):
             raise ValidationError("connector credential does not satisfy the operation scope")
         if (
@@ -320,11 +409,24 @@ def _gmail_prepared_validation_input(
         or not isinstance(input_value, Mapping)
     ):
         return input_value
-    raw_attachments = input_value.get("attachments")
-    if not isinstance(raw_attachments, list):
-        return input_value
-    attachments: list[object] = []
+    result: dict[str, object] = dict(input_value)
     changed = False
+    if (
+        operation.name in _GMAIL_RAW_UPLOAD_OPERATIONS
+        and "local_file" not in result
+        and transfer is not None
+        and ("local_file",) in transfer.uploads
+    ):
+        result["local_file"] = {
+            "grant_id": "prepared",
+            "relative_path": "prepared",
+        }
+        changed = True
+
+    raw_attachments = result.get("attachments")
+    if not isinstance(raw_attachments, list):
+        return result if changed else input_value
+    attachments: list[object] = []
     for index, item in enumerate(raw_attachments):
         if not isinstance(item, Mapping):
             attachments.append(item)
@@ -345,7 +447,6 @@ def _gmail_prepared_validation_input(
         changed = True
     if not changed:
         return input_value
-    result = dict(input_value)
     result["attachments"] = attachments
     return result
 
@@ -368,6 +469,53 @@ def _gmail_local_file_shape(input_value: object, path: ConnectorInputPath) -> bo
     return (
         isinstance(attachment, Mapping) and attachment.get("local_file") == _LOCAL_FILE_LIMIT_MARKER
     )
+
+
+def _gmail_raw_local_file_shape(input_value: object, path: ConnectorInputPath) -> bool:
+    return (
+        path == ("local_file",)
+        and isinstance(input_value, Mapping)
+        and input_value.get("local_file") == _LOCAL_FILE_LIMIT_MARKER
+    )
+
+
+def _gmail_effective_internal_date_source(
+    operation_name: str,
+    values: Mapping[str, object],
+) -> str | None:
+    if operation_name == "messages.send":
+        return None
+    default = "dateHeader" if operation_name == "messages.import" else "receivedTime"
+    source = values.get("internal_date_source", default)
+    if not isinstance(source, str) or source not in {"dateHeader", "receivedTime"}:
+        raise ValidationError("Gmail internal-date source is invalid")
+    return source
+
+
+def _gmail_raw_upload_consequences(
+    operation_name: str,
+    values: Mapping[str, object],
+) -> list[str]:
+    if operation_name == "messages.send":
+        return ["Gmail will send the exact RFC822 message to every To, Cc, and Bcc recipient"]
+    consequences = [
+        "Gmail will store the exact RFC822 message without sending its listed recipients"
+    ]
+    if values.get("deleted") is True:
+        consequences.append(
+            "The message will be permanently deleted rather than moved to Trash; this is "
+            "Google Workspace only and remains visible only to Google Vault administrators"
+        )
+    if values.get("process_for_calendar") is True:
+        consequences.append(
+            "Gmail may extract meeting data and add it to the connected user's Google Calendar"
+        )
+    if values.get("never_mark_spam") is True:
+        consequences.append(
+            "Gmail will ignore its spam-classifier decision for this import; Gmail's import "
+            "path performs no SPF checks"
+        )
+    return consequences
 
 
 def _drive_local_file_shape(input_value: object, path: ConnectorInputPath) -> bool:
@@ -493,6 +641,18 @@ def _execute_gmail(
             path=f"{base}/labels/{_segment(_required(values, 'label_id'))}",
             credential=credential,
         )
+    if (
+        name in _GMAIL_RAW_UPLOAD_OPERATIONS
+        and transfer is not None
+        and ("local_file",) in transfer.uploads
+    ):
+        return _gmail_raw_message_upload(
+            transport,
+            operation_name=name,
+            credential=credential,
+            values=values,
+            upload=transfer.upload(("local_file",)),
+        )
     if name in {"drafts.create", "drafts.update", "messages.send"}:
         draft_path = f"{base}/drafts"
         method = ConnectorMethod.POST
@@ -524,9 +684,20 @@ def _execute_gmail(
                 reply_context=reply_context,
                 transfer=transfer,
                 metadata=metadata,
+                privacy_safe_receipt=name == "messages.send",
             )
         message = _gmail_message(values, reply_context=reply_context)
         json_body = message if name == "messages.send" else {"message": message}
+        if name == "messages.send":
+            response = transport.request(
+                origin=ConnectorOrigin.GMAIL,
+                method=method,
+                path=draft_path,
+                credential=credential.credential,
+                json_body=json_body,
+                expected_statuses=_JSON_STATUSES,
+            )
+            return _gmail_message_write_receipt(response, action="sent")
         return _json_request(
             transport,
             origin=ConnectorOrigin.GMAIL,
@@ -1914,6 +2085,55 @@ def _json_result(payload: object, *, strip_upload_location: bool = False) -> Con
     )
 
 
+def _gmail_message_write_result(payload: object) -> ConnectorAdapterResult:
+    """Return only provider identifiers needed to reconcile a completed Gmail write."""
+
+    if not isinstance(payload, Mapping):
+        return ConnectorAdapterResult({})
+    receipt: dict[str, object] = {}
+    for name in _GMAIL_WRITE_RECEIPT_FIELDS:
+        value = payload.get(name)
+        if name == "sizeEstimate":
+            if type(value) is int and 0 <= value <= 2**63 - 1:
+                receipt[name] = value
+            continue
+        if name == "labelIds":
+            if (
+                isinstance(value, list)
+                and len(value) <= 1_000
+                and all(isinstance(item, str) and 0 < len(item) <= 1_024 for item in value)
+            ):
+                receipt[name] = value
+            continue
+        if isinstance(value, str) and 0 < len(value) <= 2_048:
+            receipt[name] = value
+    return ConnectorAdapterResult(receipt)
+
+
+def _gmail_message_write_receipt(
+    response: ConnectorResponse | ConnectorStreamResponse,
+    *,
+    action: str,
+) -> ConnectorAdapterResult:
+    """Parse one irreversible Gmail write receipt without inviting a duplicate retry."""
+
+    unusable_receipt = (
+        "Gmail accepted the message write but returned no usable receipt; it may already "
+        f"have been {action}, so do not retry automatically and reconcile provider state "
+        "before any manual retry"
+    )
+    try:
+        payload = response.json()
+    except ConnectorProviderError as exc:
+        raise ConnectorOutcomeUnknown(unusable_receipt) from exc
+    if not isinstance(payload, Mapping):
+        raise ConnectorOutcomeUnknown(unusable_receipt)
+    receipt = _gmail_message_write_result(payload)
+    if not isinstance(receipt.payload, Mapping) or "id" not in receipt.payload:
+        raise ConnectorOutcomeUnknown(unusable_receipt)
+    return receipt
+
+
 def _provider_mapping(result: ConnectorAdapterResult, *, context: str) -> Mapping[str, object]:
     if not isinstance(result.payload, Mapping):
         raise ValidationError(f"{context} returned an invalid resource")
@@ -2761,22 +2981,18 @@ def _gmail_resumable_message_upload(
     reply_context: _GmailReplyContext | None,
     transfer: ConnectorTransferContext,
     metadata: Mapping[str, object],
+    privacy_safe_receipt: bool,
 ) -> ConnectorAdapterResult:
     mime = _gmail_mime_upload(values, transfer, reply_context=reply_context)
-    initiated = transport.request(
-        origin=ConnectorOrigin.GMAIL,
+    location = _gmail_resumable_upload_location(
+        transport,
         method=method,
-        path=f"/upload{upload_path}",
-        credential=credential.credential,
+        upload_path=upload_path,
+        credential=credential,
         query=(("uploadType", "resumable"),),
-        json_body=dict(metadata),
-        headers={
-            "X-Upload-Content-Length": str(mime.size),
-            "X-Upload-Content-Type": "message/rfc822",
-        },
-        expected_statuses=_JSON_STATUSES,
+        metadata=metadata,
+        size=mime.size,
     )
-    location = _response_location(initiated.headers)
     uploaded = transport.request_stream(
         origin=ConnectorOrigin.GMAIL,
         method=ConnectorMethod.PUT,
@@ -2785,9 +3001,110 @@ def _gmail_resumable_message_upload(
         location=location,
         credential=None,
         content_type="message/rfc822",
-        expected_statuses=_JSON_STATUSES,
+        expected_statuses=_GMAIL_RESUMABLE_FINAL_STATUSES,
     )
-    return _json_result(uploaded.json(), strip_upload_location=True)
+    if privacy_safe_receipt:
+        return _gmail_message_write_receipt(uploaded, action="sent")
+    payload = uploaded.json()
+    return _json_result(payload, strip_upload_location=True)
+
+
+def _gmail_raw_message_upload(
+    transport: ConnectorTransport,
+    *,
+    operation_name: str,
+    credential: ConnectorRuntimeCredential,
+    values: Mapping[str, object],
+    upload: PreparedUpload,
+) -> ConnectorAdapterResult:
+    source = _gmail_effective_internal_date_source(operation_name, values)
+    gmail_raw_message_preview(
+        upload,
+        strict_send=operation_name == "messages.send",
+        require_date=source == "dateHeader",
+    )
+    upload_path = {
+        "messages.import": "/gmail/v1/users/me/messages/import",
+        "messages.insert": "/gmail/v1/users/me/messages",
+        "messages.send": "/gmail/v1/users/me/messages/send",
+    }.get(operation_name)
+    if upload_path is None:  # pragma: no cover - guarded by the finite operation set
+        raise ValidationError("Gmail raw-message operation is invalid")
+    metadata: dict[str, object] = {}
+    if "label_ids" in values:
+        metadata["labelIds"] = _strings(values["label_ids"])
+    query: list[tuple[str, str]] = [("uploadType", "resumable")]
+    query.extend(
+        _optional_query(
+            dict(values),
+            {
+                "internal_date_source": "internalDateSource",
+                "never_mark_spam": "neverMarkSpam",
+                "process_for_calendar": "processForCalendar",
+                "deleted": "deleted",
+            },
+        )
+    )
+    try:
+        location = _gmail_resumable_upload_location(
+            transport,
+            method=ConnectorMethod.POST,
+            upload_path=upload_path,
+            credential=credential,
+            query=tuple(query),
+            metadata=metadata,
+            size=upload.size,
+        )
+    except ConnectorOutcomeUnknown as exc:
+        raise ConnectorOutcomeUnknown(
+            "Gmail raw-message upload session could not be confirmed; no message bytes were "
+            "sent, so request a fresh confirmation before retrying"
+        ) from exc
+    try:
+        uploaded = transport.request_stream(
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.PUT,
+            source=upload,
+            content_length=upload.size,
+            location=location,
+            credential=None,
+            content_type="message/rfc822",
+            expected_statuses=_GMAIL_RESUMABLE_FINAL_STATUSES,
+        )
+    except ConnectorOutcomeUnknown as exc:
+        action = "sent" if operation_name == "messages.send" else "created"
+        raise ConnectorOutcomeUnknown(
+            f"Gmail raw-message outcome is unknown and may already have been {action}; "
+            "do not retry automatically, and reconcile provider state before any manual retry"
+        ) from exc
+    action = "sent" if operation_name == "messages.send" else "created"
+    return _gmail_message_write_receipt(uploaded, action=action)
+
+
+def _gmail_resumable_upload_location(
+    transport: ConnectorTransport,
+    *,
+    method: ConnectorMethod,
+    upload_path: str,
+    credential: ConnectorRuntimeCredential,
+    query: Sequence[tuple[str, str]],
+    metadata: Mapping[str, object],
+    size: int,
+) -> str:
+    initiated = transport.request(
+        origin=ConnectorOrigin.GMAIL,
+        method=method,
+        path=f"/upload{upload_path}",
+        credential=credential.credential,
+        query=query,
+        json_body=dict(metadata),
+        headers={
+            "X-Upload-Content-Length": str(size),
+            "X-Upload-Content-Type": "message/rfc822",
+        },
+        expected_statuses=_GMAIL_RESUMABLE_INIT_STATUSES,
+    )
+    return _response_location(initiated.headers)
 
 
 def _gmail_header_message(

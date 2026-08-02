@@ -35,6 +35,8 @@ _EXPECTED_NAMES = {
         "messages.modify",
         "messages.batch_modify",
         "messages.batch_purge",
+        "messages.import",
+        "messages.insert",
         "messages.trash",
         "messages.restore",
         "messages.purge",
@@ -124,11 +126,11 @@ def test_google_provider_mode_partitions_and_exact_operation_surface() -> None:
         for provider in _EXPECTED_NAMES
     }
     assert names == _EXPECTED_NAMES
-    assert len(GOOGLE_OPERATIONS) == 72
+    assert len(GOOGLE_OPERATIONS) == 74
     assert {
         provider: sum(item.provider == provider for item in GOOGLE_OPERATIONS) for provider in names
     } == {
-        "gmail": 29,
+        "gmail": 31,
         "google_calendar": 14,
         "google_drive": 29,
     }
@@ -145,6 +147,8 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
         ("gmail", "messages.modify"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "messages.batch_modify"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "messages.batch_purge"): ConnectorEffect.PERMANENT,
+        ("gmail", "messages.import"): ConnectorEffect.SAFE_MUTATION,
+        ("gmail", "messages.insert"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "messages.trash"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "messages.restore"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "messages.purge"): ConnectorEffect.PERMANENT,
@@ -307,15 +311,66 @@ def test_gmail_send_requires_at_least_one_nonempty_recipient_group() -> None:
         values = {**recipients, "text_body": "Hello"}
         assert send.validate_input(values) == values
 
+    local_file = {"grant_id": "grant", "relative_path": "message.eml"}
+    assert send.validate_input({"local_file": local_file}) == {"local_file": local_file}
+
     for invalid in (
         {},
         {"text_body": "Hello"},
         {"text_body": "Hello", "to": []},
         {"cc": [], "text_body": "Hello"},
         {"bcc": [], "text_body": "Hello"},
+        {"local_file": local_file, "to": ["recipient@example.test"]},
+        {"local_file": local_file, "subject": "Caller-supplied override"},
     ):
         with pytest.raises(ValidationError):
             send.validate_input(invalid)
+
+
+def test_gmail_insert_and_import_expose_exact_migration_controls() -> None:
+    local_file = {"grant_id": "grant", "relative_path": "message.eml"}
+    labels = [f"Label_{index}" for index in range(100)]
+    insert = _operation("gmail", ConnectorMode.WRITE, "messages.insert")
+    importing = _operation("gmail", ConnectorMode.WRITE, "messages.import")
+
+    assert insert.validate_input(
+        {
+            "deleted": True,
+            "internal_date_source": "receivedTime",
+            "label_ids": labels,
+            "local_file": local_file,
+        }
+    ) == {
+        "deleted": True,
+        "internal_date_source": "receivedTime",
+        "label_ids": labels,
+        "local_file": local_file,
+    }
+    assert importing.validate_input(
+        {
+            "internal_date_source": "dateHeader",
+            "local_file": local_file,
+            "never_mark_spam": True,
+            "process_for_calendar": True,
+        }
+    ) == {
+        "internal_date_source": "dateHeader",
+        "local_file": local_file,
+        "never_mark_spam": True,
+        "process_for_calendar": True,
+    }
+
+    for operation, invalid in (
+        (insert, {}),
+        (insert, {"local_file": local_file, "never_mark_spam": True}),
+        (insert, {"local_file": local_file, "process_for_calendar": True}),
+        (insert, {"internal_date_source": "other", "local_file": local_file}),
+        (insert, {"label_ids": [], "local_file": local_file}),
+        (insert, {"label_ids": [*labels, "extra"], "local_file": local_file}),
+        (importing, {"local_file": local_file, "unknown": True}),
+    ):
+        with pytest.raises(ValidationError):
+            operation.validate_input(invalid)
 
 
 def test_google_catalog_validates_representative_rich_inputs() -> None:

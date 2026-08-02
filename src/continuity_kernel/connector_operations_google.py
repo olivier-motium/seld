@@ -148,7 +148,8 @@ def _mail_fields() -> dict[str, object]:
 
 def _gmail_send() -> dict[str, object]:
     fields = _mail_fields()
-    schema = _object(fields)
+    local_file = _local_file()
+    schema = _object({**fields, "local_file": local_file})
     schema["oneOf"] = [
         _object(fields, required=("to",)),
         _object(
@@ -159,8 +160,29 @@ def _gmail_send() -> dict[str, object]:
             {name: field for name, field in fields.items() if name not in {"cc", "to"}},
             required=("bcc",),
         ),
+        _object({"local_file": local_file}, required=("local_file",)),
     ]
     return schema
+
+
+def _gmail_migration(*, importing: bool) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "deleted": {"type": "boolean"},
+        "internal_date_source": {
+            "enum": ["dateHeader", "receivedTime"],
+            "type": "string",
+        },
+        "label_ids": _array(_id(), maximum=100, minimum=1),
+        "local_file": _local_file(),
+    }
+    if importing:
+        fields.update(
+            {
+                "never_mark_spam": {"type": "boolean"},
+                "process_for_calendar": {"type": "boolean"},
+            }
+        )
+    return _object(fields, required=("local_file",))
 
 
 def _mail_list() -> dict[str, object]:
@@ -926,6 +948,22 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.OUTWARD,
         _GMAIL_WRITE_SCOPES,
         _gmail_send(),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "messages.insert",
+        ConnectorEffect.SAFE_MUTATION,
+        _GMAIL_WRITE_SCOPES,
+        _gmail_migration(importing=False),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.WRITE,
+        "messages.import",
+        ConnectorEffect.SAFE_MUTATION,
+        _GMAIL_WRITE_SCOPES,
+        _gmail_migration(importing=True),
     ),
     _operation(
         "gmail",

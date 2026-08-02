@@ -265,16 +265,16 @@ def test_identity_confirmation_shows_exact_account_and_defaults_to_no(
 @pytest.mark.parametrize(
     ("access", "permanent_delete", "expected_phrases"),
     [
-        (ConnectorAccessTier.READ, False, ("not available with Read",)),
+        (ConnectorAccessTier.READ, False, ("Explicit Gmail purge", "not available with Read")),
         (
             ConnectorAccessTier.FULL,
             False,
-            ("Permanent delete: off", "go to the Trash", "recoverable"),
+            ("Explicit Gmail purge: off", "recoverable Trash", "deleted=true", "permanently"),
         ),
         (
             ConnectorAccessTier.FULL,
             True,
-            ("Permanent delete: ON", "skipping the Trash", "cannot be undone"),
+            ("Explicit Gmail purge: ON", "skipping the Trash", "cannot be undone"),
         ),
     ],
 )
@@ -321,7 +321,7 @@ def test_legacy_google_confirmation_still_discloses_permanent_gmail_deletion(
 
     assert cli._confirm_connector_identity(review) is False
     stderr = capsys.readouterr().err
-    assert "Permanent delete: ON" in stderr
+    assert "Explicit Gmail purge: ON" in stderr
     assert "Gmail messages" in stderr
     assert "cannot be undone" in stderr
 

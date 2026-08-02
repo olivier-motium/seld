@@ -816,17 +816,18 @@ def _confirm_connector_identity(review: ConnectorIdentityReview) -> bool:
         lines.append(f"Permission update: {review.permission_update}")
     if review.permanent_delete:
         lines.append(
-            "Permanent delete: ON — Seld can permanently erase Gmail messages, "
-            "skipping the Trash. This cannot be undone."
+            "Explicit Gmail purge: ON — Seld can permanently erase Gmail messages, threads, or "
+            "batches, skipping the Trash. This cannot be undone."
         )
     elif review.connector == "gmail":
         if review.access is ConnectorAccessTier.FULL:
             lines.append(
-                "Permanent delete: off — deleted Gmail messages go to the Trash and are "
-                "recoverable."
+                "Explicit Gmail purge: off — ordinary delete operations use recoverable Trash. "
+                "A separately confirmed raw-message migration can still use deleted=true to "
+                "skip Trash permanently."
             )
         else:
-            lines.append("Permanent delete: not available with Read access.")
+            lines.append("Explicit Gmail purge: not available with Read access.")
     print("\n".join(lines), file=sys.stderr)
     return _confirm("Use this account? [y/N] ")
 
