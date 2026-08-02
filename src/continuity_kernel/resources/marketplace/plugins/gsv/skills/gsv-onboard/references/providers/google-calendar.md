@@ -104,6 +104,22 @@ auto-decline and changing only a private local preference remain one-step.
 Deleting a status event or moving its time interval does not promise to reverse
 invitations Google already declined.
 
+Birthday events also use `events.create` and `events.update`. Create one with
+`event_type: birthday`, a one-day all-day start/end pair, and optionally only a
+summary, color, or reminders. Seld fixes the provider-owned shape to private
+and transparent with annual recurrence. A February 29 birthday uses Google's
+last-day-of-February recurrence rule. It does not send `birthdayProperties`,
+because Google's optional fixed `birthday` type adds no user choice.
+
+Birthday updates first read the live `eventType` and may change only the
+summary, color, reminders, or one-day all-day date pair. A date linked to Google
+Contacts must be edited in Contacts; the account owner's date must be edited in
+the Google Account profile. Deleting a Calendar birthday does not change either
+source. These operations use the existing Calendar grant and do not require a
+new OAuth scope. A birthday on `primary` is private and one-step. Creating one,
+or changing its summary, color, or date on another calendar, requires outward
+confirmation; a reminder-only change remains a one-step local preference.
+
 Move, RSVP, event deletion, and whole-calendar deletion require the reviewed
 event or CalendarList snapshot returned by the preceding read. The connector
 shows that human target in the preview, re-reads it, compares the ETag and

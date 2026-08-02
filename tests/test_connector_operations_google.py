@@ -1323,7 +1323,7 @@ def test_gmail_normal_message_bodies_allow_the_documented_bound() -> None:
         operation.validate_input({"text_body": body + "x"})
 
 
-def test_calendar_status_event_schemas_are_typed_without_new_operations() -> None:
+def test_calendar_special_event_schemas_are_typed_without_new_operations() -> None:
     create = _operation("google_calendar", ConnectorMode.WRITE, "events.create")
     update = _operation("google_calendar", ConnectorMode.WRITE, "events.update")
     focus = {
@@ -1338,6 +1338,17 @@ def test_calendar_status_event_schemas_are_typed_without_new_operations() -> Non
         "start": {"date_time": "2026-08-02T10:00:00+02:00"},
     }
     assert create.validate_input(focus) == focus
+
+    birthday = {
+        "calendar_id": "primary",
+        "color_id": "7",
+        "end": {"date": "2026-08-03"},
+        "event_type": "birthday",
+        "reminders": {"use_default": True},
+        "start": {"date": "2026-08-02"},
+        "summary": "Birthday",
+    }
+    assert create.validate_input(birthday) == birthday
 
     working_location = {
         "calendar_id": "primary",

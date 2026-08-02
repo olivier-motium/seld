@@ -134,7 +134,8 @@ _OPERATION_WARNINGS: Final = {
         "Deleting an organized event cancels it for guests. Google usually keeps deleted "
         "events in Trash temporarily, but recurring-event recovery differs; send_updates=none "
         "can leave external calendars stale and may not suppress every email. Deleting focus-time "
-        "or out-of-office events does not reverse invitations Google already declined."
+        "or out-of-office events does not reverse invitations Google already declined. Deleting "
+        "a birthday from Calendar does not change its Google Contact or Google Account profile."
     ),
     (
         "google_calendar",

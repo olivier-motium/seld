@@ -407,7 +407,12 @@ class GoogleConnectorAdapter:
                     None,
                     catalog_effect=operation.effect,
                 )
-            event = _calendar_event_mutation_preflight(values, credential, transport)
+            event = _calendar_event_mutation_preflight(
+                values,
+                credential,
+                transport,
+                operation_name=operation.name,
+            )
             return _calendar_event_effect(
                 operation.name,
                 values,
@@ -462,7 +467,12 @@ class GoogleConnectorAdapter:
                 _calendar_event_body(values, is_create=False, require_change=True)
             event = None
             if operation.name != "events.respond":
-                event = _calendar_event_mutation_preflight(values, credential, transport)
+                event = _calendar_event_mutation_preflight(
+                    values,
+                    credential,
+                    transport,
+                    operation_name=operation.name,
+                )
             effect = _calendar_event_effect(
                 operation.name,
                 values,
@@ -1565,7 +1575,12 @@ def _execute_calendar(
             f"{base}/calendars/{_segment(_required(values, 'calendar_id'))}/events/"
             f"{_segment(_required(values, 'event_id'))}"
         )
-        event = _calendar_event_mutation_preflight(values, credential, transport)
+        event = _calendar_event_mutation_preflight(
+            values,
+            credential,
+            transport,
+            operation_name="events.respond",
+        )
         attendee, etag = _calendar_self_attendee(event, values)
         return _calendar_write_request(
             transport,
@@ -3162,6 +3177,8 @@ def _calendar_body(values: Mapping[str, object], *, require_change: bool) -> dic
 def _calendar_event_body(
     values: Mapping[str, object], *, is_create: bool, require_change: bool
 ) -> dict[str, object]:
+    if is_create and values.get("event_type") == "birthday":
+        return _calendar_birthday_event_body(values)
     body = _selected(
         values,
         {
@@ -3240,6 +3257,44 @@ def _calendar_event_body(
         _validate_calendar_status_event_create(values)
     if require_change and not body:
         raise ValidationError("Google Calendar event update requires at least one changed field")
+    return body
+
+
+def _calendar_birthday_event_body(values: Mapping[str, object]) -> dict[str, object]:
+    supported = {
+        "calendar_id",
+        "color_id",
+        "end",
+        "event_type",
+        "reminders",
+        "start",
+        "summary",
+    }
+    if not set(values).issubset(supported):
+        raise ValidationError(
+            "Google Calendar birthday creation supports only summary, color, reminders, "
+            "and one-day all-day dates"
+        )
+    start_date, end_date = _validate_calendar_birthday_span(
+        _required_value(values, "start"),
+        _required_value(values, "end"),
+        submitted_start=True,
+        submitted_end=True,
+    )
+    recurrence = "RRULE:FREQ=YEARLY"
+    if (start_date.month, start_date.day) == (2, 29):
+        recurrence = "RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=-1"
+    body: dict[str, object] = {
+        "end": {"date": end_date.isoformat()},
+        "eventType": "birthday",
+        "recurrence": [recurrence],
+        "start": {"date": start_date.isoformat()},
+        "transparency": "transparent",
+        "visibility": "private",
+    }
+    body.update(_selected(values, {"color_id": "colorId", "summary": "summary"}))
+    if "reminders" in values:
+        body["reminders"] = _calendar_reminders(values["reminders"])
     return body
 
 
@@ -3849,6 +3904,8 @@ def _calendar_event_mutation_preflight(
     values: Mapping[str, object],
     credential: ConnectorRuntimeCredential,
     transport: ConnectorTransport,
+    *,
+    operation_name: str,
 ) -> Mapping[str, object]:
     path = (
         "/calendar/v3/calendars/"
@@ -3887,6 +3944,8 @@ def _calendar_event_mutation_preflight(
                 "normalize the reviewed read to the documented confirmation shape"
             )
     _validate_calendar_status_event_update(values, event)
+    if operation_name == "events.update":
+        _validate_calendar_birthday_event_update(values, event)
     if values.get("recurrence"):
         _validate_calendar_recurrence_time_zones(
             values.get("start", event.get("start")),
@@ -3919,6 +3978,8 @@ def _calendar_event_preflight_fields(values: Mapping[str, object]) -> str:
                 "hangoutLink",
             )
         )
+    if "start" in values or "end" in values:
+        fields.append("birthdayProperties(contact,type)")
     fields.extend(
         (
             "focusTimeProperties(autoDeclineMode,chatStatus,declineMessage)",
@@ -3940,6 +4001,96 @@ def _calendar_event_preflight_fields(values: Mapping[str, object]) -> str:
         )
     )
     return ",".join(fields)
+
+
+def _validate_calendar_birthday_event_update(
+    values: Mapping[str, object], event: Mapping[str, object]
+) -> None:
+    if event.get("eventType") != "birthday":
+        return
+    supported = {
+        "calendar_id",
+        "color_id",
+        "end",
+        "etag",
+        "event_id",
+        "reminders",
+        "start",
+        "summary",
+    }
+    if not set(values).issubset(supported):
+        raise ValidationError(
+            "Google Calendar birthday updates support only summary, color, reminders, "
+            "and one-day all-day dates"
+        )
+    if "start" not in values and "end" not in values:
+        return
+    properties_raw = event.get("birthdayProperties")
+    if properties_raw is None:
+        properties: Mapping[str, object] = {}
+    elif isinstance(properties_raw, Mapping):
+        properties = properties_raw
+    else:
+        raise ValidationError("Google Calendar birthday properties are invalid")
+    contact = properties.get("contact")
+    if contact is not None and not isinstance(contact, str):
+        raise ValidationError("Google Calendar birthday properties are invalid")
+    if contact:
+        raise ValidationError(
+            "Google Calendar birthday date is linked to Google Contacts; "
+            "edit it in Google Contacts instead"
+        )
+    birthday_type = properties.get("type")
+    if birthday_type is not None and not isinstance(birthday_type, str):
+        raise ValidationError("Google Calendar birthday properties are invalid")
+    if birthday_type == "self":
+        raise ValidationError(
+            "Google Calendar owner's birthday date must be edited in the Google Account profile"
+        )
+    if birthday_type not in {None, "birthday"}:
+        raise ValidationError(
+            "Google Calendar linked special dates must be edited in Google Contacts"
+        )
+    _validate_calendar_birthday_span(
+        values.get("start", event.get("start")),
+        values.get("end", event.get("end")),
+        submitted_start="start" in values,
+        submitted_end="end" in values,
+    )
+
+
+def _validate_calendar_birthday_span(
+    start: object,
+    end: object,
+    *,
+    submitted_start: bool,
+    submitted_end: bool,
+) -> tuple[date, date]:
+    start_date = _calendar_birthday_date(
+        start,
+        context="Google Calendar birthday start",
+        submitted=submitted_start,
+    )
+    end_date = _calendar_birthday_date(
+        end,
+        context="Google Calendar birthday end",
+        submitted=submitted_end,
+    )
+    if end_date - start_date != timedelta(days=1):
+        raise ValidationError(
+            "Google Calendar birthdays must span exactly one all-day calendar day"
+        )
+    return start_date, end_date
+
+
+def _calendar_birthday_date(value: object, *, context: str, submitted: bool) -> date:
+    if not isinstance(value, Mapping):
+        raise ValidationError(f"{context} must be an all-day date")
+    if submitted and set(value) != {"date"}:
+        raise ValidationError(f"{context} must contain only an all-day date")
+    if "date" not in value or "date_time" in value or "dateTime" in value:
+        raise ValidationError(f"{context} must be an all-day date")
+    return _calendar_date(value["date"], context=context)
 
 
 def _validate_calendar_status_event_update(

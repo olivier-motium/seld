@@ -742,7 +742,7 @@ def _calendar_event_create_schema() -> dict[str, object]:
             **event_fields,
             "event_id": _calendar_client_event_id(),
             "event_type": {
-                "enum": ["focusTime", "outOfOffice", "workingLocation"],
+                "enum": ["birthday", "focusTime", "outOfOffice", "workingLocation"],
                 "type": "string",
             },
         },

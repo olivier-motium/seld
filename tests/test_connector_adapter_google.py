@@ -4786,6 +4786,251 @@ def test_calendar_status_creates_shape_fixed_provider_bodies_and_effects() -> No
     }
 
 
+def test_calendar_birthday_creates_shape_fixed_provider_bodies_and_effects() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.create")
+    birthday = {
+        "calendar_id": "primary",
+        "color_id": "7",
+        "end": {"date": "2026-08-03"},
+        "event_type": "birthday",
+        "reminders": {
+            "overrides": [{"delivery": "popup", "minutes": 60}],
+            "use_default": False,
+        },
+        "start": {"date": "2026-08-02"},
+        "summary": "Birthday",
+    }
+    assert adapter.classify_effect(operation, birthday) is ConnectorEffect.SAFE_MUTATION
+
+    transport = _Transport()
+    adapter.execute(
+        operation,
+        birthday,
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    assert transport.calls[0]["json_body"] == {
+        "colorId": "7",
+        "end": {"date": "2026-08-03"},
+        "eventType": "birthday",
+        "recurrence": ["RRULE:FREQ=YEARLY"],
+        "reminders": {
+            "overrides": [{"method": "popup", "minutes": 60}],
+            "useDefault": False,
+        },
+        "start": {"date": "2026-08-02"},
+        "summary": "Birthday",
+        "transparency": "transparent",
+        "visibility": "private",
+    }
+    assert "birthdayProperties" not in transport.calls[0]["json_body"]
+
+    leap_day = {
+        "calendar_id": "primary",
+        "end": {"date": "2024-03-01"},
+        "event_type": "birthday",
+        "start": {"date": "2024-02-29"},
+    }
+    leap_transport = _Transport()
+    adapter.execute(
+        operation,
+        leap_day,
+        continuation=None,
+        credential=_credential(),
+        transport=leap_transport,
+    )
+    assert leap_transport.calls[0]["json_body"]["recurrence"] == [
+        "RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=-1"
+    ]
+    assert (
+        adapter.classify_effect(operation, {**birthday, "calendar_id": "shared"})
+        is ConnectorEffect.OUTWARD
+    )
+
+
+def test_calendar_birthday_create_invariants_fail_before_transport() -> None:
+    operation = _operation("google_calendar", "events.create")
+    common = {"calendar_id": "primary", "event_type": "birthday"}
+    invalid_values = (
+        {
+            **common,
+            "end": {"date_time": "2026-08-02T10:00:00+02:00"},
+            "start": {"date_time": "2026-08-02T09:00:00+02:00"},
+        },
+        {
+            **common,
+            "end": {"date": "2026-08-04"},
+            "start": {"date": "2026-08-02"},
+        },
+        {
+            **common,
+            "description": "Provider does not accept this on birthdays",
+            "end": {"date": "2026-08-03"},
+            "start": {"date": "2026-08-02"},
+        },
+        {
+            **common,
+            "end": {"date": "2026-08-03"},
+            "start": {"date": "2026-08-02", "time_zone": "Europe/Brussels"},
+        },
+    )
+    for values in invalid_values:
+        transport = _Transport()
+        with pytest.raises(ValidationError):
+            GoogleConnectorAdapter().execute(
+                operation,
+                values,
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+            )
+        assert transport.calls == []
+
+
+def test_calendar_birthday_updates_use_live_provider_contract() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    event = {
+        "attendees": [],
+        "birthdayProperties": {"type": "birthday"},
+        "end": {"date": "2026-08-03"},
+        "etag": "etag",
+        "eventType": "birthday",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "start": {"date": "2026-08-02"},
+    }
+
+    summary = {**common, "summary": "Updated birthday"}
+    assert (
+        adapter.classify_effect(
+            operation,
+            summary,
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(event).encode()),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**summary, "calendar_id": "shared"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(event).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+
+    linked_event = {
+        **event,
+        "birthdayProperties": {
+            "contact": "people/contact",
+            "type": "birthday",
+        },
+    }
+    linked_transport = _Transport(bodies=(json.dumps(linked_event).encode(), b"{}"))
+    adapter.execute(
+        operation,
+        summary,
+        continuation=None,
+        credential=_credential(),
+        transport=linked_transport,
+    )
+    assert len(linked_transport.calls) == 2
+    assert linked_transport.calls[1]["json_body"] == {"summary": "Updated birthday"}
+
+    move = {
+        **common,
+        "end": {"date": "2026-08-04"},
+        "start": {"date": "2026-08-03"},
+    }
+    transport = _Transport(bodies=(json.dumps(event).encode(), b"{}"))
+    adapter.execute(
+        operation,
+        move,
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+    assert len(transport.calls) == 2
+    assert "birthdayProperties(contact,type)" in dict(transport.calls[0]["query"])["fields"]
+    assert transport.calls[1]["method"] is ConnectorMethod.PATCH
+    assert transport.calls[1]["headers"] == {"If-Match": "etag"}
+    assert transport.calls[1]["json_body"] == {
+        "end": {"date": "2026-08-04"},
+        "start": {"date": "2026-08-03"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("birthday_properties", "message"),
+    (
+        ({"contact": "people/contact", "type": "birthday"}, "Google Contacts"),
+        ({"type": "self"}, "Google Account profile"),
+    ),
+)
+def test_calendar_birthday_linked_date_updates_fail_before_patch(
+    birthday_properties: dict[str, str], message: str
+) -> None:
+    operation = _operation("google_calendar", "events.update")
+    values = {
+        "calendar_id": "primary",
+        "end": {"date": "2026-08-04"},
+        "etag": "etag",
+        "event_id": "event",
+        "start": {"date": "2026-08-03"},
+    }
+    event = {
+        "attendees": [],
+        "birthdayProperties": birthday_properties,
+        "end": {"date": "2026-08-03"},
+        "etag": "etag",
+        "eventType": "birthday",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "start": {"date": "2026-08-02"},
+    }
+    transport = _Transport(body=json.dumps(event).encode())
+    with pytest.raises(ValidationError, match=message):
+        GoogleConnectorAdapter().classify_effect(
+            operation,
+            values,
+            credential=_credential(),
+            transport=transport,
+        )
+    assert len(transport.calls) == 1
+
+
+def test_calendar_birthday_update_invariants_fail_before_patch() -> None:
+    operation = _operation("google_calendar", "events.update")
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    event = {
+        "attendees": [],
+        "birthdayProperties": {"type": "birthday"},
+        "end": {"date": "2026-08-03"},
+        "etag": "etag",
+        "eventType": "birthday",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "start": {"date": "2026-08-02"},
+    }
+    invalid_values = (
+        {**common, "description": "Unsupported"},
+        {**common, "end": {"date": "2026-08-04"}},
+        {**common, "start": {"date_time": "2026-08-03T09:00:00+02:00"}},
+    )
+    for values in invalid_values:
+        transport = _Transport(body=json.dumps(event).encode())
+        with pytest.raises(ValidationError):
+            GoogleConnectorAdapter().classify_effect(
+                operation,
+                values,
+                credential=_credential(),
+                transport=transport,
+            )
+        assert len(transport.calls) == 1
+
+
 def test_calendar_status_create_invariants_fail_before_transport() -> None:
     operation = _operation("google_calendar", "events.create")
     invalid_values = (

@@ -25,6 +25,9 @@ decision loop.
   transport with fail-closed capability checks and durable no-replay receipts.
 - Add context-first onboarding, a source capability catalog, bounded live-read
   guidance, local privacy screening, and an AI-authored Pulse skill.
+- Extend Google Calendar's existing event CRUD with provider-shaped private
+  birthdays, including annual recurrence, safe date-source handling, and no new
+  OAuth scope.
 - Remove unused deterministic onboarding, Pulse-controller,
   scheduler-planning, and migration modules. The shipped skills own semantic
   orchestration; legacy backup marker recognition remains for safe restore.
