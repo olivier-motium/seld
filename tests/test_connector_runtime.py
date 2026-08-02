@@ -180,6 +180,36 @@ class _PreflightAdapter(_Adapter):
         return super().classify_effect(operation, input_value)
 
 
+class _PreparedPreviewAdapter(_Adapter):
+    def __init__(self, enrichment: object | None = None) -> None:
+        super().__init__()
+        self.preview_enrichment = enrichment
+        self.preview_error: Exception | None = None
+        self.mutate_preview = False
+        self.preview_calls: list[tuple[str, object, ConnectorTransferContext]] = []
+        self.preview_events: list[tuple[str, str]] = []
+
+    def classify_effect(self, operation: OperationSpec, input_value: object) -> ConnectorEffect:
+        self.preview_events.append(("classify", operation.name))
+        return super().classify_effect(operation, input_value)
+
+    def prepared_confirmation_preview(
+        self,
+        operation: OperationSpec,
+        preview_value: object,
+        *,
+        transfer: ConnectorTransferContext,
+    ) -> object | None:
+        self.preview_events.append(("preview", operation.name))
+        self.preview_calls.append((operation.name, preview_value, transfer))
+        if self.mutate_preview:
+            assert isinstance(preview_value, dict)
+            preview_value.clear()
+        if self.preview_error is not None:
+            raise self.preview_error
+        return self.preview_enrichment
+
+
 class _OutlookAdapter(_Adapter):
     providers = frozenset({"outlook_calendar"})
 
@@ -283,6 +313,7 @@ def _install_local_upload_catalog(
     monkeypatch: pytest.MonkeyPatch,
     *,
     effect: ConnectorEffect = ConnectorEffect.OUTWARD,
+    allow_reserved_preview_key: bool = False,
 ) -> None:
     local_file = {
         "additionalProperties": False,
@@ -303,6 +334,21 @@ def _install_local_upload_catalog(
         "required": ["filename", "local_file", "mime_type"],
         "type": "object",
     }
+    input_properties: dict[str, object] = {
+        "attachments": {
+            "items": attachment,
+            "maxItems": 4,
+            "minItems": 1,
+            "type": "array",
+        },
+        "subject": {"maxLength": 998, "minLength": 1, "type": "string"},
+    }
+    if allow_reserved_preview_key:
+        input_properties["prepared_content"] = {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string",
+        }
     operation = OperationSpec(
         provider="gmail",
         mode=ConnectorMode.WRITE,
@@ -312,15 +358,7 @@ def _install_local_upload_catalog(
         required_scopes=(frozenset({"https://www.googleapis.com/auth/gmail.modify"}),),
         input_schema={
             "additionalProperties": False,
-            "properties": {
-                "attachments": {
-                    "items": attachment,
-                    "maxItems": 4,
-                    "minItems": 1,
-                    "type": "array",
-                },
-                "subject": {"maxLength": 998, "minLength": 1, "type": "string"},
-            },
+            "properties": input_properties,
             "required": ["attachments", "subject"],
             "type": "object",
         },
@@ -412,6 +450,36 @@ def _local_upload_values(grant_id: str) -> dict[str, object]:
         },
         "operation": "attachments.send",
     }
+
+
+def _prepared_local_upload_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    adapter: _Adapter | None = None,
+    allow_reserved_preview_key: bool = False,
+) -> tuple[_Adapter, ConnectorRuntime, dict[str, object]]:
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host-data"))
+    _install_local_upload_catalog(
+        monkeypatch,
+        allow_reserved_preview_key=allow_reserved_preview_key,
+    )
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    vault, _manager, prepared_adapter, runtime = _prepared(
+        tmp_path,
+        adapter=adapter,
+        artifact_store=artifacts,
+    )
+    vault.select_sources(
+        expected_revision=vault.get_source_snapshot().revision,
+        sources=("local_files",),
+    )
+    selected = tmp_path / "selected"
+    source = selected / "private" / "source-document.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"reviewed bytes")
+    grant_id = vault.grant_local_file_root(selected)["grant"]["grant_id"]
+    return prepared_adapter, runtime, _local_upload_values(grant_id)
 
 
 def test_read_uses_process_local_cursor_bound_to_exact_input_and_state(tmp_path: Path) -> None:
@@ -737,6 +805,199 @@ def test_effect_preflight_receives_live_credential_and_transport(tmp_path: Path)
     assert preflight.preflight is not None
     assert preflight.preflight[0].version == 1
     assert preflight.preflight[1] is runtime.transport
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
+def test_prepared_preview_hook_only_runs_with_bundle_and_cannot_replace_base_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _PreparedPreviewAdapter(
+        {
+            "body": "x" * 3_000,
+            "recipients": ["alice@example.test"],
+            "subject": "Reviewed invoice",
+        }
+    )
+    adapter.mutate_preview = True
+    _vault, _manager, _adapter, plain_runtime = _prepared(
+        tmp_path / "plain",
+        adapter=adapter,
+    )
+    plain = plain_runtime.call_tool(
+        "gsv_gmail_write",
+        {
+            "connection_id": str(CONNECTION_ID),
+            "input": {"draft_id": "draft-one"},
+            "operation": "drafts.send",
+        },
+    )
+    assert plain["status"] == "confirmation_required"
+    assert adapter.preview_calls == []
+    plain_runtime.close()
+
+    prepared_adapter, runtime, values = _prepared_local_upload_runtime(
+        tmp_path / "prepared",
+        monkeypatch,
+        adapter=adapter,
+    )
+    preview = runtime.call_tool("gsv_gmail_write", values)
+
+    assert prepared_adapter is adapter
+    assert adapter.preview_events[-2:] == [
+        ("classify", "attachments.send"),
+        ("preview", "attachments.send"),
+    ]
+    assert len(adapter.preview_calls) == 1
+    operation_name, hook_preview, transfer = adapter.preview_calls[0]
+    assert operation_name == "attachments.send"
+    assert hook_preview == {}
+    assert len(transfer.uploads) == 1
+    public_preview = preview["preview"]
+    assert isinstance(public_preview, dict)
+    attachments = public_preview["attachments"]
+    assert isinstance(attachments, list)
+    assert attachments[0]["local_file"] == {
+        "bytes": len(b"reviewed bytes"),
+        "filename": "invoice.pdf",
+        "media_type": "application/pdf",
+        "sha256": hashlib.sha256(b"reviewed bytes").hexdigest(),
+    }
+    assert public_preview["subject"] == "Reviewed invoice"
+    prepared_content = public_preview["prepared_content"]
+    assert isinstance(prepared_content, dict)
+    assert prepared_content["body"] == {
+        "characters": 3_000,
+        "digest": "sha256:" + hashlib.sha256(b"x" * 3_000).hexdigest(),
+        "preview": "x" * 2_000,
+        "truncated": True,
+    }
+    assert prepared_content["recipients"] == ["alice@example.test"]
+    assert prepared_content["subject"] == "Reviewed invoice"
+    runtime.close()
+
+
+@pytest.mark.parametrize("with_none_hook", (False, True))
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
+def test_absent_or_none_prepared_preview_hook_keeps_existing_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_none_hook: bool,
+) -> None:
+    adapter: _Adapter = _PreparedPreviewAdapter() if with_none_hook else _Adapter()
+    prepared_adapter, runtime, values = _prepared_local_upload_runtime(
+        tmp_path,
+        monkeypatch,
+        adapter=adapter,
+    )
+
+    preview = runtime.call_tool("gsv_gmail_write", values)
+
+    assert preview["preview"] == {
+        "attachments": [
+            {
+                "filename": "invoice.pdf",
+                "local_file": {
+                    "bytes": len(b"reviewed bytes"),
+                    "filename": "invoice.pdf",
+                    "media_type": "application/pdf",
+                    "sha256": hashlib.sha256(b"reviewed bytes").hexdigest(),
+                },
+                "mime_type": "application/pdf",
+            }
+        ],
+        "subject": "Reviewed invoice",
+    }
+    if isinstance(prepared_adapter, _PreparedPreviewAdapter):
+        assert len(prepared_adapter.preview_calls) == 1
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_match"),
+    (
+        ("oversized", "too large to show safely"),
+        ("non_json", "not JSON"),
+        ("hook_error", "could not prepare"),
+        ("validation_error", "use receivedTime"),
+    ),
+)
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
+def test_invalid_prepared_preview_fails_before_token_and_closes_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    error_match: str,
+) -> None:
+    if failure == "oversized":
+        enrichment: object = {"items": ["x" * 2_000 for _ in range(9)]}
+    elif failure == "non_json":
+        enrichment = object()
+    else:
+        enrichment = None
+    adapter = _PreparedPreviewAdapter(enrichment)
+    if failure == "hook_error":
+        adapter.preview_error = RuntimeError("offline preview failed")
+    elif failure == "validation_error":
+        adapter.preview_error = ValidationError("use receivedTime")
+    _prepared_adapter, runtime, values = _prepared_local_upload_runtime(
+        tmp_path,
+        monkeypatch,
+        adapter=adapter,
+    )
+    issued: list[dict[str, object]] = []
+
+    def record_confirmation(**kwargs: object) -> str:
+        issued.append(dict(kwargs))
+        return "unexpected-confirmation-token"
+
+    monkeypatch.setattr(runtime.session, "issue_confirmation", record_confirmation)
+
+    with pytest.raises(ValidationError, match=error_match):
+        runtime.call_tool("gsv_gmail_write", values)
+
+    assert issued == []
+    assert len(adapter.preview_calls) == 1
+    upload = next(iter(adapter.preview_calls[0][2].uploads.values()))
+    with pytest.raises(ValidationError, match="closed"):
+        list(upload.iter_chunks())
+    runtime.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
+def test_prepared_preview_rejects_reserved_base_key_before_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _PreparedPreviewAdapter({"recipients": ["alice@example.test"]})
+    _prepared_adapter, runtime, values = _prepared_local_upload_runtime(
+        tmp_path,
+        monkeypatch,
+        adapter=adapter,
+        allow_reserved_preview_key=True,
+    )
+    input_value = values["input"]
+    assert isinstance(input_value, dict)
+    values = {
+        **values,
+        "input": {**input_value, "prepared_content": "caller-owned value"},
+    }
+    issued: list[dict[str, object]] = []
+
+    def record_confirmation(**kwargs: object) -> str:
+        issued.append(dict(kwargs))
+        return "unexpected-confirmation-token"
+
+    monkeypatch.setattr(runtime.session, "issue_confirmation", record_confirmation)
+
+    with pytest.raises(ValidationError, match="reserved content key"):
+        runtime.call_tool("gsv_gmail_write", values)
+
+    assert issued == []
+    upload = next(iter(adapter.preview_calls[0][2].uploads.values()))
+    with pytest.raises(ValidationError, match="closed"):
+        list(upload.iter_chunks())
+    runtime.close()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")

@@ -16,6 +16,7 @@ from continuity_kernel.connector_adapter import (
     ConnectorAdapter,
     ConnectorAdapterRegistry,
     ConnectorAdapterResult,
+    ConnectorPreparedConfirmationPreviewAdapter,
     ConnectorProviderUploadLimitAdapter,
     ConnectorRuntimeCredential,
     ConnectorTransferAdapter,
@@ -28,6 +29,7 @@ from continuity_kernel.connector_contract import (
     ConnectorEffect,
     ConnectorMode,
     OperationSpec,
+    canonical_json,
     canonical_json_digest,
     canonicalize_json,
     validate_json,
@@ -86,6 +88,8 @@ _EFFECT_ORDER: Final = {
     ConnectorEffect.PERMANENT: 4,
 }
 _PREVIEW_TEXT_CHARS: Final = 2_000
+_PREPARED_CONTENT_KEY: Final = "prepared_content"
+_PREPARED_PREVIEW_MAX_BYTES: Final = 16 * 1_024
 _LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
 _OPERATION_WARNINGS: Final = {
     (
@@ -339,13 +343,21 @@ class ConnectorRuntime:
                             connection_revision=connection_snapshot.revision,
                         )
                     else:
+                        preview_value = prepared.preview_input
+                        if preview_bundle is not None:
+                            preview_value = _prepared_confirmation_preview(
+                                adapter,
+                                operation,
+                                preview_value,
+                                bundle=preview_bundle,
+                            )
                         preview = self._confirmation_preview(
                             provider=provider,
                             operation=operation_name,
                             connection_id=connection_id,
                             account_label=connection.account.label,
                             mutation_value=prepared.confirmation_input,
-                            preview_value=prepared.preview_input,
+                            preview_value=preview_value,
                             effect=effect,
                             access=access,
                             granted_scopes=credential.granted_scopes,
@@ -1105,6 +1117,50 @@ def _prepared_transfer_context(
     if bundle is None:
         return None
     return ConnectorTransferContext(uploads=bundle.uploads)
+
+
+def _prepared_confirmation_preview(
+    adapter: ConnectorAdapter,
+    operation: OperationSpec,
+    preview_value: object,
+    *,
+    bundle: PreparedUploadBundle,
+) -> object:
+    method = getattr(adapter, "prepared_confirmation_preview", None)
+    if method is None:
+        return preview_value
+    if not callable(method):
+        raise ValidationError("connector adapter prepared preview hook is invalid")
+
+    base_preview = canonicalize_json(preview_value)
+    hook_preview = canonicalize_json(base_preview)
+    transfer = ConnectorTransferContext(uploads=bundle.uploads)
+    preview_adapter = cast(ConnectorPreparedConfirmationPreviewAdapter, adapter)
+    try:
+        enrichment = preview_adapter.prepared_confirmation_preview(
+            operation,
+            hook_preview,
+            transfer=transfer,
+        )
+    except ValidationError:
+        raise
+    except Exception as exc:
+        raise ValidationError("connector adapter could not prepare the upload preview") from exc
+    if enrichment is None:
+        return preview_value
+    if not isinstance(base_preview, dict):
+        raise ValidationError("prepared upload preview enrichment requires an object input")
+    if _PREPARED_CONTENT_KEY in base_preview:
+        raise ValidationError("prepared upload preview input uses the reserved content key")
+
+    prepared_content = canonicalize_json(enrichment)
+    merged = {**base_preview, _PREPARED_CONTENT_KEY: prepared_content}
+    if len(canonical_json(_preview_value(merged))) > _PREPARED_PREVIEW_MAX_BYTES:
+        raise ValidationError(
+            "prepared upload confirmation is too large to show safely; reduce its recipient "
+            "or metadata set so every consequential detail can be shown"
+        )
+    return merged
 
 
 def _accepts_keyword(parameters: Mapping[str, Parameter], name: str) -> bool:

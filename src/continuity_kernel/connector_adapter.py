@@ -198,6 +198,18 @@ class ConnectorProviderUploadLimitAdapter(Protocol):
     ) -> int: ...
 
 
+class ConnectorPreparedConfirmationPreviewAdapter(Protocol):
+    """Optional offline preview enrichment for immutable prepared uploads."""
+
+    def prepared_confirmation_preview(
+        self,
+        operation: OperationSpec,
+        preview_value: object,
+        *,
+        transfer: ConnectorTransferContext,
+    ) -> object | None: ...
+
+
 class ConnectorAdapterRegistry:
     """Immutable exact provider-to-adapter lookup."""
 
