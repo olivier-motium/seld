@@ -16,6 +16,7 @@ from continuity_kernel.errors import ValidationError
 
 _EXPECTED_NAMES = {
     "gmail": {
+        "profile.get",
         "messages.list",
         "messages.get",
         "attachments.get",
@@ -24,6 +25,8 @@ _EXPECTED_NAMES = {
         "drafts.list",
         "drafts.get",
         "labels.list",
+        "labels.get",
+        "history.list",
         "drafts.create",
         "drafts.update",
         "drafts.delete",
@@ -118,11 +121,11 @@ def test_google_provider_mode_partitions_and_exact_operation_surface() -> None:
         for provider in _EXPECTED_NAMES
     }
     assert names == _EXPECTED_NAMES
-    assert len(GOOGLE_OPERATIONS) == 66
+    assert len(GOOGLE_OPERATIONS) == 69
     assert {
         provider: sum(item.provider == provider for item in GOOGLE_OPERATIONS) for provider in names
     } == {
-        "gmail": 23,
+        "gmail": 26,
         "google_calendar": 14,
         "google_drive": 29,
     }
@@ -145,7 +148,7 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
         ("gmail", "threads.purge"): ConnectorEffect.PERMANENT,
         ("gmail", "labels.create"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "labels.update"): ConnectorEffect.SAFE_MUTATION,
-        ("gmail", "labels.delete"): ConnectorEffect.DESTRUCTIVE,
+        ("gmail", "labels.delete"): ConnectorEffect.PERMANENT,
         ("google_calendar", "calendars.create"): ConnectorEffect.SAFE_MUTATION,
         ("google_calendar", "calendars.update"): ConnectorEffect.SAFE_MUTATION,
         ("google_calendar", "calendars.delete"): ConnectorEffect.PERMANENT,
@@ -190,6 +193,67 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
         assert purge.required_scopes == (frozenset({"https://mail.google.com/"}),)
         assert purge.scope_grant_satisfies(["https://mail.google.com/"])
         assert not purge.scope_grant_satisfies(["https://www.googleapis.com/auth/gmail.modify"])
+
+
+def test_gmail_history_uses_a_bounded_decimal_uint64_cursor() -> None:
+    history = _operation("gmail", ConnectorMode.READ, "history.list")
+    maximum = {
+        "history_types": ["messageAdded", "labelRemoved"],
+        "label_id": "INBOX",
+        "page_size": 500,
+        "start_history_id": "18446744073709551615",
+    }
+    assert history.validate_input(maximum) == maximum
+
+    for invalid in (
+        {},
+        {"start_history_id": "-1"},
+        {"start_history_id": "1.5"},
+        {"page_size": 501, "start_history_id": "1"},
+    ):
+        with pytest.raises(ValidationError):
+            history.validate_input(invalid)
+
+
+def test_gmail_metadata_headers_require_metadata_format_and_drafts_reject_label_filters() -> None:
+    requests = (
+        ("messages.get", "message_id"),
+        ("threads.get", "thread_id"),
+    )
+    for name, identifier in requests:
+        operation = _operation("gmail", ConnectorMode.READ, name)
+        values = {
+            "format": "metadata",
+            identifier: "resource",
+            "metadata_header_names": ["Subject", "From"],
+        }
+        assert operation.validate_input(values) == values
+        with pytest.raises(ValidationError):
+            operation.validate_input(
+                {
+                    "format": "full",
+                    identifier: "resource",
+                    "metadata_header_names": ["Subject"],
+                }
+            )
+
+    drafts = _operation("gmail", ConnectorMode.READ, "drafts.list")
+    with pytest.raises(ValidationError):
+        drafts.validate_input({"label_ids": ["INBOX"]})
+
+
+def test_gmail_message_and_thread_modify_accept_the_provider_label_limit() -> None:
+    label_ids = [f"Label_{index}" for index in range(100)]
+    cases = (
+        ("messages.modify", "message_id", "add_label_ids"),
+        ("threads.modify", "thread_id", "remove_label_ids"),
+    )
+    for name, identifier, label_field in cases:
+        operation = _operation("gmail", ConnectorMode.WRITE, name)
+        maximum = {identifier: "resource", label_field: label_ids}
+        assert operation.validate_input(maximum) == maximum
+        with pytest.raises(ValidationError):
+            operation.validate_input({identifier: "resource", label_field: [*label_ids, "extra"]})
 
 
 def test_google_catalog_validates_representative_rich_inputs() -> None:

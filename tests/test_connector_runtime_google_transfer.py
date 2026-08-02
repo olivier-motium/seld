@@ -29,11 +29,12 @@ from continuity_kernel.connector_secrets import InMemorySecretStore
 from continuity_kernel.connector_session import ConnectorSession
 from continuity_kernel.connector_transfer import ArtifactStore
 from continuity_kernel.connector_transport import (
+    ConnectorMethod,
     ConnectorResponse,
     ConnectorStreamResponse,
     ConnectorTransport,
 )
-from continuity_kernel.errors import ValidationError
+from continuity_kernel.errors import ConflictError, ValidationError
 from continuity_kernel.vault import Vault
 
 _CONNECTION_ID = parse_connection_id("con-" + "g" * 32)
@@ -106,6 +107,20 @@ class _DriveLroTransport(ConnectorTransport):
             len(body),
             hashlib.sha256(body).hexdigest(),
             artifact=artifact,
+        )
+
+
+class _GmailModifyTransport(ConnectorTransport):
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.requests.append(kwargs)
+        return ConnectorResponse(
+            kwargs["origin"],
+            200,
+            {},
+            b'{"id":"message-1","labelIds":["TRASH"]}',
         )
 
 
@@ -390,6 +405,47 @@ def test_google_transfer_previews_reach_confirmation_without_provider_http(
         assert drive["effect"] == ConnectorEffect.OUTWARD.value
         assert drive["provider"] == "google_drive"
         assert transport.call_count == 0
+    finally:
+        runtime.close()
+
+
+def test_gmail_destructive_modify_requires_one_bound_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _unused = _runtime(tmp_path, monkeypatch)
+    transport = _GmailModifyTransport()
+    runtime.transport = transport
+    values = {
+        "connection_id": str(_CONNECTION_ID),
+        "input": {"add_label_ids": ["TRASH"], "message_id": "message-1"},
+        "operation": "messages.modify",
+    }
+    try:
+        preview = runtime.call_tool("gsv_gmail_write", values)
+        token = preview["confirmation_token"]
+        assert preview["status"] == "confirmation_required"
+        assert preview["effect"] == ConnectorEffect.DESTRUCTIVE.value
+        assert isinstance(token, str)
+        assert transport.requests == []
+
+        completed = runtime.call_tool(
+            "gsv_gmail_write",
+            {**values, "confirmation_token": token},
+        )
+        assert completed["status"] == "ok"
+        assert completed["effect"] == ConnectorEffect.DESTRUCTIVE.value
+        assert len(transport.requests) == 1
+        assert transport.requests[0]["method"] is ConnectorMethod.POST
+        assert transport.requests[0]["path"] == ("/gmail/v1/users/me/messages/message-1/modify")
+        assert transport.requests[0]["json_body"] == {"addLabelIds": ["TRASH"]}
+
+        with pytest.raises(ConflictError, match=r"consumed|unavailable|expired|replayed"):
+            runtime.call_tool(
+                "gsv_gmail_write",
+                {**values, "confirmation_token": token},
+            )
+        assert len(transport.requests) == 1
     finally:
         runtime.close()
 

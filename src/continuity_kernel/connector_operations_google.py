@@ -23,6 +23,8 @@ _DRIVE_MEET_READONLY: Final = "https://www.googleapis.com/auth/drive.meet.readon
 _DRIVE_FILE: Final = "https://www.googleapis.com/auth/drive.file"
 _DRIVE: Final = "https://www.googleapis.com/auth/drive"
 _MAX_DRIVE_BYTE_OFFSET: Final = 5 * 1024**4
+# The fixed transport permits 128 query items; metadata reads also send `format`.
+_GMAIL_MAX_METADATA_HEADER_NAMES: Final = 127
 
 
 def _object(properties: dict[str, object], *, required: tuple[str, ...] = ()) -> dict[str, object]:
@@ -153,6 +155,80 @@ def _mail_list() -> dict[str, object]:
             "query": _text(8_192, minimum=0),
         }
     )
+
+
+def _draft_list() -> dict[str, object]:
+    return _object(
+        {
+            "include_spam_trash": {"type": "boolean"},
+            "page_size": {"maximum": 500, "minimum": 1, "type": "integer"},
+            "query": _text(8_192, minimum=0),
+        }
+    )
+
+
+def _gmail_message_get() -> dict[str, object]:
+    identifier = {"message_id": _id()}
+    schema = _object(
+        {
+            **identifier,
+            "format": {"enum": ["full", "metadata", "minimal"], "type": "string"},
+            "metadata_header_names": _array(_text(998), maximum=_GMAIL_MAX_METADATA_HEADER_NAMES),
+        },
+        required=("message_id",),
+    )
+    schema["oneOf"] = [
+        _object(
+            {
+                **identifier,
+                "format": {"enum": ["full", "minimal"], "type": "string"},
+            },
+            required=("message_id",),
+        ),
+        _object(
+            {
+                **identifier,
+                "format": {"const": "metadata", "type": "string"},
+                "metadata_header_names": _array(
+                    _text(998), maximum=_GMAIL_MAX_METADATA_HEADER_NAMES
+                ),
+            },
+            required=("format", "message_id"),
+        ),
+    ]
+    return schema
+
+
+def _gmail_thread_get() -> dict[str, object]:
+    identifier = {"thread_id": _id()}
+    schema = _object(
+        {
+            **identifier,
+            "format": {"enum": ["full", "metadata", "minimal"], "type": "string"},
+            "metadata_header_names": _array(_text(998), maximum=_GMAIL_MAX_METADATA_HEADER_NAMES),
+        },
+        required=("thread_id",),
+    )
+    schema["oneOf"] = [
+        _object(
+            {
+                **identifier,
+                "format": {"enum": ["full", "minimal"], "type": "string"},
+            },
+            required=("thread_id",),
+        ),
+        _object(
+            {
+                **identifier,
+                "format": {"const": "metadata", "type": "string"},
+                "metadata_header_names": _array(
+                    _text(998), maximum=_GMAIL_MAX_METADATA_HEADER_NAMES
+                ),
+            },
+            required=("format", "thread_id"),
+        ),
+    ]
+    return schema
 
 
 def _event_time() -> dict[str, object]:
@@ -662,6 +738,14 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
     _operation(
         "gmail",
         ConnectorMode.READ,
+        "profile.get",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
         "messages.list",
         ConnectorEffect.READ,
         _GMAIL_READ_SCOPES,
@@ -673,13 +757,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "messages.get",
         ConnectorEffect.READ,
         _GMAIL_READ_SCOPES,
-        _object(
-            {
-                "format": {"enum": ["full", "metadata", "minimal"], "type": "string"},
-                "message_id": _id(),
-            },
-            required=("message_id",),
-        ),
+        _gmail_message_get(),
     ),
     _operation(
         "gmail",
@@ -703,13 +781,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "threads.get",
         ConnectorEffect.READ,
         _GMAIL_READ_SCOPES,
-        _object(
-            {
-                "format": {"enum": ["full", "metadata", "minimal"], "type": "string"},
-                "thread_id": _id(),
-            },
-            required=("thread_id",),
-        ),
+        _gmail_thread_get(),
     ),
     _operation(
         "gmail",
@@ -717,7 +789,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "drafts.list",
         ConnectorEffect.READ,
         _GMAIL_READ_SCOPES,
-        _mail_list(),
+        _draft_list(),
     ),
     _operation(
         "gmail",
@@ -740,6 +812,46 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.READ,
         _GMAIL_READ_SCOPES,
         _object({}),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "labels.get",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object({"label_id": _id()}, required=("label_id",)),
+    ),
+    _operation(
+        "gmail",
+        ConnectorMode.READ,
+        "history.list",
+        ConnectorEffect.READ,
+        _GMAIL_READ_SCOPES,
+        _object(
+            {
+                "history_types": _array(
+                    {
+                        "enum": [
+                            "labelAdded",
+                            "labelRemoved",
+                            "messageAdded",
+                            "messageDeleted",
+                        ],
+                        "type": "string",
+                    },
+                    maximum=4,
+                ),
+                "label_id": _id(),
+                "page_size": {"maximum": 500, "minimum": 1, "type": "integer"},
+                "start_history_id": {
+                    "maxLength": 20,
+                    "minLength": 1,
+                    "pattern": "^[0-9]+$",
+                    "type": "string",
+                },
+            },
+            required=("start_history_id",),
+        ),
     ),
     _operation(
         "gmail",
@@ -781,9 +893,9 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _GMAIL_WRITE_SCOPES,
         _object(
             {
-                "add_label_ids": _array(_id(), maximum=64),
+                "add_label_ids": _array(_id(), maximum=100),
                 "message_id": _id(),
-                "remove_label_ids": _array(_id(), maximum=64),
+                "remove_label_ids": _array(_id(), maximum=100),
             },
             required=("message_id",),
         ),
@@ -820,8 +932,8 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _GMAIL_WRITE_SCOPES,
         _object(
             {
-                "add_label_ids": _array(_id(), maximum=64),
-                "remove_label_ids": _array(_id(), maximum=64),
+                "add_label_ids": _array(_id(), maximum=100),
+                "remove_label_ids": _array(_id(), maximum=100),
                 "thread_id": _id(),
             },
             required=("thread_id",),
@@ -886,7 +998,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "gmail",
         ConnectorMode.WRITE,
         "labels.delete",
-        ConnectorEffect.DESTRUCTIVE,
+        ConnectorEffect.PERMANENT,
         _GMAIL_WRITE_SCOPES,
         _object({"label_id": _id()}, required=("label_id",)),
     ),

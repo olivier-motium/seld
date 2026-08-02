@@ -44,6 +44,9 @@ from continuity_kernel.errors import ContinuityError, ValidationError
 _GOOGLE_PROVIDERS: Final = frozenset({"gmail", "google_calendar", "google_drive"})
 _GOOGLE_BY_KEY: Final = {operation.key: operation for operation in GOOGLE_OPERATIONS}
 _GMAIL_PURGE_SCOPE: Final = "https://mail.google.com/"
+_GMAIL_DESTRUCTIVE_ADD_LABELS: Final = frozenset({"SPAM", "TRASH"})
+_GMAIL_DESTRUCTIVE_REMOVE_LABELS: Final = frozenset({"INBOX"})
+_GMAIL_MAX_HISTORY_ID: Final = 2**64 - 1
 _JSON_STATUSES: Final = frozenset({200, 201, 202})
 _DELETE_STATUSES: Final = frozenset({200, 202, 204})
 _MAX_CONTENT_BYTES: Final = 180_000
@@ -185,6 +188,11 @@ class GoogleConnectorAdapter:
                 reply_context = _gmail_reply_context(values, credential, transport)
             _gmail_mime_upload(values, transfer, reply_context=reply_context)
             return operation.effect
+        if operation.provider == "gmail" and operation.name in {
+            "messages.modify",
+            "threads.modify",
+        }:
+            return _gmail_modify_effect(values)
         if (
             operation.provider == "google_drive"
             and operation.name in _DRIVE_LOCAL_UPLOAD_OPERATIONS
@@ -225,6 +233,15 @@ class GoogleConnectorAdapter:
         operation, values = _known_operation(operation, input_value, transfer=transfer)
         if not isinstance(credential, ConnectorRuntimeCredential):
             raise ValidationError("connector runtime credential is invalid")
+        if (
+            operation.provider == "gmail"
+            and operation.name in {"messages.modify", "threads.modify"}
+            and _gmail_modify_effect(values) is ConnectorEffect.DESTRUCTIVE
+            and not write_idempotency_key
+        ):
+            raise ValidationError(
+                "destructive Gmail label changes require a fresh confirmation preview"
+            )
         if (
             operation.provider == "google_drive"
             and operation.name in _DRIVE_LOCAL_UPLOAD_OPERATIONS
@@ -375,7 +392,7 @@ def _execute_gmail(
 ) -> ConnectorAdapterResult:
     base = "/gmail/v1/users/me"
     name = operation.name
-    if name in {"messages.list", "threads.list", "drafts.list"}:
+    if name in {"messages.list", "threads.list"}:
         resource = name.split(".", 1)[0]
         return _json_request(
             transport,
@@ -385,7 +402,43 @@ def _execute_gmail(
             credential=credential,
             query=_gmail_list_query(values, continuation),
         )
+    if name == "drafts.list":
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.GET,
+            path=f"{base}/drafts",
+            credential=credential,
+            query=_gmail_draft_list_query(values, continuation),
+        )
+    if name == "history.list":
+        try:
+            return _json_request(
+                transport,
+                origin=ConnectorOrigin.GMAIL,
+                method=ConnectorMethod.GET,
+                path=f"{base}/history",
+                credential=credential,
+                query=_gmail_history_query(values, continuation),
+            )
+        except ConnectorProviderError as exc:
+            if exc.origin is ConnectorOrigin.GMAIL and exc.status == 404:
+                raise ConnectorProviderError(
+                    origin=exc.origin,
+                    status=exc.status,
+                    code="full_sync_required",
+                    retry_after=exc.retry_after,
+                ) from exc
+            raise
     _reject_continuation(continuation)
+    if name == "profile.get":
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.GET,
+            path=f"{base}/profile",
+            credential=credential,
+        )
     if name == "messages.get":
         return _json_request(
             transport,
@@ -393,7 +446,7 @@ def _execute_gmail(
             method=ConnectorMethod.GET,
             path=f"{base}/messages/{_segment(_required(values, 'message_id'))}",
             credential=credential,
-            query=_optional_query(values, {"format": "format"}),
+            query=_gmail_get_query(values),
         )
     if name == "attachments.get":
         return _gmail_attachment_request(
@@ -409,7 +462,7 @@ def _execute_gmail(
             method=ConnectorMethod.GET,
             path=f"{base}/threads/{_segment(_required(values, 'thread_id'))}",
             credential=credential,
-            query=_optional_query(values, {"format": "format"}),
+            query=_gmail_get_query(values),
         )
     if name == "drafts.get":
         return _json_request(
@@ -426,6 +479,14 @@ def _execute_gmail(
             origin=ConnectorOrigin.GMAIL,
             method=ConnectorMethod.GET,
             path=f"{base}/labels",
+            credential=credential,
+        )
+    if name == "labels.get":
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GMAIL,
+            method=ConnectorMethod.GET,
+            path=f"{base}/labels/{_segment(_required(values, 'label_id'))}",
             credential=credential,
         )
     if name in {"drafts.create", "drafts.update"}:
@@ -1834,6 +1895,46 @@ def _gmail_list_query(
     return tuple(query)
 
 
+def _gmail_draft_list_query(
+    values: dict[str, object], continuation: object | None
+) -> tuple[tuple[str, str], ...]:
+    query = list(_optional_query(values, {"include_spam_trash": "includeSpamTrash", "query": "q"}))
+    if "page_size" in values:
+        query.append(("maxResults", str(_integer(values["page_size"]))))
+    query.extend(_continuation_query(continuation))
+    return tuple(query)
+
+
+def _gmail_get_query(values: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    query = list(_optional_query(values, {"format": "format"}))
+    if "metadata_header_names" in values:
+        query.extend(
+            ("metadataHeaders", _safe_header(name))
+            for name in _strings(values["metadata_header_names"])
+        )
+    return tuple(query)
+
+
+def _gmail_history_query(
+    values: dict[str, object], continuation: object | None
+) -> tuple[tuple[str, str], ...]:
+    start_history_id = _required(values, "start_history_id")
+    if int(start_history_id) > _GMAIL_MAX_HISTORY_ID:
+        raise ValidationError("Gmail history ID exceeds the provider uint64 bound")
+    query: list[tuple[str, str]] = [("startHistoryId", start_history_id)]
+    if "label_id" in values:
+        query.append(("labelId", _required(values, "label_id")))
+    if "page_size" in values:
+        query.append(("maxResults", str(_integer(values["page_size"]))))
+    if "history_types" in values:
+        history_types = _strings(values["history_types"])
+        if len(set(history_types)) != len(history_types):
+            raise ValidationError("Gmail history types must be unique")
+        query.extend(("historyTypes", history_type) for history_type in history_types)
+    query.extend(_continuation_query(continuation))
+    return tuple(query)
+
+
 def _calendar_list_query(
     values: dict[str, object], continuation: object | None
 ) -> tuple[tuple[str, str], ...]:
@@ -2664,6 +2765,14 @@ def _gmail_resource_identifier(values: dict[str, object], name: str) -> tuple[st
     if name.startswith("messages."):
         return "messages", _required(values, "message_id")
     return "threads", _required(values, "thread_id")
+
+
+def _gmail_modify_effect(values: Mapping[str, object]) -> ConnectorEffect:
+    added = set(_strings(values.get("add_label_ids", [])))
+    removed = set(_strings(values.get("remove_label_ids", [])))
+    if added & _GMAIL_DESTRUCTIVE_ADD_LABELS or removed & _GMAIL_DESTRUCTIVE_REMOVE_LABELS:
+        return ConnectorEffect.DESTRUCTIVE
+    return ConnectorEffect.SAFE_MUTATION
 
 
 def _etag_headers(values: Mapping[str, object]) -> dict[str, str]:

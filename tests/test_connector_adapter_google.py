@@ -120,6 +120,16 @@ class _Transport(ConnectorTransport):
         )
 
 
+class _ProviderErrorTransport(_Transport):
+    def __init__(self, error: ConnectorProviderError) -> None:
+        super().__init__()
+        self.error = error
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.calls.append({"kind": "request", **kwargs})
+        raise self.error
+
+
 class _DriveRecoveryTransport(ConnectorTransport):
     def __init__(
         self,
@@ -325,8 +335,10 @@ def test_google_local_file_limit_hook_allows_only_sanitized_provider_shapes() ->
 def _sample(operation: OperationSpec) -> dict[str, object]:
     name = operation.name
     if operation.provider == "gmail":
-        if name == "labels.list":
+        if name in {"labels.list", "profile.get"}:
             return {}
+        if name == "history.list":
+            return {"page_size": 1, "start_history_id": "1"}
         if name.endswith(".list"):
             return {"page_size": 1}
         if name == "attachments.get":
@@ -357,7 +369,7 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
             return {"draft_id": "draft"}
         if name == "labels.create":
             return {"name": "Projects"}
-        if name in {"labels.update", "labels.delete"}:
+        if name in {"labels.get", "labels.update", "labels.delete"}:
             return {"label_id": "label"}
     if operation.provider == "google_calendar":
         if name == "calendars.list":
@@ -556,6 +568,212 @@ def test_only_top_level_pagination_is_stripped_and_replayed_as_runtime_continuat
     )
     assert ("pageToken", "provider-page") in transport.calls[-1]["query"]
     assert not any(field in transport.calls[-1]["query"] for field in ("cursor", "nextLink", "url"))
+
+
+def test_gmail_core_read_routes_and_history_continuation_are_provider_native() -> None:
+    history_body = json.dumps(
+        {
+            "history": [{"id": "41", "messagesAdded": [{"message": {"id": "message"}}]}],
+            "historyId": "42",
+            "nextPageToken": "next-history-page",
+        }
+    ).encode()
+    adapter = GoogleConnectorAdapter()
+    transport = _Transport(body=history_body)
+    credential = _credential()
+
+    overflow_transport = _Transport()
+    with pytest.raises(ValidationError):
+        adapter.execute(
+            _operation("gmail", "history.list"),
+            {"start_history_id": "18446744073709551616"},
+            continuation=None,
+            credential=credential,
+            transport=overflow_transport,
+        )
+    assert overflow_transport.calls == []
+
+    adapter.execute(
+        _operation("gmail", "profile.get"),
+        {},
+        continuation=None,
+        credential=credential,
+        transport=transport,
+    )
+    assert transport.calls[-1]["path"] == "/gmail/v1/users/me/profile"
+
+    adapter.execute(
+        _operation("gmail", "labels.get"),
+        {"label_id": "Label_7"},
+        continuation=None,
+        credential=credential,
+        transport=transport,
+    )
+    assert transport.calls[-1]["path"] == "/gmail/v1/users/me/labels/Label_7"
+
+    history_input = {
+        "history_types": ["messageAdded", "labelRemoved"],
+        "label_id": "INBOX",
+        "page_size": 500,
+        "start_history_id": "40",
+    }
+    first = adapter.execute(
+        _operation("gmail", "history.list"),
+        history_input,
+        continuation=None,
+        credential=credential,
+        transport=transport,
+    )
+    assert first.payload == {
+        "history": [{"id": "41", "messagesAdded": [{"message": {"id": "message"}}]}],
+        "historyId": "42",
+    }
+    assert first.continuation == "next-history-page"
+    history_query = transport.calls[-1]["query"]
+    assert set(history_query) == {
+        ("historyTypes", "labelRemoved"),
+        ("historyTypes", "messageAdded"),
+        ("labelId", "INBOX"),
+        ("maxResults", "500"),
+        ("startHistoryId", "40"),
+    }
+
+    adapter.execute(
+        _operation("gmail", "history.list"),
+        history_input,
+        continuation=first.continuation,
+        credential=credential,
+        transport=transport,
+    )
+    assert ("pageToken", "next-history-page") in transport.calls[-1]["query"]
+
+
+def test_gmail_get_repeats_metadata_headers_and_draft_list_never_sends_label_ids() -> None:
+    adapter = GoogleConnectorAdapter()
+    transport = _Transport()
+    credential = _credential()
+    for name, identifier, path in (
+        ("messages.get", "message_id", "/gmail/v1/users/me/messages/message"),
+        ("threads.get", "thread_id", "/gmail/v1/users/me/threads/thread"),
+    ):
+        value = "message" if identifier == "message_id" else "thread"
+        adapter.execute(
+            _operation("gmail", name),
+            {
+                "format": "metadata",
+                identifier: value,
+                "metadata_header_names": ["Subject", "From"],
+            },
+            continuation=None,
+            credential=credential,
+            transport=transport,
+        )
+        call = transport.calls[-1]
+        assert call["path"] == path
+        assert ("format", "metadata") in call["query"]
+        assert [value for key, value in call["query"] if key == "metadataHeaders"] == [
+            "Subject",
+            "From",
+        ]
+
+    adapter.execute(
+        _operation("gmail", "drafts.list"),
+        {"include_spam_trash": True, "page_size": 25, "query": "is:draft"},
+        continuation=None,
+        credential=credential,
+        transport=transport,
+    )
+    assert transport.calls[-1]["path"] == "/gmail/v1/users/me/drafts"
+    assert {key for key, _value in transport.calls[-1]["query"]} == {
+        "includeSpamTrash",
+        "maxResults",
+        "q",
+    }
+
+
+def test_gmail_modify_effects_escalate_mailbox_removal_and_require_confirmation() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("gmail", "messages.modify")
+    assert (
+        adapter.classify_effect(operation, {"add_label_ids": ["TRASH"], "message_id": "m"})
+        is ConnectorEffect.DESTRUCTIVE
+    )
+    assert (
+        adapter.classify_effect(operation, {"add_label_ids": ["SPAM"], "message_id": "m"})
+        is ConnectorEffect.DESTRUCTIVE
+    )
+    assert (
+        adapter.classify_effect(operation, {"message_id": "m", "remove_label_ids": ["INBOX"]})
+        is ConnectorEffect.DESTRUCTIVE
+    )
+    assert (
+        adapter.classify_effect(operation, {"message_id": "m", "remove_label_ids": ["TRASH"]})
+        is ConnectorEffect.SAFE_MUTATION
+    )
+
+    destructive = {"add_label_ids": ["TRASH"], "message_id": "message"}
+    blocked_transport = _Transport()
+    with pytest.raises(ValidationError):
+        adapter.execute(
+            operation,
+            destructive,
+            continuation=None,
+            credential=_credential(),
+            transport=blocked_transport,
+        )
+    assert blocked_transport.calls == []
+
+    confirmed_transport = _Transport()
+    adapter.execute(
+        operation,
+        destructive,
+        continuation=None,
+        credential=_credential(),
+        transport=confirmed_transport,
+        write_idempotency_key="confirmed-modify",
+    )
+    assert confirmed_transport.calls[-1]["path"] == "/gmail/v1/users/me/messages/message/modify"
+    assert confirmed_transport.calls[-1]["json_body"] == {"addLabelIds": ["TRASH"]}
+
+
+def test_only_expired_gmail_history_maps_to_full_sync_required() -> None:
+    adapter = GoogleConnectorAdapter()
+    credential = _credential()
+    expired = ConnectorProviderError(origin=ConnectorOrigin.GMAIL, status=404)
+    with pytest.raises(ConnectorProviderError) as mapped:
+        adapter.execute(
+            _operation("gmail", "history.list"),
+            {"start_history_id": "1"},
+            continuation=None,
+            credential=credential,
+            transport=_ProviderErrorTransport(expired),
+        )
+    assert mapped.value.origin is ConnectorOrigin.GMAIL
+    assert mapped.value.status == 404
+    assert mapped.value.code == "full_sync_required"
+
+    unchanged_cases = (
+        (
+            _operation("gmail", "labels.get"),
+            {"label_id": "missing"},
+            ConnectorProviderError(origin=ConnectorOrigin.GMAIL, status=404),
+        ),
+        (
+            _operation("gmail", "history.list"),
+            {"start_history_id": "1"},
+            ConnectorProviderError(origin=ConnectorOrigin.GMAIL, status=503, code="unavailable"),
+        ),
+    )
+    for operation, values, error in unchanged_cases:
+        with pytest.raises(ConnectorProviderError) as unchanged:
+            adapter.execute(
+                operation,
+                values,
+                continuation=None,
+                credential=credential,
+                transport=_ProviderErrorTransport(error),
+            )
+        assert unchanged.value is error
 
 
 def test_calendar_location_and_nested_drive_properties_survive_response_sanitization() -> None:
