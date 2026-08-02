@@ -75,6 +75,28 @@ class ConnectorEffect(StrEnum):
     PERMANENT = "permanent"
 
 
+_CALENDAR_ATTACHMENT_OPERATIONS: Final = frozenset(
+    {
+        ("google_calendar", ConnectorMode.WRITE, "events.create"),
+        ("google_calendar", ConnectorMode.WRITE, "events.update"),
+    }
+)
+_CALENDAR_ATTACHMENT_FILE_URL_PATH: Final = ("attachments", "[]", "file_url")
+
+
+class _ToolInputSchema(dict[str, object]):
+    """A rendered tool schema retaining its catalog-owned field exception."""
+
+    def __init__(
+        self,
+        value: Mapping[str, object],
+        *,
+        allowed_transport_field_paths: frozenset[tuple[str, ...]],
+    ) -> None:
+        super().__init__(value)
+        self.allowed_transport_field_paths = allowed_transport_field_paths
+
+
 @dataclass(frozen=True)
 class OperationSpec:
     """One named provider operation with an exact input boundary."""
@@ -109,6 +131,11 @@ class OperationSpec:
             depth=0,
             require_closed_object=True,
             allow_control_fields=False,
+            allowed_transport_field_paths=_operation_transport_field_paths(
+                self.provider,
+                self.mode,
+                self.name,
+            ),
         )
         object.__setattr__(self, "input_schema", _freeze_json(normalized))
 
@@ -218,7 +245,19 @@ class OperationCatalog:
                     "type": "object",
                 }
             )
-        return {"oneOf": variants}
+        allowed_transport_field_paths = frozenset(
+            ("input", *path)
+            for operation in operations
+            for path in _operation_transport_field_paths(
+                operation.provider,
+                operation.mode,
+                operation.name,
+            )
+        )
+        return _ToolInputSchema(
+            {"oneOf": variants},
+            allowed_transport_field_paths=allowed_transport_field_paths,
+        )
 
 
 def canonicalize_json(value: object) -> object:
@@ -252,6 +291,11 @@ def validate_json(value: object, schema: Mapping[str, object]) -> object:
         depth=0,
         require_closed_object=False,
         allow_control_fields=True,
+        allowed_transport_field_paths=(
+            schema.allowed_transport_field_paths
+            if isinstance(schema, _ToolInputSchema)
+            else frozenset()
+        ),
     )
     return _validate_value(canonicalize_json(value), normalized, depth=0)
 
@@ -330,6 +374,8 @@ def _normalize_schema(
     depth: int,
     require_closed_object: bool,
     allow_control_fields: bool,
+    allowed_transport_field_paths: frozenset[tuple[str, ...]] = frozenset(),
+    property_path: tuple[str, ...] = (),
 ) -> dict[str, object]:
     if depth > MAX_JSON_DEPTH or not isinstance(schema, Mapping):
         raise ValidationError("JSON schema is invalid or too deeply nested")
@@ -372,6 +418,8 @@ def _normalize_schema(
                 depth=depth + 1,
                 require_closed_object=False,
                 allow_control_fields=allow_control_fields,
+                allowed_transport_field_paths=allowed_transport_field_paths,
+                property_path=property_path,
             )
             for branch in one_of
         ]
@@ -391,13 +439,18 @@ def _normalize_schema(
         for name, child in properties.items():
             if not isinstance(name, str) or not name or "\x00" in name:
                 raise ValidationError("JSON schema property name is invalid")
-            if not allow_control_fields or name not in {"confirmation_token", "cursor"}:
+            child_path = (*property_path, name)
+            if child_path not in allowed_transport_field_paths and (
+                not allow_control_fields or name not in {"confirmation_token", "cursor"}
+            ):
                 _reject_transport_field(name)
             normalized_properties[name] = _normalize_schema(
                 child,
                 depth=depth + 1,
                 require_closed_object=False,
                 allow_control_fields=allow_control_fields,
+                allowed_transport_field_paths=allowed_transport_field_paths,
+                property_path=child_path,
             )
         normalized_required: list[str] = []
         for name in required:
@@ -422,6 +475,8 @@ def _normalize_schema(
             depth=depth + 1,
             require_closed_object=False,
             allow_control_fields=allow_control_fields,
+            allowed_transport_field_paths=allowed_transport_field_paths,
+            property_path=(*property_path, "[]"),
         )
     elif "items" in schema:
         raise ValidationError("JSON schema items require an array type")
@@ -628,6 +683,25 @@ def _reject_transport_field(name: str) -> None:
     normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
     if normalized in _FORBIDDEN_TRANSPORT_FIELDS or any(
         normalized.endswith(term)
-        for term in ("authorization", "headers", "method", "nextlink", "token", "uploadurl", "url")
+        for term in (
+            "authorization",
+            "endpoint",
+            "headers",
+            "method",
+            "nextlink",
+            "token",
+            "uploadurl",
+            "url",
+        )
     ):
         raise ValidationError("operation input contains a forbidden transport field")
+
+
+def _operation_transport_field_paths(
+    provider: str,
+    mode: ConnectorMode,
+    name: str,
+) -> frozenset[tuple[str, ...]]:
+    if (provider, mode, name) in _CALENDAR_ATTACHMENT_OPERATIONS:
+        return frozenset({_CALENDAR_ATTACHMENT_FILE_URL_PATH})
+    return frozenset()

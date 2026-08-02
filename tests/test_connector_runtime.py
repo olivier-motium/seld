@@ -790,7 +790,13 @@ def test_google_calendar_previews_disclose_patch_notification_and_recovery_seman
         "events.delete": ("Trash", "external calendars", "email"),
         "events.move": ("organizer", "external calendars", "email"),
         "events.respond": ("organizer", "RSVP"),
-        "events.update": ("replaces", "complete array", "external calendars"),
+        "events.update": (
+            "attachments",
+            "complete array",
+            "extended-property",
+            "Meet",
+            "external calendars",
+        ),
     }
 
     for operation, input_value in inputs.items():

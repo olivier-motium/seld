@@ -14,3 +14,8 @@
   Calendar, and one exact Slack conversation. Provider-reported grants are
   constrained to those profiles, and connector removal uses a terminal,
   retryable revocation checkpoint across concurrent credential operations.
+- Expanded Google Calendar's typed interactive event surface with the live
+  color palette, transparency, Meet creation, inert HTTP(S) attachments,
+  additional guest counts, and bounded private/shared extended properties,
+  without adding OAuth scopes or Drive lookups. Array removal, Meet replacement,
+  and explicit property deletion keep destructive confirmation semantics.

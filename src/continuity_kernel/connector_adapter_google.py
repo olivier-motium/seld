@@ -11,6 +11,7 @@ from email.message import EmailMessage
 from email.policy import SMTP
 from io import BytesIO
 from typing import Final, NoReturn, cast
+from urllib.parse import urlsplit
 
 from continuity_kernel.connector_adapter import (
     ConnectorAdapterResult,
@@ -155,6 +156,20 @@ _CALENDAR_RECURRENCE_LINE: Final = re.compile(
 )
 _CALENDAR_RFC3339: Final = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})?$"
+)
+_CALENDAR_MAX_EXTENDED_PROPERTIES: Final = 300
+_CALENDAR_MAX_EXTENDED_PROPERTY_BYTES: Final = 32_768
+_CALENDAR_EVENT_SYNC_FILTER_FIELDS: Final = frozenset(
+    {
+        "i_cal_uid",
+        "order_by",
+        "private_extended_properties",
+        "query",
+        "shared_extended_properties",
+        "time_max",
+        "time_min",
+        "updated_min",
+    }
 )
 _DRIVE_COMMENT_RESOURCE_FIELDS: Final = (
     "id,kind,createdTime,modifiedTime,author(displayName,emailAddress,kind,me,"
@@ -364,7 +379,7 @@ class GoogleConnectorAdapter:
                 _calendar_delete_preflight(values, credential, transport)
             return operation.effect
         if operation.name == "events.create":
-            _calendar_event_body(values, include_client_id=True, require_change=False)
+            _calendar_event_body(values, is_create=True, require_change=False)
             return (
                 ConnectorEffect.OUTWARD
                 if _calendar_has_external_effect(values)
@@ -374,7 +389,7 @@ class GoogleConnectorAdapter:
             _validate_calendar_move(values)
         if operation.name in _EXISTING_CALENDAR_EVENT_MUTATIONS:
             if operation.name == "events.update":
-                _calendar_event_body(values, include_client_id=False, require_change=True)
+                _calendar_event_body(values, is_create=False, require_change=True)
             if credential is None or transport is None:
                 return _calendar_event_effect(
                     operation.name,
@@ -434,7 +449,7 @@ class GoogleConnectorAdapter:
             if operation.name == "events.move":
                 _validate_calendar_move(values)
             if operation.name == "events.update":
-                _calendar_event_body(values, include_client_id=False, require_change=True)
+                _calendar_event_body(values, is_create=False, require_change=True)
             event = None
             if operation.name != "events.respond":
                 event = _calendar_event_mutation_preflight(values, credential, transport)
@@ -1396,6 +1411,14 @@ def _execute_calendar(
             allow_sync_cursor=False,
         )
     _reject_continuation(continuation)
+    if name == "colors.get":
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path=f"{base}/colors",
+            credential=credential,
+        )
     if name == "calendars.get":
         calendar_id = _required(values, "calendar_id")
         result = _json_request(
@@ -1493,10 +1516,14 @@ def _execute_calendar(
             headers = _etag_headers(values)
         event_body = _calendar_event_body(
             values,
-            include_client_id=name == "events.create",
+            is_create=name == "events.create",
             require_change=name == "events.update",
         )
         query = list(_optional_query(values, {"send_updates": "sendUpdates"}))
+        if "meet_request_id" in values:
+            query.append(("conferenceDataVersion", "1"))
+        if "attachments" in values:
+            query.append(("supportsAttachments", "true"))
         request = _calendar_write_request if name == "events.update" else _json_request
         return request(
             transport,
@@ -2847,15 +2874,7 @@ def _calendar_event_list_query(
         _calendar_rfc3339(values["updated_min"], context="Google Calendar updated-min")
     continuation_query = _calendar_continuation_query(continuation)
     if _calendar_sync_token(continuation) is not None:
-        filters = {
-            "i_cal_uid",
-            "order_by",
-            "query",
-            "time_max",
-            "time_min",
-            "updated_min",
-        }
-        if any(field in values for field in filters):
+        if any(field in values for field in _CALENDAR_EVENT_SYNC_FILTER_FIELDS):
             raise ValidationError("Google Calendar sync cannot combine event list filters")
         if values.get("show_deleted") is False:
             raise ValidationError("Google Calendar sync must include deleted events")
@@ -2869,6 +2888,7 @@ def _calendar_event_list_query(
                 "page_size": "maxResults",
                 "query": "q",
                 "show_deleted": "showDeleted",
+                "show_hidden_invitations": "showHiddenInvitations",
                 "single_events": "singleEvents",
                 "time_max": "timeMax",
                 "time_min": "timeMin",
@@ -2879,8 +2899,33 @@ def _calendar_event_list_query(
     )
     if "event_types" in values:
         query.extend(("eventTypes", item) for item in _strings(values["event_types"]))
+    query.extend(_calendar_extended_property_filter_query(values))
     query.extend(continuation_query)
     return tuple(query)
+
+
+def _calendar_extended_property_filter_query(
+    values: Mapping[str, object],
+) -> tuple[tuple[str, str], ...]:
+    rendered: list[tuple[str, str]] = []
+    for source, target in (
+        ("private_extended_properties", "privateExtendedProperty"),
+        ("shared_extended_properties", "sharedExtendedProperty"),
+    ):
+        if source not in values:
+            continue
+        items = _calendar_extended_property_items(
+            values[source],
+            context="Google Calendar extended-property filter",
+            allow_deletion=False,
+            allow_repeated_keys=True,
+        )
+        if any("=" in key for key, _value in items):
+            raise ValidationError(
+                "Google Calendar extended-property filter keys cannot contain equals signs"
+            )
+        rendered.extend((target, f"{key}={value}") for key, value in items)
+    return tuple(rendered)
 
 
 def _calendar_instance_query(
@@ -3078,16 +3123,9 @@ def _calendar_list_sync_compatible(values: Mapping[str, object]) -> bool:
 
 
 def _calendar_event_sync_compatible(values: Mapping[str, object]) -> bool:
-    prohibited = {
-        "i_cal_uid",
-        "order_by",
-        "query",
-        "time_max",
-        "time_min",
-        "updated_min",
-    }
     return (
-        not any(field in values for field in prohibited) and values.get("show_deleted") is not False
+        not any(field in values for field in _CALENDAR_EVENT_SYNC_FILTER_FIELDS)
+        and values.get("show_deleted") is not False
     )
 
 
@@ -3112,11 +3150,12 @@ def _calendar_body(values: Mapping[str, object], *, require_change: bool) -> dic
 
 
 def _calendar_event_body(
-    values: Mapping[str, object], *, include_client_id: bool, require_change: bool
+    values: Mapping[str, object], *, is_create: bool, require_change: bool
 ) -> dict[str, object]:
     body = _selected(
         values,
         {
+            "color_id": "colorId",
             "description": "description",
             "guests_can_invite_others": "guestsCanInviteOthers",
             "guests_can_modify": "guestsCanModify",
@@ -3124,10 +3163,11 @@ def _calendar_event_body(
             "location": "location",
             "recurrence": "recurrence",
             "summary": "summary",
+            "transparency": "transparency",
             "visibility": "visibility",
         },
     )
-    if include_client_id and "event_id" in values:
+    if is_create and "event_id" in values:
         body["id"] = _text(values["event_id"])
     if "attendee_emails" in values and "attendees" in values:
         raise ValidationError("Google Calendar attendees are specified twice")
@@ -3144,6 +3184,7 @@ def _calendar_event_body(
             _selected(
                 attendee,
                 {
+                    "additional_guests": "additionalGuests",
                     "display_name": "displayName",
                     "email": "email",
                     "optional": "optional",
@@ -3151,6 +3192,21 @@ def _calendar_event_body(
             )
             for attendee in attendees
         ]
+    if "attachments" in values:
+        body["attachments"] = _calendar_event_attachments(values["attachments"])
+    if "meet_request_id" in values:
+        body["conferenceData"] = {
+            "createRequest": {
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                "requestId": _required(values, "meet_request_id"),
+            }
+        }
+    extended_properties = _calendar_event_extended_properties(
+        values,
+        allow_deletion=not is_create,
+    )
+    if extended_properties:
+        body["extendedProperties"] = extended_properties
     if "attendees" in body and "send_updates" not in values:
         raise ValidationError(
             "Google Calendar attendee changes require an explicit send-updates choice"
@@ -3172,6 +3228,102 @@ def _calendar_event_body(
     if require_change and not body:
         raise ValidationError("Google Calendar event update requires at least one changed field")
     return body
+
+
+def _calendar_event_attachments(value: object) -> list[dict[str, str]]:
+    attachments: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for attachment in _mappings(value):
+        file_url = _required(attachment, "file_url")
+        _validate_calendar_attachment_url(file_url)
+        if file_url in seen:
+            raise ValidationError("Google Calendar attachment URLs must be unique")
+        seen.add(file_url)
+        attachments.append({"fileUrl": file_url})
+    return attachments
+
+
+def _validate_calendar_attachment_url(value: str) -> None:
+    if any(character.isspace() for character in value):
+        raise ValidationError("Google Calendar attachment URL must use absolute HTTP or HTTPS")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+    except ValueError as exc:
+        raise ValidationError(
+            "Google Calendar attachment URL must use absolute HTTP or HTTPS"
+        ) from exc
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValidationError("Google Calendar attachment URL must use absolute HTTP or HTTPS")
+
+
+def _calendar_event_extended_properties(
+    values: Mapping[str, object],
+    *,
+    allow_deletion: bool,
+) -> dict[str, dict[str, str | None]]:
+    result: dict[str, dict[str, str | None]] = {}
+    all_items: list[tuple[str, str | None]] = []
+    for source, target in (
+        ("private_extended_properties", "private"),
+        ("shared_extended_properties", "shared"),
+    ):
+        if source not in values:
+            continue
+        items = _calendar_extended_property_items(
+            values[source],
+            context="Google Calendar extended properties",
+            allow_deletion=allow_deletion,
+            allow_repeated_keys=False,
+        )
+        all_items.extend(items)
+        result[target] = {key: value for key, value in items}
+    _validate_calendar_extended_property_collection(all_items)
+    return result
+
+
+def _calendar_extended_property_items(
+    value: object,
+    *,
+    context: str,
+    allow_deletion: bool,
+    allow_repeated_keys: bool,
+) -> list[tuple[str, str | None]]:
+    items: list[tuple[str, str | None]] = []
+    seen: set[object] = set()
+    for item in _mappings(value):
+        key = _required(item, "key")
+        raw_value = _required_value(item, "value")
+        if raw_value is None:
+            if not allow_deletion:
+                raise ValidationError(f"{context} cannot delete a property")
+            rendered_value = None
+        else:
+            rendered_value = _text(raw_value)
+        identity: object = (key, rendered_value) if allow_repeated_keys else key
+        if identity in seen:
+            raise ValidationError(f"{context} must not contain duplicate properties")
+        seen.add(identity)
+        items.append((key, rendered_value))
+    return items
+
+
+def _validate_calendar_extended_property_collection(
+    items: Sequence[tuple[str, str | None]],
+) -> None:
+    if len(items) > _CALENDAR_MAX_EXTENDED_PROPERTIES:
+        raise ValidationError("Google Calendar supports at most 300 extended properties")
+    encoded_bytes = sum(
+        len(key.encode("utf-8")) + (len(value.encode("utf-8")) if isinstance(value, str) else 0)
+        for key, value in items
+    )
+    if encoded_bytes > _CALENDAR_MAX_EXTENDED_PROPERTY_BYTES:
+        raise ValidationError("Google Calendar extended properties exceed their 32 KiB bound")
 
 
 def _calendar_self_attendee(
@@ -3348,12 +3500,31 @@ def _calendar_event_effect(
         return catalog_effect
     if "recurrence" in values:
         return ConnectorEffect.DESTRUCTIVE
+    if _calendar_extended_property_deletion(values):
+        return ConnectorEffect.DESTRUCTIVE
+    if "attachments" in values:
+        if event is None:
+            return ConnectorEffect.DESTRUCTIVE
+        current_attachments, attachments_complete = _calendar_event_attachment_urls(event)
+        requested_attachments = {
+            _required(attachment, "file_url") for attachment in _mappings(values["attachments"])
+        }
+        if not attachments_complete or not current_attachments.issubset(requested_attachments):
+            return ConnectorEffect.DESTRUCTIVE
+    if "meet_request_id" in values and (event is None or _calendar_event_has_conference(event)):
+        return ConnectorEffect.DESTRUCTIVE
     if "attendee_emails" in values or "attendees" in values:
         if event is None:
             return ConnectorEffect.OUTWARD
         current, current_complete = _calendar_event_attendee_emails(event)
         requested = _calendar_requested_attendee_emails(values)
         if not current_complete or not current.issubset(requested):
+            return ConnectorEffect.DESTRUCTIVE
+        current_guests, current_guests_complete = _calendar_event_additional_guests(event)
+        requested_guests = _calendar_requested_additional_guests(values)
+        if not current_guests_complete or any(
+            requested_guests.get(email, 0) < count for email, count in current_guests.items()
+        ):
             return ConnectorEffect.DESTRUCTIVE
         return ConnectorEffect.OUTWARD
     local_fields = {"calendar_id", "etag", "event_id", "reminders", "send_updates"}
@@ -3381,13 +3552,7 @@ def _calendar_event_mutation_preflight(
             method=ConnectorMethod.GET,
             path=path,
             credential=credential,
-            query=(
-                (
-                    "fields",
-                    "attendees(comment,email,self),end(date,dateTime,timeZone),etag,eventType,id,"
-                    "organizer(displayName,email,self),start(date,dateTime,timeZone),status,summary",
-                ),
-            ),
+            query=(("fields", _calendar_event_preflight_fields(values)),),
         ),
         context="Google Calendar event effect preflight",
     )
@@ -3423,6 +3588,39 @@ def _calendar_event_mutation_preflight(
     if "destination_calendar_id" in values:
         _calendar_move_destination_preflight(values, credential, transport)
     return event
+
+
+def _calendar_event_preflight_fields(values: Mapping[str, object]) -> str:
+    attendee_fields = (
+        "attendees(additionalGuests,comment,email,self)"
+        if "attendee_emails" in values or "attendees" in values
+        else "attendees(comment,email,self)"
+    )
+    fields = [attendee_fields]
+    if "attachments" in values:
+        fields.insert(0, "attachments(fileUrl)")
+    if "meet_request_id" in values:
+        fields.extend(
+            (
+                "conferenceData(conferenceId,conferenceSolution(key(type)),"
+                "createRequest(requestId,status(statusCode)),"
+                "entryPoints(entryPointType,uri))",
+                "hangoutLink",
+            )
+        )
+    fields.extend(
+        (
+            "end(date,dateTime,timeZone)",
+            "etag",
+            "eventType",
+            "id",
+            "organizer(displayName,email,self)",
+            "start(date,dateTime,timeZone)",
+            "status",
+            "summary",
+        )
+    )
+    return ",".join(fields)
 
 
 def _validate_calendar_recurrence_time_zones(start: object, end: object) -> None:
@@ -3534,6 +3732,34 @@ def _calendar_event_attendee_emails(event: Mapping[str, object]) -> tuple[set[st
     return emails, complete
 
 
+def _calendar_event_additional_guests(
+    event: Mapping[str, object],
+) -> tuple[dict[str, int], bool]:
+    attendees = event.get("attendees", [])
+    if not isinstance(attendees, list):
+        raise ValidationError("Google Calendar event preflight returned invalid attendees")
+    counts: dict[str, int] = {}
+    complete = True
+    for attendee in attendees:
+        if not isinstance(attendee, Mapping):
+            raise ValidationError("Google Calendar event preflight returned invalid attendees")
+        email = attendee.get("email")
+        if not isinstance(email, str) or not email:
+            complete = False
+            continue
+        normalized = email.casefold()
+        if normalized in counts:
+            complete = False
+            continue
+        count = attendee.get("additionalGuests", 0)
+        if type(count) is not int or count < 0:
+            raise ValidationError(
+                "Google Calendar event preflight returned invalid additional guests"
+            )
+        counts[normalized] = count
+    return counts, complete
+
+
 def _calendar_requested_attendee_emails(values: Mapping[str, object]) -> set[str]:
     if "attendee_emails" in values:
         return {email.casefold() for email in _strings(values["attendee_emails"])}
@@ -3541,6 +3767,62 @@ def _calendar_requested_attendee_emails(values: Mapping[str, object]) -> set[str
         _required(attendee, "email").casefold()
         for attendee in _mappings(_required_value(values, "attendees"))
     }
+
+
+def _calendar_requested_additional_guests(values: Mapping[str, object]) -> dict[str, int]:
+    if "attendee_emails" in values:
+        return {email.casefold(): 0 for email in _strings(values["attendee_emails"])}
+    result: dict[str, int] = {}
+    for attendee in _mappings(_required_value(values, "attendees")):
+        count = cast(int, attendee.get("additional_guests", 0))
+        result[_required(attendee, "email").casefold()] = count
+    return result
+
+
+def _calendar_event_attachment_urls(
+    event: Mapping[str, object],
+) -> tuple[set[str], bool]:
+    raw_attachments = event.get("attachments", [])
+    if not isinstance(raw_attachments, list):
+        raise ValidationError("Google Calendar event preflight returned invalid attachments")
+    urls: set[str] = set()
+    complete = True
+    for attachment in raw_attachments:
+        if not isinstance(attachment, Mapping):
+            raise ValidationError("Google Calendar event preflight returned invalid attachments")
+        file_url = attachment.get("fileUrl")
+        if not isinstance(file_url, str) or not file_url or file_url in urls:
+            complete = False
+            continue
+        urls.add(file_url)
+    return urls, complete
+
+
+def _calendar_event_has_conference(event: Mapping[str, object]) -> bool:
+    hangout_link = event.get("hangoutLink")
+    if hangout_link is not None:
+        if not isinstance(hangout_link, str):
+            raise ValidationError(
+                "Google Calendar event preflight returned invalid conference data"
+            )
+        if hangout_link:
+            return True
+    conference = event.get("conferenceData")
+    if conference is None:
+        return False
+    if not isinstance(conference, Mapping):
+        raise ValidationError("Google Calendar event preflight returned invalid conference data")
+    return bool(conference)
+
+
+def _calendar_extended_property_deletion(values: Mapping[str, object]) -> bool:
+    for name in ("private_extended_properties", "shared_extended_properties"):
+        if name not in values:
+            continue
+        for item in _mappings(values[name]):
+            if item.get("value") is None:
+                return True
+    return False
 
 
 def _validate_calendar_move(values: Mapping[str, object]) -> None:

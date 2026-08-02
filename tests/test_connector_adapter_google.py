@@ -515,6 +515,8 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
                 "start_time": None,
             }
     if operation.provider == "google_calendar":
+        if name == "colors.get":
+            return {}
         if name == "calendars.list":
             return {"page_size": 1}
         if name == "calendars.get":
@@ -4210,6 +4212,445 @@ def test_calendar_list_and_event_filters_use_fixed_google_parameters() -> None:
             continuation=None,
             credential=credential,
             transport=transport,
+        )
+
+
+def test_calendar_colors_use_the_fixed_existing_read_route() -> None:
+    colors = {
+        "calendar": {"1": {"background": "#ac725e", "foreground": "#1d1d1d"}},
+        "event": {"7": {"background": "#46d6db", "foreground": "#1d1d1d"}},
+        "updated": "2026-08-02T00:00:00Z",
+    }
+    transport = _Transport(body=json.dumps(colors).encode())
+    result = GoogleConnectorAdapter().execute(
+        _operation("google_calendar", "colors.get"),
+        {},
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+
+    assert result.payload == colors
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["method"] is ConnectorMethod.GET
+    assert transport.calls[0]["path"] == "/calendar/v3/colors"
+    assert transport.calls[0]["query"] == ()
+    with pytest.raises(ValidationError, match="does not accept a continuation"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_calendar", "colors.get"),
+            {},
+            continuation="page",
+            credential=_credential(),
+            transport=transport,
+        )
+    assert len(transport.calls) == 1
+
+
+def test_calendar_rich_event_create_uses_one_calendar_call_and_returns_pending_meet() -> None:
+    response = {
+        "conferenceData": {
+            "createRequest": {
+                "requestId": "seld-meet-20260802-01",
+                "status": {"statusCode": "pending"},
+            }
+        },
+        "id": "event-1",
+    }
+    transport = _Transport(body=json.dumps(response).encode())
+    result = GoogleConnectorAdapter().execute(
+        _operation("google_calendar", "events.create"),
+        {
+            "attachments": [
+                {"file_url": "https://files.example.test/brief.pdf"},
+                {"file_url": "https://files.example.test/agenda.pdf"},
+            ],
+            "attendees": [
+                {
+                    "additional_guests": 2,
+                    "display_name": "Guest",
+                    "email": "guest@example.test",
+                    "optional": False,
+                }
+            ],
+            "calendar_id": "primary",
+            "color_id": "7",
+            "end": _event_end_time(),
+            "meet_request_id": "seld-meet-20260802-01",
+            "private_extended_properties": [{"key": "source", "value": "seld"}],
+            "send_updates": "none",
+            "shared_extended_properties": [{"key": "team", "value": "platform"}],
+            "start": _event_time(),
+            "transparency": "transparent",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        write_idempotency_key="confirmed-rich-event",
+    )
+
+    assert result.payload == response
+    assert len(transport.calls) == 1
+    call = transport.calls[0]
+    assert call["path"] == "/calendar/v3/calendars/primary/events"
+    assert call["query"] == (
+        ("sendUpdates", "none"),
+        ("conferenceDataVersion", "1"),
+        ("supportsAttachments", "true"),
+    )
+    assert call["json_body"] == {
+        "attachments": [
+            {"fileUrl": "https://files.example.test/brief.pdf"},
+            {"fileUrl": "https://files.example.test/agenda.pdf"},
+        ],
+        "attendees": [
+            {
+                "additionalGuests": 2,
+                "displayName": "Guest",
+                "email": "guest@example.test",
+                "optional": False,
+            }
+        ],
+        "colorId": "7",
+        "conferenceData": {
+            "createRequest": {
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                "requestId": "seld-meet-20260802-01",
+            }
+        },
+        "end": {"dateTime": "2026-08-01T10:00:00+02:00", "timeZone": "Europe/Brussels"},
+        "extendedProperties": {
+            "private": {"source": "seld"},
+            "shared": {"team": "platform"},
+        },
+        "start": {"dateTime": "2026-08-01T09:00:00+02:00", "timeZone": "Europe/Brussels"},
+        "transparency": "transparent",
+    }
+    assert not any(call["path"].startswith("/drive/") for call in transport.calls)
+
+
+def test_calendar_attachment_urls_are_http_or_https_unique_and_never_dereferenced() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.create")
+    common = {"calendar_id": "primary", "end": _event_end_time(), "start": _event_time()}
+    for file_url in (
+        "ftp://files.example.test/brief.pdf",
+        "javascript:alert(1)",
+        "https://person:secret@files.example.test/brief.pdf",
+        "https://files.example.test/brief pdf",
+        "relative/brief.pdf",
+    ):
+        transport = _Transport()
+        with pytest.raises(ValidationError, match="absolute HTTP or HTTPS"):
+            GoogleConnectorAdapter().execute(
+                operation,
+                {**common, "attachments": [{"file_url": file_url}]},
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+            )
+        assert transport.calls == []
+
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "attachments": [{"file_url": "http://files.example.test/brief.pdf"}]},
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+
+    with pytest.raises(ValidationError, match="must be unique"):
+        GoogleConnectorAdapter().classify_effect(
+            operation,
+            {
+                **common,
+                "attachments": [
+                    {"file_url": "https://files.example.test/brief.pdf"},
+                    {"file_url": "https://files.example.test/brief.pdf"},
+                ],
+            },
+        )
+
+
+def test_calendar_extended_property_filters_disable_sync_cursors_on_both_paths() -> None:
+    operation = _operation("google_calendar", "events.list")
+    values = {
+        "calendar_id": "primary",
+        "private_extended_properties": [
+            {"key": "source", "value": "seld"},
+            {"key": "source", "value": "manual"},
+        ],
+        "shared_extended_properties": [{"key": "team", "value": "platform"}],
+        "show_hidden_invitations": True,
+    }
+    transport = _Transport(body=b'{"items":[],"nextSyncToken":"not-replayable"}')
+    result = GoogleConnectorAdapter().execute(
+        operation,
+        values,
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+    )
+
+    assert result.continuation is None
+    assert transport.calls[0]["query"] == (
+        ("showHiddenInvitations", "true"),
+        ("privateExtendedProperty", "source=seld"),
+        ("privateExtendedProperty", "source=manual"),
+        ("sharedExtendedProperty", "team=platform"),
+    )
+
+    malformed = _Transport()
+    with pytest.raises(ValidationError, match="cannot contain equals signs"):
+        GoogleConnectorAdapter().execute(
+            operation,
+            {
+                "calendar_id": "primary",
+                "private_extended_properties": [{"key": "source=kind", "value": "seld"}],
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=malformed,
+        )
+    assert malformed.calls == []
+
+    for field in ("private_extended_properties", "shared_extended_properties"):
+        blocked = _Transport()
+        with pytest.raises(ValidationError, match="cannot combine event list filters"):
+            GoogleConnectorAdapter().execute(
+                operation,
+                {
+                    "calendar_id": "primary",
+                    field: [{"key": "source", "value": "seld"}],
+                },
+                continuation={"syncToken": "existing-sync"},
+                credential=_credential(),
+                transport=blocked,
+            )
+        assert blocked.calls == []
+
+
+def test_calendar_show_hidden_invitations_remains_sync_replayable() -> None:
+    operation = _operation("google_calendar", "events.list")
+    values = {"calendar_id": "primary", "show_hidden_invitations": True}
+    first = GoogleConnectorAdapter().execute(
+        operation,
+        values,
+        continuation=None,
+        credential=_credential(),
+        transport=_Transport(body=b'{"items":[],"nextSyncToken":"sync-1"}'),
+    )
+    assert first.continuation == {"syncToken": "sync-1"}
+
+    replay = _Transport()
+    GoogleConnectorAdapter().execute(
+        operation,
+        values,
+        continuation=first.continuation,
+        credential=_credential(),
+        transport=replay,
+    )
+    assert replay.calls[0]["query"] == (
+        ("showHiddenInvitations", "true"),
+        ("syncToken", "sync-1"),
+    )
+
+
+def test_calendar_rich_update_effects_fail_closed_for_removed_or_replaced_content() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    private = {
+        "attendees": [],
+        "etag": "etag",
+        "eventType": "default",
+        "organizer": {"email": "owner@example.test", "self": True},
+    }
+    shared = {
+        **private,
+        "attendees": [{"email": "guest@example.test"}],
+    }
+
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "color_id": "7"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(private).encode()),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "color_id": "7"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(shared).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+
+    attachment_event = {
+        **private,
+        "attachments": [{"fileUrl": "https://files.example.test/old.pdf"}],
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "attachments": [{"file_url": "https://files.example.test/new.pdf"}],
+            },
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(attachment_event).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "private_extended_properties": [{"key": "source", "value": None}],
+            },
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(private).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+
+    conference_event = {
+        **private,
+        "conferenceData": {"conferenceId": "existing-conference"},
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "meet_request_id": "replacement-request"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(conference_event).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+    hangout_event = {**private, "hangoutLink": "https://meet.google.com/existing"}
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "meet_request_id": "replacement-request"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(hangout_event).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "meet_request_id": "first-meet-request"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(private).encode()),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+
+    guests = {
+        **private,
+        "attendees": [{"additionalGuests": 2, "email": "guest@example.test"}],
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "attendees": [{"additional_guests": 1, "email": "guest@example.test"}],
+                "send_updates": "none",
+            },
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(guests).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+
+
+def test_calendar_rich_update_preflight_reads_only_fields_needed_for_the_effect() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    event = {
+        "attendees": [],
+        "etag": "etag",
+        "eventType": "default",
+        "organizer": {"email": "owner@example.test", "self": True},
+    }
+    cases = (
+        (
+            {**common, "attachments": []},
+            ("attachments(fileUrl)",),
+            ("additionalGuests", "conferenceData", "hangoutLink"),
+        ),
+        (
+            {**common, "meet_request_id": "new-meet"},
+            ("conferenceData", "hangoutLink"),
+            ("additionalGuests", "attachments(fileUrl)"),
+        ),
+        (
+            {
+                **common,
+                "attendees": [{"additional_guests": 1, "email": "guest@example.test"}],
+                "send_updates": "none",
+            },
+            ("additionalGuests",),
+            ("attachments(fileUrl)", "conferenceData", "hangoutLink"),
+        ),
+    )
+
+    for values, present, absent in cases:
+        transport = _Transport(body=json.dumps(event).encode())
+        adapter.classify_effect(
+            operation,
+            values,
+            credential=_credential(),
+            transport=transport,
+        )
+        fields = dict(transport.calls[0]["query"])["fields"]
+        assert all(value in fields for value in present)
+        assert all(value not in fields for value in absent)
+
+
+def test_calendar_extended_properties_enforce_combined_provider_bounds() -> None:
+    operation = _operation("google_calendar", "events.update")
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    with pytest.raises(ValidationError, match="at most 300"):
+        GoogleConnectorAdapter().classify_effect(
+            operation,
+            {
+                **common,
+                "private_extended_properties": [
+                    {"key": f"private-{index}", "value": "x"} for index in range(150)
+                ],
+                "shared_extended_properties": [
+                    {"key": f"shared-{index}", "value": "x"} for index in range(151)
+                ],
+            },
+        )
+    with pytest.raises(ValidationError, match="32 KiB"):
+        GoogleConnectorAdapter().classify_effect(
+            operation,
+            {
+                **common,
+                "private_extended_properties": [
+                    {"key": f"key-{index}", "value": "x" * 1024} for index in range(33)
+                ],
+            },
+        )
+    with pytest.raises(ValidationError, match="duplicate properties"):
+        GoogleConnectorAdapter().classify_effect(
+            operation,
+            {
+                **common,
+                "private_extended_properties": [
+                    {"key": "source", "value": "seld"},
+                    {"key": "source", "value": "other"},
+                ],
+            },
         )
 
 

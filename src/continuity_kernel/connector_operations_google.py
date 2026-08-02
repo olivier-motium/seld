@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Final
 
 from continuity_kernel.connector_contract import (
+    MAX_JSON_ARRAY_ITEMS,
     MAX_STRING_LENGTH,
     ConnectorEffect,
     ConnectorMode,
@@ -542,11 +543,32 @@ def _expected_calendar_list_entry() -> dict[str, object]:
 def _event_attendee() -> dict[str, object]:
     return _object(
         {
+            "additional_guests": {"minimum": 0, "type": "integer"},
             "display_name": _text(1_024, minimum=0),
             "email": _text(512),
             "optional": {"type": "boolean"},
         },
         required=("email",),
+    )
+
+
+def _event_attachment() -> dict[str, object]:
+    return _object(
+        {"file_url": _text(MAX_STRING_LENGTH)},
+        required=("file_url",),
+    )
+
+
+def _event_extended_property(*, allow_deletion: bool) -> dict[str, object]:
+    value: dict[str, object] = _text(1_024, minimum=0)
+    if allow_deletion:
+        value = _nullable(value)
+    return _object(
+        {
+            "key": _text(44),
+            "value": value,
+        },
+        required=("key", "value"),
     )
 
 
@@ -588,10 +610,12 @@ def _event_reminders() -> dict[str, object]:
     }
 
 
-def _event_fields() -> dict[str, object]:
+def _event_fields(*, allow_property_deletion: bool) -> dict[str, object]:
     return {
+        "attachments": _array(_event_attachment(), maximum=25),
         "attendee_emails": _email_addresses(),
         "attendees": _array(_event_attendee(), maximum=64),
+        "color_id": _text(64),
         "description": _text(200_000, minimum=0),
         "end": _event_time(),
         "event_id": _calendar_event_id(),
@@ -599,14 +623,26 @@ def _event_fields() -> dict[str, object]:
         "guests_can_modify": {"type": "boolean"},
         "guests_can_see_other_guests": {"type": "boolean"},
         "location": _text(4_096, minimum=0),
+        "meet_request_id": _text(1_024),
+        "private_extended_properties": _array(
+            _event_extended_property(allow_deletion=allow_property_deletion),
+            maximum=300,
+            minimum=1,
+        ),
         "recurrence": _array(_text(2_048), maximum=32),
         "reminders": _event_reminders(),
         "send_updates": {
             "enum": ["all", "externalOnly", "none"],
             "type": "string",
         },
+        "shared_extended_properties": _array(
+            _event_extended_property(allow_deletion=allow_property_deletion),
+            maximum=300,
+            minimum=1,
+        ),
         "start": _event_time(),
         "summary": _text(4_096, minimum=0),
+        "transparency": {"enum": ["opaque", "transparent"], "type": "string"},
         "visibility": {
             "enum": ["default", "private", "public", "confidential"],
             "type": "string",
@@ -645,6 +681,7 @@ def _calendar_list() -> dict[str, object]:
 
 
 def _calendar_event_list() -> dict[str, object]:
+    extended_property = _event_extended_property(allow_deletion=False)
     return _object(
         {
             "calendar_id": _id(),
@@ -667,8 +704,19 @@ def _calendar_event_list() -> dict[str, object]:
             "max_attendees": {"maximum": 1_000, "minimum": 1, "type": "integer"},
             "order_by": {"enum": ["startTime", "updated"], "type": "string"},
             "page_size": {"maximum": 2_500, "minimum": 1, "type": "integer"},
+            "private_extended_properties": _array(
+                extended_property,
+                maximum=MAX_JSON_ARRAY_ITEMS,
+                minimum=1,
+            ),
             "query": _text(8_192, minimum=0),
+            "shared_extended_properties": _array(
+                extended_property,
+                maximum=MAX_JSON_ARRAY_ITEMS,
+                minimum=1,
+            ),
             "show_deleted": {"type": "boolean"},
+            "show_hidden_invitations": {"type": "boolean"},
             "single_events": {"type": "boolean"},
             "time_max": _text(64),
             "time_min": _text(64),
@@ -1492,6 +1540,14 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
     _operation(
         "google_calendar",
         ConnectorMode.READ,
+        "colors.get",
+        ConnectorEffect.READ,
+        _CALENDAR_LIST_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "google_calendar",
+        ConnectorMode.READ,
         "calendars.get",
         ConnectorEffect.READ,
         _CALENDAR_RESOURCE_READ_SCOPES,
@@ -1583,7 +1639,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _object(
             {
                 "calendar_id": _id(),
-                **_event_fields(),
+                **_event_fields(allow_property_deletion=False),
                 "event_id": _calendar_client_event_id(),
             },
             required=("calendar_id", "start", "end"),
@@ -1596,7 +1652,11 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.SAFE_MUTATION,
         _CALENDAR_EVENT_WRITE_SCOPES,
         _object(
-            {"calendar_id": _id(), "etag": _text(1_024), **_event_fields()},
+            {
+                "calendar_id": _id(),
+                "etag": _text(1_024),
+                **_event_fields(allow_property_deletion=True),
+            },
             required=("calendar_id", "event_id", "etag"),
         ),
     ),

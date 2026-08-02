@@ -185,6 +185,93 @@ def test_schema_boundary_rejects_proxy_nonfinite_oversized_deep_and_ambiguous_va
         validate_json(deep, {"items": {"type": "string"}, "type": "array"})
 
 
+def test_only_calendar_event_attachment_items_may_expose_file_url() -> None:
+    attachment = _object(
+        {"file_url": {"type": "string"}},
+        required=["file_url"],
+    )
+    input_schema = _object(
+        {"attachments": {"items": attachment, "maxItems": 25, "type": "array"}},
+        required=["attachments"],
+    )
+    operations = tuple(
+        OperationSpec(
+            provider="google_calendar",
+            mode=ConnectorMode.WRITE,
+            name=name,
+            effect=ConnectorEffect.SAFE_MUTATION,
+            endpoint=name,
+            required_scopes=(frozenset(),),
+            input_schema=input_schema,
+        )
+        for name in ("events.create", "events.update")
+    )
+    catalog = OperationCatalog(operations)
+    value = {"attachments": [{"file_url": "https://drive.google.com/open?id=file"}]}
+
+    assert (
+        catalog.validate_input("google_calendar", ConnectorMode.WRITE, "events.create", value)
+        == value
+    )
+    tool_call = {
+        "connection_id": "con-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "input": value,
+        "operation": "events.update",
+    }
+    assert (
+        validate_json(
+            tool_call,
+            catalog.tool_input_schema("google_calendar", ConnectorMode.WRITE),
+        )
+        == tool_call
+    )
+
+    for provider, name in (
+        ("demo", "events.create"),
+        ("google_calendar", "events.move"),
+    ):
+        with pytest.raises(ValidationError, match="forbidden transport field"):
+            OperationSpec(
+                provider=provider,
+                mode=ConnectorMode.WRITE,
+                name=name,
+                effect=ConnectorEffect.SAFE_MUTATION,
+                endpoint=name,
+                required_scopes=(frozenset(),),
+                input_schema=input_schema,
+            )
+
+    for field in ("url", "base_url", "endpoint"):
+        with pytest.raises(ValidationError, match="forbidden transport field"):
+            OperationSpec(
+                provider="google_calendar",
+                mode=ConnectorMode.WRITE,
+                name="events.create",
+                effect=ConnectorEffect.SAFE_MUTATION,
+                endpoint="events.create",
+                required_scopes=(frozenset(),),
+                input_schema=_object(
+                    {
+                        "attachments": {
+                            "items": _object({field: {"type": "string"}}),
+                            "type": "array",
+                        }
+                    }
+                ),
+            )
+
+    with pytest.raises(ValidationError, match="forbidden transport field"):
+        OperationSpec(
+            provider="google_calendar",
+            mode=ConnectorMode.WRITE,
+            name="events.create",
+            effect=ConnectorEffect.SAFE_MUTATION,
+            endpoint="events.create",
+            required_scopes=(frozenset(),),
+            input_schema=_object({"file_url": {"type": "string"}}),
+        )
+
+
 def test_schema_subset_handles_large_text_arrays_patterns_and_numeric_bounds() -> None:
     schema = _object(
         {

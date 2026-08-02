@@ -36,20 +36,43 @@ coverage; it is not the interactive feature boundary.
 
 The isolated `gsv_connectors` server exposes `gsv_google_calendar_read` and
 `gsv_google_calendar_write`. Their closed schemas cover the ordinary calendar
-and event fields, recurrence instances, free/busy, moves, and responses. Event
-list continuations are opaque: keep using the returned continuation until the
-last page rotates it to a new sync cursor. An expired cursor reports
-`full_sync_required`; restart that one list without its old cursor.
+and event fields, recurrence instances, free/busy, moves, responses, the live
+Google color palette, Meet creation, URL attachments, attendee guest counts,
+and private or shared extended properties. These additions use the existing
+Calendar grants; they do not trigger another OAuth upgrade. Event list
+continuations are opaque: keep using the returned continuation until the last
+page rotates it to a new sync cursor. An expired cursor reports
+`full_sync_required`; restart that one list without its old cursor. Filters on
+extended properties cannot be replayed with a sync cursor, so filtered lists return
+only ordinary page continuations. `show_hidden_invitations` remains replayable
+when the same value accompanies every sync request.
 
-Calendar and event `update` operations are partial PATCHes. Supplying attendees
-or recurrence replaces that complete array. Attendee removal and recurrence
-replacement are destructive; attendee additions and shared-event changes are
-outward. Reminder-only changes remain local. Ordinary single events may use an
-RFC3339 offset without a separate time zone, while recurring events, including
-all-day series, need one matching explicit zone. All-day end dates are
-exclusive. Optional
+Calendar and event `update` operations are partial PATCHes. Supplying attendees,
+attachments, or recurrence replaces that complete array. Attendee or attachment
+removal, a lower `additional_guests` count, recurrence replacement, Meet
+replacement, and an extended-property value of `null` are destructive.
+Attendee additions and shared-event changes are outward. Reminder-only changes
+remain local. Ordinary single events may use an RFC3339 offset without a
+separate time zone, while recurring events, including all-day series, need one
+matching explicit zone. All-day end dates are exclusive. Optional
 client-supplied event IDs use Google's base32hex alphabet (`0-9`, `a-v`) and
 must be 5-1024 characters.
+
+Use `colors.get` to read the account's current event and calendar color IDs;
+do not assume a static palette. To ask Google to create a Meet conference,
+supply a fresh caller-owned `meet_request_id`. Seld sends
+`conferenceDataVersion=1` and returns Google's `pending`, `success`, or
+`failure` state as received. It does not poll or retry a pending create request.
+Re-read the event later if the person wants the final conference state.
+
+An event accepts at most 25 attachments. Supply each exact absolute HTTP or HTTPS
+`file_url`; Seld validates and forwards the URL but never fetches it, looks up
+Drive metadata, or changes file permissions. The Calendar connection therefore
+needs no Drive scope, while recipients still need whatever access the linked
+file itself requires. Private and shared extended-property keys are at most 44
+characters, values are at most 1,024 characters, and the submitted sets are
+bounded to 300 properties and 32 KiB combined. Updates use an explicit `null`
+value to delete one property.
 
 Move, RSVP, event deletion, and whole-calendar deletion require the reviewed
 event or CalendarList snapshot returned by the preceding read. The connector
@@ -91,11 +114,6 @@ normalization error, not provider drift.
   }
 }
 ```
-
-Drive attachments are not exposed by a separate Calendar connection because
-that grant deliberately has no Drive authority. A later cross-connector flow
-may add them only after it can bind a separately verified Drive connection;
-Calendar OAuth never broadens silently.
 
 Return only the identity basis, bounded-read result, covered interval, and
 stable references to `$gsv-onboard`. Do not persist provider bodies, raw account

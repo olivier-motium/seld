@@ -68,6 +68,7 @@ _EXPECTED_NAMES = {
     },
     "google_calendar": {
         "calendars.list",
+        "colors.get",
         "calendars.get",
         "events.list",
         "events.get",
@@ -166,12 +167,12 @@ def test_google_provider_mode_partitions_and_exact_operation_surface() -> None:
         for provider in _EXPECTED_NAMES
     }
     assert names == _EXPECTED_NAMES
-    assert len(GOOGLE_OPERATIONS) == 92
+    assert len(GOOGLE_OPERATIONS) == 93
     assert {
         provider: sum(item.provider == provider for item in GOOGLE_OPERATIONS) for provider in names
     } == {
         "gmail": 49,
-        "google_calendar": 14,
+        "google_calendar": 15,
         "google_drive": 29,
     }
     assert all(item.endpoint == item.name for item in GOOGLE_OPERATIONS)
@@ -269,6 +270,7 @@ def test_calendar_reads_accept_legacy_readonly_and_metadata_uses_resource_scope(
     legacy = ["https://www.googleapis.com/auth/calendar.readonly"]
     for name in (
         "calendars.list",
+        "colors.get",
         "calendars.get",
         "events.list",
         "events.get",
@@ -283,6 +285,18 @@ def test_calendar_reads_accept_legacy_readonly_and_metadata_uses_resource_scope(
     )
     assert not metadata.scope_grant_satisfies(
         ["https://www.googleapis.com/auth/calendar.calendarlist.readonly"]
+    )
+
+
+def test_calendar_colors_uses_the_existing_calendar_list_read_scopes() -> None:
+    colors = _operation("google_calendar", ConnectorMode.READ, "colors.get")
+    assert colors.validate_input({}) == {}
+    assert colors.scope_grant_satisfies(
+        ["https://www.googleapis.com/auth/calendar.calendarlist.readonly"]
+    )
+    assert colors.scope_grant_satisfies(["https://www.googleapis.com/auth/calendar.readonly"])
+    assert not colors.scope_grant_satisfies(
+        ["https://www.googleapis.com/auth/calendar.events.readonly"]
     )
 
 
@@ -710,6 +724,119 @@ def test_calendar_schemas_match_provider_time_id_and_notification_contracts() ->
     )
 
 
+def test_calendar_rich_event_fields_are_typed_closed_and_bound_to_provider_caps() -> None:
+    catalog = _catalog()
+    event_time = {"date_time": "2026-08-02T10:00:00+02:00"}
+    attachments = [{"file_url": f"https://drive.example.test/files/{index}"} for index in range(25)]
+    event = {
+        "attachments": attachments,
+        "attendees": [
+            {
+                "additional_guests": 0,
+                "email": "guest@example.test",
+            }
+        ],
+        "calendar_id": "primary",
+        "color_id": "7",
+        "end": event_time,
+        "meet_request_id": "seld-meet-request-01",
+        "private_extended_properties": [{"key": "source", "value": "seld"}],
+        "shared_extended_properties": [{"key": "team", "value": ""}],
+        "start": event_time,
+        "transparency": "transparent",
+    }
+    assert (
+        catalog.validate_input("google_calendar", ConnectorMode.WRITE, "events.create", event)
+        == event
+    )
+
+    update = {
+        "calendar_id": "primary",
+        "etag": "etag",
+        "event_id": "event",
+        "private_extended_properties": [{"key": "source", "value": None}],
+        "shared_extended_properties": [{"key": "team", "value": None}],
+    }
+    assert (
+        catalog.validate_input("google_calendar", ConnectorMode.WRITE, "events.update", update)
+        == update
+    )
+
+    for invalid in (
+        {**event, "attachments": [*attachments, {"file_url": "https://example.test/extra"}]},
+        {
+            **event,
+            "attachments": [{"file_url": "https://example.test/file", "file_id": "file"}],
+        },
+        {**event, "attendees": [{"additional_guests": -1, "email": "guest@example.test"}]},
+        {**event, "private_extended_properties": [{"key": "k" * 45, "value": "value"}]},
+        {**event, "private_extended_properties": [{"key": "key", "value": "v" * 1_025}]},
+        {
+            **event,
+            "private_extended_properties": [
+                {"key": f"key-{index}", "value": "value"} for index in range(301)
+            ],
+        },
+        {**event, "private_extended_properties": [{"key": "source", "value": None}]},
+        {**event, "transparency": "busy"},
+        {**event, "source": {"title": "unadvertised provider field"}},
+    ):
+        with pytest.raises(ValidationError):
+            catalog.validate_input(
+                "google_calendar",
+                ConnectorMode.WRITE,
+                "events.create",
+                invalid,
+            )
+
+
+def test_calendar_event_list_exposes_closed_extended_property_filters() -> None:
+    operation = _operation("google_calendar", ConnectorMode.READ, "events.list")
+    values = {
+        "calendar_id": "primary",
+        "private_extended_properties": [{"key": "source", "value": "seld"}],
+        "shared_extended_properties": [{"key": "team", "value": "platform"}],
+        "show_hidden_invitations": True,
+    }
+    assert operation.validate_input(values) == values
+
+    many_filters = {
+        "calendar_id": "primary",
+        "private_extended_properties": [
+            {"key": f"key-{index}", "value": "value"} for index in range(301)
+        ],
+    }
+    assert operation.validate_input(many_filters) == many_filters
+
+    for invalid in (
+        {**values, "private_extended_properties": [{"key": "source", "value": None}]},
+        {**values, "shared_extended_properties": [{"key": "team"}]},
+        {
+            **values,
+            "private_extended_properties": [
+                {"key": "source", "value": "seld", "operator": "equals"}
+            ],
+        },
+    ):
+        with pytest.raises(ValidationError):
+            operation.validate_input(invalid)
+
+
+def test_calendar_confirmation_snapshot_stays_fixed_when_rich_fields_expand() -> None:
+    move = _operation("google_calendar", ConnectorMode.WRITE, "events.move")
+    values = {
+        "calendar_id": "source",
+        "destination_calendar_id": "destination",
+        "etag": "etag",
+        "event_id": "event",
+        "expected_destination_calendar": _expected_calendar("destination"),
+        "expected_event": {**_expected_event(), "colorId": "7"},
+        "send_updates": "all",
+    }
+    with pytest.raises(ValidationError, match="unknown field"):
+        move.validate_input(values)
+
+
 def test_gmail_attachment_delivery_and_typed_local_file_sources_are_explicit() -> None:
     attachment = _operation("gmail", ConnectorMode.READ, "attachments.get")
     identifiers = {"attachment_id": "attachment", "message_id": "message"}
@@ -794,11 +921,20 @@ def _schema_property_names(schema: Mapping[str, object]) -> set[str]:
 
 def test_google_schemas_and_tool_envelopes_keep_transport_sealed() -> None:
     forbidden = ("url", "method", "header", "token", "nextlink", "authorization", "host", "cursor")
+    provider_resource_url_operations: set[tuple[str, ConnectorMode, str]] = set()
     for operation in GOOGLE_OPERATIONS:
         for name in _schema_property_names(operation.input_schema):
             normalized = "".join(character for character in name.casefold() if character.isalnum())
+            if normalized == "fileurl":
+                provider_resource_url_operations.add(operation.key)
+                continue
             assert normalized not in {"header", "headers", "url", "urls"}
             assert not any(normalized.endswith(suffix) for suffix in forbidden)
+
+    assert provider_resource_url_operations == {
+        ("google_calendar", ConnectorMode.WRITE, "events.create"),
+        ("google_calendar", ConnectorMode.WRITE, "events.update"),
+    }
 
     catalog = _catalog()
     for provider, mode in {(item.provider, item.mode) for item in GOOGLE_OPERATIONS}:

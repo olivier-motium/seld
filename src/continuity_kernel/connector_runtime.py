@@ -157,8 +157,10 @@ _OPERATION_WARNINGS: Final = {
         "google_calendar",
         "events.update",
     ): (
-        "Supplying attendees or recurrence replaces that complete array; send_updates=none can "
-        "leave external calendars stale and may not suppress every email."
+        "Supplying attendees, attachments, or recurrence replaces that complete array; a null "
+        "extended-property value deletes that entry, and a new Meet request can replace existing "
+        "conference data. send_updates=none can leave external calendars stale and may not "
+        "suppress every email."
     ),
     (
         "outlook_calendar",
