@@ -120,6 +120,31 @@ new OAuth scope. A birthday on `primary` is private and one-step. Creating one,
 or changing its summary, color, or date on another calendar, requires outward
 confirmation; a reminder-only change remains a one-step local preference.
 
+Events generated automatically from Gmail are provider-owned
+`eventType: fromGmail` events. Seld can read, filter, update, RSVP to, and
+delete an existing one, but it cannot create one or move it to another
+calendar. Google controls whether the account and region generate these events;
+reconnecting does not enable Gmail smart features or create a missing event.
+
+For `events.update`, Google permits only color, reminders, visibility,
+transparency, `confirmed` or `tentative` status, attendees, and private or
+shared extended properties. Seld reads the live type and ETag before PATCH and
+rejects schedule, title, description, location, recurrence, attachment, Meet,
+guest-policy, or status-property changes before writing. Use `events.delete`,
+not an update with cancelled status, to remove one; that keeps deletion on the
+snapshot-bound destructive path with an explicit `send_updates` choice.
+
+Color, reminders, and non-deleting private properties on `primary` are
+copy-private one-step changes. Visibility, transparency, non-deleting status,
+shared properties, notifying updates, and attendee changes require outward
+confirmation. Removing an attendee, reducing additional guests, or deleting an
+extended property is destructive. Supplying attendees replaces the complete
+array; preserve each attendee's comment, display name, optional/resource flag,
+and response status when it should remain. The email-only attendee shorthand is
+refused for these events because it would discard that metadata. `events.respond`
+works only when the fresh read identifies exactly one self attendee. These
+behaviors use the existing Calendar grant and need no OAuth upgrade.
+
 Move, RSVP, event deletion, and whole-calendar deletion require the reviewed
 event or CalendarList snapshot returned by the preceding read. The connector
 shows that human target in the preview, re-reads it, compares the ETag and

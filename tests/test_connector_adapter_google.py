@@ -3086,7 +3086,7 @@ def test_calendar_rsvp_preflights_self_attendee_and_etag() -> None:
                 },
             ],
             "etag": '"event-version-4"',
-            "eventType": "default",
+            "eventType": "fromGmail",
             "id": "event-1",
             "status": "confirmed",
         }
@@ -3099,7 +3099,11 @@ def test_calendar_rsvp_preflights_self_attendee_and_etag() -> None:
             "comment": "See you there",
             "etag": '"event-version-4"',
             "event_id": "event-1",
-            "expected_event": _expected_event(etag='"event-version-4"', event_id="event-1"),
+            "expected_event": _expected_event(
+                etag='"event-version-4"',
+                event_id="event-1",
+                event_type="fromGmail",
+            ),
             "response_status": "tentative",
             "send_updates": "all",
         },
@@ -5029,6 +5033,224 @@ def test_calendar_birthday_update_invariants_fail_before_patch() -> None:
                 transport=transport,
             )
         assert len(transport.calls) == 1
+
+
+def test_calendar_from_gmail_updates_use_live_type_and_copy_aware_effects() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    event = {
+        "attendees": [{"additionalGuests": 0, "email": "guest@example.test"}],
+        "etag": "etag",
+        "eventType": "fromGmail",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "status": "confirmed",
+    }
+    copy_private = {
+        **common,
+        "color_id": "7",
+        "private_extended_properties": [{"key": "source", "value": "seld"}],
+        "reminders": {"use_default": True},
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            copy_private,
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(event).encode()),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**copy_private, "calendar_id": "delegated@example.test"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(event).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+
+    outward_values = (
+        {**common, "visibility": "private"},
+        {**common, "transparency": "transparent"},
+        {**common, "status": "tentative"},
+        {
+            **common,
+            "shared_extended_properties": [{"key": "trip", "value": "confirmed"}],
+        },
+        {**common, "color_id": "7", "send_updates": "all"},
+    )
+    for values in outward_values:
+        assert (
+            adapter.classify_effect(
+                operation,
+                values,
+                credential=_credential(),
+                transport=_Transport(body=json.dumps(event).encode()),
+            )
+            is ConnectorEffect.OUTWARD
+        )
+
+    deletion = {
+        **common,
+        "private_extended_properties": [{"key": "source", "value": None}],
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            deletion,
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(event).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+
+    local_transport = _Transport(bodies=(json.dumps(event).encode(), b"{}"))
+    adapter.execute(
+        operation,
+        copy_private,
+        continuation=None,
+        credential=_credential(),
+        transport=local_transport,
+    )
+    assert local_transport.calls[1]["headers"] == {"If-Match": "etag"}
+    assert local_transport.calls[1]["json_body"] == {
+        "colorId": "7",
+        "extendedProperties": {"private": {"source": "seld"}},
+        "reminders": {"useDefault": True},
+    }
+
+    status_transport = _Transport(bodies=(json.dumps(event).encode(), b"{}"))
+    adapter.execute(
+        operation,
+        {**common, "status": "tentative"},
+        continuation=None,
+        credential=_credential(),
+        transport=status_transport,
+        write_idempotency_key="confirmed-gmail-status",
+    )
+    assert status_transport.calls[1]["json_body"] == {"status": "tentative"}
+
+
+def test_calendar_from_gmail_rejects_provider_owned_fields_before_patch() -> None:
+    operation = _operation("google_calendar", "events.update")
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    event = {
+        "attendees": [],
+        "etag": "etag",
+        "eventType": "fromGmail",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "status": "confirmed",
+    }
+    invalid_values = (
+        {**common, "summary": "Provider-owned title"},
+        {**common, "start": _event_time()},
+        {
+            **common,
+            "attendee_emails": ["traveller@example.test"],
+            "send_updates": "none",
+        },
+        {
+            **common,
+            "attachments": [{"file_url": "https://files.example.test/brief.pdf"}],
+        },
+    )
+    for values in invalid_values:
+        transport = _Transport(body=json.dumps(event).encode())
+        with pytest.raises(ValidationError, match="generated from Gmail"):
+            GoogleConnectorAdapter().classify_effect(
+                operation,
+                values,
+                credential=_credential(),
+                transport=transport,
+            )
+        assert len(transport.calls) == 1
+
+
+def test_calendar_from_gmail_attendee_replacement_is_lossless_and_complete() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    values = {
+        "attendees": [
+            {
+                "additional_guests": 1,
+                "comment": "Window seat requested",
+                "display_name": "Traveller",
+                "email": "traveller@example.test",
+                "optional": False,
+                "resource": False,
+                "response_status": "accepted",
+            }
+        ],
+        "calendar_id": "primary",
+        "etag": "etag",
+        "event_id": "event",
+        "send_updates": "none",
+    }
+    event = {
+        "attendees": [
+            {
+                "additionalGuests": 1,
+                "comment": "Window seat requested",
+                "displayName": "Traveller",
+                "email": "traveller@example.test",
+                "optional": False,
+                "resource": False,
+                "responseStatus": "accepted",
+            }
+        ],
+        "attendeesOmitted": False,
+        "etag": "etag",
+        "eventType": "fromGmail",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "status": "confirmed",
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            values,
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(event).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+
+    transport = _Transport(bodies=(json.dumps(event).encode(), b"{}"))
+    adapter.execute(
+        operation,
+        values,
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        write_idempotency_key="confirmed-gmail-attendees",
+    )
+    fields = dict(transport.calls[0]["query"])["fields"]
+    assert "attendeesOmitted" in fields
+    assert "responseStatus" in fields
+    assert transport.calls[1]["json_body"] == {
+        "attendees": [
+            {
+                "additionalGuests": 1,
+                "comment": "Window seat requested",
+                "displayName": "Traveller",
+                "email": "traveller@example.test",
+                "optional": False,
+                "resource": False,
+                "responseStatus": "accepted",
+            }
+        ]
+    }
+
+    incomplete = _Transport(body=json.dumps({**event, "attendeesOmitted": True}).encode())
+    with pytest.raises(ValidationError, match="complete attendee list"):
+        adapter.classify_effect(
+            operation,
+            values,
+            credential=_credential(),
+            transport=incomplete,
+        )
+    assert len(incomplete.calls) == 1
 
 
 def test_calendar_status_create_invariants_fail_before_transport() -> None:

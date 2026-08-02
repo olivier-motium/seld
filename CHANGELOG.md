@@ -28,6 +28,9 @@ decision loop.
 - Extend Google Calendar's existing event CRUD with provider-shaped private
   birthdays, including annual recurrence, safe date-source handling, and no new
   OAuth scope.
+- Manage Gmail-generated Calendar events through their existing read, bounded
+  update, RSVP, and delete paths while refusing provider-owned create and move
+  operations.
 - Remove unused deterministic onboarding, Pulse-controller,
   scheduler-planning, and migration modules. The shipped skills own semantic
   orchestration; legacy backup marker recognition remains for safe restore.

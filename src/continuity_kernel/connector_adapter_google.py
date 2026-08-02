@@ -3189,6 +3189,7 @@ def _calendar_event_body(
             "guests_can_see_other_guests": "guestsCanSeeOtherGuests",
             "location": "location",
             "recurrence": "recurrence",
+            "status": "status",
             "summary": "summary",
             "transparency": "transparency",
             "visibility": "visibility",
@@ -3213,9 +3214,12 @@ def _calendar_event_body(
                 attendee,
                 {
                     "additional_guests": "additionalGuests",
+                    "comment": "comment",
                     "display_name": "displayName",
                     "email": "email",
                     "optional": "optional",
+                    "resource": "resource",
+                    "response_status": "responseStatus",
                 },
             )
             for attendee in attendees
@@ -3817,6 +3821,9 @@ def _calendar_event_effect(
         ):
             return ConnectorEffect.DESTRUCTIVE
         return ConnectorEffect.OUTWARD
+    from_gmail_effect = _calendar_from_gmail_update_effect(values, event)
+    if from_gmail_effect is not None:
+        return from_gmail_effect
     status_effect = _calendar_status_update_effect(values, event)
     if status_effect is not None:
         return status_effect
@@ -3826,6 +3833,36 @@ def _calendar_event_effect(
     if event is None or _calendar_event_is_shared(event) or values.get("calendar_id") != "primary":
         return ConnectorEffect.OUTWARD
     return catalog_effect
+
+
+def _calendar_from_gmail_update_effect(
+    values: Mapping[str, object], event: Mapping[str, object] | None
+) -> ConnectorEffect | None:
+    if not isinstance(event, Mapping) or event.get("eventType") != "fromGmail":
+        return None
+    outward_fields = {
+        "shared_extended_properties",
+        "status",
+        "transparency",
+        "visibility",
+    }
+    if set(values).intersection(outward_fields) or values.get("send_updates") in {
+        "all",
+        "externalOnly",
+    }:
+        return ConnectorEffect.OUTWARD
+    copy_private_fields = {
+        "calendar_id",
+        "color_id",
+        "etag",
+        "event_id",
+        "private_extended_properties",
+        "reminders",
+        "send_updates",
+    }
+    if values.get("calendar_id") == "primary" and set(values).issubset(copy_private_fields):
+        return ConnectorEffect.SAFE_MUTATION
+    return ConnectorEffect.OUTWARD
 
 
 def _calendar_status_update_effect(
@@ -3943,9 +3980,20 @@ def _calendar_event_mutation_preflight(
                 "Google Calendar expected event snapshot does not match the current event; "
                 "normalize the reviewed read to the documented confirmation shape"
             )
+    if "attendee_emails" in values or "attendees" in values:
+        attendees_omitted = event.get("attendeesOmitted", False)
+        if type(attendees_omitted) is not bool:
+            raise ValidationError(
+                "Google Calendar event preflight returned an invalid attendee completeness marker"
+            )
+        if attendees_omitted:
+            raise ValidationError(
+                "Google Calendar attendee replacement requires a complete attendee list"
+            )
     _validate_calendar_status_event_update(values, event)
     if operation_name == "events.update":
         _validate_calendar_birthday_event_update(values, event)
+        _validate_calendar_from_gmail_event_update(values, event)
     if values.get("recurrence"):
         _validate_calendar_recurrence_time_zones(
             values.get("start", event.get("start")),
@@ -3962,11 +4010,14 @@ def _calendar_event_mutation_preflight(
 
 def _calendar_event_preflight_fields(values: Mapping[str, object]) -> str:
     attendee_fields = (
-        "attendees(additionalGuests,comment,email,self)"
+        "attendees(additionalGuests,comment,displayName,email,optional,organizer,resource,"
+        "responseStatus,self)"
         if "attendee_emails" in values or "attendees" in values
         else "attendees(comment,email,self)"
     )
     fields = [attendee_fields]
+    if "attendee_emails" in values or "attendees" in values:
+        fields.append("attendeesOmitted")
     if "attachments" in values:
         fields.insert(0, "attachments(fileUrl)")
     if "meet_request_id" in values:
@@ -4001,6 +4052,32 @@ def _calendar_event_preflight_fields(values: Mapping[str, object]) -> str:
         )
     )
     return ",".join(fields)
+
+
+def _validate_calendar_from_gmail_event_update(
+    values: Mapping[str, object], event: Mapping[str, object]
+) -> None:
+    if event.get("eventType") != "fromGmail":
+        return
+    supported = {
+        "attendees",
+        "calendar_id",
+        "color_id",
+        "etag",
+        "event_id",
+        "private_extended_properties",
+        "reminders",
+        "send_updates",
+        "shared_extended_properties",
+        "status",
+        "transparency",
+        "visibility",
+    }
+    if not set(values).issubset(supported):
+        raise ValidationError(
+            "Google Calendar events generated from Gmail can update only color, reminders, "
+            "visibility, transparency, status, attendees, and private or shared properties"
+        )
 
 
 def _validate_calendar_birthday_event_update(

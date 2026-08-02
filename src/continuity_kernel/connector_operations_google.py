@@ -544,9 +544,15 @@ def _event_attendee() -> dict[str, object]:
     return _object(
         {
             "additional_guests": {"minimum": 0, "type": "integer"},
+            "comment": _text(16_384, minimum=0),
             "display_name": _text(1_024, minimum=0),
             "email": _text(512),
             "optional": {"type": "boolean"},
+            "resource": {"type": "boolean"},
+            "response_status": {
+                "enum": ["accepted", "declined", "needsAction", "tentative"],
+                "type": "string",
+            },
         },
         required=("email",),
     )
@@ -1749,6 +1755,10 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
                 "calendar_id": _id(),
                 "etag": _text(1_024),
                 **_event_fields(allow_property_deletion=True),
+                "status": {
+                    "enum": ["confirmed", "tentative"],
+                    "type": "string",
+                },
             },
             required=("calendar_id", "event_id", "etag"),
         ),

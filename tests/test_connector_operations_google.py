@@ -1405,6 +1405,31 @@ def test_calendar_special_event_schemas_are_typed_without_new_operations() -> No
     }
 
 
+def test_calendar_update_exposes_lossless_attendees_and_nondeletion_status() -> None:
+    update = _operation("google_calendar", ConnectorMode.WRITE, "events.update")
+    values = {
+        "attendees": [
+            {
+                "additional_guests": 1,
+                "comment": "Window seat requested",
+                "display_name": "Traveller",
+                "email": "traveller@example.test",
+                "optional": False,
+                "resource": False,
+                "response_status": "accepted",
+            }
+        ],
+        "calendar_id": "primary",
+        "etag": "etag",
+        "event_id": "event",
+        "send_updates": "none",
+        "status": "tentative",
+    }
+    assert update.validate_input(values) == values
+    with pytest.raises(ValidationError):
+        update.validate_input({**values, "status": "cancelled"})
+
+
 def test_separate_calendar_connection_does_not_advertise_unreachable_drive_attachments() -> None:
     operation = _operation("google_calendar", ConnectorMode.WRITE, "events.create")
     event_time = {
