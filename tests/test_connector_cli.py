@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import webbrowser
 from argparse import Namespace
 from pathlib import Path
@@ -8,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from continuity_kernel import cli
+import continuity_kernel.cli as cli
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_onboarding import ConnectorIdentityReview, ConnectorOnboarding
 from continuity_kernel.connector_profiles import ConnectorAccessTier
@@ -585,9 +587,9 @@ def test_firefox_opener_is_lazy_and_uses_bounded_macos_bundle_fallback(
         subprocess_calls.append((command, kwargs))
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(cli.webbrowser, "get", unavailable)
-    monkeypatch.setattr(cli.subprocess, "run", run)
-    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    monkeypatch.setattr(webbrowser, "get", unavailable)
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(sys, "platform", "darwin")
 
     opener = cli._connector_browser_opener(args)
     assert looked_up == []
@@ -604,9 +606,9 @@ def test_firefox_opener_is_lazy_and_uses_bounded_macos_bundle_fallback(
                 "https://accounts.example/authorize",
             ],
             {
-                "stdin": cli.subprocess.DEVNULL,
-                "stdout": cli.subprocess.DEVNULL,
-                "stderr": cli.subprocess.DEVNULL,
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
                 "check": False,
                 "timeout": 5,
             },
@@ -618,12 +620,10 @@ def test_firefox_opener_returns_manual_fallback_when_non_macos_browser_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     args = Namespace(browser="firefox", no_browser=False)
+    monkeypatch.setattr(webbrowser, "get", lambda name: (_ for _ in ()).throw(webbrowser.Error()))
+    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(
-        cli.webbrowser, "get", lambda name: (_ for _ in ()).throw(webbrowser.Error())
-    )
-    monkeypatch.setattr(cli.sys, "platform", "linux")
-    monkeypatch.setattr(
-        cli.subprocess,
+        subprocess,
         "run",
         lambda *args, **kwargs: pytest.fail("macOS fallback reached"),
     )

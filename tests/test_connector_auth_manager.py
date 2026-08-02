@@ -948,7 +948,7 @@ def test_authorize_downgrades_before_token_publish_and_can_resume_after_failure(
         expected_version: int,
         value: bytes,
         updated_at: datetime | None = None,
-    ):
+    ) -> TokenState:
         nonlocal fail_once
         visible = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
         assert visible is not None
@@ -974,8 +974,10 @@ def test_authorize_downgrades_before_token_publish_and_can_resume_after_failure(
     assert failed is not None
     assert failed.health is ConnectionHealth.UNVERIFIED
     assert manager.tokens.read(CONNECTION_ID).value == original.to_bytes()
+    replacement_refresh_token = replacement.refresh_token
+    assert replacement_refresh_token is not None
     assert replacement.access_token not in str(failure.value)
-    assert replacement.refresh_token not in str(failure.value)
+    assert replacement_refresh_token not in str(failure.value)
     assert replacement.access_token not in json.dumps(manager.status(), sort_keys=True)
 
     manager.authorize_oauth(CONNECTION_ID)

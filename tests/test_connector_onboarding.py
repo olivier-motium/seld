@@ -4,7 +4,7 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -18,7 +18,11 @@ from continuity_kernel.connector_auth import (
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_client_registration import PublicClientRegistration
 from continuity_kernel.connector_credentials import OAuthCredential
-from continuity_kernel.connector_identifiers import new_connection_id
+from continuity_kernel.connector_identifiers import (
+    ConnectionId,
+    new_connection_id,
+    parse_connection_id,
+)
 from continuity_kernel.connector_identity import ConnectorIdentity
 from continuity_kernel.connector_oauth import OAuthTokenType
 from continuity_kernel.connector_onboarding import (
@@ -370,10 +374,15 @@ def test_wrong_account_upgrade_aborts_and_explicit_new_account_keeps_both(
     )
 
     reviewed: list[str] = []
+
+    def confirm_different_identity(review: ConnectorIdentityReview) -> bool:
+        reviewed.append(review.display_label)
+        return True
+
     different = onboarding.connect_oauth(
         "outlook_calendar",
         access="full",
-        confirm_identity=lambda review: reviewed.append(review.display_label) is None or True,
+        confirm_identity=confirm_different_identity,
     )
     assert reviewed == ["Ada <ada@example.test>"]
     assert different["status"] == "different_account"
@@ -391,7 +400,7 @@ def test_wrong_account_upgrade_aborts_and_explicit_new_account_keeps_both(
     assert connected["status"] == "connected"
     snapshot = manager.vault.get_connection_snapshot()
     assert len(snapshot.connections) == 2
-    new_connection = snapshot.connection(cast(str, connected["connection_id"]))
+    new_connection = snapshot.connection(parse_connection_id(connected["connection_id"]))
     assert new_connection is not None
     assert profile.access_for_scopes(new_connection.scopes) is ConnectorAccessTier.FULL
 
@@ -494,7 +503,7 @@ def test_same_account_upgrade_keeps_read_ready_until_full_is_published_then_remo
     assert result["replaced_connection_id"] == str(old.connection_id)
     snapshot = manager.vault.get_connection_snapshot()
     assert snapshot.connection(old.connection_id) is None
-    new = snapshot.connection(cast(str, result["connection_id"]))
+    new = snapshot.connection(parse_connection_id(result["connection_id"]))
     assert new is not None and new.health is ConnectionHealth.READY
     assert "https://mail.google.com/" not in new.scopes
 
@@ -522,7 +531,7 @@ def test_gmail_permanent_delete_is_a_separate_explicit_full_step_up(
         confirm_identity=lambda review: True,
     )
     connection = manager.vault.get_connection_snapshot().connection(
-        cast(str, connected["connection_id"])
+        parse_connection_id(connected["connection_id"])
     )
     assert connection is not None
     assert "https://mail.google.com/" in connection.scopes
@@ -544,6 +553,11 @@ def test_sufficient_existing_oauth_fast_path_keeps_equal_and_broader_grants_unch
     existing = _existing_oauth(manager, "google_drive", access=ConnectorAccessTier.READ)
     before = manager.tokens.read(existing.connection_id)
     touched: list[str] = []
+
+    def confirm_existing_identity(review: ConnectorIdentityReview) -> bool:
+        touched.append(review.display_label)
+        return True
+
     onboarding = ConnectorOnboarding(
         manager,
         registration_loader=_registration,
@@ -558,7 +572,7 @@ def test_sufficient_existing_oauth_fast_path_keeps_equal_and_broader_grants_unch
     result = onboarding.connect_oauth(
         "google_drive",
         access="read",
-        confirm_identity=lambda review: touched.append(review.display_label) is None,
+        confirm_identity=confirm_existing_identity,
     )
     assert result["status"] == "already_connected"
     assert result["credential"] == "unchanged"
@@ -695,9 +709,14 @@ def test_resume_shows_wrong_identity_before_returning_exact_retry(
         identity_verifier=lambda provider, credential: _identity(provider, FP_TWO),
     )
     reviewed: list[str] = []
+
+    def confirm_resumed_identity(review: ConnectorIdentityReview) -> bool:
+        reviewed.append(review.display_label)
+        return True
+
     result = onboarding.resume(
         str(pending.connection_id),
-        confirm_identity=lambda review: reviewed.append(review.display_label) is None or True,
+        confirm_identity=confirm_resumed_identity,
     )
 
     assert reviewed == ["Ada <ada@example.test>"]
@@ -991,12 +1010,11 @@ def test_discord_same_bot_reconnect_reuses_connection_and_refreshes_credential(
     assert second["connection_id"] == first["connection_id"]
     assert third["status"] == "already_connected"
     assert third["connection_id"] == first["connection_id"]
-    assert manager.resolve_credential_state(cast(str, first["connection_id"])).value == (
-        b"discord-bot-token-v3"
-    )
+    first_connection_id = parse_connection_id(first["connection_id"])
+    assert manager.resolve_credential_state(first_connection_id).value == (b"discord-bot-token-v3")
     snapshot = manager.vault.get_connection_snapshot()
     assert len(snapshot.connections) == 1
-    current = snapshot.connection(cast(str, first["connection_id"]))
+    current = snapshot.connection(first_connection_id)
     assert current is not None and current.account.label == "Community Bot"
 
 
@@ -1014,18 +1032,33 @@ def test_discord_reuse_fails_closed_if_metadata_changes_after_confirmation(
         access="full",
         confirm_identity=lambda review: True,
     )
-    connection_id = cast(str, first["connection_id"])
-    before = manager.resolve_credential_state(connection_id)
+    active_connection_id = parse_connection_id(first["connection_id"])
+    before = manager.resolve_credential_state(active_connection_id)
     real_rotate = manager.rotate_verified_bearer_credential
 
-    def race(*args: object, **kwargs: object) -> dict[str, object]:
+    def race(
+        connection_id: ConnectionId | str,
+        *,
+        expected_revision: str,
+        expected_account_fingerprint: str,
+        expected_token_version: int,
+        replacement: bytes,
+        account_label: str | None = None,
+    ) -> dict[str, Any]:
         snapshot = manager.vault.get_connection_snapshot()
         manager.vault.mark_connection_health(
             expected_revision=snapshot.revision,
-            connection_id=connection_id,
+            connection_id=active_connection_id,
             health=ConnectionHealth.DEGRADED,
         )
-        return real_rotate(*args, **kwargs)  # type: ignore[arg-type,return-value]
+        return real_rotate(
+            connection_id,
+            expected_revision=expected_revision,
+            expected_account_fingerprint=expected_account_fingerprint,
+            expected_token_version=expected_token_version,
+            replacement=replacement,
+            account_label=account_label,
+        )
 
     monkeypatch.setattr(manager, "rotate_verified_bearer_credential", race)
 
@@ -1036,7 +1069,7 @@ def test_discord_reuse_fails_closed_if_metadata_changes_after_confirmation(
             confirm_identity=lambda review: True,
         )
 
-    after = manager.resolve_credential_state(connection_id)
+    after = manager.resolve_credential_state(active_connection_id)
     assert after.state.version == before.state.version
     assert after.value == before.value
 
@@ -1054,7 +1087,7 @@ def test_discord_stuck_unverified_same_bot_returns_resume_instead_of_duplicate(
         access="full",
         confirm_identity=lambda review: True,
     )
-    connection_id = cast(str, first["connection_id"])
+    connection_id = parse_connection_id(first["connection_id"])
     before = manager.resolve_credential_state(connection_id)
     snapshot = manager.vault.get_connection_snapshot()
     manager.vault.mark_connection_health(
@@ -1099,7 +1132,7 @@ def test_discord_stuck_unverified_corrupt_custody_points_to_disconnect(
         access="full",
         confirm_identity=lambda review: True,
     )
-    connection_id = cast(str, first["connection_id"])
+    connection_id = parse_connection_id(first["connection_id"])
     snapshot = manager.vault.get_connection_snapshot()
     manager.vault.mark_connection_health(
         expected_revision=snapshot.revision,
@@ -1121,8 +1154,10 @@ def test_discord_stuck_unverified_corrupt_custody_points_to_disconnect(
     )
 
     assert retry["status"] == "credential_invalid_reconnect_required"
-    assert retry["next"] == f"gsv connectors disconnect {connection_id}"
-    assert "resume" not in cast(str, retry["next"])
+    next_command = retry["next"]
+    assert isinstance(next_command, str)
+    assert next_command == f"gsv connectors disconnect {connection_id}"
+    assert "resume" not in next_command
 
 
 def test_discord_different_bot_requires_explicit_new_account(
@@ -1140,7 +1175,7 @@ def test_discord_different_bot_requires_explicit_new_account(
         access="full",
         confirm_identity=lambda review: True,
     )
-    connection_id = cast(str, first["connection_id"])
+    connection_id = parse_connection_id(first["connection_id"])
     assert first["next"] == "gsv discord-source binding-status"
     assert first["source_status"] == "source_setup_required"
     source_setup = cast(dict[str, object], first["source_setup"])
@@ -1486,14 +1521,19 @@ def test_sufficient_preflight_does_not_load_registration_or_touch_oauth(
     before = manager.tokens.read(existing.connection_id)
     registration_calls: list[str] = []
     identity_calls: list[str] = []
+
+    def load_registration(provider: str) -> PublicClientRegistration:
+        registration_calls.append(provider)
+        return _registration(provider)
+
+    def verify_identity(provider: str, credential: ConnectorCredential) -> ConnectorIdentity:
+        identity_calls.append(provider)
+        return _identity(provider)
+
     onboarding = ConnectorOnboarding(
         manager,
-        registration_loader=lambda provider: (
-            registration_calls.append(provider) or _registration(provider)
-        ),
-        identity_verifier=lambda provider, credential: (
-            identity_calls.append(provider) or _identity(provider)
-        ),
+        registration_loader=load_registration,
+        identity_verifier=verify_identity,
     )
     monkeypatch.setattr(
         manager,
@@ -1534,11 +1574,14 @@ def test_two_bound_accounts_require_selection_and_exact_selector_is_deterministi
         fingerprint=FP_TWO,
     )
     registration_calls: list[str] = []
+
+    def load_registration(provider: str) -> PublicClientRegistration:
+        registration_calls.append(provider)
+        return _registration(provider)
+
     onboarding = ConnectorOnboarding(
         manager,
-        registration_loader=lambda provider: (
-            registration_calls.append(provider) or _registration(provider)
-        ),
+        registration_loader=load_registration,
         identity_verifier=lambda provider, credential: pytest.fail("identity verification reached"),
     )
     monkeypatch.setattr(
@@ -1675,8 +1718,10 @@ def test_corrupt_unverified_custody_never_points_to_resume(
     )
 
     assert result["status"] == "credential_invalid_reconnect_required"
-    assert result["next"] == f"gsv connectors disconnect {pending.connection_id}"
-    assert "resume" not in cast(str, result["next"])
+    next_command = result["next"]
+    assert isinstance(next_command, str)
+    assert next_command == f"gsv connectors disconnect {pending.connection_id}"
+    assert "resume" not in next_command
 
 
 def test_new_account_oauth_retry_guides_corrupt_unverified_custody_to_disconnect(
@@ -1814,11 +1859,14 @@ def test_exact_connect_repairs_missing_or_corrupt_custody_in_place(
         )
     replacement = _credential(existing.scopes)
     registration_calls: list[str] = []
+
+    def fail_registration_load(provider: str) -> PublicClientRegistration:
+        registration_calls.append(provider)
+        pytest.fail("registration loading reached")
+
     onboarding = ConnectorOnboarding(
         manager,
-        registration_loader=lambda provider: (
-            registration_calls.append(provider) or pytest.fail("registration loading reached")
-        ),
+        registration_loader=fail_registration_load,
         identity_verifier=lambda provider, credential: _identity(provider),
     )
     monkeypatch.setattr(
@@ -1969,14 +2017,29 @@ def test_reauthorization_race_after_confirmation_fails_closed(
     )
     real_rotate = manager.rotate_verified_oauth_credential
 
-    def race(*args: object, **kwargs: object) -> dict[str, object]:
+    def race(
+        connection_id: ConnectionId | str,
+        *,
+        expected_revision: str,
+        expected_account_fingerprint: str,
+        expected_token_version: int,
+        replacement: OAuthCredential,
+        account_label: str | None = None,
+    ) -> dict[str, Any]:
         current_snapshot = manager.vault.get_connection_snapshot()
         manager.vault.mark_connection_health(
             expected_revision=current_snapshot.revision,
             connection_id=existing.connection_id,
             health=ConnectionHealth.DEGRADED,
         )
-        return real_rotate(*args, **kwargs)  # type: ignore[arg-type]
+        return real_rotate(
+            connection_id,
+            expected_revision=expected_revision,
+            expected_account_fingerprint=expected_account_fingerprint,
+            expected_token_version=expected_token_version,
+            replacement=replacement,
+            account_label=account_label,
+        )
 
     monkeypatch.setattr(manager, "rotate_verified_oauth_credential", race)
 
@@ -2058,7 +2121,7 @@ def test_gmail_purge_step_up_publishes_rank_two_then_removes_plain_full(
     assert observed_old_during_publish == [True]
     snapshot = manager.vault.get_connection_snapshot()
     assert snapshot.connection(old.connection_id) is None
-    new = snapshot.connection(cast(str, result["connection_id"]))
+    new = snapshot.connection(parse_connection_id(result["connection_id"]))
     assert new is not None
     assert "https://mail.google.com/" in new.scopes
 
@@ -2129,7 +2192,7 @@ def test_broken_broader_grant_never_claims_success_after_narrower_oauth(
             value=b"corrupt-oauth-custody",
         )
     profile = get_connector_profile("gmail")
-    acquired: list[str] = []
+    acquired: list[ConnectionId] = []
     onboarding = ConnectorOnboarding(
         manager,
         registration_loader=_registration,
@@ -2137,7 +2200,7 @@ def test_broken_broader_grant_never_claims_success_after_narrower_oauth(
     )
 
     def acquire(metadata: ConnectionMetadata, **kwargs: object) -> OAuthCredential:
-        acquired.append(str(metadata.connection_id))
+        acquired.append(metadata.connection_id)
         return _credential(profile.scopes_for(ConnectorAccessTier.READ))
 
     monkeypatch.setattr(manager, "acquire_oauth_credential", acquire)
@@ -2156,7 +2219,7 @@ def test_broken_broader_grant_never_claims_success_after_narrower_oauth(
     assert result["provider_access_may_remain"] is True
     assert result["revocation_help"]
     assert "credential" not in result
-    assert acquired and acquired[0] != str(existing.connection_id)
+    assert acquired and acquired[0] != existing.connection_id
     assert manager.tokens.state(acquired[0]) is None
     snapshot = manager.vault.get_connection_snapshot()
     assert snapshot.connections == (snapshot.connection(existing.connection_id),)
@@ -2202,7 +2265,7 @@ def test_new_account_bypasses_sufficient_fast_path_and_runs_fresh_oauth(
 ) -> None:
     manager = _manager(tmp_path)
     existing = _existing_oauth(manager, "google_drive", access=ConnectorAccessTier.READ)
-    acquired: list[str] = []
+    acquired: list[ConnectionId] = []
     onboarding = ConnectorOnboarding(
         manager,
         registration_loader=_registration,
@@ -2210,7 +2273,7 @@ def test_new_account_bypasses_sufficient_fast_path_and_runs_fresh_oauth(
     )
 
     def acquire(metadata: ConnectionMetadata, **kwargs: object) -> OAuthCredential:
-        acquired.append(str(metadata.connection_id))
+        acquired.append(metadata.connection_id)
         return _credential(metadata.scopes)
 
     monkeypatch.setattr(manager, "acquire_oauth_credential", acquire)

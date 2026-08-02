@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 import pytest
 
@@ -62,7 +63,15 @@ def _open(session: ConnectorSession, token: str, **changes: object) -> object:
         "credential_version": 4,
     }
     expected.update(changes)
-    return session.open_cursor(token, **expected)
+    return session.open_cursor(
+        token,
+        provider=cast(str, expected["provider"]),
+        operation=cast(str, expected["operation"]),
+        connection_id=cast(str, expected["connection_id"]),
+        input_value=expected["input_value"],
+        connection_revision=cast(str, expected["connection_revision"]),
+        credential_version=cast(int, expected["credential_version"]),
+    )
 
 
 def _confirmation(session: ConnectorSession) -> str:
@@ -92,7 +101,18 @@ def _consume(session: ConnectorSession, token: str, **changes: object) -> None:
         "credential_version": 4,
     }
     expected.update(changes)
-    session.consume_confirmation(token, **expected)
+    session.consume_confirmation(
+        token,
+        provider=cast(str, expected["provider"]),
+        operation=cast(str, expected["operation"]),
+        connection_id=cast(str, expected["connection_id"]),
+        effect=cast(ConnectorEffect, expected["effect"]),
+        authorization_tier=cast(str, expected["authorization_tier"]),
+        granted_scopes=cast(set[str] | tuple[str, ...], expected["granted_scopes"]),
+        mutation=expected["mutation"],
+        connection_version=cast(int, expected["connection_version"]),
+        credential_version=cast(int, expected["credential_version"]),
+    )
 
 
 def test_cursor_is_canonical_detached_and_invalid_after_restart() -> None:

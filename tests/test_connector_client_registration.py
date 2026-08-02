@@ -76,7 +76,9 @@ def test_release_gate_requires_all_registrations_without_returning_client_ids() 
 
 def test_release_gate_preserves_strict_secret_rejection() -> None:
     providers = _all_providers()
-    google = dict(providers["google"])
+    google_value = providers["google"]
+    assert isinstance(google_value, dict)
+    google = dict(google_value)
     google["client_secret"] = "must-not-be-accepted"
     providers["google"] = google
 

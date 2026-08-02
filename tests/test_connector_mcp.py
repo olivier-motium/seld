@@ -5,7 +5,8 @@ from typing import Any, cast
 
 import pytest
 
-from continuity_kernel import cli, mcp_server
+import continuity_kernel.cli as cli
+import continuity_kernel.mcp_server as mcp_server
 from continuity_kernel.connector_operations import CONNECTOR_PROFILE, CONNECTOR_TOOL_NAMES
 from continuity_kernel.connector_runtime import ConnectorRuntime
 from continuity_kernel.errors import ValidationError

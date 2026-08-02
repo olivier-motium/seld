@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,7 +13,6 @@ from urllib.request import Request
 import pytest
 
 from continuity_kernel import connector_runtime as connector_runtime_module
-from continuity_kernel import local_files as local_files_module
 from continuity_kernel.connector_adapter import (
     ConnectorAdapterRegistry,
     ConnectorAdapterResult,
@@ -45,6 +44,7 @@ from continuity_kernel.connector_session import ConnectorSession
 from continuity_kernel.connector_transfer import (
     ArtifactReceipt,
     ArtifactStore,
+    PreparedUpload,
     PreparedUploadCache,
 )
 from continuity_kernel.connector_transport import (
@@ -59,6 +59,8 @@ from continuity_kernel.local_files import (
     FILE_TRANSFER_CHUNK_BYTES,
     MAX_FILE_TRANSFER_BYTES,
     LocalFileAuthorityUse,
+    LocalFileRef,
+    LocalFileTransferCandidate,
 )
 from continuity_kernel.vault import Vault
 
@@ -800,7 +802,7 @@ def test_confirmed_upload_reuses_reviewed_snapshot_and_mismatch_stays_retryable(
             source_nonempty_reads += 1
         return block
 
-    monkeypatch.setattr(local_files_module.os, "read", tracked_read)
+    monkeypatch.setattr(os, "read", tracked_read)
 
     preview = runtime.call_tool("gsv_gmail_write", values)
     token = preview["confirmation_token"]
@@ -1053,7 +1055,7 @@ def test_snapshot_budget_is_reserved_before_artifact_staging(
         pytest.fail("artifact staging ran before aggregate bytes were reserved")
 
     monkeypatch.setattr(artifacts, "prepare_upload", fail_staging)
-    monkeypatch.setattr(local_files_module.os, "read", tracked_read)
+    monkeypatch.setattr(os, "read", tracked_read)
     with pytest.raises(ConflictError, match="byte capacity"):
         runtime.call_tool("gsv_gmail_write", _local_upload_values(grant_id))
     assert source_reads == 0
@@ -1089,7 +1091,7 @@ def test_adapter_upload_limit_fails_before_source_content_is_read(
             source_reads += 1
         return actual_read(descriptor, amount)
 
-    monkeypatch.setattr(local_files_module.os, "read", tracked_read)
+    monkeypatch.setattr(os, "read", tracked_read)
     with pytest.raises(ValidationError, match="provider operation's size limit"):
         runtime.call_tool("gsv_gmail_write", _local_upload_values(grant_id))
 
@@ -1168,7 +1170,7 @@ def test_revoke_during_multifile_snapshot_stops_at_current_source_chunk(
     actual_prepare = artifacts.prepare_upload
 
     @contextmanager
-    def controlled_chunk(self: LocalFileAuthorityUse):
+    def controlled_chunk(self: LocalFileAuthorityUse) -> Iterator[None]:
         previous_depth = getattr(thread_state, "authority_depth", 0)
         with actual_chunk(self):
             thread_state.authority_depth = previous_depth + 1
@@ -1196,12 +1198,25 @@ def test_revoke_during_multifile_snapshot_stops_at_current_source_chunk(
             thread_state.wait_for_revocation = True
         return block
 
-    def marked_prepare(*args: object, **kwargs: object):
+    def marked_prepare(
+        reference: LocalFileRef | LocalFileTransferCandidate,
+        *,
+        authority: LocalFileAuthorityUse | None = None,
+        filename: str | None = None,
+        media_type: str | None = None,
+        max_bytes: int | None = None,
+    ) -> PreparedUpload:
         staging_started.set()
-        return actual_prepare(*args, **kwargs)
+        return actual_prepare(
+            reference,
+            authority=authority,
+            filename=filename,
+            media_type=media_type,
+            max_bytes=max_bytes,
+        )
 
     monkeypatch.setattr(LocalFileAuthorityUse, "chunk", controlled_chunk)
-    monkeypatch.setattr(local_files_module.os, "read", tracked_read)
+    monkeypatch.setattr(os, "read", tracked_read)
     monkeypatch.setattr(artifacts, "prepare_upload", marked_prepare)
     preparation_errors: list[BaseException] = []
     revocation_errors: list[BaseException] = []

@@ -226,7 +226,7 @@ def test_message_page_size_and_follow_up_status_are_bounded(catalog: OperationCa
 def test_message_list_schema_exposes_only_provider_valid_query_combinations(
     catalog: OperationCatalog,
 ) -> None:
-    valid = (
+    valid: tuple[dict[str, object], ...] = (
         {},
         {"fields": ["id", "subject"], "folder_id": "inbox", "page_size": 1_000},
         {"is_read": False, "page_size": 25},
@@ -245,7 +245,7 @@ def test_message_list_schema_exposes_only_provider_valid_query_combinations(
             == value
         )
 
-    invalid = (
+    invalid: tuple[dict[str, object], ...] = (
         {"fields": ["internet_message_headers"]},
         {"sort_direction": "ascending"},
         {"is_read": True, "order_by": "received_at"},
@@ -347,7 +347,9 @@ def test_event_attendees_match_graphs_500_person_limit(catalog: OperationCatalog
         "events.create",
         {**_event(), "attendees": attendees},
     )
-    assert len(cast(dict[str, object], validated)["attendees"]) == 500
+    validated_attendees = cast(dict[str, object], validated)["attendees"]
+    assert isinstance(validated_attendees, list)
+    assert len(validated_attendees) == 500
 
     with pytest.raises(ValidationError):
         catalog.validate_input(

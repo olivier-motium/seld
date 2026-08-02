@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +13,7 @@ from pathlib import Path
 import pytest
 
 import continuity_kernel.discord_source as discord_source_module
-from continuity_kernel import mcp_server
+import continuity_kernel.mcp_server as mcp_server
 from continuity_kernel.connector_auth import (
     AccountMetadata,
     ClientKind,
@@ -872,7 +873,7 @@ def test_discord_poll_lock_order_releases_binding_snapshot_before_lifecycle(
     global_path = bridge.vault.state / "locks/global.lock"
 
     @contextmanager
-    def observed_lock(path: Path):
+    def observed_lock(path: Path) -> Iterator[None]:
         label = "global" if path == global_path else "binding"
         events.append((label, "acquire", lifecycle_held))
         try:
@@ -881,7 +882,7 @@ def test_discord_poll_lock_order_releases_binding_snapshot_before_lifecycle(
             events.append((label, "release", lifecycle_held))
 
     @contextmanager
-    def observed_lifecycle(_connection_id: ConnectionId):
+    def observed_lifecycle(_connection_id: ConnectionId) -> Iterator[None]:
         nonlocal lifecycle_held
         events.append(("lifecycle", "acquire", lifecycle_held))
         lifecycle_held = True

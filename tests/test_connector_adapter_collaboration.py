@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -1243,7 +1244,7 @@ def test_discord_multipart_boundary_retries_after_payload_collision(
 ) -> None:
     candidates = iter(("collision", "safe"))
     monkeypatch.setattr(
-        collaboration_module.secrets,
+        secrets,
         "token_hex",
         lambda _length: next(candidates),
     )
@@ -1271,7 +1272,7 @@ def test_discord_multipart_boundary_fails_closed_after_exhaustion(
         attempts += 1
         return "collision"
 
-    monkeypatch.setattr(collaboration_module.secrets, "token_hex", collision)
+    monkeypatch.setattr(secrets, "token_hex", collision)
     with pytest.raises(ValidationError, match="boundary could not be made safe"):
         collaboration_module._multipart_body({"content": candidate}, "hello.txt", b"attachment")
     assert attempts == collaboration_module._MULTIPART_BOUNDARY_ATTEMPTS

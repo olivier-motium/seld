@@ -6,7 +6,8 @@ import json
 import os
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, Protocol, cast
+from urllib.request import Request
 
 import pytest
 
@@ -32,11 +33,16 @@ from continuity_kernel.connector_transport import (
     ConnectorResponse,
     ConnectorStreamResponse,
     ConnectorTransport,
+    ResponseLike,
 )
 from continuity_kernel.errors import ValidationError
 
 _ORIGIN = ConnectorOrigin.MICROSOFT_GRAPH
 _UPLOAD_URL = "https://outlook.office.com/upload-session/opaque?sig=redacted"
+
+
+class _ReadableRequestBody(Protocol):
+    def read(self, amount: int = -1) -> bytes: ...
 
 
 class _RecordingTransport:
@@ -120,7 +126,7 @@ class _RecordingTransport:
 class _HTTPResponse:
     def __init__(self, status: int, body: bytes, headers: MappingProxyType[str, str]) -> None:
         self.status = status
-        self.headers = headers
+        self.headers: object = headers
         self._body = body
         self._offset = 0
 
@@ -143,7 +149,7 @@ class _HTTPRecorder:
         self.responses = list(responses)
         self.requests: list[dict[str, object]] = []
 
-    def __call__(self, request: Any, timeout: float) -> _HTTPResponse:
+    def __call__(self, request: Request, timeout: float) -> ResponseLike:
         del timeout
         body = request.data
         if body is None:
@@ -151,9 +157,10 @@ class _HTTPRecorder:
         elif isinstance(body, bytes):
             encoded = body
         else:
+            reader = cast(_ReadableRequestBody, body)
             chunks: list[bytes] = []
             while True:
-                block = body.read(1024 * 1024)
+                block = reader.read(1024 * 1024)
                 if not block:
                     break
                 chunks.append(block)
@@ -341,6 +348,7 @@ def test_calendar_large_file_uses_the_documented_event_upload_session_route(
     finally:
         upload.close()
 
+    assert isinstance(result.payload, dict)
     assert result.payload["attachment_id"] == "calendar-attachment"
     assert [call["path"] for call in transport.calls] == [
         "/v1.0/me/calendar/events/event-1",

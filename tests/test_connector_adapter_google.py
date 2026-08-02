@@ -1015,6 +1015,25 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
     assert sent["credential"] is None
 
 
+def test_drive_binary_upload_requires_adapter_confirmation_before_transport() -> None:
+    transport = _Transport()
+
+    with pytest.raises(ValidationError, match="fresh outward confirmation"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.create"),
+            {
+                "content_base64": "aGVsbG8=",
+                "mime_type": "text/plain",
+                "name": "note.txt",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+        )
+
+    assert transport.calls == []
+
+
 def test_drive_local_file_upload_uses_the_prepared_snapshot_and_fixed_routes(
     tmp_path: Path,
 ) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -297,7 +298,9 @@ def test_slack_local_file_is_snapshot_bound_then_streamed_to_the_credentialless_
         assert isinstance(token, str)
         assert preview["status"] == "confirmation_required"
         assert transport.requests == []
-        assert preview["preview"]["local_file"] == {
+        preview_payload = preview["preview"]
+        assert isinstance(preview_payload, Mapping)
+        assert preview_payload["local_file"] == {
             "bytes": len(content),
             "filename": "large.bin",
             "media_type": None,
@@ -390,6 +393,7 @@ def test_slack_download_defaults_to_an_owner_only_artifact(
             },
         )
         artifact = result["artifact"]
+        assert isinstance(artifact, Mapping)
         path = Path(artifact["path"])
         assert result["result"] == {
             "bytes": len(content),
