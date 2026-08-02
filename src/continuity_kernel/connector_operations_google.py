@@ -610,8 +610,84 @@ def _event_reminders() -> dict[str, object]:
     }
 
 
+def _focus_time_properties() -> dict[str, object]:
+    return _object(
+        {
+            "auto_decline_mode": {
+                "enum": [
+                    "declineAllConflictingInvitations",
+                    "declineNone",
+                    "declineOnlyNewConflictingInvitations",
+                ],
+                "type": "string",
+            },
+            "chat_status": {"enum": ["available", "doNotDisturb"], "type": "string"},
+            "decline_message": _text(MAX_STRING_LENGTH, minimum=0),
+        }
+    )
+
+
+def _out_of_office_properties() -> dict[str, object]:
+    return _object(
+        {
+            "auto_decline_mode": {
+                "enum": [
+                    "declineAllConflictingInvitations",
+                    "declineNone",
+                    "declineOnlyNewConflictingInvitations",
+                ],
+                "type": "string",
+            },
+            "decline_message": _text(MAX_STRING_LENGTH, minimum=0),
+        }
+    )
+
+
+def _working_location_properties() -> dict[str, object]:
+    custom_location = _object({"label": _text(MAX_STRING_LENGTH, minimum=0)})
+    office_location = _object(
+        {
+            "building_id": _text(MAX_STRING_LENGTH),
+            "desk_id": _text(MAX_STRING_LENGTH),
+            "floor_id": _text(MAX_STRING_LENGTH),
+            "floor_section_id": _text(MAX_STRING_LENGTH),
+            "label": _text(MAX_STRING_LENGTH, minimum=0),
+        }
+    )
+    properties = {
+        "custom_location": custom_location,
+        "office_location": office_location,
+        "type": {
+            "enum": ["customLocation", "homeOffice", "officeLocation"],
+            "type": "string",
+        },
+    }
+    schema = _object(properties, required=("type",))
+    schema["oneOf"] = [
+        _object(
+            {"type": {"const": "homeOffice", "type": "string"}},
+            required=("type",),
+        ),
+        _object(
+            {
+                "custom_location": custom_location,
+                "type": {"const": "customLocation", "type": "string"},
+            },
+            required=("type",),
+        ),
+        _object(
+            {
+                "office_location": office_location,
+                "type": {"const": "officeLocation", "type": "string"},
+            },
+            required=("type",),
+        ),
+    ]
+    return schema
+
+
 def _event_fields(*, allow_property_deletion: bool) -> dict[str, object]:
-    return {
+    fields: dict[str, object] = {
         "attachments": _array(_event_attachment(), maximum=25),
         "attendee_emails": _email_addresses(),
         "attendees": _array(_event_attendee(), maximum=64),
@@ -648,6 +724,30 @@ def _event_fields(*, allow_property_deletion: bool) -> dict[str, object]:
             "type": "string",
         },
     }
+    fields.update(
+        {
+            "focus_time_properties": _focus_time_properties(),
+            "out_of_office_properties": _out_of_office_properties(),
+            "working_location_properties": _working_location_properties(),
+        }
+    )
+    return fields
+
+
+def _calendar_event_create_schema() -> dict[str, object]:
+    event_fields = _event_fields(allow_property_deletion=False)
+    return _object(
+        {
+            "calendar_id": _id(),
+            **event_fields,
+            "event_id": _calendar_client_event_id(),
+            "event_type": {
+                "enum": ["focusTime", "outOfOffice", "workingLocation"],
+                "type": "string",
+            },
+        },
+        required=("calendar_id", "start", "end"),
+    )
 
 
 def _calendar_fields() -> dict[str, object]:
@@ -1636,14 +1736,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "events.create",
         ConnectorEffect.SAFE_MUTATION,
         _CALENDAR_EVENT_WRITE_SCOPES,
-        _object(
-            {
-                "calendar_id": _id(),
-                **_event_fields(allow_property_deletion=False),
-                "event_id": _calendar_client_event_id(),
-            },
-            required=("calendar_id", "start", "end"),
-        ),
+        _calendar_event_create_schema(),
     ),
     _operation(
         "google_calendar",

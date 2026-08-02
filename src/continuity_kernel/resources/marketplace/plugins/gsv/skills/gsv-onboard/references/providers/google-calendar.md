@@ -38,7 +38,8 @@ The isolated `gsv_connectors` server exposes `gsv_google_calendar_read` and
 `gsv_google_calendar_write`. Their closed schemas cover the ordinary calendar
 and event fields, recurrence instances, free/busy, moves, responses, the live
 Google color palette, Meet creation, URL attachments, attendee guest counts,
-and private or shared extended properties. These additions use the existing
+private or shared extended properties, and Google Workspace focus-time,
+out-of-office, and working-location events. These additions use the existing
 Calendar grants; they do not trigger another OAuth upgrade. Event list
 continuations are opaque: keep using the returned continuation until the last
 page rotates it to a new sync cursor. An expired cursor reports
@@ -73,6 +74,35 @@ file itself requires. Private and shared extended-property keys are at most 44
 characters, values are at most 1,024 characters, and the submitted sets are
 bounded to 300 properties and 32 KiB combined. Updates use an explicit `null`
 value to delete one property.
+
+Special status events use the same `events.create` and `events.update`
+operations rather than a parallel tool family. On create, set `event_type` to
+`focusTime`, `outOfOffice`, or `workingLocation` and supply its matching typed
+properties object. Seld adds Google's required opacity for focus time and out of
+office, and public/transparent visibility for working location. When create
+omits auto-decline or focus-time Chat status, Seld explicitly sends
+`declineNone` and `available`; an undocumented provider default cannot add an
+external effect behind a one-step change. Updates first read the immutable
+provider `eventType` and reject a properties object for a different type before
+writing. Reads and `event_types` filters already return the provider's
+corresponding typed properties without projection.
+
+Google offers these status types only on a primary calendar and only to
+eligible Workspace accounts, so use `calendar_id: primary`. Account edition,
+administrator policy, and whether Chat is enabled remain provider-owned. An
+unsupported-account response does not mean the OAuth connection is stale and
+reconnecting does not add a missing product entitlement. Focus time and out of
+office must be timed. All-day working locations span exactly one day; timed
+ones may span normally. A focus-time `chat_status` of `doNotDisturb` also needs
+a block under 24 hours.
+
+Working location is public, so creation and location or schedule changes need
+an outward confirmation. Non-`declineNone` auto-decline rules can respond to
+new or existing conflicting invitations; a decline message and an explicit
+focus-time Chat status are also shown in an outward preview. Disabling
+auto-decline and changing only a private local preference remain one-step.
+Deleting a status event or moving its time interval does not promise to reverse
+invitations Google already declined.
 
 Move, RSVP, event deletion, and whole-calendar deletion require the reviewed
 event or CalendarList snapshot returned by the preceding read. The connector

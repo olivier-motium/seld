@@ -19,3 +19,8 @@
   additional guest counts, and bounded private/shared extended properties,
   without adding OAuth scopes or Drive lookups. Array removal, Meet replacement,
   and explicit property deletion keep destructive confirmation semantics.
+- Added typed focus-time, out-of-office, and working-location creation and
+  updates to the existing Google Calendar event operations. Provider-fixed
+  timing and visibility rules fail locally, while public working locations,
+  automatic declines, and Chat-presence changes remain confirmation-bound and
+  use the existing Calendar Full grant.

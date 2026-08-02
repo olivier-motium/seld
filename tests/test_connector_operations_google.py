@@ -1323,6 +1323,77 @@ def test_gmail_normal_message_bodies_allow_the_documented_bound() -> None:
         operation.validate_input({"text_body": body + "x"})
 
 
+def test_calendar_status_event_schemas_are_typed_without_new_operations() -> None:
+    create = _operation("google_calendar", ConnectorMode.WRITE, "events.create")
+    update = _operation("google_calendar", ConnectorMode.WRITE, "events.update")
+    focus = {
+        "calendar_id": "primary",
+        "end": {"date_time": "2026-08-02T11:00:00+02:00"},
+        "event_type": "focusTime",
+        "focus_time_properties": {
+            "auto_decline_mode": "declineOnlyNewConflictingInvitations",
+            "chat_status": "doNotDisturb",
+            "decline_message": "Protecting focus time",
+        },
+        "start": {"date_time": "2026-08-02T10:00:00+02:00"},
+    }
+    assert create.validate_input(focus) == focus
+
+    working_location = {
+        "calendar_id": "primary",
+        "end": {"date": "2026-08-03"},
+        "event_type": "workingLocation",
+        "start": {"date": "2026-08-02"},
+        "working_location_properties": {
+            "office_location": {
+                "building_id": "brussels",
+                "desk_id": "42",
+                "floor_id": "4",
+                "floor_section_id": "north",
+                "label": "Brussels HQ",
+            },
+            "type": "officeLocation",
+        },
+    }
+    assert create.validate_input(working_location) == working_location
+
+    with pytest.raises(ValidationError):
+        create.validate_input({**focus, "event_type": "fromGmail"})
+    with pytest.raises(ValidationError):
+        create.validate_input(
+            {
+                **working_location,
+                "working_location_properties": {
+                    "custom_location": {"label": "Client site"},
+                    "type": "homeOffice",
+                },
+            }
+        )
+    with pytest.raises(ValidationError, match="unknown field"):
+        update.validate_input(
+            {
+                "calendar_id": "primary",
+                "etag": "etag",
+                "event_id": "event",
+                "event_type": "focusTime",
+                "focus_time_properties": {},
+            }
+        )
+    assert update.validate_input(
+        {
+            "calendar_id": "primary",
+            "etag": "etag",
+            "event_id": "event",
+            "focus_time_properties": {"auto_decline_mode": "declineNone"},
+        }
+    ) == {
+        "calendar_id": "primary",
+        "etag": "etag",
+        "event_id": "event",
+        "focus_time_properties": {"auto_decline_mode": "declineNone"},
+    }
+
+
 def test_separate_calendar_connection_does_not_advertise_unreachable_drive_attachments() -> None:
     operation = _operation("google_calendar", ConnectorMode.WRITE, "events.create")
     event_time = {

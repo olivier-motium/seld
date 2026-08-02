@@ -6,7 +6,7 @@ import base64
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from email.policy import SMTP
 from io import BytesIO
@@ -159,6 +159,13 @@ _CALENDAR_RFC3339: Final = re.compile(
 )
 _CALENDAR_MAX_EXTENDED_PROPERTIES: Final = 300
 _CALENDAR_MAX_EXTENDED_PROPERTY_BYTES: Final = 32_768
+_CALENDAR_STATUS_PROPERTY_FIELDS: Final = frozenset(
+    {
+        "focus_time_properties",
+        "out_of_office_properties",
+        "working_location_properties",
+    }
+)
 _CALENDAR_EVENT_SYNC_FILTER_FIELDS: Final = frozenset(
     {
         "i_cal_uid",
@@ -380,6 +387,9 @@ class GoogleConnectorAdapter:
             return operation.effect
         if operation.name == "events.create":
             _calendar_event_body(values, is_create=True, require_change=False)
+            status_effect = _calendar_status_create_effect(values)
+            if status_effect is not None:
+                return status_effect
             return (
                 ConnectorEffect.OUTWARD
                 if _calendar_has_external_effect(values)
@@ -3167,6 +3177,7 @@ def _calendar_event_body(
             "visibility": "visibility",
         },
     )
+    body.update(_calendar_status_event_body(values, is_create=is_create))
     if is_create and "event_id" in values:
         body["id"] = _text(values["event_id"])
     if "attendee_emails" in values and "attendees" in values:
@@ -3225,9 +3236,151 @@ def _calendar_event_body(
         if source in values:
             body[target] = _calendar_time(values[source])
     _validate_calendar_event_times(values)
+    if is_create:
+        _validate_calendar_status_event_create(values)
     if require_change and not body:
         raise ValidationError("Google Calendar event update requires at least one changed field")
     return body
+
+
+def _calendar_status_event_body(
+    values: Mapping[str, object], *, is_create: bool
+) -> dict[str, object]:
+    event_type = values.get("event_type")
+    present = [field for field in _CALENDAR_STATUS_PROPERTY_FIELDS if field in values]
+    if len(present) > 1:
+        raise ValidationError("Google Calendar status properties must describe one event type")
+    if not is_create and event_type is not None:
+        raise ValidationError("Google Calendar event type cannot be changed")
+    if is_create and event_type is None:
+        if present:
+            raise ValidationError("Google Calendar status properties require a matching event type")
+        return {}
+    if not is_create:
+        if present and not _mapping(values[present[0]]):
+            raise ValidationError(
+                "Google Calendar status-properties update requires at least one changed field"
+            )
+        return _calendar_status_property_body(values)
+    if not isinstance(event_type, str) or event_type not in {
+        "focusTime",
+        "outOfOffice",
+        "workingLocation",
+    }:
+        raise ValidationError("Google Calendar event type is not creatable")
+    expected = {
+        "focusTime": "focus_time_properties",
+        "outOfOffice": "out_of_office_properties",
+        "workingLocation": "working_location_properties",
+    }[event_type]
+    if present != [expected]:
+        raise ValidationError("Google Calendar event type requires its matching properties")
+    body = {"eventType": event_type, **_calendar_status_property_body(values)}
+    if event_type == "focusTime":
+        focus_properties = cast(dict[str, object], body["focusTimeProperties"])
+        focus_properties.setdefault("autoDeclineMode", "declineNone")
+        focus_properties.setdefault("chatStatus", "available")
+        if values.get("transparency", "opaque") != "opaque":
+            raise ValidationError(f"Google Calendar {event_type} events must be opaque")
+        body["transparency"] = "opaque"
+    elif event_type == "outOfOffice":
+        out_of_office_properties = cast(dict[str, object], body["outOfOfficeProperties"])
+        out_of_office_properties.setdefault("autoDeclineMode", "declineNone")
+        if values.get("transparency", "opaque") != "opaque":
+            raise ValidationError(f"Google Calendar {event_type} events must be opaque")
+        body["transparency"] = "opaque"
+    else:
+        if values.get("transparency", "transparent") != "transparent":
+            raise ValidationError("Google Calendar working-location events must be transparent")
+        if values.get("visibility", "public") != "public":
+            raise ValidationError("Google Calendar working-location events must be public")
+        body["transparency"] = "transparent"
+        body["visibility"] = "public"
+    return body
+
+
+def _calendar_status_property_body(values: Mapping[str, object]) -> dict[str, object]:
+    if "focus_time_properties" in values:
+        properties = _mapping(values["focus_time_properties"])
+        return {
+            "focusTimeProperties": _selected(
+                properties,
+                {
+                    "auto_decline_mode": "autoDeclineMode",
+                    "chat_status": "chatStatus",
+                    "decline_message": "declineMessage",
+                },
+            )
+        }
+    if "out_of_office_properties" in values:
+        properties = _mapping(values["out_of_office_properties"])
+        return {
+            "outOfOfficeProperties": _selected(
+                properties,
+                {
+                    "auto_decline_mode": "autoDeclineMode",
+                    "decline_message": "declineMessage",
+                },
+            )
+        }
+    if "working_location_properties" in values:
+        return {
+            "workingLocationProperties": _calendar_working_location_properties(
+                values["working_location_properties"]
+            )
+        }
+    return {}
+
+
+def _calendar_working_location_properties(value: object) -> dict[str, object]:
+    properties = _mapping(value)
+    location_type = _required(properties, "type")
+    result: dict[str, object] = {"type": location_type}
+    if location_type == "customLocation":
+        if "office_location" in properties:
+            raise ValidationError("Google Calendar working location fields do not match its type")
+        if "custom_location" in properties:
+            result["customLocation"] = _selected(
+                _mapping(properties["custom_location"]),
+                {"label": "label"},
+            )
+        return result
+    if location_type == "officeLocation":
+        if "custom_location" in properties:
+            raise ValidationError("Google Calendar working location fields do not match its type")
+        if "office_location" in properties:
+            result["officeLocation"] = _selected(
+                _mapping(properties["office_location"]),
+                {
+                    "building_id": "buildingId",
+                    "desk_id": "deskId",
+                    "floor_id": "floorId",
+                    "floor_section_id": "floorSectionId",
+                    "label": "label",
+                },
+            )
+        return result
+    if location_type == "homeOffice":
+        if "custom_location" in properties or "office_location" in properties:
+            raise ValidationError("Google Calendar working location fields do not match its type")
+        return result
+    raise ValidationError("Google Calendar working location type is invalid")
+
+
+def _validate_calendar_status_event_create(values: Mapping[str, object]) -> None:
+    event_type = values.get("event_type")
+    if event_type in {"focusTime", "outOfOffice"}:
+        if (
+            _calendar_time_kind(values["start"]) != "date_time"
+            or _calendar_time_kind(values["end"]) != "date_time"
+        ):
+            raise ValidationError(f"Google Calendar {event_type} events must be timed")
+        if event_type == "focusTime":
+            properties = _mapping(values["focus_time_properties"])
+            if properties.get("chat_status") == "doNotDisturb":
+                _validate_calendar_focus_chat_duration(values["start"], values["end"])
+    elif event_type == "workingLocation":
+        _validate_calendar_working_location_times(values["start"], values["end"])
 
 
 def _calendar_event_attachments(value: object) -> list[dict[str, str]]:
@@ -3404,7 +3557,64 @@ def _calendar_rfc3339(value: object, *, context: str, require_offset: bool = Tru
 def _calendar_time_kind(value: object) -> str:
     if not isinstance(value, Mapping):
         raise ValidationError("Google Calendar event time is invalid")
-    return "date_time" if "date_time" in value else "date"
+    return "date_time" if "date_time" in value or "dateTime" in value else "date"
+
+
+def _validate_calendar_working_location_times(start: object, end: object) -> None:
+    start_kind = _calendar_time_kind(start)
+    end_kind = _calendar_time_kind(end)
+    if start_kind != end_kind:
+        raise ValidationError(
+            "Google Calendar working-location start and end must use the same time kind"
+        )
+    if start_kind != "date":
+        _validate_calendar_timed_order(start, end)
+        return
+    assert isinstance(start, Mapping) and isinstance(end, Mapping)
+    start_date = _calendar_date(start.get("date"), context="Google Calendar working-location start")
+    end_date = _calendar_date(end.get("date"), context="Google Calendar working-location end")
+    if end_date - start_date != timedelta(days=1):
+        raise ValidationError(
+            "Google Calendar all-day working-location events must span exactly one day"
+        )
+
+
+def _validate_calendar_focus_chat_duration(start: object, end: object) -> None:
+    duration = _calendar_timed_duration(start, end)
+    if duration is not None and duration >= timedelta(hours=24):
+        raise ValidationError(
+            "Google Calendar focus-time Chat do-not-disturb requires a block under 24 hours"
+        )
+
+
+def _validate_calendar_timed_order(start: object, end: object) -> None:
+    duration = _calendar_timed_duration(start, end)
+    if duration is not None and duration <= timedelta(0):
+        raise ValidationError("Google Calendar event end must follow its start")
+
+
+def _calendar_timed_duration(start: object, end: object) -> timedelta | None:
+    if not isinstance(start, Mapping) or not isinstance(end, Mapping):
+        raise ValidationError("Google Calendar event time is invalid")
+    start_text = start.get("date_time", start.get("dateTime"))
+    end_text = end.get("date_time", end.get("dateTime"))
+    if not isinstance(start_text, str) or not isinstance(end_text, str):
+        raise ValidationError("Google Calendar event requires timed bounds")
+    start_zone = start.get("time_zone", start.get("timeZone"))
+    end_zone = end.get("time_zone", end.get("timeZone"))
+    start_value = _calendar_rfc3339(
+        start_text,
+        context="Google Calendar event start",
+        require_offset=start_zone is None,
+    )
+    end_value = _calendar_rfc3339(
+        end_text,
+        context="Google Calendar event end",
+        require_offset=end_zone is None,
+    )
+    if start_value.utcoffset() is not None and end_value.utcoffset() is not None:
+        return end_value - start_value
+    return None
 
 
 def _validate_calendar_event_times(values: Mapping[str, object]) -> None:
@@ -3485,6 +3695,31 @@ def _calendar_has_external_effect(values: Mapping[str, object]) -> bool:
     return isinstance(calendar_id, str) and calendar_id != "primary"
 
 
+def _calendar_status_create_effect(values: Mapping[str, object]) -> ConnectorEffect | None:
+    event_type = values.get("event_type")
+    if event_type == "workingLocation":
+        return ConnectorEffect.OUTWARD
+    if event_type in {"focusTime", "outOfOffice"} and values.get("visibility") == "public":
+        return ConnectorEffect.OUTWARD
+    if event_type == "focusTime":
+        properties = _mapping(values.get("focus_time_properties"))
+        decline_mode = properties.get("auto_decline_mode", "declineNone")
+        if (
+            decline_mode not in {None, "declineNone"}
+            or "chat_status" in properties
+            or ("decline_message" in properties and decline_mode != "declineNone")
+        ):
+            return ConnectorEffect.OUTWARD
+    if event_type == "outOfOffice":
+        properties = _mapping(values.get("out_of_office_properties"))
+        decline_mode = properties.get("auto_decline_mode", "declineNone")
+        if decline_mode not in {None, "declineNone"} or (
+            "decline_message" in properties and decline_mode != "declineNone"
+        ):
+            return ConnectorEffect.OUTWARD
+    return None
+
+
 def _calendar_event_effect(
     name: str,
     values: Mapping[str, object],
@@ -3527,12 +3762,87 @@ def _calendar_event_effect(
         ):
             return ConnectorEffect.DESTRUCTIVE
         return ConnectorEffect.OUTWARD
+    status_effect = _calendar_status_update_effect(values, event)
+    if status_effect is not None:
+        return status_effect
     local_fields = {"calendar_id", "etag", "event_id", "reminders", "send_updates"}
     if set(values).issubset(local_fields):
         return ConnectorEffect.SAFE_MUTATION
     if event is None or _calendar_event_is_shared(event) or values.get("calendar_id") != "primary":
         return ConnectorEffect.OUTWARD
     return catalog_effect
+
+
+def _calendar_status_update_effect(
+    values: Mapping[str, object], event: Mapping[str, object] | None
+) -> ConnectorEffect | None:
+    event_type = event.get("eventType") if isinstance(event, Mapping) else None
+    if event_type is None:
+        if "working_location_properties" in values:
+            return ConnectorEffect.OUTWARD
+        if "focus_time_properties" in values:
+            properties = _mapping(values["focus_time_properties"])
+            decline_mode = properties.get("auto_decline_mode")
+            if (
+                decline_mode not in {None, "declineNone"}
+                or "chat_status" in properties
+                or ("decline_message" in properties and decline_mode != "declineNone")
+            ):
+                return ConnectorEffect.OUTWARD
+        if "out_of_office_properties" in values:
+            properties = _mapping(values["out_of_office_properties"])
+            decline_mode = properties.get("auto_decline_mode")
+            if decline_mode not in {None, "declineNone"} or (
+                "decline_message" in properties and decline_mode != "declineNone"
+            ):
+                return ConnectorEffect.OUTWARD
+        return None
+    assert event is not None
+    if event_type == "workingLocation":
+        locally_safe = {
+            "calendar_id",
+            "color_id",
+            "etag",
+            "event_id",
+            "private_extended_properties",
+            "reminders",
+        }
+        if not set(values).issubset(locally_safe):
+            return ConnectorEffect.OUTWARD
+        return None
+    if event_type not in {"focusTime", "outOfOffice"}:
+        return None
+    if values.get("visibility") == "public":
+        return ConnectorEffect.OUTWARD
+    submitted, current = _calendar_status_property_state(values, event, event_type)
+    resulting_mode = submitted.get("auto_decline_mode", current.get("autoDeclineMode"))
+    time_changed = "start" in values or "end" in values
+    if event_type == "focusTime":
+        resulting_chat_status = submitted.get("chat_status", current.get("chatStatus"))
+        if "chat_status" in submitted or (time_changed and resulting_chat_status != "available"):
+            return ConnectorEffect.OUTWARD
+    if "decline_message" in submitted and resulting_mode != "declineNone":
+        return ConnectorEffect.OUTWARD
+    if submitted.get("auto_decline_mode") not in {None, "declineNone"}:
+        return ConnectorEffect.OUTWARD
+    if time_changed and resulting_mode != "declineNone":
+        return ConnectorEffect.OUTWARD
+    return None
+
+
+def _calendar_status_property_state(
+    values: Mapping[str, object],
+    event: Mapping[str, object],
+    event_type: str,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    source = "focus_time_properties" if event_type == "focusTime" else "out_of_office_properties"
+    provider_source = (
+        "focusTimeProperties" if event_type == "focusTime" else "outOfOfficeProperties"
+    )
+    submitted = _mapping(values[source]) if source in values else {}
+    current_raw = event.get(provider_source)
+    current = current_raw if isinstance(current_raw, Mapping) else {}
+    return submitted, current
 
 
 def _calendar_event_mutation_preflight(
@@ -3576,6 +3886,7 @@ def _calendar_event_mutation_preflight(
                 "Google Calendar expected event snapshot does not match the current event; "
                 "normalize the reviewed read to the documented confirmation shape"
             )
+    _validate_calendar_status_event_update(values, event)
     if values.get("recurrence"):
         _validate_calendar_recurrence_time_zones(
             values.get("start", event.get("start")),
@@ -3610,6 +3921,14 @@ def _calendar_event_preflight_fields(values: Mapping[str, object]) -> str:
         )
     fields.extend(
         (
+            "focusTimeProperties(autoDeclineMode,chatStatus,declineMessage)",
+            "outOfOfficeProperties(autoDeclineMode,declineMessage)",
+            "workingLocationProperties(customLocation(label),homeOffice,"
+            "officeLocation(buildingId,deskId,floorId,floorSectionId,label),type)",
+        )
+    )
+    fields.extend(
+        (
             "end(date,dateTime,timeZone)",
             "etag",
             "eventType",
@@ -3621,6 +3940,55 @@ def _calendar_event_preflight_fields(values: Mapping[str, object]) -> str:
         )
     )
     return ",".join(fields)
+
+
+def _validate_calendar_status_event_update(
+    values: Mapping[str, object], event: Mapping[str, object]
+) -> None:
+    event_type = _provider_text(
+        event,
+        "eventType",
+        context="Google Calendar event effect preflight",
+    )
+    present = [field for field in _CALENDAR_STATUS_PROPERTY_FIELDS if field in values]
+    expected_property = {
+        "focusTime": "focus_time_properties",
+        "outOfOffice": "out_of_office_properties",
+        "workingLocation": "working_location_properties",
+    }.get(event_type)
+    if present and present != [expected_property]:
+        raise ValidationError(
+            "Google Calendar status properties do not match the current event type"
+        )
+    if event_type in {"focusTime", "outOfOffice"}:
+        if values.get("transparency", "opaque") != "opaque":
+            raise ValidationError(f"Google Calendar {event_type} events must remain opaque")
+        if "start" in values or "end" in values:
+            start = values.get("start", event.get("start"))
+            end = values.get("end", event.get("end"))
+            if _calendar_time_kind(start) != "date_time" or _calendar_time_kind(end) != "date_time":
+                raise ValidationError(f"Google Calendar {event_type} events must be timed")
+            _validate_calendar_timed_order(start, end)
+        if event_type == "focusTime":
+            submitted, current = _calendar_status_property_state(values, event, event_type)
+            chat_status = submitted.get("chat_status", current.get("chatStatus"))
+            if chat_status == "doNotDisturb" and (
+                "chat_status" in submitted or "start" in values or "end" in values
+            ):
+                _validate_calendar_focus_chat_duration(
+                    values.get("start", event.get("start")),
+                    values.get("end", event.get("end")),
+                )
+    elif event_type == "workingLocation":
+        if values.get("transparency", "transparent") != "transparent":
+            raise ValidationError("Google Calendar working-location events must remain transparent")
+        if values.get("visibility", "public") != "public":
+            raise ValidationError("Google Calendar working-location events must remain public")
+        if "start" in values or "end" in values:
+            _validate_calendar_working_location_times(
+                values.get("start", event.get("start")),
+                values.get("end", event.get("end")),
+            )
 
 
 def _validate_calendar_recurrence_time_zones(start: object, end: object) -> None:
@@ -4490,6 +4858,12 @@ def _strings(value: object) -> list[str]:
     if not isinstance(value, list):
         raise ValidationError("connector operation text array is invalid")
     return [_text(item) for item in value]
+
+
+def _mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValidationError("connector operation object is invalid")
+    return value
 
 
 def _mappings(value: object) -> list[Mapping[str, object]]:

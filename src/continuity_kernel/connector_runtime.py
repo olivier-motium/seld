@@ -133,14 +133,17 @@ _OPERATION_WARNINGS: Final = {
     ): (
         "Deleting an organized event cancels it for guests. Google usually keeps deleted "
         "events in Trash temporarily, but recurring-event recovery differs; send_updates=none "
-        "can leave external calendars stale and may not suppress every email."
+        "can leave external calendars stale and may not suppress every email. Deleting focus-time "
+        "or out-of-office events does not reverse invitations Google already declined."
     ),
     (
         "google_calendar",
         "events.create",
     ): (
         "If attendees are included, Google may send invitations; send_updates=none can leave "
-        "external calendars stale and may not suppress every email."
+        "external calendars stale and may not suppress every email. Working-location events "
+        "are public. Focus-time and out-of-office auto-decline rules can respond to conflicting "
+        "invitations, and a focus-time Chat status affects Google Chat and related products."
     ),
     (
         "google_calendar",
@@ -160,7 +163,9 @@ _OPERATION_WARNINGS: Final = {
         "Supplying attendees, attachments, or recurrence replaces that complete array; a null "
         "extended-property value deletes that entry, and a new Meet request can replace existing "
         "conference data. send_updates=none can leave external calendars stale and may not "
-        "suppress every email."
+        "suppress every email. Working-location changes are public. Focus-time and out-of-office "
+        "auto-decline rules can respond to conflicting invitations, and a focus-time Chat status "
+        "affects Google Chat and related products."
     ),
     (
         "outlook_calendar",

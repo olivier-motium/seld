@@ -3115,7 +3115,12 @@ def test_calendar_rsvp_preflights_self_attendee_and_etag() -> None:
     assert preflight["query"] == (
         (
             "fields",
-            "attendees(comment,email,self),end(date,dateTime,timeZone),etag,eventType,id,"
+            "attendees(comment,email,self),"
+            "focusTimeProperties(autoDeclineMode,chatStatus,declineMessage),"
+            "outOfOfficeProperties(autoDeclineMode,declineMessage),"
+            "workingLocationProperties(customLocation(label),homeOffice,"
+            "officeLocation(buildingId,deskId,floorId,floorSectionId,label),type),"
+            "end(date,dateTime,timeZone),etag,eventType,id,"
             "organizer(displayName,email,self),start(date,dateTime,timeZone),status,summary",
         ),
     )
@@ -4652,6 +4657,448 @@ def test_calendar_extended_properties_enforce_combined_provider_bounds() -> None
                 ],
             },
         )
+
+
+def test_calendar_status_creates_shape_fixed_provider_bodies_and_effects() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.create")
+    timed = {"calendar_id": "primary", "end": _event_end_time(), "start": _event_time()}
+
+    focus = {
+        **timed,
+        "event_type": "focusTime",
+        "focus_time_properties": {},
+    }
+    assert adapter.classify_effect(operation, focus) is ConnectorEffect.SAFE_MUTATION
+    focus_transport = _Transport()
+    adapter.execute(
+        operation,
+        focus,
+        continuation=None,
+        credential=_credential(),
+        transport=focus_transport,
+    )
+    assert focus_transport.calls[0]["json_body"] == {
+        "end": {"dateTime": "2026-08-01T10:00:00+02:00", "timeZone": "Europe/Brussels"},
+        "eventType": "focusTime",
+        "focusTimeProperties": {
+            "autoDeclineMode": "declineNone",
+            "chatStatus": "available",
+        },
+        "start": {"dateTime": "2026-08-01T09:00:00+02:00", "timeZone": "Europe/Brussels"},
+        "transparency": "opaque",
+    }
+
+    out_of_office = {
+        **timed,
+        "event_type": "outOfOffice",
+        "out_of_office_properties": {
+            "auto_decline_mode": "declineAllConflictingInvitations",
+            "decline_message": "I am away",
+        },
+    }
+    assert adapter.classify_effect(operation, out_of_office) is ConnectorEffect.OUTWARD
+    out_transport = _Transport()
+    adapter.execute(
+        operation,
+        out_of_office,
+        continuation=None,
+        credential=_credential(),
+        transport=out_transport,
+        write_idempotency_key="confirmed-out-of-office",
+    )
+    assert out_transport.calls[0]["json_body"] == {
+        "end": {"dateTime": "2026-08-01T10:00:00+02:00", "timeZone": "Europe/Brussels"},
+        "eventType": "outOfOffice",
+        "outOfOfficeProperties": {
+            "autoDeclineMode": "declineAllConflictingInvitations",
+            "declineMessage": "I am away",
+        },
+        "start": {"dateTime": "2026-08-01T09:00:00+02:00", "timeZone": "Europe/Brussels"},
+        "transparency": "opaque",
+    }
+
+    quiet_out_of_office = {
+        **timed,
+        "event_type": "outOfOffice",
+        "out_of_office_properties": {},
+    }
+    assert adapter.classify_effect(operation, quiet_out_of_office) is ConnectorEffect.SAFE_MUTATION
+    quiet_out_transport = _Transport()
+    adapter.execute(
+        operation,
+        quiet_out_of_office,
+        continuation=None,
+        credential=_credential(),
+        transport=quiet_out_transport,
+    )
+    assert quiet_out_transport.calls[0]["json_body"]["outOfOfficeProperties"] == {
+        "autoDeclineMode": "declineNone"
+    }
+
+    decline_message_without_declines = {
+        **timed,
+        "event_type": "outOfOffice",
+        "out_of_office_properties": {
+            "auto_decline_mode": "declineNone",
+            "decline_message": "No automatic replies",
+        },
+    }
+    assert (
+        adapter.classify_effect(operation, decline_message_without_declines)
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert (
+        adapter.classify_effect(operation, {**focus, "visibility": "public"})
+        is ConnectorEffect.OUTWARD
+    )
+
+    working_location = {
+        "calendar_id": "primary",
+        "end": {"date": "2026-08-03"},
+        "event_type": "workingLocation",
+        "start": {"date": "2026-08-02"},
+        "working_location_properties": {
+            "custom_location": {"label": "Client site"},
+            "type": "customLocation",
+        },
+    }
+    assert adapter.classify_effect(operation, working_location) is ConnectorEffect.OUTWARD
+    location_transport = _Transport()
+    adapter.execute(
+        operation,
+        working_location,
+        continuation=None,
+        credential=_credential(),
+        transport=location_transport,
+        write_idempotency_key="confirmed-working-location",
+    )
+    assert location_transport.calls[0]["json_body"] == {
+        "end": {"date": "2026-08-03"},
+        "eventType": "workingLocation",
+        "start": {"date": "2026-08-02"},
+        "transparency": "transparent",
+        "visibility": "public",
+        "workingLocationProperties": {
+            "customLocation": {"label": "Client site"},
+            "type": "customLocation",
+        },
+    }
+
+
+def test_calendar_status_create_invariants_fail_before_transport() -> None:
+    operation = _operation("google_calendar", "events.create")
+    invalid_values = (
+        {
+            "calendar_id": "primary",
+            "end": {"date": "2026-08-03"},
+            "event_type": "focusTime",
+            "focus_time_properties": {},
+            "start": {"date": "2026-08-02"},
+        },
+        {
+            "calendar_id": "primary",
+            "end": {"date": "2026-08-04"},
+            "event_type": "workingLocation",
+            "start": {"date": "2026-08-02"},
+            "working_location_properties": {"type": "homeOffice"},
+        },
+        {
+            "calendar_id": "primary",
+            "end": _event_end_time(),
+            "event_type": "focusTime",
+            "out_of_office_properties": {},
+            "start": _event_time(),
+        },
+        {
+            "calendar_id": "primary",
+            "end": {"date_time": "2026-08-02T09:00:00+02:00"},
+            "event_type": "focusTime",
+            "focus_time_properties": {"chat_status": "doNotDisturb"},
+            "start": {"date_time": "2026-08-01T09:00:00+02:00"},
+        },
+        {
+            "calendar_id": "primary",
+            "end": _event_end_time(),
+            "event_type": "outOfOffice",
+            "out_of_office_properties": {},
+            "start": _event_time(),
+            "transparency": "transparent",
+        },
+        {
+            "calendar_id": "primary",
+            "end": {"date": "2026-08-03"},
+            "event_type": "workingLocation",
+            "start": {"date": "2026-08-02"},
+            "visibility": "private",
+            "working_location_properties": {"type": "homeOffice"},
+        },
+    )
+    for values in invalid_values:
+        transport = _Transport()
+        with pytest.raises(ValidationError):
+            GoogleConnectorAdapter().execute(
+                operation,
+                values,
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+            )
+        assert transport.calls == []
+
+
+def test_calendar_focus_chat_duration_defers_naive_dst_math_to_google() -> None:
+    values = {
+        "calendar_id": "primary",
+        "end": {
+            "date_time": "2026-03-29T03:30:00",
+            "time_zone": "Europe/Brussels",
+        },
+        "event_type": "focusTime",
+        "focus_time_properties": {"chat_status": "doNotDisturb"},
+        "start": {
+            "date_time": "2026-03-28T03:00:00",
+            "time_zone": "Europe/Brussels",
+        },
+    }
+    assert (
+        GoogleConnectorAdapter().classify_effect(
+            _operation("google_calendar", "events.create"), values
+        )
+        is ConnectorEffect.OUTWARD
+    )
+
+
+def test_calendar_status_updates_use_live_type_and_effect_bearing_rules() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    focus_event = {
+        "attendees": [],
+        "end": {"dateTime": "2026-08-01T10:00:00+02:00"},
+        "etag": "etag",
+        "eventType": "focusTime",
+        "focusTimeProperties": {
+            "autoDeclineMode": "declineAllConflictingInvitations",
+            "chatStatus": "doNotDisturb",
+        },
+        "organizer": {"email": "owner@example.test", "self": True},
+        "start": {"dateTime": "2026-08-01T09:00:00+02:00"},
+    }
+
+    disable = {
+        **common,
+        "focus_time_properties": {"auto_decline_mode": "declineNone"},
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            disable,
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(focus_event).encode()),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "focus_time_properties": {
+                    "auto_decline_mode": "declineNone",
+                    "decline_message": "No automatic replies",
+                },
+            },
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(focus_event).encode()),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "visibility": "public"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(focus_event).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+    enable = {
+        **common,
+        "focus_time_properties": {
+            "auto_decline_mode": "declineOnlyNewConflictingInvitations",
+            "decline_message": "Protecting focus time",
+        },
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            enable,
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(focus_event).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+    unknown_decline_mode_event = {
+        **focus_event,
+        "focusTimeProperties": {"chatStatus": "available"},
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "start": {"date_time": "2026-08-01T08:15:00+02:00"}},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(unknown_decline_mode_event).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "start": {"date_time": "2026-08-01T08:00:00+02:00"}},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(focus_event).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "focus_time_properties": {"chat_status": "available"}},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(focus_event).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+    chat_only_event = {
+        **focus_event,
+        "focusTimeProperties": {
+            "autoDeclineMode": "declineNone",
+            "chatStatus": "doNotDisturb",
+        },
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "start": {"date_time": "2026-08-01T08:30:00+02:00"}},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(chat_only_event).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+
+    mismatch = _Transport(body=json.dumps(focus_event).encode())
+    with pytest.raises(ValidationError, match="do not match"):
+        adapter.classify_effect(
+            operation,
+            {**common, "working_location_properties": {"type": "homeOffice"}},
+            credential=_credential(),
+            transport=mismatch,
+        )
+    assert len(mismatch.calls) == 1
+
+    empty_properties = _Transport(body=json.dumps(focus_event).encode())
+    with pytest.raises(ValidationError, match="at least one changed field"):
+        adapter.classify_effect(
+            operation,
+            {**common, "focus_time_properties": {}},
+            credential=_credential(),
+            transport=empty_properties,
+        )
+    assert empty_properties.calls == []
+
+    too_long = _Transport(body=json.dumps(focus_event).encode())
+    with pytest.raises(ValidationError, match="under 24 hours"):
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "end": {"date_time": "2026-08-02T09:00:00+02:00"},
+                "start": {"date_time": "2026-08-01T09:00:00+02:00"},
+            },
+            credential=_credential(),
+            transport=too_long,
+        )
+    assert len(too_long.calls) == 1
+
+    backwards = _Transport(body=json.dumps(focus_event).encode())
+    with pytest.raises(ValidationError, match="end must follow"):
+        adapter.classify_effect(
+            operation,
+            {**common, "start": {"date_time": "2026-08-01T11:00:00+02:00"}},
+            credential=_credential(),
+            transport=backwards,
+        )
+    assert len(backwards.calls) == 1
+
+    execution = _Transport(bodies=(json.dumps(focus_event).encode(), b"{}"))
+    adapter.execute(
+        operation,
+        enable,
+        continuation=None,
+        credential=_credential(),
+        transport=execution,
+        write_idempotency_key="confirmed-focus-rule",
+    )
+    assert len(execution.calls) == 2
+    assert execution.calls[0]["query"][0][0] == "fields"
+    fields = execution.calls[0]["query"][0][1]
+    assert "focusTimeProperties(autoDeclineMode,chatStatus,declineMessage)" in fields
+    assert execution.calls[1]["json_body"] == {
+        "focusTimeProperties": {
+            "autoDeclineMode": "declineOnlyNewConflictingInvitations",
+            "declineMessage": "Protecting focus time",
+        }
+    }
+
+
+def test_calendar_working_location_updates_keep_local_preferences_one_step() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    event = {
+        "attendees": [],
+        "end": {"date": "2026-08-03"},
+        "etag": "etag",
+        "eventType": "workingLocation",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "start": {"date": "2026-08-02"},
+        "workingLocationProperties": {"type": "homeOffice"},
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "color_id": "7"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(event).encode()),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    assert (
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "working_location_properties": {
+                    "custom_location": {"label": "Client site"},
+                    "type": "customLocation",
+                },
+            },
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(event).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+
+    invalid = _Transport(body=json.dumps(event).encode())
+    with pytest.raises(ValidationError, match="must remain public"):
+        adapter.classify_effect(
+            operation,
+            {**common, "visibility": "private"},
+            credential=_credential(),
+            transport=invalid,
+        )
+    assert len(invalid.calls) == 1
 
 
 def test_drive_shared_drive_routes_remain_fixed_and_require_support() -> None:

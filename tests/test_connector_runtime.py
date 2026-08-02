@@ -787,7 +787,7 @@ def test_google_calendar_previews_disclose_patch_notification_and_recovery_seman
     expected_phrases = {
         "calendars.delete": ("permanently", "everyone"),
         "events.create": ("attendees", "invitations", "external calendars", "email"),
-        "events.delete": ("Trash", "external calendars", "email"),
+        "events.delete": ("Trash", "external calendars", "email", "already declined"),
         "events.move": ("organizer", "external calendars", "email"),
         "events.respond": ("organizer", "RSVP"),
         "events.update": (
