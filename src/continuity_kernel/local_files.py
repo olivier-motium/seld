@@ -46,6 +46,7 @@ MAX_LOCAL_GRANT_STORE_BYTES: Final = 512 * 1024
 # from a descriptor-pinned file and is never materialized in a request object.
 MAX_FILE_TRANSFER_BYTES: Final = 5 * 1024**4
 FILE_TRANSFER_CHUNK_BYTES: Final = 1024 * 1024
+_POSIX_OS = cast(Any, os)
 _PINNED_FILE_TRANSFER_SUPPORTED: Final = (
     os.name != "nt"
     and hasattr(os, "O_DIRECTORY")
@@ -857,7 +858,7 @@ def _open_granted_file(grant: LocalFileGrant, relative: Path) -> Iterator[int]:
     ):
         raise ValidationError("local file is not eligible for binary transfer")
 
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags = os.O_RDONLY | _POSIX_OS.O_DIRECTORY | _POSIX_OS.O_NOFOLLOW
     root_descriptor = -1
     directory_descriptors: list[int] = []
     directory_links: list[tuple[int, str, tuple[int, int]]] = []
@@ -898,7 +899,7 @@ def _open_granted_file(grant: LocalFileGrant, relative: Path) -> Iterator[int]:
         if stat.S_ISLNK(listed.st_mode) or not stat.S_ISREG(listed.st_mode):
             raise ValidationError("local file transfer requires a regular file, not a link")
 
-        file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        file_flags = os.O_RDONLY | _POSIX_OS.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
         try:
             file_descriptor = os.open(name, file_flags, dir_fd=parent)
         except OSError as exc:

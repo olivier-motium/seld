@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock, Timer
-from typing import Final, Protocol
+from typing import Any, Final, Protocol, cast
 
 from continuity_kernel.config import data_dir
 from continuity_kernel.errors import ConflictError, ValidationError
@@ -36,6 +36,7 @@ MAX_ARTIFACT_BYTES: Final = MAX_FILE_TRANSFER_BYTES
 ARTIFACT_CHUNK_BYTES: Final = 1024 * 1024
 DEFAULT_ARTIFACT_TTL_SECONDS: Final = 24 * 60 * 60
 MAX_ARTIFACT_TTL_SECONDS: Final = 7 * 24 * 60 * 60
+_POSIX_OS = cast(Any, os)
 
 _HANDLE = re.compile(r"^tr1\.[A-Za-z0-9_-]{43}$")
 _ARTIFACT_NAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -785,7 +786,7 @@ class ArtifactWriter:
             raise ValidationError("artifact size does not match its declared length")
         try:
             os.fsync(self._descriptor)
-            os.fchmod(self._descriptor, 0o600)
+            _POSIX_OS.fchmod(self._descriptor, 0o600)
             os.close(self._descriptor)
             self._descriptor = -1
             self._finalizer.detach()
@@ -988,7 +989,7 @@ class ArtifactStore:
             ):
                 raise ValidationError("local file changed while its upload was prepared")
             os.fsync(descriptor)
-            os.fchmod(descriptor, 0o600)
+            _POSIX_OS.fchmod(descriptor, 0o600)
             os.close(descriptor)
             descriptor = -1
             read_descriptor = os.open(
