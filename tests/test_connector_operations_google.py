@@ -828,6 +828,32 @@ def test_calendar_schemas_match_provider_time_id_and_notification_contracts() ->
             {**freebusy, "calendar_ids": [*freebusy["calendar_ids"], "one-too-many"]},
         )
 
+    reviewed_update = {
+        "calendar_id": "primary",
+        "etag": "etag",
+        "event_id": "event",
+        "expected_event": _expected_event(),
+        "visibility": "private",
+    }
+    assert (
+        catalog.validate_input(
+            "google_calendar",
+            ConnectorMode.WRITE,
+            "events.update",
+            reviewed_update,
+        )
+        == reviewed_update
+    )
+    malformed_snapshot = dict(_expected_event())
+    malformed_snapshot.pop("status")
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "google_calendar",
+            ConnectorMode.WRITE,
+            "events.update",
+            {**reviewed_update, "expected_event": malformed_snapshot},
+        )
+
     move = {
         "calendar_id": "source",
         "destination_calendar_id": "destination",

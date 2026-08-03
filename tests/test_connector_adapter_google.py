@@ -237,6 +237,19 @@ def _expected_event(
     }
 
 
+def _expected_event_for(event: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "end": event.get("end"),
+        "etag": event["etag"],
+        "eventType": event["eventType"],
+        "id": event["id"],
+        "organizer": event.get("organizer"),
+        "start": event.get("start"),
+        "status": event["status"],
+        "summary": event.get("summary"),
+    }
+
+
 def _expected_calendar(
     calendar_id: str,
     *,
@@ -3015,16 +3028,22 @@ def test_calendar_event_patch_distinguishes_local_outward_and_destructive_change
         "end": {"dateTime": "2026-08-01T10:00:00+02:00", "timeZone": "Europe/Brussels"},
         "etag": "etag",
         "eventType": "default",
+        "id": "event",
         "organizer": {"email": "owner@example.test", "self": True},
         "start": {"dateTime": "2026-08-01T09:00:00+02:00", "timeZone": "Europe/Brussels"},
+        "status": "confirmed",
     }
     common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
     private_team_event = {
         "attendees": [],
         "etag": "etag",
         "eventType": "default",
+        "id": "event",
         "organizer": {"email": "team@example.test", "self": True},
+        "status": "confirmed",
     }
+    shared_expected = _expected_event_for(shared)
+    private_team_expected = _expected_event_for(private_team_event)
 
     assert (
         adapter.classify_effect(
@@ -3047,7 +3066,12 @@ def test_calendar_event_patch_distinguishes_local_outward_and_destructive_change
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "calendar_id": "team", "summary": "Visible team change"},
+            {
+                **common,
+                "calendar_id": "team",
+                "expected_event": private_team_expected,
+                "summary": "Visible team change",
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(private_team_event).encode()),
         )
@@ -3059,6 +3083,7 @@ def test_calendar_event_patch_distinguishes_local_outward_and_destructive_change
             {
                 **common,
                 "attendee_emails": ["owner@example.test"],
+                "expected_event": shared_expected,
                 "send_updates": "all",
             },
             credential=_credential(),
@@ -3071,10 +3096,15 @@ def test_calendar_event_patch_distinguishes_local_outward_and_destructive_change
         "end": {"dateTime": "2026-08-01T10:00:00+02:00"},
         "start": {"dateTime": "2026-08-01T09:00:00+02:00"},
     }
+    recurrence_without_zone_expected = _expected_event_for(recurrence_without_zone)
     with pytest.raises(ValidationError, match="matching explicit time zone"):
         adapter.classify_effect(
             operation,
-            {**common, "recurrence": ["RRULE:FREQ=DAILY;COUNT=2"]},
+            {
+                **common,
+                "expected_event": recurrence_without_zone_expected,
+                "recurrence": ["RRULE:FREQ=DAILY;COUNT=2"],
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(recurrence_without_zone).encode()),
         )
@@ -3082,14 +3112,18 @@ def test_calendar_event_patch_distinguishes_local_outward_and_destructive_change
         "attendees": [{"self": True}],
         "etag": "etag",
         "eventType": "default",
+        "id": "event",
         "organizer": {"email": "owner@example.test", "self": True},
+        "status": "confirmed",
     }
+    email_less_expected = _expected_event_for(email_less_attendee)
     assert (
         adapter.classify_effect(
             operation,
             {
                 **common,
                 "attendee_emails": ["owner@example.test"],
+                "expected_event": email_less_expected,
                 "send_updates": "all",
             },
             credential=_credential(),
@@ -3100,7 +3134,11 @@ def test_calendar_event_patch_distinguishes_local_outward_and_destructive_change
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "recurrence": ["RRULE:FREQ=DAILY;COUNT=2"]},
+            {
+                **common,
+                "expected_event": shared_expected,
+                "recurrence": ["RRULE:FREQ=DAILY;COUNT=2"],
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(shared).encode()),
         )
@@ -3109,7 +3147,11 @@ def test_calendar_event_patch_distinguishes_local_outward_and_destructive_change
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "recurrence": []},
+            {
+                **common,
+                "expected_event": recurrence_without_zone_expected,
+                "recurrence": [],
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(recurrence_without_zone).encode()),
         )
@@ -3269,6 +3311,11 @@ def test_existing_calendar_event_effect_uses_live_sharing_state_and_rechecks_exe
         "calendar_id": "primary",
         "etag": "event-version-1",
         "event_id": "event-1",
+        "expected_event": _expected_event(
+            etag="event-version-1",
+            event_id="event-1",
+            organizer={"email": "owner@example.test", "self": True},
+        ),
         "summary": "Updated",
     }
     private = json.dumps(
@@ -3276,7 +3323,9 @@ def test_existing_calendar_event_effect_uses_live_sharing_state_and_rechecks_exe
             "attendees": [{"email": "owner@example.test", "self": True}],
             "etag": "event-version-1",
             "eventType": "default",
+            "id": "event-1",
             "organizer": {"email": "owner@example.test", "self": True},
+            "status": "confirmed",
         }
     ).encode()
     shared = json.dumps(
@@ -3287,7 +3336,9 @@ def test_existing_calendar_event_effect_uses_live_sharing_state_and_rechecks_exe
             ],
             "etag": "event-version-1",
             "eventType": "default",
+            "id": "event-1",
             "organizer": {"email": "owner@example.test", "self": True},
+            "status": "confirmed",
         }
     ).encode()
 
@@ -3345,13 +3396,282 @@ def test_existing_calendar_event_effect_uses_live_sharing_state_and_rechecks_exe
     assert all(call["method"] is ConnectorMethod.GET for call in changed_transport.calls)
 
 
+@pytest.mark.parametrize(
+    ("current_visibility", "requested_visibility"),
+    (("public", "private"), ("private", "public")),
+)
+def test_calendar_visibility_rejects_every_recurring_instance_direction(
+    current_visibility: str,
+    requested_visibility: str,
+) -> None:
+    event = {
+        "etag": "etag",
+        "eventType": "default",
+        "id": "occurrence-1",
+        "originalStartTime": {"dateTime": "2026-08-01T09:00:00+02:00"},
+        "recurringEventId": "series-1",
+        "status": "confirmed",
+        "visibility": current_visibility,
+    }
+    transport = _Transport(body=json.dumps(event).encode())
+
+    with pytest.raises(ValidationError, match=r"recurring parent series-1.*fresh ETag"):
+        GoogleConnectorAdapter().classify_effect(
+            _operation("google_calendar", "events.update"),
+            {
+                "calendar_id": "primary",
+                "etag": "etag",
+                "event_id": "occurrence-1",
+                "visibility": requested_visibility,
+            },
+            credential=_credential(),
+            transport=transport,
+        )
+
+    assert [call["method"] for call in transport.calls] == [ConnectorMethod.GET]
+    fields = dict(transport.calls[0]["query"])["fields"]
+    for field in ("originalStartTime", "recurrence", "recurringEventId", "visibility"):
+        assert field in fields
+
+
+@pytest.mark.parametrize(
+    "provider_state",
+    (
+        {
+            "etag": "etag",
+            "eventType": "default",
+            "id": "event",
+            "status": "confirmed",
+            "visibility": "unexpected",
+        },
+        {
+            "etag": "etag",
+            "eventType": "default",
+            "id": "event",
+            "recurringEventId": "series-1",
+            "status": "confirmed",
+            "visibility": "public",
+        },
+        {
+            "etag": "etag",
+            "eventType": "default",
+            "id": "event",
+            "recurrence": [],
+            "status": "confirmed",
+            "visibility": "public",
+        },
+        {
+            "etag": "etag",
+            "eventType": "default",
+            "id": "event",
+            "originalStartTime": {"dateTime": "2026-08-01T09:00:00+02:00"},
+            "status": "confirmed",
+            "visibility": "public",
+        },
+        {
+            "etag": "etag",
+            "eventType": "default",
+            "id": "event",
+            "originalStartTime": {"dateTime": "2026-08-01T09:00:00+02:00"},
+            "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=2"],
+            "recurringEventId": "series-1",
+            "status": "confirmed",
+            "visibility": "public",
+        },
+        {
+            "etag": "etag",
+            "eventType": "default",
+            "id": "event",
+            "recurrence": ["NOT-A-RECURRENCE"],
+            "status": "confirmed",
+            "visibility": "public",
+        },
+    ),
+)
+def test_calendar_visibility_fails_closed_on_incomplete_provider_state(
+    provider_state: dict[str, object],
+) -> None:
+    transport = _Transport(body=json.dumps(provider_state).encode())
+
+    with pytest.raises(ValidationError, match=r"visibility preflight.*(?:visibility|recurrence)"):
+        GoogleConnectorAdapter().classify_effect(
+            _operation("google_calendar", "events.update"),
+            {
+                "calendar_id": "primary",
+                "etag": "etag",
+                "event_id": "event",
+                "visibility": "private",
+            },
+            credential=_credential(),
+            transport=transport,
+        )
+
+    assert [call["method"] for call in transport.calls] == [ConnectorMethod.GET]
+
+
+def test_calendar_visibility_parent_and_standalone_changes_are_never_safe() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    common = {"calendar_id": "primary", "etag": "etag", "event_id": "event"}
+    parent = {
+        "etag": "etag",
+        "eventType": "default",
+        "id": "event",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=2"],
+        "status": "confirmed",
+        "visibility": "public",
+    }
+
+    with pytest.raises(ValidationError, match=r"requires expected_event"):
+        adapter.classify_effect(
+            operation,
+            {**common, "visibility": "private"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(parent).encode()),
+        )
+
+    assert (
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "expected_event": _expected_event_for(parent),
+                "visibility": "private",
+            },
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(parent).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+
+    standalone = dict(parent)
+    standalone.pop("recurrence")
+    standalone["visibility"] = "private"
+    assert (
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "expected_event": _expected_event_for(standalone),
+                "visibility": "public",
+            },
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(standalone).encode()),
+        )
+        is ConnectorEffect.OUTWARD
+    )
+
+    default_visibility = dict(standalone)
+    default_visibility.pop("visibility")
+    assert (
+        adapter.classify_effect(
+            operation,
+            {
+                **common,
+                "expected_event": _expected_event_for(default_visibility),
+                "visibility": "private",
+            },
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(default_visibility).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+
+    assert (
+        adapter.classify_effect(operation, {**common, "visibility": "public"})
+        is ConnectorEffect.OUTWARD
+    )
+    assert (
+        adapter.classify_effect(operation, {**common, "visibility": "default"})
+        is ConnectorEffect.DESTRUCTIVE
+    )
+
+
+@pytest.mark.parametrize(
+    ("current_visibility", "requested_visibility"),
+    (
+        ("private", "private"),
+        ("private", "confidential"),
+        ("confidential", "private"),
+        ("public", "public"),
+    ),
+)
+def test_calendar_visibility_rejects_exact_and_compatibility_noops(
+    current_visibility: str,
+    requested_visibility: str,
+) -> None:
+    event = {
+        "etag": "etag",
+        "eventType": "default",
+        "id": "event",
+        "status": "confirmed",
+        "visibility": current_visibility,
+    }
+    transport = _Transport(body=json.dumps(event).encode())
+
+    with pytest.raises(ValidationError, match="no-op"):
+        GoogleConnectorAdapter().classify_effect(
+            _operation("google_calendar", "events.update"),
+            {
+                "calendar_id": "primary",
+                "etag": "etag",
+                "event_id": "event",
+                "visibility": requested_visibility,
+            },
+            credential=_credential(),
+            transport=transport,
+        )
+
+    assert [call["method"] for call in transport.calls] == [ConnectorMethod.GET]
+
+
+def test_calendar_consequential_update_requires_reviewed_target_but_safe_update_does_not() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "events.update")
+    values = {
+        "calendar_id": "primary",
+        "etag": "etag",
+        "event_id": "event",
+        "summary": "Updated",
+    }
+    private = {
+        "attendees": [],
+        "etag": "etag",
+        "eventType": "default",
+        "id": "event",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "status": "confirmed",
+    }
+    shared = {**private, "attendees": [{"email": "guest@example.test"}]}
+
+    assert (
+        adapter.classify_effect(
+            operation,
+            values,
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(private).encode()),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+    with pytest.raises(ValidationError, match="requires expected_event"):
+        adapter.classify_effect(
+            operation,
+            values,
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(shared).encode()),
+        )
+
+
 def test_confirmed_shared_calendar_event_update_rechecks_then_writes() -> None:
     shared = json.dumps(
         {
             "attendees": [{"email": "guest@example.test"}],
             "etag": "event-version-1",
             "eventType": "default",
+            "id": "event-1",
             "organizer": {"email": "owner@example.test", "self": True},
+            "status": "confirmed",
         }
     ).encode()
     transport = _Transport(bodies=(shared, b"{}"))
@@ -3361,6 +3681,11 @@ def test_confirmed_shared_calendar_event_update_rechecks_then_writes() -> None:
             "calendar_id": "primary",
             "etag": "event-version-1",
             "event_id": "event-1",
+            "expected_event": _expected_event(
+                etag="event-version-1",
+                event_id="event-1",
+                organizer={"email": "owner@example.test", "self": True},
+            ),
             "summary": "Confirmed update",
         },
         continuation=None,
@@ -3527,7 +3852,9 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
             "attendees": [{"email": "guest@example.test"}],
             "etag": "calendar-etag",
             "eventType": "default",
+            "id": "event",
             "organizer": {"email": "owner@example.test", "self": True},
+            "status": "confirmed",
         }
     ).encode()
     transport = _Transport(bodies=(event, b"{}"))
@@ -3545,6 +3872,11 @@ def test_calendar_and_drive_shape_fixed_bodies_headers_and_resumable_uploads() -
             "calendar_id": "primary",
             "etag": "calendar-etag",
             "event_id": "event",
+            "expected_event": _expected_event(
+                etag="calendar-etag",
+                event_id="event",
+                organizer={"email": "owner@example.test", "self": True},
+            ),
             "guests_can_invite_others": False,
             "guests_can_modify": True,
             "guests_can_see_other_guests": False,
@@ -5635,12 +5967,16 @@ def test_calendar_rich_update_effects_fail_closed_for_removed_or_replaced_conten
         "attendees": [],
         "etag": "etag",
         "eventType": "default",
+        "id": "event",
         "organizer": {"email": "owner@example.test", "self": True},
+        "status": "confirmed",
     }
     shared = {
         **private,
         "attendees": [{"email": "guest@example.test"}],
     }
+    private_expected = _expected_event_for(private)
+    shared_expected = _expected_event_for(shared)
 
     assert (
         adapter.classify_effect(
@@ -5654,7 +5990,7 @@ def test_calendar_rich_update_effects_fail_closed_for_removed_or_replaced_conten
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "color_id": "7"},
+            {**common, "color_id": "7", "expected_event": shared_expected},
             credential=_credential(),
             transport=_Transport(body=json.dumps(shared).encode()),
         )
@@ -5671,6 +6007,7 @@ def test_calendar_rich_update_effects_fail_closed_for_removed_or_replaced_conten
             {
                 **common,
                 "attachments": [{"file_url": "https://files.example.test/new.pdf"}],
+                "expected_event": _expected_event_for(attachment_event),
             },
             credential=_credential(),
             transport=_Transport(body=json.dumps(attachment_event).encode()),
@@ -5683,6 +6020,7 @@ def test_calendar_rich_update_effects_fail_closed_for_removed_or_replaced_conten
             {
                 **common,
                 "private_extended_properties": [{"key": "source", "value": None}],
+                "expected_event": private_expected,
             },
             credential=_credential(),
             transport=_Transport(body=json.dumps(private).encode()),
@@ -5697,7 +6035,11 @@ def test_calendar_rich_update_effects_fail_closed_for_removed_or_replaced_conten
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "meet_request_id": "replacement-request"},
+            {
+                **common,
+                "expected_event": _expected_event_for(conference_event),
+                "meet_request_id": "replacement-request",
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(conference_event).encode()),
         )
@@ -5707,7 +6049,11 @@ def test_calendar_rich_update_effects_fail_closed_for_removed_or_replaced_conten
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "meet_request_id": "replacement-request"},
+            {
+                **common,
+                "expected_event": _expected_event_for(hangout_event),
+                "meet_request_id": "replacement-request",
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(hangout_event).encode()),
         )
@@ -5733,6 +6079,7 @@ def test_calendar_rich_update_effects_fail_closed_for_removed_or_replaced_conten
             {
                 **common,
                 "attendees": [{"additional_guests": 1, "email": "guest@example.test"}],
+                "expected_event": _expected_event_for(guests),
                 "send_updates": "none",
             },
             credential=_credential(),
@@ -5750,7 +6097,9 @@ def test_calendar_rich_update_preflight_reads_only_fields_needed_for_the_effect(
         "attendees": [],
         "etag": "etag",
         "eventType": "default",
+        "id": "event",
         "organizer": {"email": "owner@example.test", "self": True},
+        "status": "confirmed",
     }
     cases = (
         (
@@ -5767,6 +6116,7 @@ def test_calendar_rich_update_preflight_reads_only_fields_needed_for_the_effect(
             {
                 **common,
                 "attendees": [{"additional_guests": 1, "email": "guest@example.test"}],
+                "expected_event": _expected_event_for(event),
                 "send_updates": "none",
             },
             ("additionalGuests",),
@@ -6066,8 +6416,10 @@ def test_calendar_birthday_updates_use_live_provider_contract() -> None:
         "end": {"date": "2026-08-03"},
         "etag": "etag",
         "eventType": "birthday",
+        "id": "event",
         "organizer": {"email": "owner@example.test", "self": True},
         "start": {"date": "2026-08-02"},
+        "status": "confirmed",
     }
 
     summary = {**common, "summary": "Updated birthday"}
@@ -6083,7 +6435,11 @@ def test_calendar_birthday_updates_use_live_provider_contract() -> None:
     assert (
         adapter.classify_effect(
             operation,
-            {**summary, "calendar_id": "shared"},
+            {
+                **summary,
+                "calendar_id": "shared",
+                "expected_event": _expected_event_for(event),
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(event).encode()),
         )
@@ -6206,9 +6562,12 @@ def test_calendar_from_gmail_updates_use_live_type_and_copy_aware_effects() -> N
         "attendees": [{"additionalGuests": 0, "email": "guest@example.test"}],
         "etag": "etag",
         "eventType": "fromGmail",
+        "id": "event",
         "organizer": {"email": "owner@example.test", "self": True},
         "status": "confirmed",
+        "visibility": "public",
     }
+    expected_event = _expected_event_for(event)
     copy_private = {
         **common,
         "color_id": "7",
@@ -6227,22 +6586,41 @@ def test_calendar_from_gmail_updates_use_live_type_and_copy_aware_effects() -> N
     assert (
         adapter.classify_effect(
             operation,
-            {**copy_private, "calendar_id": "delegated@example.test"},
+            {
+                **copy_private,
+                "calendar_id": "delegated@example.test",
+                "expected_event": expected_event,
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(event).encode()),
         )
         is ConnectorEffect.OUTWARD
     )
 
+    assert (
+        adapter.classify_effect(
+            operation,
+            {**common, "expected_event": expected_event, "visibility": "private"},
+            credential=_credential(),
+            transport=_Transport(body=json.dumps(event).encode()),
+        )
+        is ConnectorEffect.DESTRUCTIVE
+    )
+
     outward_values = (
-        {**common, "visibility": "private"},
-        {**common, "transparency": "transparent"},
-        {**common, "status": "tentative"},
+        {**common, "expected_event": expected_event, "transparency": "transparent"},
+        {**common, "expected_event": expected_event, "status": "tentative"},
         {
             **common,
+            "expected_event": expected_event,
             "shared_extended_properties": [{"key": "trip", "value": "confirmed"}],
         },
-        {**common, "color_id": "7", "send_updates": "all"},
+        {
+            **common,
+            "color_id": "7",
+            "expected_event": expected_event,
+            "send_updates": "all",
+        },
     )
     for values in outward_values:
         assert (
@@ -6257,6 +6635,7 @@ def test_calendar_from_gmail_updates_use_live_type_and_copy_aware_effects() -> N
 
     deletion = {
         **common,
+        "expected_event": expected_event,
         "private_extended_properties": [{"key": "source", "value": None}],
     }
     assert (
@@ -6287,7 +6666,7 @@ def test_calendar_from_gmail_updates_use_live_type_and_copy_aware_effects() -> N
     status_transport = _Transport(bodies=(json.dumps(event).encode(), b"{}"))
     adapter.execute(
         operation,
-        {**common, "status": "tentative"},
+        {**common, "expected_event": expected_event, "status": "tentative"},
         continuation=None,
         credential=_credential(),
         transport=status_transport,
@@ -6334,7 +6713,7 @@ def test_calendar_from_gmail_rejects_provider_owned_fields_before_patch() -> Non
 def test_calendar_from_gmail_attendee_replacement_is_lossless_and_complete() -> None:
     adapter = GoogleConnectorAdapter()
     operation = _operation("google_calendar", "events.update")
-    values = {
+    values: dict[str, object] = {
         "attendees": [
             {
                 "additional_guests": 1,
@@ -6366,9 +6745,11 @@ def test_calendar_from_gmail_attendee_replacement_is_lossless_and_complete() -> 
         "attendeesOmitted": False,
         "etag": "etag",
         "eventType": "fromGmail",
+        "id": "event",
         "organizer": {"email": "owner@example.test", "self": True},
         "status": "confirmed",
     }
+    values["expected_event"] = _expected_event_for(event)
     assert (
         adapter.classify_effect(
             operation,
@@ -6512,9 +6893,13 @@ def test_calendar_status_updates_use_live_type_and_effect_bearing_rules() -> Non
             "autoDeclineMode": "declineAllConflictingInvitations",
             "chatStatus": "doNotDisturb",
         },
+        "id": "event",
         "organizer": {"email": "owner@example.test", "self": True},
         "start": {"dateTime": "2026-08-01T09:00:00+02:00"},
+        "status": "confirmed",
+        "visibility": "private",
     }
+    reviewed = {"expected_event": _expected_event_for(focus_event)}
 
     disable = {
         **common,
@@ -6547,7 +6932,7 @@ def test_calendar_status_updates_use_live_type_and_effect_bearing_rules() -> Non
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "visibility": "public"},
+            {**common, **reviewed, "visibility": "public"},
             credential=_credential(),
             transport=_Transport(body=json.dumps(focus_event).encode()),
         )
@@ -6555,6 +6940,7 @@ def test_calendar_status_updates_use_live_type_and_effect_bearing_rules() -> Non
     )
     enable = {
         **common,
+        **reviewed,
         "focus_time_properties": {
             "auto_decline_mode": "declineOnlyNewConflictingInvitations",
             "decline_message": "Protecting focus time",
@@ -6576,7 +6962,11 @@ def test_calendar_status_updates_use_live_type_and_effect_bearing_rules() -> Non
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "start": {"date_time": "2026-08-01T08:15:00+02:00"}},
+            {
+                **common,
+                **reviewed,
+                "start": {"date_time": "2026-08-01T08:15:00+02:00"},
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(unknown_decline_mode_event).encode()),
         )
@@ -6585,7 +6975,11 @@ def test_calendar_status_updates_use_live_type_and_effect_bearing_rules() -> Non
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "start": {"date_time": "2026-08-01T08:00:00+02:00"}},
+            {
+                **common,
+                **reviewed,
+                "start": {"date_time": "2026-08-01T08:00:00+02:00"},
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(focus_event).encode()),
         )
@@ -6594,7 +6988,11 @@ def test_calendar_status_updates_use_live_type_and_effect_bearing_rules() -> Non
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "focus_time_properties": {"chat_status": "available"}},
+            {
+                **common,
+                **reviewed,
+                "focus_time_properties": {"chat_status": "available"},
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(focus_event).encode()),
         )
@@ -6610,7 +7008,11 @@ def test_calendar_status_updates_use_live_type_and_effect_bearing_rules() -> Non
     assert (
         adapter.classify_effect(
             operation,
-            {**common, "start": {"date_time": "2026-08-01T08:30:00+02:00"}},
+            {
+                **common,
+                **reviewed,
+                "start": {"date_time": "2026-08-01T08:30:00+02:00"},
+            },
             credential=_credential(),
             transport=_Transport(body=json.dumps(chat_only_event).encode()),
         )
@@ -6691,8 +7093,11 @@ def test_calendar_working_location_updates_keep_local_preferences_one_step() -> 
         "end": {"date": "2026-08-03"},
         "etag": "etag",
         "eventType": "workingLocation",
+        "id": "event",
         "organizer": {"email": "owner@example.test", "self": True},
         "start": {"date": "2026-08-02"},
+        "status": "confirmed",
+        "visibility": "public",
         "workingLocationProperties": {"type": "homeOffice"},
     }
     assert (
@@ -6709,6 +7114,7 @@ def test_calendar_working_location_updates_keep_local_preferences_one_step() -> 
             operation,
             {
                 **common,
+                "expected_event": _expected_event_for(event),
                 "working_location_properties": {
                     "custom_location": {"label": "Client site"},
                     "type": "customLocation",

@@ -796,6 +796,7 @@ def test_google_calendar_previews_disclose_patch_notification_and_recovery_seman
             "calendar_id": "primary",
             "etag": "event-etag",
             "event_id": "event-1",
+            "expected_event": expected_event,
             "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=2"],
         },
     }
@@ -826,6 +827,8 @@ def test_google_calendar_previews_disclose_patch_notification_and_recovery_seman
             "extended-property",
             "Meet",
             "external calendars",
+            "recurring parent",
+            "every occurrence",
         ),
     }
 

@@ -178,6 +178,21 @@ class _CalendarListTransport(ConnectorTransport):
         return ConnectorResponse(kwargs["origin"], 200, {}, body)
 
 
+class _CalendarEventTransport(ConnectorTransport):
+    def __init__(self, resources: tuple[dict[str, object], ...]) -> None:
+        self.resources = list(resources)
+        self.requests: list[dict[str, Any]] = []
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.requests.append(kwargs)
+        body: dict[str, object] = {"id": "series-1"}
+        if kwargs["method"] is ConnectorMethod.GET:
+            if not self.resources:
+                raise AssertionError("unexpected Google Calendar event preflight")
+            body = self.resources.pop(0)
+        return ConnectorResponse(kwargs["origin"], 200, {}, json.dumps(body).encode())
+
+
 class _DriveLifecycleTransport(ConnectorTransport):
     def __init__(self, bodies: tuple[dict[str, object], ...]) -> None:
         self.bodies = list(bodies)
@@ -327,6 +342,33 @@ def _calendar_list_entry(*, summary: str = "Team") -> dict[str, object]:
         "kind": "calendar#calendarListEntry",
         "primary": False,
         "summary": summary,
+    }
+
+
+def _recurring_calendar_event(*, summary: str = "Weekly plan") -> dict[str, object]:
+    return {
+        "attendees": [],
+        "etag": '"event-etag"',
+        "eventType": "default",
+        "id": "series-1",
+        "organizer": {"email": "owner@example.test", "self": True},
+        "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=2"],
+        "status": "confirmed",
+        "summary": summary,
+        "visibility": "public",
+    }
+
+
+def _expected_calendar_event(event: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "end": event.get("end"),
+        "etag": event["etag"],
+        "eventType": event["eventType"],
+        "id": event["id"],
+        "organizer": event.get("organizer"),
+        "start": event.get("start"),
+        "status": event["status"],
+        "summary": event.get("summary"),
     }
 
 
@@ -1498,6 +1540,121 @@ def test_calendar_list_remove_confirmation_rechecks_and_never_deletes_drift(
             ConnectorMethod.GET,
         ]
         assert all(request["method"] is not ConnectorMethod.DELETE for request in changed.requests)
+    finally:
+        runtime.close()
+
+
+def test_recurring_parent_visibility_confirmation_rechecks_and_patches_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    event = _recurring_calendar_event()
+    input_value = {
+        "calendar_id": "primary",
+        "etag": '"event-etag"',
+        "event_id": "series-1",
+        "expected_event": _expected_calendar_event(event),
+        "visibility": "private",
+    }
+    missing_snapshot = _CalendarEventTransport((event,))
+    runtime.transport = missing_snapshot
+    with pytest.raises(ValidationError, match="requires expected_event"):
+        runtime.call_tool(
+            "gsv_google_calendar_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": {
+                    key: value for key, value in input_value.items() if key != "expected_event"
+                },
+                "operation": "events.update",
+            },
+        )
+    assert [request["method"] for request in missing_snapshot.requests] == [ConnectorMethod.GET]
+
+    transport = _CalendarEventTransport((event, event, event))
+    runtime.transport = transport
+    try:
+        preview = runtime.call_tool(
+            "gsv_google_calendar_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "events.update",
+            },
+        )
+        assert preview["status"] == "confirmation_required"
+        assert preview["effect"] == ConnectorEffect.DESTRUCTIVE.value
+        assert preview["preview"] == input_value
+        warning = str(preview["warning"])
+        assert "recurring parent" in warning
+        assert "every occurrence" in warning
+        assert [request["method"] for request in transport.requests] == [ConnectorMethod.GET]
+
+        completed = runtime.call_tool(
+            "gsv_google_calendar_write",
+            {
+                "confirmation_token": preview["confirmation_token"],
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "events.update",
+            },
+        )
+        assert completed["status"] == "ok"
+        assert [request["method"] for request in transport.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.PATCH,
+        ]
+        patch = transport.requests[-1]
+        assert patch["headers"] == {"If-Match": '"event-etag"'}
+        assert patch["json_body"] == {"visibility": "private"}
+    finally:
+        runtime.close()
+
+
+def test_recurring_parent_visibility_drift_prevents_patch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    event = _recurring_calendar_event()
+    input_value = {
+        "calendar_id": "primary",
+        "etag": '"event-etag"',
+        "event_id": "series-1",
+        "expected_event": _expected_calendar_event(event),
+        "visibility": "private",
+    }
+    transport = _CalendarEventTransport(
+        (event, event, _recurring_calendar_event(summary="Renamed elsewhere"))
+    )
+    runtime.transport = transport
+    try:
+        preview = runtime.call_tool(
+            "gsv_google_calendar_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "events.update",
+            },
+        )
+        with pytest.raises(ValidationError, match="expected event snapshot"):
+            runtime.call_tool(
+                "gsv_google_calendar_write",
+                {
+                    "confirmation_token": preview["confirmation_token"],
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": input_value,
+                    "operation": "events.update",
+                },
+            )
+        assert [request["method"] for request in transport.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+        ]
     finally:
         runtime.close()
 

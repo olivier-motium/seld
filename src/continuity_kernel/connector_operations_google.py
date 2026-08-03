@@ -1943,6 +1943,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
                 "calendar_id": _id(),
                 "etag": _text(1_024),
                 **_event_fields(allow_property_deletion=True),
+                "expected_event": _expected_event(),
                 "status": {
                     "enum": ["confirmed", "tentative"],
                     "type": "string",

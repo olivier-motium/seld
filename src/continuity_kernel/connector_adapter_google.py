@@ -163,6 +163,7 @@ _EXISTING_CALENDAR_EVENT_MUTATIONS: Final = frozenset(
 _CALENDAR_RECURRENCE_LINE: Final = re.compile(
     r"^(?:RRULE|EXRULE|RDATE|EXDATE)(?:;[^:\r\n]*)?:[^\r\n]+$"
 )
+_CALENDAR_VISIBILITY_VALUES: Final = frozenset({"default", "private", "public", "confidential"})
 _CALENDAR_RFC3339: Final = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})?$"
 )
@@ -4560,6 +4561,37 @@ def _calendar_event_effect(
         return ConnectorEffect.DESTRUCTIVE
     if name != "events.update":
         return catalog_effect
+    expected_event_supplied = "expected_event" in values
+    effect_values = {key: value for key, value in values.items() if key != "expected_event"}
+    visibility_effect = (
+        _calendar_visibility_update_effect(effect_values, event)
+        if "visibility" in effect_values
+        else None
+    )
+    effect = _calendar_event_update_effect(
+        effect_values,
+        event,
+        catalog_effect=catalog_effect,
+    )
+    effect = _combine_calendar_event_effect(effect, visibility_effect)
+    if (
+        event is not None
+        and effect is not ConnectorEffect.SAFE_MUTATION
+        and not expected_event_supplied
+    ):
+        raise ValidationError(
+            "Google Calendar consequential events.update requires expected_event from a fresh "
+            "human-readable event read"
+        )
+    return effect
+
+
+def _calendar_event_update_effect(
+    values: Mapping[str, object],
+    event: Mapping[str, object] | None,
+    *,
+    catalog_effect: ConnectorEffect,
+) -> ConnectorEffect:
     if "recurrence" in values:
         return ConnectorEffect.DESTRUCTIVE
     if _calendar_extended_property_deletion(values):
@@ -4601,6 +4633,37 @@ def _calendar_event_effect(
     if event is None or _calendar_event_is_shared(event) or values.get("calendar_id") != "primary":
         return ConnectorEffect.OUTWARD
     return catalog_effect
+
+
+def _combine_calendar_event_effect(
+    effect: ConnectorEffect,
+    visibility_effect: ConnectorEffect | None,
+) -> ConnectorEffect:
+    if visibility_effect is None:
+        return effect
+    if effect is ConnectorEffect.DESTRUCTIVE or visibility_effect is ConnectorEffect.DESTRUCTIVE:
+        return ConnectorEffect.DESTRUCTIVE
+    if effect is ConnectorEffect.OUTWARD or visibility_effect is ConnectorEffect.OUTWARD:
+        return ConnectorEffect.OUTWARD
+    return effect
+
+
+def _calendar_visibility_update_effect(
+    values: Mapping[str, object], event: Mapping[str, object] | None
+) -> ConnectorEffect:
+    requested = _text(values["visibility"])
+    if event is None:
+        return ConnectorEffect.OUTWARD if requested == "public" else ConnectorEffect.DESTRUCTIVE
+    current, recurring_parent_id = _calendar_event_visibility_state(values, event)
+    if recurring_parent_id is not None:
+        raise ValidationError(
+            "Google Calendar visibility updates must target recurring parent "
+            f"{recurring_parent_id}; read that parent and retry events.update using its fresh ETag"
+        )
+    _reject_calendar_visibility_noop(requested, current)
+    if requested == "public":
+        return ConnectorEffect.OUTWARD
+    return ConnectorEffect.DESTRUCTIVE
 
 
 def _calendar_from_gmail_update_effect(
@@ -4807,6 +4870,15 @@ def _calendar_event_preflight_fields(values: Mapping[str, object]) -> str:
             "officeLocation(buildingId,deskId,floorId,floorSectionId,label),type)",
         )
     )
+    if "visibility" in values:
+        fields.extend(
+            (
+                "originalStartTime(date,dateTime,timeZone)",
+                "recurrence",
+                "recurringEventId",
+                "visibility",
+            )
+        )
     fields.extend(
         (
             "end(date,dateTime,timeZone)",
@@ -4822,6 +4894,57 @@ def _calendar_event_preflight_fields(values: Mapping[str, object]) -> str:
     return ",".join(fields)
 
 
+def _calendar_event_visibility_state(
+    values: Mapping[str, object], event: Mapping[str, object]
+) -> tuple[str, str | None]:
+    context = "Google Calendar visibility preflight"
+    event_id = _provider_text(event, "id", context=context)
+    if event_id != _required(values, "event_id"):
+        raise ValidationError(f"{context} returned a different event")
+    visibility = event.get("visibility", "default")
+    if not isinstance(visibility, str) or visibility not in _CALENDAR_VISIBILITY_VALUES:
+        raise ValidationError(f"{context} returned invalid current visibility")
+
+    has_recurring_event_id = "recurringEventId" in event
+    has_original_start_time = "originalStartTime" in event
+    if has_recurring_event_id != has_original_start_time:
+        raise ValidationError(f"{context} returned contradictory recurrence markers")
+
+    recurring_parent_id: str | None = None
+    if has_recurring_event_id:
+        recurring_parent_id = _provider_text(event, "recurringEventId", context=context)
+        original_start = _calendar_provider_time_snapshot(
+            event["originalStartTime"],
+            context=f"{context} originalStartTime",
+        )
+        if original_start is None:
+            raise ValidationError(f"{context} returned invalid recurrence state")
+
+    has_recurrence = "recurrence" in event
+    if has_recurrence:
+        _calendar_provider_recurrence(event["recurrence"], context=context)
+    if recurring_parent_id is not None and has_recurrence:
+        raise ValidationError(f"{context} returned contradictory recurrence markers")
+
+    return visibility, recurring_parent_id
+
+
+def _calendar_provider_recurrence(value: object, *, context: str) -> None:
+    if not isinstance(value, list) or not value:
+        raise ValidationError(f"{context} returned invalid recurrence state")
+    if any(not isinstance(line, str) or not line for line in value):
+        raise ValidationError(f"{context} returned invalid recurrence state")
+    if len(set(value)) != len(value) or any(
+        _CALENDAR_RECURRENCE_LINE.fullmatch(line) is None for line in value
+    ):
+        raise ValidationError(f"{context} returned invalid recurrence state")
+
+
+def _reject_calendar_visibility_noop(requested: str, current: str) -> None:
+    if requested == current or {requested, current} <= {"private", "confidential"}:
+        raise ValidationError("Google Calendar visibility update is a no-op")
+
+
 def _validate_calendar_from_gmail_event_update(
     values: Mapping[str, object], event: Mapping[str, object]
 ) -> None:
@@ -4833,6 +4956,7 @@ def _validate_calendar_from_gmail_event_update(
         "color_id",
         "etag",
         "event_id",
+        "expected_event",
         "private_extended_properties",
         "reminders",
         "send_updates",
@@ -4859,6 +4983,7 @@ def _validate_calendar_birthday_event_update(
         "end",
         "etag",
         "event_id",
+        "expected_event",
         "reminders",
         "start",
         "summary",

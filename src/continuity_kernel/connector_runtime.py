@@ -187,9 +187,10 @@ _OPERATION_WARNINGS: Final = {
         "Supplying attendees, attachments, or recurrence replaces that complete array; a null "
         "extended-property value deletes that entry, and a new Meet request can replace existing "
         "conference data. send_updates=none can leave external calendars stale and may not "
-        "suppress every email. Working-location changes are public. Focus-time and out-of-office "
-        "auto-decline rules can respond to conflicting invitations, and a focus-time Chat status "
-        "affects Google Chat and related products."
+        "suppress every email. Visibility changes must target the recurring parent; changing the "
+        "parent changes every occurrence. Working-location changes are public. Focus-time and "
+        "out-of-office auto-decline rules can respond to conflicting invitations, and a focus-time "
+        "Chat status affects Google Chat and related products."
     ),
     (
         "google_drive",
