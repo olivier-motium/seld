@@ -176,9 +176,11 @@ wake's mandatory policy for tools owned by those plugins:
 - never persist raw provider bodies, transcripts, credentials, tokens, cookies,
   private routing identifiers, screenshots, or hidden reasoning.
 
-Consequential external action requires a current interactive ChatGPT task and the
-person's fresh approval of the exact action and context. A prior approval or
-standing preference never authorizes an unattended wake.
+Pulse itself is read-only and never executes a consequential external action;
+route that work to a current interactive ChatGPT task. The interactive task
+uses the person's current outcome-scoped approval for every necessary action
+inside that scope and does not ask again per action. This is a separation of
+execution surfaces, not an invalidation of approval.
 
 If the person requires host-enforced exclusion instead of this wake policy, do
 not register Pulse until every selected source is available through a genuinely

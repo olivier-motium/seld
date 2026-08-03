@@ -21,7 +21,7 @@ apply` or `update recover`.
    `interrupted` as distinct states. Do not turn missing or failed evidence into
    an available update.
 
-## Obtain exact approval
+## Use the outcome approval
 
 For `available`, read the current ChatGPT task UUID from the supported app/task
 context. Stop if it is unavailable; never invent or reuse a task ID.
@@ -35,17 +35,22 @@ candidate with isolated host-state directories, stop only a verified live
 Bridge, replace the managed `uv` tool environment, rerun setup and health
 checks, and restore the previous environment if verification fails.
 
-Ask for fresh approval of those exact values in this task. A standing approval,
-another task, or approval given before the final status read does not count.
-After approval, run exactly once:
+The person's request to update Seld or plain-language approval of this update
+outcome covers the candidate identified by current status and every necessary
+backup, apply, restart, verification, rollback, recovery, and repair action in
+scope. SHA, revision, and task-reference values constrain execution; they are
+not separate approval surfaces. Do not ask again because a later status read
+changed an implementation value inside the same current update. Ask once only
+if the target or consequence leaves the approved update outcome. Then run:
 
 ```text
 gsv update apply --from-sha <installed.sha> --to-sha <candidate.sha> --expected-check-revision <check_revision> --approval-ref codex:<current-task-uuid>
 ```
 
-If the command reports a conflict, re-read status and ask again only if the
-person still wants the now-current update. Never weaken or bypass the SHA,
-revision, or task-reference binding.
+If the command reports a conflict, re-read status and continue under the same
+approval when it remains the same update outcome. Ask again only if the target
+or consequence leaves that outcome. Never weaken or bypass the SHA, revision,
+or task-reference binding.
 
 ## Verify or recover
 
@@ -57,8 +62,8 @@ For `interrupted`, read the transaction's exact token, from/to SHAs, phase, and
 recovery command. If `gsv` is temporarily unavailable during the environment
 swap, use `seld-recover --json update status`; that owner-only entrypoint is
 published before the move and runs outside uv's managed `gsv` path. Explain what
-the retained transaction shows, obtain fresh interactive approval, then run the
-reported exact command at most once. In the ordinary case it is:
+the retained transaction shows, then run the reported command under the current
+update-outcome approval. In the ordinary case it is:
 
 ```text
 gsv update recover --token <transaction.token>
@@ -72,11 +77,11 @@ do not delete retained environments or retry over an unresolved transaction.
 environments and follow the exact reported repair command in a current
 interactive task. For `vault_changed_during_activation`, compare the current
 local changes with the verified pre-update backup and explain the ambiguity.
-Only after the person approves those exact current bytes, replace
+When repair remains inside the approved update outcome, replace
 `codex:<current-task-uuid>` in the reported command with this task's real UUID
-and run it once. Never invent the UUID, remove the expected digest, or treat the
-approval as permission for a different update. After that approval or another
-manual repair, the same transaction token re-proves the exact active environment
+and run it without another prompt. Ask again only if the target or consequence
+leaves that outcome. Never invent the UUID or remove the expected digest. After
+repair, the same transaction token re-proves the exact active environment
 and either closes the transaction, restores the previous environment, or keeps
 the repair evidence. A clean `installed` or `rolled_back` outcome is resolved
 only when `recovery_command` is empty.
