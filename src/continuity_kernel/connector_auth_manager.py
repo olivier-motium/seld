@@ -46,6 +46,7 @@ from continuity_kernel.connector_oauth_loopback import BoundLoopbackCallback, be
 from continuity_kernel.connector_profiles import (
     ConnectorAccessTier,
     connector_connect_command,
+    get_profile,
     get_profile_for_connection,
     validate_connector_alias,
 )
@@ -1078,11 +1079,27 @@ class ConnectorAuthManager:
             metadata.provider,
             profile.supplemental_scopes,
         )
-        if not granted_access.issubset(purge_authority):
+        grant_authority = purge_authority
+        relevant_grant = granted_access
+        if metadata.provider == "microsoft" and profile.name in {
+            "outlook_mail",
+            "outlook_calendar",
+        }:
+            provider_profile = get_profile("microsoft")
+            grant_authority = ConnectorAuthManager._canonical_oauth_access_scopes(
+                metadata.provider,
+                (*provider_profile.read_scopes, *provider_profile.full_scopes),
+            )
+            # Microsoft returns the union of delegated Graph permissions already
+            # granted to one app/account. Keep rejecting unknown provider grants,
+            # but judge this logical connector only by the scopes its closed
+            # operation surface can exercise.
+            relevant_grant &= purge_authority
+        if not granted_access.issubset(grant_authority):
             raise OAuthPermissionGrantError("outside_selected_tier")
-        if granted_access.issubset(read_authority):
+        if relevant_grant.issubset(read_authority):
             granted_capability = 0
-        elif granted_access.issubset(full_authority):
+        elif relevant_grant.issubset(full_authority):
             granted_capability = 1
         else:
             granted_capability = 2

@@ -1498,6 +1498,59 @@ def test_microsoft_accepts_canonical_short_grants_without_offline_access(
     )
 
 
+def test_microsoft_logical_connector_accepts_known_sibling_grants(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Microsoft logical scopes")
+    profile = get_connector_profile("outlook_mail")
+    metadata = ConnectionMetadata(
+        connection_id=CONNECTION_ID,
+        provider=profile.provider,
+        source_ids=profile.source_ids,
+        credential_kind=profile.credential_kind,
+        account=AccountMetadata(label="Synthetic Microsoft"),
+        scopes=profile.full_scopes,
+        client=ClientMetadata(
+            kind=ClientKind.PUBLIC,
+            identifier="public-microsoft-client",
+            redirect_uris=("http://localhost:0/oauth/callback",),
+            authorization_endpoint=profile.authorization_endpoint,
+            token_endpoint=profile.token_endpoint,
+        ),
+        health=ConnectionHealth.UNVERIFIED,
+        created_at=BASE_TIME,
+        updated_at=BASE_TIME,
+        version=1,
+    )
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=metadata,
+        observed_at=BASE_TIME,
+    )
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    credential = OAuthCredential(
+        access_token="microsoft-access",
+        refresh_token="microsoft-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=(*profile.full_scopes, "Calendars.ReadWrite"),
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    stored = _import_oauth_credential(manager, credential)
+
+    assert stored.version == 1
+    assert OAuthCredential.from_bytes(manager.tokens.read(CONNECTION_ID).value).scopes == (
+        "User.Read",
+        "Mail.ReadWrite",
+        "Mail.Send",
+        "Calendars.ReadWrite",
+    )
+
+
 def test_microsoft_publish_canonicalizes_access_scopes_and_omits_non_resource_scopes(
     tmp_path: Path,
 ) -> None:
