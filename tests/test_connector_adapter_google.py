@@ -252,6 +252,42 @@ def _expected_calendar(
     }
 
 
+def _calendar_list_resource(
+    *,
+    access_role: str = "reader",
+    calendar_id: str = "team@example.test",
+    data_owner: str | None = None,
+    default_reminders: list[dict[str, object]] | None = None,
+    etag: str = '"list-etag"',
+    notification_types: list[str] | None = None,
+    primary: bool = False,
+    summary: str | None = "Team",
+    summary_override: str | None = None,
+) -> bytes:
+    resource: dict[str, object] = {
+        "accessRole": access_role,
+        "etag": etag,
+        "id": calendar_id,
+        "kind": "calendar#calendarListEntry",
+        "primary": primary,
+        "summary": summary,
+    }
+    if data_owner is not None:
+        resource["dataOwner"] = data_owner
+    if default_reminders is not None:
+        resource["defaultReminders"] = default_reminders
+    if notification_types is not None:
+        resource["notificationSettings"] = {
+            "notifications": [
+                {"method": "email", "type": notification_type}
+                for notification_type in notification_types
+            ]
+        }
+    if summary_override is not None:
+        resource["summaryOverride"] = summary_override
+    return json.dumps(resource).encode()
+
+
 def _prepared_upload(
     tmp_path: Path,
     content: bytes = b"streamed Google Drive content",
@@ -526,6 +562,27 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
             return {}
         if name == "calendars.list":
             return {"page_size": 1}
+        if name == "calendar_list.get":
+            return {"calendar_id": "team@example.test"}
+        if name == "calendar_list.insert":
+            return {"calendar_id": "team@example.test", "selected": True}
+        if name == "calendar_list.update":
+            return {
+                "calendar_id": "team@example.test",
+                "etag": '"list-etag"',
+                "hidden": True,
+            }
+        if name == "calendar_list.remove":
+            return {
+                "calendar_id": "team@example.test",
+                "etag": '"list-etag"',
+                "expected_calendar": {
+                    "accessRole": "reader",
+                    "id": "team@example.test",
+                    "primary": False,
+                    "summary": "Team",
+                },
+            }
         if name == "calendars.get":
             return {"calendar_id": "primary"}
         if name == "events.list":
@@ -690,6 +747,18 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests(tmp_pat
                 transport.body = (
                     b'{"etag":"calendar-etag","id":"calendar-id","kind":"calendar#calendar"}'
                 )
+            if operation.provider == "google_calendar" and operation.name in {
+                "calendar_list.get",
+                "calendar_list.update",
+                "calendar_list.remove",
+            }:
+                transport.body = (
+                    b'{"accessRole":"reader","etag":"\\"list-etag\\"",'
+                    b'"id":"team@example.test","kind":"calendar#calendarListEntry",'
+                    b'"primary":false,"summary":"Team"}'
+                )
+                if operation.name != "calendar_list.get":
+                    expected_requests = 2
             if operation.provider == "google_calendar" and operation.name == "calendars.delete":
                 transport.body = (
                     b'{"accessRole":"owner","id":"secondary","primary":false,"summary":"Secondary"}'
@@ -4281,6 +4350,345 @@ def test_drive_comment_requests_use_required_valid_field_projections() -> None:
         "content": "note",
         "quotedFileContent": {"value": "quote"},
     }
+
+
+def test_calendar_list_routes_shape_user_state_and_bind_patch_to_etag() -> None:
+    adapter = GoogleConnectorAdapter()
+    credential = _credential()
+    calendar_id = "team@example.test"
+
+    read_transport = _Transport(body=_calendar_list_resource())
+    read = adapter.execute(
+        _operation("google_calendar", "calendar_list.get"),
+        {"calendar_id": calendar_id},
+        continuation=None,
+        credential=credential,
+        transport=read_transport,
+    )
+    assert isinstance(read.payload, dict)
+    assert read.payload["id"] == calendar_id
+    assert read_transport.calls[0]["method"] is ConnectorMethod.GET
+    assert read_transport.calls[0]["path"] == (
+        "/calendar/v3/users/me/calendarList/team%40example.test"
+    )
+
+    malformed_primary = _Transport(
+        body=b'{"etag":"\\"primary-etag\\"","kind":"calendar#calendarListEntry"}'
+    )
+    with pytest.raises(ValidationError, match="omitted required provider metadata"):
+        adapter.execute(
+            _operation("google_calendar", "calendar_list.get"),
+            {"calendar_id": "primary"},
+            continuation=None,
+            credential=credential,
+            transport=malformed_primary,
+        )
+
+    insert_transport = _Transport()
+    adapter.execute(
+        _operation("google_calendar", "calendar_list.insert"),
+        {
+            "calendar_id": calendar_id,
+            "color": {"background_color": "#16a766", "foreground_color": "#ffffff"},
+            "default_reminders": [{"delivery": "popup", "minutes": 30}],
+            "hidden": False,
+            "notification_types": ["eventChange", "eventCancellation"],
+            "selected": True,
+            "summary_override": "Team planning",
+        },
+        continuation=None,
+        credential=credential,
+        transport=insert_transport,
+    )
+    inserted = insert_transport.calls[0]
+    assert inserted["method"] is ConnectorMethod.POST
+    assert inserted["path"] == "/calendar/v3/users/me/calendarList"
+    assert inserted["query"] == (("colorRgbFormat", "true"),)
+    assert inserted["json_body"] == {
+        "backgroundColor": "#16a766",
+        "defaultReminders": [{"method": "popup", "minutes": 30}],
+        "foregroundColor": "#ffffff",
+        "hidden": False,
+        "id": calendar_id,
+        "notificationSettings": {
+            "notifications": [
+                {"method": "email", "type": "eventChange"},
+                {"method": "email", "type": "eventCancellation"},
+            ]
+        },
+        "selected": True,
+        "summaryOverride": "Team planning",
+    }
+
+    update_transport = _Transport(
+        bodies=(
+            _calendar_list_resource(
+                default_reminders=[{"method": "popup", "minutes": 30}],
+                notification_types=["eventChange"],
+                summary_override="Old planning",
+            ),
+            b"{}",
+        )
+    )
+    adapter.execute(
+        _operation("google_calendar", "calendar_list.update"),
+        {
+            "calendar_id": calendar_id,
+            "color": {"background_color": "#16a766", "foreground_color": "#ffffff"},
+            "default_reminders": [
+                {"delivery": "popup", "minutes": 30},
+                {"delivery": "email", "minutes": 60},
+            ],
+            "etag": '"list-etag"',
+            "hidden": True,
+            "notification_types": ["eventChange", "eventResponse"],
+            "summary_override": "New planning",
+        },
+        continuation=None,
+        credential=credential,
+        transport=update_transport,
+    )
+    preflight, patched = update_transport.calls
+    assert preflight["method"] is ConnectorMethod.GET
+    assert "defaultReminders" in dict(preflight["query"])["fields"]
+    assert patched["method"] is ConnectorMethod.PATCH
+    assert patched["headers"] == {"If-Match": '"list-etag"'}
+    assert patched["query"] == (("colorRgbFormat", "true"),)
+    assert patched["json_body"]["defaultReminders"] == [
+        {"method": "popup", "minutes": 30},
+        {"method": "email", "minutes": 60},
+    ]
+
+    empty = _Transport()
+    with pytest.raises(ValidationError, match="at least one changed field"):
+        adapter.execute(
+            _operation("google_calendar", "calendar_list.update"),
+            {"calendar_id": calendar_id, "etag": '"list-etag"'},
+            continuation=None,
+            credential=credential,
+            transport=empty,
+        )
+    assert empty.calls == []
+
+    duplicate = _Transport()
+    with pytest.raises(ValidationError, match="notification types must be unique"):
+        adapter.execute(
+            _operation("google_calendar", "calendar_list.insert"),
+            {
+                "calendar_id": calendar_id,
+                "notification_types": ["eventChange", "eventChange"],
+            },
+            continuation=None,
+            credential=credential,
+            transport=duplicate,
+        )
+    assert duplicate.calls == []
+
+    raced = _Transport(
+        body=_calendar_list_resource(),
+        provider_errors=(None, 412),
+    )
+    with pytest.raises(ConnectorProviderError) as stale:
+        adapter.execute(
+            _operation("google_calendar", "calendar_list.update"),
+            {"calendar_id": calendar_id, "etag": '"list-etag"', "hidden": True},
+            continuation=None,
+            credential=credential,
+            transport=raced,
+        )
+    assert stale.value.code == "resource_changed_reread_required"
+
+
+def test_calendar_list_update_effect_escalates_preference_loss_and_rechecks_before_patch() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "calendar_list.update")
+    credential = _credential()
+    calendar_id = "team@example.test"
+    existing = _calendar_list_resource(
+        default_reminders=[{"method": "popup", "minutes": 30}],
+        notification_types=["eventChange"],
+        summary_override="Team planning",
+    )
+    additive = {
+        "calendar_id": calendar_id,
+        "default_reminders": [
+            {"delivery": "popup", "minutes": 30},
+            {"delivery": "email", "minutes": 60},
+        ],
+        "etag": '"list-etag"',
+        "notification_types": ["eventResponse", "eventChange"],
+        "summary_override": "New planning",
+    }
+    assert (
+        adapter.classify_effect(
+            operation,
+            additive,
+            credential=credential,
+            transport=_Transport(body=existing),
+        )
+        is ConnectorEffect.SAFE_MUTATION
+    )
+
+    destructive_cases = (
+        {**additive, "default_reminders": []},
+        {**additive, "notification_types": []},
+        {**additive, "summary_override": None},
+    )
+    for values in destructive_cases:
+        assert (
+            adapter.classify_effect(
+                operation,
+                values,
+                credential=credential,
+                transport=_Transport(body=existing),
+            )
+            is ConnectorEffect.DESTRUCTIVE
+        )
+
+    newly_lossy = _calendar_list_resource(
+        default_reminders=[
+            {"method": "popup", "minutes": 30},
+            {"method": "popup", "minutes": 10},
+        ],
+        notification_types=["eventChange"],
+        summary_override="Team planning",
+    )
+    execution = _Transport(body=newly_lossy)
+    with pytest.raises(ValidationError, match="fresh confirmation preview"):
+        adapter.execute(
+            operation,
+            additive,
+            continuation=None,
+            credential=credential,
+            transport=execution,
+        )
+    assert [call["method"] for call in execution.calls] == [ConnectorMethod.GET]
+
+    confirmed = _Transport(bodies=(newly_lossy, b"{}"))
+    adapter.execute(
+        operation,
+        additive,
+        continuation=None,
+        credential=credential,
+        transport=confirmed,
+        write_idempotency_key="confirmed-preference-replacement",
+    )
+    assert [call["method"] for call in confirmed.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.PATCH,
+    ]
+
+
+def test_calendar_list_remove_rejects_primary_data_owner_and_drift_before_delete() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_calendar", "calendar_list.remove")
+    credential = _credential()
+    calendar_id = "team@example.test"
+    values = {
+        "calendar_id": calendar_id,
+        "etag": '"list-etag"',
+        "expected_calendar": _expected_calendar(
+            calendar_id,
+            access_role="reader",
+            summary="Team",
+        ),
+    }
+
+    primary = _Transport()
+    with pytest.raises(ValidationError, match="primary calendar; hide it instead"):
+        adapter.classify_effect(
+            operation,
+            {**values, "calendar_id": "primary"},
+            credential=credential,
+            transport=primary,
+        )
+    assert primary.calls == []
+
+    owner_values = {
+        **values,
+        "expected_calendar": _expected_calendar(
+            calendar_id,
+            access_role="owner",
+            summary="Team",
+        ),
+    }
+    owner = _Transport(
+        bodies=(
+            _calendar_list_resource(access_role="owner", data_owner="me@example.test"),
+            _calendar_list_resource(
+                access_role="owner",
+                calendar_id="me@example.test",
+                primary=True,
+                summary="Me",
+            ),
+        )
+    )
+    with pytest.raises(ValidationError, match="data-own; hide it instead"):
+        adapter.classify_effect(
+            operation,
+            owner_values,
+            credential=credential,
+            transport=owner,
+        )
+    assert [call["method"] for call in owner.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.GET,
+    ]
+    assert "dataOwner" in dict(owner.calls[0]["query"])["fields"]
+    assert owner.calls[1]["path"] == "/calendar/v3/users/me/calendarList/primary"
+
+    delegated_owner = _Transport(
+        bodies=(
+            _calendar_list_resource(
+                access_role="owner",
+                data_owner="colleague@example.test",
+            ),
+            _calendar_list_resource(
+                access_role="owner",
+                calendar_id="me@example.test",
+                primary=True,
+                summary="Me",
+            ),
+            b"{}",
+        )
+    )
+    adapter.execute(
+        operation,
+        owner_values,
+        continuation=None,
+        credential=credential,
+        transport=delegated_owner,
+    )
+    assert [call["method"] for call in delegated_owner.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.GET,
+        ConnectorMethod.DELETE,
+    ]
+
+    changed = _Transport(body=_calendar_list_resource(summary="Renamed"))
+    with pytest.raises(ConflictError, match="read it again"):
+        adapter.execute(
+            operation,
+            values,
+            continuation=None,
+            credential=credential,
+            transport=changed,
+        )
+    assert all(call["method"] is not ConnectorMethod.DELETE for call in changed.calls)
+
+    removed = _Transport(bodies=(_calendar_list_resource(), b"{}"))
+    adapter.execute(
+        operation,
+        values,
+        continuation=None,
+        credential=credential,
+        transport=removed,
+    )
+    preflight, deletion = removed.calls
+    assert preflight["method"] is ConnectorMethod.GET
+    assert deletion["method"] is ConnectorMethod.DELETE
+    assert deletion["headers"] == {"If-Match": '"list-etag"'}
+    assert deletion["path"] == "/calendar/v3/users/me/calendarList/team%40example.test"
 
 
 def test_calendar_list_and_event_filters_use_fixed_google_parameters() -> None:

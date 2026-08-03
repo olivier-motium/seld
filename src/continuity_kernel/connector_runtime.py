@@ -129,6 +129,21 @@ _OPERATION_WARNINGS: Final = {
     ): "Gmail will send this reply automatically to future qualifying messages.",
     (
         "google_calendar",
+        "calendar_list.remove",
+    ): (
+        "This removes the calendar only from your list and loses its saved view settings. "
+        "The calendar and events remain. Re-adding works only while you retain access and "
+        "does not restore those preferences; hide it instead for a reversible everyday change."
+    ),
+    (
+        "google_calendar",
+        "calendar_list.update",
+    ): (
+        "Supplying default reminders or notification types replaces that complete list; "
+        "clearing a custom summary also removes that saved preference."
+    ),
+    (
+        "google_calendar",
         "calendars.delete",
     ): "Deleting an owned secondary calendar permanently removes it for everyone.",
     (
@@ -1306,6 +1321,16 @@ def _scope_error(provider: str, operation: str) -> str:
         return (
             "Gmail settings control is not enabled; reconnect Gmail Full access to add it while "
             "the existing connection keeps working"
+        )
+    if provider == "google_calendar" and operation in {
+        "calendar_list.insert",
+        "calendar_list.remove",
+        "calendar_list.update",
+    }:
+        return (
+            "Google Calendar list control is not enabled; run `gsv connectors status "
+            "google_calendar` and reconnect Full access while the existing calendar and event "
+            "capabilities keep working"
         )
     return "the provider did not grant the permission required for this operation"
 

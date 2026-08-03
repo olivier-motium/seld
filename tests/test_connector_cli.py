@@ -328,6 +328,53 @@ def test_gmail_confirmation_discloses_permission_update_and_delete_semantics(
         assert phrase in stderr
 
 
+@pytest.mark.parametrize(
+    ("access", "calendar_list_control", "expected_phrases"),
+    [
+        (
+            ConnectorAccessTier.READ,
+            False,
+            ("Google Calendar Read", "calendar-list settings", "changes are off"),
+        ),
+        (
+            ConnectorAccessTier.FULL,
+            True,
+            ("Google Calendar Full", "visibility", "reminder", "subscription"),
+        ),
+        (
+            ConnectorAccessTier.FULL,
+            False,
+            (
+                "Legacy Google Calendar Full",
+                "visible but not changeable",
+                "keeps the current grant",
+                "gsv connectors status google_calendar",
+            ),
+        ),
+    ],
+)
+def test_google_calendar_confirmation_explains_calendar_list_authority(
+    access: ConnectorAccessTier,
+    calendar_list_control: bool,
+    expected_phrases: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    review = ConnectorIdentityReview(
+        connector="google_calendar",
+        provider="google",
+        access=access,
+        display_label="Ada <ada@example.test>",
+        calendar_list_control=calendar_list_control,
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+
+    assert cli._confirm_connector_identity(review) is False
+    stderr = capsys.readouterr().err
+    for phrase in expected_phrases:
+        assert phrase in stderr
+
+
 def test_legacy_google_confirmation_is_honest_about_settings_and_permanent_deletion(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

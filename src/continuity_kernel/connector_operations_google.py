@@ -17,6 +17,7 @@ _GMAIL_MODIFY: Final = "https://www.googleapis.com/auth/gmail.modify"
 _GMAIL_SETTINGS_BASIC: Final = "https://www.googleapis.com/auth/gmail.settings.basic"
 _MAIL: Final = "https://mail.google.com/"
 
+_CALENDAR_LIST: Final = "https://www.googleapis.com/auth/calendar.calendarlist"
 _CALENDAR_LIST_READONLY: Final = "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
 _CALENDAR_READONLY: Final = "https://www.googleapis.com/auth/calendar.readonly"
 _CALENDAR_EVENTS_READONLY: Final = "https://www.googleapis.com/auth/calendar.events.readonly"
@@ -825,6 +826,45 @@ def _calendar_list() -> dict[str, object]:
     )
 
 
+def _calendar_list_color() -> dict[str, object]:
+    color = {
+        "maxLength": 7,
+        "minLength": 7,
+        "pattern": "^#[0-9a-f]{6}$",
+        "type": "string",
+    }
+    return _object(
+        {
+            "background_color": color,
+            "foreground_color": color,
+        },
+        required=("background_color", "foreground_color"),
+    )
+
+
+def _calendar_list_fields() -> dict[str, object]:
+    return {
+        "color": _calendar_list_color(),
+        "default_reminders": _array(_event_reminder(), maximum=5),
+        "hidden": {"type": "boolean"},
+        "notification_types": _array(
+            {
+                "enum": [
+                    "agenda",
+                    "eventCancellation",
+                    "eventChange",
+                    "eventCreation",
+                    "eventResponse",
+                ],
+                "type": "string",
+            },
+            maximum=5,
+        ),
+        "selected": {"type": "boolean"},
+        "summary_override": _nullable(_text(4_096, minimum=0)),
+    }
+
+
 def _calendar_event_list() -> dict[str, object]:
     extended_property = _event_extended_property(allow_deletion=False)
     return _object(
@@ -1188,10 +1228,12 @@ _GMAIL_WRITE_SCOPES: Final = _scopes(_GMAIL_MODIFY, _MAIL)
 _GMAIL_SETTINGS_WRITE_SCOPES: Final = _scopes(_GMAIL_SETTINGS_BASIC)
 _GMAIL_PURGE_SCOPES: Final = _scopes(_MAIL)
 _CALENDAR_LIST_SCOPES: Final = _scopes(
+    _CALENDAR_LIST,
     _CALENDAR_LIST_READONLY,
     _CALENDAR_READONLY,
     _CALENDAR,
 )
+_CALENDAR_LIST_WRITE_SCOPES: Final = _scopes(_CALENDAR_LIST, _CALENDAR)
 _CALENDAR_RESOURCE_READ_SCOPES: Final = _scopes(
     _CALENDAR_CALENDARS_READONLY,
     _CALENDAR_CALENDARS,
@@ -1682,6 +1724,14 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
     _operation(
         "google_calendar",
         ConnectorMode.READ,
+        "calendar_list.get",
+        ConnectorEffect.READ,
+        _CALENDAR_LIST_SCOPES,
+        _object({"calendar_id": _id()}, required=("calendar_id",)),
+    ),
+    _operation(
+        "google_calendar",
+        ConnectorMode.READ,
         "colors.get",
         ConnectorEffect.READ,
         _CALENDAR_LIST_SCOPES,
@@ -1736,6 +1786,50 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
                 "time_zone": _text(128),
             },
             required=("calendar_ids", "time_max", "time_min"),
+        ),
+    ),
+    _operation(
+        "google_calendar",
+        ConnectorMode.WRITE,
+        "calendar_list.insert",
+        ConnectorEffect.SAFE_MUTATION,
+        _CALENDAR_LIST_WRITE_SCOPES,
+        _object(
+            {
+                "calendar_id": _id(),
+                **_calendar_list_fields(),
+            },
+            required=("calendar_id",),
+        ),
+    ),
+    _operation(
+        "google_calendar",
+        ConnectorMode.WRITE,
+        "calendar_list.update",
+        ConnectorEffect.SAFE_MUTATION,
+        _CALENDAR_LIST_WRITE_SCOPES,
+        _object(
+            {
+                "calendar_id": _id(),
+                "etag": _text(1_024),
+                **_calendar_list_fields(),
+            },
+            required=("calendar_id", "etag"),
+        ),
+    ),
+    _operation(
+        "google_calendar",
+        ConnectorMode.WRITE,
+        "calendar_list.remove",
+        ConnectorEffect.DESTRUCTIVE,
+        _CALENDAR_LIST_WRITE_SCOPES,
+        _object(
+            {
+                "calendar_id": _id(),
+                "etag": _text(1_024),
+                "expected_calendar": _expected_calendar_list_entry(),
+            },
+            required=("calendar_id", "etag", "expected_calendar"),
         ),
     ),
     _operation(

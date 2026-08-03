@@ -13,13 +13,26 @@ gsv connectors connect google_calendar --access full --alias 'Family Calendar'
 
 Read grants CalendarList, calendar metadata, event, instance, and free/busy
 reads with separate least-authority scopes. Full adds calendar and event
-create/update/move/respond/delete operations. The command opens Google OAuth
+create/update/move/respond/delete operations plus control of the person's own
+CalendarList visibility, colors, reminders, notifications, and subscriptions.
+That user-state control uses Google's narrow `calendar.calendarlist` permission;
+it does not request the broad `calendar` scope. The command opens Google OAuth
 with PKCE and a loopback callback, verifies the returned Google identity, shows
 it with the selected access tier, and asks `Use this account? [y/N]` before
 publishing. The default is no. A Read connection remains ready while a
 same-account Full upgrade is in progress. Older Read grants remain connected;
 if one lacks the newer calendar-metadata scope, only that metadata operation
 asks for fresh Read consent.
+
+An older single-source Google Calendar Full connection remains usable for every
+calendar and event operation its current grant supports. Run
+`gsv connectors status google_calendar`; it reports
+`calendar_list_control=upgrade_required` when only CalendarList reads are
+authorized and returns the exact same-account reconnect command. The existing
+connection stays active until the new grant is verified and published. Read
+connections report `read_only`; current Full connections report `ready`. A
+historical multi-source Google provider bundle is left intact; connect logical
+Google Calendar Full separately and confirm the account shown.
 
 The person owns account selection, consent, Workspace policy, administrator
 approval, and second factors. If the installed build lacks a public Google
@@ -47,6 +60,36 @@ page rotates it to a new sync cursor. An expired cursor reports
 extended properties cannot be replayed with a sync cursor, so filtered lists return
 only ordinary page continuations. `show_hidden_invitations` remains replayable
 when the same value accompanies every sync request.
+
+`calendars.list` continues to return the user's CalendarList entries with sync
+continuations. Use `calendar_list.get` for one complete entry and
+`calendar_list.insert`, `calendar_list.update`, or `calendar_list.remove` for
+that person's list state. These are intentionally separate from
+`calendars.get/create/update/delete`, which act on the shared Calendar resource.
+Hiding a CalendarList entry with `hidden=true` is the reversible everyday way to
+remove it from view.
+
+CalendarList insert and update support a provider-validated foreground/background
+RGB pair, `hidden`, `selected`, a custom summary, complete default-reminder
+replacement, and complete email-notification-type replacement. Supplying a color
+pair sends Google's required `colorRgbFormat=true`. Reminder and notification
+arrays replace the entire corresponding provider array. Adding entries or
+reordering them is one-step; dropping an existing entry or clearing a non-empty
+custom summary is destructive and requires confirmation. Seld reads the exact
+CalendarList ETag and current preference arrays again before PATCH, refuses a
+stale version, and sends `If-Match`.
+
+`calendar_list.remove` removes only a non-owned, non-primary entry from this
+person's list. It does not delete the Calendar or its events, so it is
+destructive rather than permanent. It does lose the saved view preferences;
+`calendar_list.insert` can add the calendar again only while access remains and
+does not promise to restore those preferences. Removal therefore requires the
+reviewed CalendarList snapshot plus its ETag and is re-read immediately before
+DELETE. Google does not let a data owner remove their own CalendarList entry;
+hide it instead. An `owner` access role alone is not data ownership, so an
+owner-level shared entry remains removable when its separate `dataOwner` is
+someone else. CalendarList `watch` is not exposed because it requires a separate
+webhook-channel lifecycle and there is no current consumer.
 
 Calendar and event `update` operations are partial PATCHes. Supplying attendees,
 attachments, or recurrence replaces that complete array. Attendee or attachment
@@ -158,7 +201,8 @@ stale and does not guarantee that Google sends no email.
 
 For whole-calendar deletion, use the Calendar resource ETag returned by
 `calendars.get`; a CalendarList entry has a different ETag and will fail closed
-with `resource_changed_reread_required`. Normalize the preceding reads to the
+with `resource_changed_reread_required`. For CalendarList update or removal, use
+the CalendarList ETag returned by `calendar_list.get`. Normalize the preceding reads to the
 closed confirmation shapes below rather than copying their extra provider
 fields. Keep every listed key, using `null` where the provider omitted a
 nullable event or calendar field. Within `organizer`, keep `displayName` and

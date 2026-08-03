@@ -162,6 +162,21 @@ class _GmailLabelPurgeTransport(ConnectorTransport):
         return ConnectorResponse(kwargs["origin"], 200, {}, body)
 
 
+class _CalendarListTransport(ConnectorTransport):
+    def __init__(self, resources: tuple[dict[str, object], ...]) -> None:
+        self.resources = list(resources)
+        self.requests: list[dict[str, Any]] = []
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.requests.append(kwargs)
+        body = b"{}"
+        if kwargs["method"] is ConnectorMethod.GET:
+            if not self.resources:
+                raise AssertionError("unexpected Google CalendarList preflight")
+            body = json.dumps(self.resources.pop(0)).encode()
+        return ConnectorResponse(kwargs["origin"], 200, {}, body)
+
+
 class _AmbiguousGmailSendTransport(_GmailModifyTransport):
     def request(self, **kwargs: Any) -> ConnectorResponse:
         self.requests.append(kwargs)
@@ -284,6 +299,17 @@ def _write_sized_file(path: Path, size: int) -> None:
 def _fail_confirmation_issue(*args: object, **kwargs: object) -> str:
     del args, kwargs
     raise AssertionError("confirmation must not be issued for an oversized Gmail MIME upload")
+
+
+def _calendar_list_entry(*, summary: str = "Team") -> dict[str, object]:
+    return {
+        "accessRole": "reader",
+        "etag": '"list-etag"',
+        "id": "team@example.test",
+        "kind": "calendar#calendarListEntry",
+        "primary": False,
+        "summary": summary,
+    }
 
 
 def test_gmail_send_near_limit_attachment_fails_before_confirmation_or_provider_http(
@@ -1037,6 +1063,125 @@ def test_legacy_gmail_full_keeps_mail_authority_but_settings_upgrade_fails_actio
                 },
             )
         assert transport.call_count == 0
+    finally:
+        runtime.close()
+
+
+def test_legacy_google_full_keeps_existing_authority_but_calendar_list_upgrade_is_actionable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, transport = _runtime(tmp_path, monkeypatch, legacy_full=True)
+    try:
+        with pytest.raises(
+            ValidationError,
+            match=(
+                r"Google Calendar list control is not enabled.*connectors status "
+                r"google_calendar.*existing calendar and event capabilities keep working"
+            ),
+        ):
+            runtime.call_tool(
+                "gsv_google_calendar_write",
+                {
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": {"calendar_id": "team@example.test", "selected": True},
+                    "operation": "calendar_list.insert",
+                },
+            )
+        assert transport.call_count == 0
+    finally:
+        runtime.close()
+
+
+def test_calendar_list_remove_confirmation_rechecks_and_never_deletes_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    expected = {
+        "accessRole": "reader",
+        "id": "team@example.test",
+        "primary": False,
+        "summary": "Team",
+    }
+    input_value = {
+        "calendar_id": "team@example.test",
+        "etag": '"list-etag"',
+        "expected_calendar": expected,
+    }
+    success = _CalendarListTransport(
+        (_calendar_list_entry(), _calendar_list_entry(), _calendar_list_entry())
+    )
+    runtime.transport = success
+    try:
+        preview = runtime.call_tool(
+            "gsv_google_calendar_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "calendar_list.remove",
+            },
+        )
+        assert preview["status"] == "confirmation_required"
+        assert preview["effect"] == ConnectorEffect.DESTRUCTIVE.value
+        assert preview["preview"] == input_value
+        warning = str(preview["warning"])
+        for phrase in ("only from your list", "saved view settings", "hide it instead"):
+            assert phrase in warning
+        assert [request["method"] for request in success.requests] == [ConnectorMethod.GET]
+
+        completed = runtime.call_tool(
+            "gsv_google_calendar_write",
+            {
+                "confirmation_token": preview["confirmation_token"],
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "calendar_list.remove",
+            },
+        )
+        assert completed["status"] == "ok"
+        assert [request["method"] for request in success.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.DELETE,
+        ]
+        assert {request["path"] for request in success.requests} == {
+            "/calendar/v3/users/me/calendarList/team%40example.test"
+        }
+
+        changed = _CalendarListTransport(
+            (
+                _calendar_list_entry(),
+                _calendar_list_entry(),
+                _calendar_list_entry(summary="Renamed elsewhere"),
+            )
+        )
+        runtime.transport = changed
+        raced_preview = runtime.call_tool(
+            "gsv_google_calendar_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "calendar_list.remove",
+            },
+        )
+        with pytest.raises(ConflictError, match="read it again"):
+            runtime.call_tool(
+                "gsv_google_calendar_write",
+                {
+                    "confirmation_token": raced_preview["confirmation_token"],
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": input_value,
+                    "operation": "calendar_list.remove",
+                },
+            )
+        assert [request["method"] for request in changed.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+        ]
+        assert all(request["method"] is not ConnectorMethod.DELETE for request in changed.requests)
     finally:
         runtime.close()
 

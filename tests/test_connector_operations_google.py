@@ -68,12 +68,16 @@ _EXPECTED_NAMES = {
     },
     "google_calendar": {
         "calendars.list",
+        "calendar_list.get",
         "colors.get",
         "calendars.get",
         "events.list",
         "events.get",
         "events.instances",
         "freebusy.query",
+        "calendar_list.insert",
+        "calendar_list.update",
+        "calendar_list.remove",
         "calendars.create",
         "calendars.update",
         "calendars.delete",
@@ -167,12 +171,12 @@ def test_google_provider_mode_partitions_and_exact_operation_surface() -> None:
         for provider in _EXPECTED_NAMES
     }
     assert names == _EXPECTED_NAMES
-    assert len(GOOGLE_OPERATIONS) == 93
+    assert len(GOOGLE_OPERATIONS) == 97
     assert {
         provider: sum(item.provider == provider for item in GOOGLE_OPERATIONS) for provider in names
     } == {
         "gmail": 49,
-        "google_calendar": 15,
+        "google_calendar": 19,
         "google_drive": 29,
     }
     assert all(item.endpoint == item.name for item in GOOGLE_OPERATIONS)
@@ -207,6 +211,9 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
         ("gmail", "settings.pop.update"): ConnectorEffect.SAFE_MUTATION,
         ("gmail", "settings.send_as.patch"): ConnectorEffect.OUTWARD,
         ("gmail", "settings.vacation.update"): ConnectorEffect.SAFE_MUTATION,
+        ("google_calendar", "calendar_list.insert"): ConnectorEffect.SAFE_MUTATION,
+        ("google_calendar", "calendar_list.update"): ConnectorEffect.SAFE_MUTATION,
+        ("google_calendar", "calendar_list.remove"): ConnectorEffect.DESTRUCTIVE,
         ("google_calendar", "calendars.create"): ConnectorEffect.SAFE_MUTATION,
         ("google_calendar", "calendars.update"): ConnectorEffect.SAFE_MUTATION,
         ("google_calendar", "calendars.delete"): ConnectorEffect.PERMANENT,
@@ -270,6 +277,7 @@ def test_calendar_reads_accept_legacy_readonly_and_metadata_uses_resource_scope(
     legacy = ["https://www.googleapis.com/auth/calendar.readonly"]
     for name in (
         "calendars.list",
+        "calendar_list.get",
         "colors.get",
         "calendars.get",
         "events.list",
@@ -297,6 +305,70 @@ def test_calendar_colors_uses_the_existing_calendar_list_read_scopes() -> None:
     assert colors.scope_grant_satisfies(["https://www.googleapis.com/auth/calendar.readonly"])
     assert not colors.scope_grant_satisfies(
         ["https://www.googleapis.com/auth/calendar.events.readonly"]
+    )
+
+
+def test_calendar_list_schemas_separate_read_and_typed_user_state_writes() -> None:
+    get_entry = _operation("google_calendar", ConnectorMode.READ, "calendar_list.get")
+    assert get_entry.validate_input({"calendar_id": "team@example.test"}) == {
+        "calendar_id": "team@example.test"
+    }
+    for scope in (
+        "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+        "https://www.googleapis.com/auth/calendar.calendarlist",
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/calendar",
+    ):
+        assert get_entry.scope_grant_satisfies([scope])
+
+    insert = _operation("google_calendar", ConnectorMode.WRITE, "calendar_list.insert")
+    update = _operation("google_calendar", ConnectorMode.WRITE, "calendar_list.update")
+    remove = _operation("google_calendar", ConnectorMode.WRITE, "calendar_list.remove")
+    for operation in (insert, update, remove):
+        assert operation.required_scopes == (
+            frozenset({"https://www.googleapis.com/auth/calendar.calendarlist"}),
+            frozenset({"https://www.googleapis.com/auth/calendar"}),
+        )
+        assert not operation.scope_grant_satisfies(
+            ["https://www.googleapis.com/auth/calendar.calendarlist.readonly"]
+        )
+
+    values = {
+        "calendar_id": "team@example.test",
+        "color": {"background_color": "#16a766", "foreground_color": "#ffffff"},
+        "default_reminders": [{"delivery": "popup", "minutes": 30}],
+        "hidden": False,
+        "notification_types": ["eventChange", "eventCancellation"],
+        "selected": True,
+        "summary_override": None,
+    }
+    assert insert.validate_input(values) == values
+    with pytest.raises(ValidationError):
+        insert.validate_input(
+            {
+                "calendar_id": "team@example.test",
+                "color": {"background_color": "#16a766"},
+            }
+        )
+    with pytest.raises(ValidationError):
+        insert.validate_input(
+            {
+                "calendar_id": "team@example.test",
+                "notification_types": ["unsupported"],
+            }
+        )
+
+    assert remove.validate_input(
+        {
+            "calendar_id": "team@example.test",
+            "etag": '"list-etag"',
+            "expected_calendar": {
+                "accessRole": "reader",
+                "id": "team@example.test",
+                "primary": False,
+                "summary": "Team",
+            },
+        }
     )
 
 

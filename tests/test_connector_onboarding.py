@@ -179,9 +179,10 @@ def _unverified_oauth(
     *,
     with_credential: bool,
     fingerprint: str | None = None,
+    scopes_override: tuple[str, ...] | None = None,
 ) -> ConnectionMetadata:
     profile = get_connector_profile(connector)
-    scopes = profile.scopes_for(ConnectorAccessTier.READ)
+    scopes = scopes_override or profile.scopes_for(ConnectorAccessTier.READ)
     now = datetime.now(UTC)
     metadata = ConnectionMetadata(
         connection_id=new_connection_id(),
@@ -708,6 +709,144 @@ def test_legacy_gmail_full_adds_settings_scope_only_after_atomic_same_account_up
     replacement = snapshot.connection(parse_connection_id(result["connection_id"]))
     assert replacement is not None and replacement.health is ConnectionHealth.READY
     assert frozenset(replacement.scopes) == frozenset(profile.full_scopes)
+
+
+def test_legacy_google_calendar_full_adds_list_control_only_after_atomic_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("google_calendar")
+    old = _existing_oauth(
+        manager,
+        "google_calendar",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=profile.legacy_full_scopes[0],
+    )
+    before = manager.tokens.read(old.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider),
+    )
+    events: list[str] = []
+
+    def acquire(metadata: ConnectionMetadata, **kwargs: object) -> OAuthCredential:
+        del kwargs
+        current = manager.vault.get_connection_snapshot().connection(old.connection_id)
+        assert current is not None and current.health is ConnectionHealth.READY
+        during = manager.tokens.read(old.connection_id)
+        assert during.state.version == before.state.version
+        assert during.value == before.value
+        assert "https://www.googleapis.com/auth/calendar.calendarlist" in metadata.scopes
+        assert "https://www.googleapis.com/auth/calendar" not in metadata.scopes
+        events.append("acquire")
+        return _credential(metadata.scopes)
+
+    monkeypatch.setattr(manager, "acquire_oauth_credential", acquire)
+
+    def confirm(review: ConnectorIdentityReview) -> bool:
+        assert review.access is ConnectorAccessTier.FULL
+        assert review.calendar_list_control is True
+        assert review.permission_update is not None
+        assert "existing connection keeps working until this succeeds" in review.permission_update
+        assert "https://" not in review.permission_update
+        return True
+
+    result = onboarding.connect_oauth(
+        "google_calendar",
+        access="full",
+        confirm_identity=confirm,
+        present_permission_update=lambda message: (
+            events.append("permission_update")
+            if "https://" not in message
+            else pytest.fail("raw scope shown before sign-in")
+        ),
+    )
+
+    assert result["status"] == "connected"
+    assert result["replaced_connection_id"] == str(old.connection_id)
+    assert events == ["permission_update", "acquire"]
+    snapshot = manager.vault.get_connection_snapshot()
+    assert snapshot.connection(old.connection_id) is None
+    replacement = snapshot.connection(parse_connection_id(result["connection_id"]))
+    assert replacement is not None and replacement.health is ConnectionHealth.READY
+    assert frozenset(replacement.scopes) == frozenset(profile.full_scopes)
+    row = cast(
+        list[dict[str, object]],
+        onboarding.status("google_calendar")["connections"],
+    )[0]
+    assert row["calendar_list_control"] == "ready"
+
+
+def test_prelogical_google_calendar_full_follows_status_upgrade_path_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    logical = get_connector_profile("google_calendar")
+    aggregate = get_profile("google")
+    old = _existing_oauth(
+        manager,
+        "google_calendar",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=aggregate.legacy_full_scopes[-1],
+    )
+    before = manager.tokens.read(old.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider),
+    )
+    row = cast(
+        list[dict[str, object]],
+        onboarding.status("google_calendar")["connections"],
+    )[0]
+    upgrade = format_connector_command(
+        (
+            "gsv",
+            "connectors",
+            "connect",
+            "google_calendar",
+            "--access",
+            "full",
+            "--connection-id",
+            str(old.connection_id),
+        )
+    )
+    assert row["calendar_list_control"] == "upgrade_required"
+    assert row["calendar_list_upgrade"] == upgrade
+
+    def acquire(metadata: ConnectionMetadata, **kwargs: object) -> OAuthCredential:
+        del kwargs
+        current = manager.vault.get_connection_snapshot().connection(old.connection_id)
+        assert current is not None and current.health is ConnectionHealth.READY
+        during = manager.tokens.read(old.connection_id)
+        assert during.state.version == before.state.version
+        assert during.value == before.value
+        assert metadata.source_ids == logical.source_ids
+        assert frozenset(metadata.scopes) == frozenset(logical.full_scopes)
+        return _credential(metadata.scopes)
+
+    monkeypatch.setattr(manager, "acquire_oauth_credential", acquire)
+    result = onboarding.connect_oauth(
+        "google_calendar",
+        access="full",
+        connection_id=str(old.connection_id),
+        confirm_identity=lambda review: (
+            review.calendar_list_control
+            and review.permission_update is not None
+            and "existing connection keeps working" in review.permission_update
+        ),
+    )
+
+    assert result["status"] == "connected"
+    assert result["replaced_connection_id"] == str(old.connection_id)
+    snapshot = manager.vault.get_connection_snapshot()
+    assert snapshot.connection(old.connection_id) is None
+    replacement = snapshot.connection(parse_connection_id(result["connection_id"]))
+    assert replacement is not None and replacement.source_ids == logical.source_ids
+    assert frozenset(replacement.scopes) == frozenset(logical.full_scopes)
 
 
 def test_legacy_gmail_purge_upgrade_retains_purge_while_adding_settings_atomically(
@@ -1418,6 +1557,50 @@ def test_resume_wrong_identity_keeps_user_alias_only_on_retry(tmp_path: Path) ->
     assert "Ada <ada@example.test>" not in repr(result)
 
 
+def test_prelogical_calendar_resume_keeps_logical_identity_and_recovery(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    aggregate = get_profile("google")
+    scopes = (*aggregate.legacy_full_scopes[-1], *aggregate.supplemental_scopes)
+    pending = _unverified_oauth(
+        manager,
+        "google_calendar",
+        with_credential=True,
+        fingerprint=FP_ONE,
+        scopes_override=scopes,
+    )
+    onboarding = ConnectorOnboarding(
+        manager,
+        identity_verifier=lambda provider, credential: _identity(provider, FP_TWO),
+    )
+    reviews: list[ConnectorIdentityReview] = []
+
+    def confirm_identity(review: ConnectorIdentityReview) -> bool:
+        reviews.append(review)
+        return True
+
+    result = onboarding.resume(
+        str(pending.connection_id),
+        confirm_identity=confirm_identity,
+    )
+
+    assert len(reviews) == 1
+    review = reviews[0]
+    assert review.connector == "google_calendar"
+    assert review.access is ConnectorAccessTier.FULL
+    assert review.permanent_delete is False
+    assert review.calendar_list_control is False
+    assert result["status"] == "different_account"
+    assert result["connector"] == "google_calendar"
+    assert result["new_account"] == (
+        "gsv connectors connect google_calendar --access full --new-account"
+    )
+    assert result["next"] == f"gsv connectors resume {pending.connection_id}"
+    current = manager.vault.get_connection_snapshot().connection(pending.connection_id)
+    assert current is not None and current.health is ConnectionHealth.UNVERIFIED
+
+
 def test_list_and_disconnected_status_include_registration_readiness(
     tmp_path: Path,
 ) -> None:
@@ -1473,6 +1656,79 @@ def test_legacy_gmail_full_status_exposes_the_exact_settings_upgrade(
     assert row["permanent_delete"] is with_permanent_delete
     assert row["settings_control"] == "upgrade_required"
     assert row["settings_upgrade"] == format_connector_command(expected_arguments)
+
+
+def test_google_calendar_status_distinguishes_read_current_and_upgradeable_full(
+    tmp_path: Path,
+) -> None:
+    profile = get_connector_profile("google_calendar")
+    cases = (
+        ("read", ConnectorAccessTier.READ, profile.read_scopes, "read_only"),
+        ("current", ConnectorAccessTier.FULL, profile.full_scopes, "ready"),
+        (
+            "legacy",
+            ConnectorAccessTier.FULL,
+            profile.legacy_full_scopes[0],
+            "upgrade_required",
+        ),
+    )
+    for label, access, scopes, expected_control in cases:
+        manager = _manager(tmp_path / label)
+        connection = _existing_oauth(
+            manager,
+            "google_calendar",
+            access=access,
+            scopes_override=scopes,
+        )
+        status = ConnectorOnboarding(manager).status("google_calendar")
+        row = cast(list[dict[str, object]], status["connections"])[0]
+        assert row["access"] == access.value
+        assert row["calendar_list_control"] == expected_control
+        if expected_control == "upgrade_required":
+            assert row["calendar_list_upgrade"] == format_connector_command(
+                (
+                    "gsv",
+                    "connectors",
+                    "connect",
+                    "google_calendar",
+                    "--access",
+                    "full",
+                    "--connection-id",
+                    str(connection.connection_id),
+                )
+            )
+        else:
+            assert "calendar_list_upgrade" not in row
+
+
+def test_prelogical_gmail_full_exposes_the_logical_settings_upgrade(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    logical = get_connector_profile("gmail")
+    aggregate = get_profile("google")
+    connection = _existing_oauth(
+        manager,
+        "gmail",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=aggregate.legacy_full_scopes[0],
+    )
+
+    row = cast(
+        list[dict[str, object]],
+        ConnectorOnboarding(manager).status("gmail")["connections"],
+    )[0]
+    assert row["settings_control"] == "upgrade_required"
+    assert row["settings_upgrade"] == format_connector_command(
+        (
+            "gsv",
+            "connectors",
+            "connect",
+            logical.name,
+            "--access",
+            "full",
+            "--connection-id",
+            str(connection.connection_id),
+        )
+    )
 
 
 def test_catalog_counts_only_usable_accounts_as_connected(tmp_path: Path) -> None:
@@ -3130,6 +3386,115 @@ def test_legacy_gmail_reauthorization_review_does_not_claim_settings_control(
     assert len(reviews) == 1
     assert reviews[0].access is ConnectorAccessTier.FULL
     assert reviews[0].gmail_settings_control is False
+    assert manager.vault.get_connection_snapshot() == before_snapshot
+    after = manager.tokens.read(existing.connection_id)
+    assert after.state.version == before.state.version
+    assert after.value == before.value
+
+
+def test_legacy_google_calendar_reauthorization_review_does_not_claim_list_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    profile = get_connector_profile("google_calendar")
+    existing = _existing_oauth(
+        manager,
+        "google_calendar",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=profile.legacy_full_scopes[0],
+    )
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = manager.tokens.read(existing.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=lambda provider: pytest.fail("registration loading reached"),
+        identity_verifier=lambda provider, credential: _identity(provider),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: _credential(metadata.scopes),
+    )
+    reviews: list[ConnectorIdentityReview] = []
+
+    def reject_identity(review: ConnectorIdentityReview) -> bool:
+        reviews.append(review)
+        return False
+
+    result = onboarding.reauthorize_oauth(
+        str(existing.connection_id),
+        confirm_identity=reject_identity,
+    )
+
+    assert result["status"] == "cancelled"
+    assert len(reviews) == 1
+    assert reviews[0].access is ConnectorAccessTier.FULL
+    assert reviews[0].calendar_list_control is False
+    assert manager.vault.get_connection_snapshot() == before_snapshot
+    after = manager.tokens.read(existing.connection_id)
+    assert after.state.version == before.state.version
+    assert after.value == before.value
+
+
+def test_prelogical_calendar_reauthorization_stays_calendar_and_never_projects_gmail_purge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    aggregate = get_profile("google")
+    scopes = (*aggregate.legacy_full_scopes[-1], *aggregate.supplemental_scopes)
+    existing = _existing_oauth(
+        manager,
+        "google_calendar",
+        access=ConnectorAccessTier.FULL,
+        scopes_override=scopes,
+    )
+    before_snapshot = manager.vault.get_connection_snapshot()
+    before = manager.tokens.read(existing.connection_id)
+    onboarding = ConnectorOnboarding(
+        manager,
+        registration_loader=_registration,
+        identity_verifier=lambda provider, credential: _identity(provider, FP_TWO),
+    )
+    monkeypatch.setattr(
+        manager,
+        "acquire_oauth_credential",
+        lambda metadata, **kwargs: _credential(metadata.scopes),
+    )
+    row = cast(
+        list[dict[str, object]],
+        onboarding.status("google_calendar")["connections"],
+    )[0]
+    assert row["connector"] == "google_calendar"
+    assert row["access"] == "full"
+    assert row["permanent_delete"] is False
+    assert row["calendar_list_control"] == "upgrade_required"
+    reviews: list[ConnectorIdentityReview] = []
+
+    def confirm_identity(review: ConnectorIdentityReview) -> bool:
+        reviews.append(review)
+        return True
+
+    result = onboarding.reauthorize_oauth(
+        str(existing.connection_id),
+        confirm_identity=confirm_identity,
+    )
+
+    assert len(reviews) == 1
+    review = reviews[0]
+    assert review.connector == "google_calendar"
+    assert review.access is ConnectorAccessTier.FULL
+    assert review.permanent_delete is False
+    assert review.gmail_settings_control is False
+    assert review.calendar_list_control is False
+    assert result["status"] == "different_account"
+    assert result["connector"] == "google_calendar"
+    assert result["new_account"] == (
+        "gsv connectors connect google_calendar --access full --new-account"
+    )
+    assert result["retry"] == f"gsv connectors reauthorize {existing.connection_id}"
+    assert result["next"] == result["retry"]
     assert manager.vault.get_connection_snapshot() == before_snapshot
     after = manager.tokens.read(existing.connection_id)
     assert after.state.version == before.state.version

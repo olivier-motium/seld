@@ -61,7 +61,7 @@ def test_builtin_connector_profiles_are_finite_and_expose_both_access_tiers() ->
         "email",
         "https://www.googleapis.com/auth/gmail.modify",
         "https://www.googleapis.com/auth/gmail.settings.basic",
-        "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+        "https://www.googleapis.com/auth/calendar.calendarlist",
         "https://www.googleapis.com/auth/calendar.events",
         "https://www.googleapis.com/auth/calendar.calendars",
         "https://www.googleapis.com/auth/calendar.freebusy",
@@ -136,6 +136,7 @@ def test_access_tier_classification_preserves_legacy_read_connections() -> None:
         google.access_for_scopes(("https://www.googleapis.com/auth/gmail.readonly",))
     assert google.access_for_scopes(google.full_scopes) is ConnectorAccessTier.FULL
     assert google.access_for_scopes(google.legacy_full_scopes[0]) is ConnectorAccessTier.FULL
+    assert google.access_for_scopes(google.legacy_full_scopes[1]) is ConnectorAccessTier.FULL
     assert (
         google.access_for_scopes((*google.legacy_full_scopes[0], *google.supplemental_scopes))
         is ConnectorAccessTier.FULL
@@ -290,6 +291,11 @@ def test_logical_connector_profiles_are_finite_single_source_least_authority_pro
     assert "https://www.googleapis.com/auth/calendar.calendars.readonly" not in calendar.scopes_for(
         "full"
     )
+    assert "https://www.googleapis.com/auth/calendar.calendarlist" in calendar.scopes_for("full")
+    assert (
+        "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
+        not in calendar.scopes_for("full")
+    )
 
     outlook_mail = get_connector_profile("outlook_mail")
     assert outlook_mail.scopes_for("read") == ("offline_access", "User.Read", "Mail.Read")
@@ -334,6 +340,8 @@ def test_logical_profiles_classify_current_and_legacy_single_source_scope_sets()
         )
         is ConnectorAccessTier.READ
     )
+    assert calendar.access_for_scopes(calendar.full_scopes) is ConnectorAccessTier.FULL
+    assert calendar.access_for_scopes(calendar.legacy_full_scopes[0]) is ConnectorAccessTier.FULL
     with pytest.raises(ValidationError, match="built-in access tier"):
         gmail.access_for_scopes(("https://www.googleapis.com/auth/calendar.events.readonly",))
 

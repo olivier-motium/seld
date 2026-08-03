@@ -833,6 +833,25 @@ def _confirm_connector_identity(review: ConnectorIdentityReview) -> bool:
                 "Gmail Read: messages and current everyday settings are visible, but settings "
                 "changes are off."
             )
+    if review.connector == "google_calendar":
+        if review.access is ConnectorAccessTier.FULL:
+            if review.calendar_list_control:
+                lines.append(
+                    "Google Calendar Full: event and calendar changes plus your own calendar-list "
+                    "visibility, color, reminder, notification, and subscription settings."
+                )
+            else:
+                lines.append(
+                    "Legacy Google Calendar Full: event and calendar changes, with calendar-list "
+                    "settings visible but not changeable. This reauthorization keeps the current "
+                    "grant; after sign-in, run `gsv connectors status google_calendar` for the "
+                    "separate calendar-list upgrade."
+                )
+        else:
+            lines.append(
+                "Google Calendar Read: events, calendars, and calendar-list settings are "
+                "visible, but changes are off."
+            )
     if review.permanent_delete:
         lines.append(
             "Explicit Gmail purge: ON — Seld can permanently erase Gmail messages, threads, or "

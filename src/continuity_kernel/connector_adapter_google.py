@@ -178,6 +178,15 @@ _CALENDAR_EVENT_SYNC_FILTER_FIELDS: Final = frozenset(
         "updated_min",
     }
 )
+_CALENDAR_LIST_NOTIFICATION_TYPES: Final = frozenset(
+    {
+        "agenda",
+        "eventCancellation",
+        "eventChange",
+        "eventCreation",
+        "eventResponse",
+    }
+)
 _DRIVE_COMMENT_RESOURCE_FIELDS: Final = (
     "id,kind,createdTime,modifiedTime,author(displayName,emailAddress,kind,me,"
     "permissionId,photoLink),content,htmlContent,deleted,resolved,anchor,"
@@ -387,6 +396,22 @@ class GoogleConnectorAdapter:
             return operation.effect
         if operation.provider != "google_calendar":
             return operation.effect
+        if operation.name == "calendar_list.update":
+            _calendar_list_body(values, include_id=False, require_change=True)
+            current = None
+            if credential is not None and transport is not None:
+                current = _calendar_list_preflight(
+                    values,
+                    credential,
+                    transport,
+                    context="Google CalendarList update preflight",
+                )
+            return _calendar_list_update_effect(values, current)
+        if operation.name == "calendar_list.remove":
+            _validate_calendar_list_remove_target(values)
+            if credential is not None and transport is not None:
+                _calendar_list_remove_preflight(values, credential, transport)
+            return operation.effect
         if operation.name == "calendars.update":
             _calendar_body(values, require_change=True)
             return ConnectorEffect.OUTWARD
@@ -467,6 +492,26 @@ class GoogleConnectorAdapter:
                 raise ValidationError("Gmail raw-message uploads require a fresh confirmation")
         if not operation.scope_grant_satisfies(credential.granted_scopes):
             raise ValidationError("connector credential does not satisfy the operation scope")
+        if operation.provider == "google_calendar" and operation.name == "calendar_list.update":
+            _calendar_list_body(values, include_id=False, require_change=True)
+            current_calendar_list_entry = _calendar_list_preflight(
+                values,
+                credential,
+                transport,
+                context="Google CalendarList update preflight",
+            )
+            calendar_list_effect = _calendar_list_update_effect(
+                values,
+                current_calendar_list_entry,
+            )
+            if (
+                calendar_list_effect is not ConnectorEffect.SAFE_MUTATION
+                and write_idempotency_key is None
+            ):
+                raise ValidationError(
+                    "the Google CalendarList entry changed or the update removes preferences; "
+                    "request a fresh confirmation preview"
+                )
         if (
             operation.provider == "google_calendar"
             and operation.name in _EXISTING_CALENDAR_EVENT_MUTATIONS
@@ -1518,6 +1563,21 @@ def _execute_calendar(
             allow_sync_cursor=False,
         )
     _reject_continuation(continuation)
+    if name == "calendar_list.get":
+        calendar_id = _required(values, "calendar_id")
+        result = _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path=f"{base}/users/me/calendarList/{_segment(calendar_id)}",
+            credential=credential,
+        )
+        _validate_calendar_list_resource(
+            _provider_mapping(result, context="Google CalendarList read"),
+            calendar_id=calendar_id,
+            context="Google CalendarList read",
+        )
+        return result
     if name == "colors.get":
         return _json_request(
             transport,
@@ -1583,6 +1643,40 @@ def _execute_calendar(
             credential=credential,
             json_body=freebusy_body,
             expected_statuses=_JSON_STATUSES,
+        )
+    if name in {"calendar_list.insert", "calendar_list.update"}:
+        calendar_id = _required(values, "calendar_id")
+        method = ConnectorMethod.POST
+        path = f"{base}/users/me/calendarList"
+        calendar_list_headers: dict[str, str] | None = None
+        if name == "calendar_list.update":
+            method = ConnectorMethod.PATCH
+            path += f"/{_segment(calendar_id)}"
+            calendar_list_headers = _etag_headers(values)
+        return _calendar_write_request(
+            transport,
+            method=method,
+            path=path,
+            credential=credential,
+            query=_calendar_list_color_query(values),
+            json_body=_calendar_list_body(
+                values,
+                include_id=name == "calendar_list.insert",
+                require_change=name == "calendar_list.update",
+            ),
+            headers=calendar_list_headers,
+            expected_statuses=_JSON_STATUSES,
+        )
+    if name == "calendar_list.remove":
+        _validate_calendar_list_remove_target(values)
+        _calendar_list_remove_preflight(values, credential, transport)
+        return _calendar_write_request(
+            transport,
+            method=ConnectorMethod.DELETE,
+            path=f"{base}/users/me/calendarList/{_segment(_required(values, 'calendar_id'))}",
+            credential=credential,
+            headers=_etag_headers(values),
+            expected_statuses=_DELETE_STATUSES,
         )
     if name in {"calendars.create", "calendars.update"}:
         path = f"{base}/calendars"
@@ -3246,6 +3340,64 @@ def _reject_continuation(continuation: object | None) -> None:
         raise ValidationError("connector operation does not accept a continuation")
 
 
+def _calendar_list_body(
+    values: Mapping[str, object],
+    *,
+    include_id: bool,
+    require_change: bool,
+) -> dict[str, object]:
+    body = _selected(
+        values,
+        {
+            "hidden": "hidden",
+            "selected": "selected",
+            "summary_override": "summaryOverride",
+        },
+    )
+    if include_id:
+        body["id"] = _required(values, "calendar_id")
+    if "color" in values:
+        body.update(
+            _selected(
+                _mapping(values["color"]),
+                {
+                    "background_color": "backgroundColor",
+                    "foreground_color": "foregroundColor",
+                },
+            )
+        )
+    if "default_reminders" in values:
+        reminders = [
+            _selected(reminder, {"delivery": "method", "minutes": "minutes"})
+            for reminder in _mappings(values["default_reminders"])
+        ]
+        reminder_keys = [
+            (_required(reminder, "delivery"), cast(int, reminder["minutes"]))
+            for reminder in _mappings(values["default_reminders"])
+        ]
+        if len(set(reminder_keys)) != len(reminder_keys):
+            raise ValidationError("Google CalendarList default reminders must be unique")
+        body["defaultReminders"] = reminders
+    if "notification_types" in values:
+        notification_types = _strings(values["notification_types"])
+        if len(set(notification_types)) != len(notification_types):
+            raise ValidationError("Google CalendarList notification types must be unique")
+        body["notificationSettings"] = {
+            "notifications": [
+                {"method": "email", "type": notification_type}
+                for notification_type in notification_types
+            ]
+        }
+    changed_fields = set(body) - {"id"}
+    if require_change and not changed_fields:
+        raise ValidationError("Google CalendarList update requires at least one changed field")
+    return body
+
+
+def _calendar_list_color_query(values: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
+    return (("colorRgbFormat", "true"),) if "color" in values else ()
+
+
 def _calendar_body(values: Mapping[str, object], *, require_change: bool) -> dict[str, object]:
     body = _selected(
         values,
@@ -4516,6 +4668,234 @@ def _validate_calendar_move(values: Mapping[str, object]) -> None:
 def _validate_secondary_calendar_target(values: Mapping[str, object]) -> None:
     if _required(values, "calendar_id") == "primary":
         raise ValidationError("Google Calendar cannot delete the primary calendar")
+
+
+def _calendar_list_preflight(
+    values: Mapping[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+    *,
+    context: str,
+) -> Mapping[str, object]:
+    calendar_id = _required(values, "calendar_id")
+    calendar = _provider_mapping(
+        _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path=f"/calendar/v3/users/me/calendarList/{_segment(calendar_id)}",
+            credential=credential,
+            query=(
+                (
+                    "fields",
+                    "accessRole,dataOwner,defaultReminders,etag,id,kind,"
+                    "notificationSettings(notifications(method,type)),primary,summary,"
+                    "summaryOverride",
+                ),
+            ),
+        ),
+        context=context,
+    )
+    _validate_calendar_list_resource(calendar, calendar_id=calendar_id, context=context)
+    current_etag = _safe_header(_provider_text(calendar, "etag", context=context))
+    if current_etag != _safe_header(_required(values, "etag")):
+        raise ConflictError("Google CalendarList entry changed; read it again before changing it")
+    return calendar
+
+
+def _validate_calendar_list_resource(
+    calendar: Mapping[str, object],
+    *,
+    calendar_id: str,
+    context: str,
+) -> None:
+    if calendar.get("kind") != "calendar#calendarListEntry":
+        raise ValidationError(f"{context} returned a different resource")
+    actual_id = _provider_text(calendar, "id", context=context)
+    if calendar_id != "primary" and actual_id != calendar_id:
+        raise ValidationError(f"{context} returned a different calendar")
+    _safe_header(_provider_text(calendar, "etag", context=context))
+
+
+def _calendar_list_update_effect(
+    values: Mapping[str, object],
+    calendar: Mapping[str, object] | None,
+) -> ConnectorEffect:
+    loss_sensitive_fields = {"default_reminders", "notification_types", "summary_override"}
+    if calendar is None:
+        return (
+            ConnectorEffect.DESTRUCTIVE
+            if set(values).intersection(loss_sensitive_fields)
+            else ConnectorEffect.SAFE_MUTATION
+        )
+    if "default_reminders" in values:
+        current_reminders = _calendar_list_provider_reminders(calendar)
+        requested_reminders = {
+            (_required(reminder, "delivery"), cast(int, reminder["minutes"]))
+            for reminder in _mappings(values["default_reminders"])
+        }
+        if not current_reminders.issubset(requested_reminders):
+            return ConnectorEffect.DESTRUCTIVE
+    if "notification_types" in values:
+        current_notifications = _calendar_list_provider_notification_types(calendar)
+        requested_notifications = set(_strings(values["notification_types"]))
+        if not current_notifications.issubset(requested_notifications):
+            return ConnectorEffect.DESTRUCTIVE
+    if "summary_override" in values:
+        current_summary = calendar.get("summaryOverride")
+        if current_summary is not None and not isinstance(current_summary, str):
+            raise ValidationError(
+                "Google CalendarList update preflight returned an invalid summary override"
+            )
+        if current_summary and values["summary_override"] in {None, ""}:
+            return ConnectorEffect.DESTRUCTIVE
+    return ConnectorEffect.SAFE_MUTATION
+
+
+def _calendar_list_provider_reminders(
+    calendar: Mapping[str, object],
+) -> set[tuple[str, int]]:
+    raw_reminders = calendar.get("defaultReminders", [])
+    if not isinstance(raw_reminders, list):
+        raise ValidationError(
+            "Google CalendarList update preflight returned invalid default reminders"
+        )
+    reminders: set[tuple[str, int]] = set()
+    for raw_reminder in raw_reminders:
+        if not isinstance(raw_reminder, Mapping):
+            raise ValidationError(
+                "Google CalendarList update preflight returned invalid default reminders"
+            )
+        method = raw_reminder.get("method")
+        minutes = raw_reminder.get("minutes")
+        if (
+            method not in {"email", "popup"}
+            or type(minutes) is not int
+            or not 0 <= minutes <= 40_320
+        ):
+            raise ValidationError(
+                "Google CalendarList update preflight returned invalid default reminders"
+            )
+        reminder = (cast(str, method), minutes)
+        if reminder in reminders:
+            raise ValidationError(
+                "Google CalendarList update preflight returned duplicate default reminders"
+            )
+        reminders.add(reminder)
+    return reminders
+
+
+def _calendar_list_provider_notification_types(calendar: Mapping[str, object]) -> set[str]:
+    settings = calendar.get("notificationSettings")
+    if settings is None:
+        return set()
+    if not isinstance(settings, Mapping):
+        raise ValidationError(
+            "Google CalendarList update preflight returned invalid notification settings"
+        )
+    raw_notifications = settings.get("notifications", [])
+    if not isinstance(raw_notifications, list):
+        raise ValidationError(
+            "Google CalendarList update preflight returned invalid notification settings"
+        )
+    notification_types: set[str] = set()
+    for raw_notification in raw_notifications:
+        if not isinstance(raw_notification, Mapping):
+            raise ValidationError(
+                "Google CalendarList update preflight returned invalid notification settings"
+            )
+        method = raw_notification.get("method")
+        notification_type = raw_notification.get("type")
+        if method != "email" or notification_type not in _CALENDAR_LIST_NOTIFICATION_TYPES:
+            raise ValidationError(
+                "Google CalendarList update preflight returned invalid notification settings"
+            )
+        assert isinstance(notification_type, str)
+        if notification_type in notification_types:
+            raise ValidationError(
+                "Google CalendarList update preflight returned duplicate notification settings"
+            )
+        notification_types.add(notification_type)
+    return notification_types
+
+
+def _validate_calendar_list_remove_target(values: Mapping[str, object]) -> None:
+    if _required(values, "calendar_id") == "primary":
+        raise ValidationError(
+            "Google CalendarList cannot remove the primary calendar; hide it instead"
+        )
+
+
+def _calendar_list_remove_preflight(
+    values: Mapping[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> None:
+    calendar_id = _required(values, "calendar_id")
+    calendar = _calendar_list_preflight(
+        values,
+        credential,
+        transport,
+        context="Google CalendarList removal preflight",
+    )
+    expected = _calendar_list_entry_snapshot(
+        values["expected_calendar"],
+        context="Google CalendarList expected removal target",
+    )
+    current = _calendar_list_entry_snapshot(
+        calendar,
+        context="Google CalendarList current removal target",
+    )
+    if expected["id"] != calendar_id:
+        raise ValidationError("Google CalendarList expected calendar ID does not match the target")
+    if current != expected:
+        raise ConflictError("Google CalendarList entry changed; read it again before removing it")
+    if current["primary"] is True:
+        raise ValidationError(
+            "Google CalendarList cannot remove the primary calendar; hide it instead"
+        )
+    if current["accessRole"] == "owner":
+        data_owner = calendar.get("dataOwner")
+        if not isinstance(data_owner, str) or not data_owner:
+            raise ValidationError(
+                "Google CalendarList removal preflight returned no usable data owner"
+            )
+        if data_owner.casefold() != _calendar_list_primary_id(credential, transport).casefold():
+            return
+        raise ValidationError(
+            "Google CalendarList cannot remove a calendar you data-own; hide it instead"
+        )
+
+
+def _calendar_list_primary_id(
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> str:
+    calendar = _provider_mapping(
+        _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path="/calendar/v3/users/me/calendarList/primary",
+            credential=credential,
+            query=(("fields", "etag,id,kind,primary"),),
+        ),
+        context="Google CalendarList primary-calendar preflight",
+    )
+    _validate_calendar_list_resource(
+        calendar,
+        calendar_id="primary",
+        context="Google CalendarList primary-calendar preflight",
+    )
+    if calendar.get("primary") is not True:
+        raise ValidationError(
+            "Google CalendarList primary-calendar preflight returned a non-primary calendar"
+        )
+    return _provider_text(
+        calendar,
+        "id",
+        context="Google CalendarList primary-calendar preflight",
+    )
 
 
 def _calendar_delete_preflight(

@@ -732,6 +732,21 @@ def test_google_calendar_previews_disclose_patch_notification_and_recovery_seman
         "summary": "Reviewed event",
     }
     inputs = {
+        "calendar_list.remove": {
+            "calendar_id": "team@example.test",
+            "etag": '"list-etag"',
+            "expected_calendar": {
+                "accessRole": "reader",
+                "id": "team@example.test",
+                "primary": False,
+                "summary": "Reviewed subscription",
+            },
+        },
+        "calendar_list.update": {
+            "calendar_id": "team@example.test",
+            "default_reminders": [],
+            "etag": '"list-etag"',
+        },
         "calendars.delete": {
             "calendar_id": "secondary",
             "etag": "calendar-etag",
@@ -785,6 +800,14 @@ def test_google_calendar_previews_disclose_patch_notification_and_recovery_seman
         },
     }
     expected_phrases = {
+        "calendar_list.remove": (
+            "only from your list",
+            "saved view settings",
+            "retain access",
+            "does not restore",
+            "hide it instead",
+        ),
+        "calendar_list.update": ("complete list", "custom summary", "saved preference"),
         "calendars.delete": ("permanently", "everyone"),
         "events.create": ("attendees", "invitations", "external calendars", "email"),
         "events.delete": (

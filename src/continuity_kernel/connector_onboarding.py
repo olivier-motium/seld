@@ -69,6 +69,8 @@ _REAUTH_HEALTH: Final = _CONNECTED_HEALTH | frozenset({ConnectionHealth.REAUTHOR
 _CANDIDATE_HEALTH: Final = _REAUTH_HEALTH | frozenset({ConnectionHealth.UNVERIFIED})
 _RETAINED_BROADER_CREDENTIAL: Final = "existing_broader_grant_retained"
 _GMAIL_SETTINGS_BASIC: Final = "https://www.googleapis.com/auth/gmail.settings.basic"
+_CALENDAR: Final = "https://www.googleapis.com/auth/calendar"
+_CALENDAR_LIST: Final = "https://www.googleapis.com/auth/calendar.calendarlist"
 
 
 @dataclass(frozen=True, repr=False)
@@ -81,6 +83,7 @@ class ConnectorIdentityReview:
     display_label: str
     permanent_delete: bool = False
     gmail_settings_control: bool = False
+    calendar_list_control: bool = False
     permission_update: str | None = None
 
     def __repr__(self) -> str:
@@ -89,6 +92,7 @@ class ConnectorIdentityReview:
             f"connector={self.connector!r}, provider={self.provider!r}, "
             f"access={self.access!r}, permanent_delete={self.permanent_delete!r}, "
             f"gmail_settings_control={self.gmail_settings_control!r}, "
+            f"calendar_list_control={self.calendar_list_control!r}, "
             f"permission_update={self.permission_update is not None!r}, "
             "display_label=<redacted>)"
         )
@@ -198,14 +202,14 @@ class ConnectorOnboarding:
                 pinned_fingerprint = candidate.account.fingerprint
                 preferred_label = candidate.account.label
                 force_fresh = pinned_fingerprint is not None
-                if not _scopes_satisfy_requirement(
+                if not _connection_scopes_satisfy_requirement(
                     profile,
-                    candidate.scopes,
+                    candidate,
                     requested_scopes,
                 ):
                     permission_update = _permission_update(
                         profile,
-                        candidate.scopes,
+                        candidate,
                         tier,
                         include_permanent_delete=include_permanent_delete,
                     )
@@ -356,9 +360,8 @@ class ConnectorOnboarding:
         profile = get_profile_for_connection(
             connection.provider,
             connection.source_ids,
-            connection.scopes,
         )
-        access = profile.access_for_scopes(connection.scopes)
+        access = _connection_access(profile, connection)
         custody_status = self.manager.inspect_custody(connection)
         if custody_status == "pointer_invalid":
             return _credential_recovery_result(profile, connection, custody_status)
@@ -423,6 +426,7 @@ class ConnectorOnboarding:
                         profile,
                         connection.scopes,
                         new_account=True,
+                        access=access,
                         browser_mode=validated_browser_mode,
                         timeout_seconds=timeout_seconds,
                     ),
@@ -439,6 +443,7 @@ class ConnectorOnboarding:
                     profile,
                     connection.scopes,
                 ),
+                calendar_list_control=_calendar_list_control(profile, connection.scopes),
             )
             if confirm_identity(review) is not True:
                 return _cancelled_identity_result(
@@ -459,6 +464,7 @@ class ConnectorOnboarding:
                         profile,
                         connection.scopes,
                         new_account=True,
+                        access=access,
                         browser_mode=validated_browser_mode,
                         timeout_seconds=timeout_seconds,
                     ),
@@ -537,7 +543,7 @@ class ConnectorOnboarding:
             )
             if selected is None:
                 raise ValidationError("connection ID does not identify this logical connector")
-            if _try_capability_rank(profile, selected.scopes) is None:
+            if _try_connection_capability_rank(profile, selected) is None:
                 return None, _scope_profile_recovery_result(profile, selected), False
         else:
             bound_fingerprints = {
@@ -566,7 +572,7 @@ class ConnectorOnboarding:
                 requested_scopes,
             )
             if usable is not None:
-                if _capability_rank(profile, usable.scopes) > requested_rank:
+                if _connection_capability_rank(profile, usable) > requested_rank:
                     return (
                         None,
                         _broader_access_result(
@@ -614,12 +620,12 @@ class ConnectorOnboarding:
 
         if selected.account.fingerprint is None:
             return None, _identity_binding_recovery_result(profile, selected), False
-        scopes_sufficient = _scopes_satisfy_requirement(
+        scopes_sufficient = _connection_scopes_satisfy_requirement(
             profile,
-            selected.scopes,
+            selected,
             requested_scopes,
         )
-        if _capability_rank(profile, selected.scopes) > requested_rank and scopes_sufficient:
+        if _connection_capability_rank(profile, selected) > requested_rank and scopes_sufficient:
             custody_status = self.manager.inspect_custody(selected)
             if custody_status != "valid":
                 return (
@@ -685,14 +691,14 @@ class ConnectorOnboarding:
             ),
             reverse=True,
         ):
-            capability = _try_capability_rank(profile, candidate.scopes)
+            capability = _try_connection_capability_rank(profile, candidate)
             if (
                 capability is not None
                 and candidate.health in _CONNECTED_HEALTH
                 and candidate.account.fingerprint is not None
-                and _scopes_satisfy_requirement(
+                and _connection_scopes_satisfy_requirement(
                     profile,
-                    candidate.scopes,
+                    candidate,
                     requested_scopes,
                 )
                 and self.manager.inspect_custody(candidate) == "valid"
@@ -844,9 +850,8 @@ class ConnectorOnboarding:
                 profile = get_profile_for_connection(
                     connection.provider,
                     connection.source_ids,
-                    connection.scopes,
                 )
-                access = profile.access_for_scopes(connection.scopes).value
+                access = _connection_access(profile, connection).value
             except ValidationError:
                 try:
                     recovery_profile = get_profile_for_connection(
@@ -892,7 +897,8 @@ class ConnectorOnboarding:
                     if len(connection.source_ids) == 1
                     else "legacy_provider_bundle",
                     "permanent_delete": _permanent_delete_enabled(profile, connection.scopes),
-                    **_gmail_settings_status(profile, connection, access=access),
+                    **_gmail_settings_status(connection, access=access),
+                    **_calendar_list_status(connection, access=access),
                 }
             )
         readiness = self.registration_readiness()
@@ -1048,18 +1054,18 @@ class ConnectorOnboarding:
             raise ValidationError("connector connection was not found")
         if connection.health is not ConnectionHealth.UNVERIFIED:
             raise ValidationError("only an unverified connection can resume setup")
+        profile = get_profile_for_connection(
+            connection.provider,
+            connection.source_ids,
+        )
+        access = _connection_access(profile, connection)
         token_state = self.manager.tokens.state(clean_id)
         if token_state is None:
             removed = self.manager.remove(clean_id, expected_revision=snapshot.revision)
-            profile = get_profile_for_connection(
-                connection.provider,
-                connection.source_ids,
-                connection.scopes,
-            )
             return {
                 **removed,
                 "connection_id": str(clean_id),
-                "next": _connect_command(profile, connection.scopes),
+                "next": _connect_command(profile, connection.scopes, access=access),
                 "nothing_saved": True,
                 "status": "credential_missing_reconnect_required",
             }
@@ -1091,12 +1097,6 @@ class ConnectorOnboarding:
         else:  # pragma: no cover - closed enum defense
             raise ValidationError("connector credential kind is unsupported")
         identity = self.identity_verifier(connection.provider, credential)
-        profile = get_profile_for_connection(
-            connection.provider,
-            connection.source_ids,
-            connection.scopes,
-        )
-        access = profile.access_for_scopes(connection.scopes)
         review = ConnectorIdentityReview(
             connector=profile.name,
             provider=profile.provider,
@@ -1104,6 +1104,7 @@ class ConnectorOnboarding:
             display_label=identity.display_label,
             permanent_delete=_permanent_delete_enabled(profile, connection.scopes),
             gmail_settings_control=_gmail_settings_control(profile, connection.scopes),
+            calendar_list_control=_calendar_list_control(profile, connection.scopes),
         )
         if confirm_identity(review) is not True:
             return _cancelled_identity_result(
@@ -1117,7 +1118,7 @@ class ConnectorOnboarding:
             return {
                 **removed,
                 "connection_id": str(clean_id),
-                "next": _connect_command(profile, connection.scopes),
+                "next": _connect_command(profile, connection.scopes, access=access),
                 "nothing_saved": True,
                 "status": "identity_binding_missing_reconnect_required",
             }
@@ -1131,6 +1132,7 @@ class ConnectorOnboarding:
                     profile,
                     connection.scopes,
                     new_account=True,
+                    access=access,
                 ),
                 provider_authorization=False,
                 existing_connection_preserved=True,
@@ -1275,7 +1277,7 @@ class ConnectorOnboarding:
                 connection
                 for connection in same_account
                 if connection.health is ConnectionHealth.UNVERIFIED
-                and _try_capability_rank(profile, connection.scopes) is not None
+                and _try_connection_capability_rank(profile, connection) is not None
             ),
             key=lambda connection: (connection.updated_at, str(connection.connection_id)),
             default=None,
@@ -1302,6 +1304,7 @@ class ConnectorOnboarding:
             display_label=identity.display_label,
             permanent_delete=_permanent_delete_enabled(profile, pending.scopes),
             gmail_settings_control=_gmail_settings_control(profile, pending.scopes),
+            calendar_list_control=_calendar_list_control(profile, pending.scopes),
             permission_update=permission_update,
         )
         if confirm_identity(review) is not True:
@@ -1349,7 +1352,7 @@ class ConnectorOnboarding:
                         reusable_custody_status,
                     ),
                 )
-            if _capability_rank(profile, reusable.scopes) > requested_capability:
+            if _connection_capability_rank(profile, reusable) > requested_capability:
                 if reusable_custody_status != "valid":
                     return _post_authorization_discard(
                         profile,
@@ -1380,7 +1383,7 @@ class ConnectorOnboarding:
                     retry_command=retry_command or _connect_command(profile, pending.scopes),
                     connection_id=str(reusable.connection_id),
                     existing_connection_preserved=True,
-                    existing_effective_access=profile.access_for_scopes(reusable.scopes).value,
+                    existing_effective_access=_connection_access(profile, reusable).value,
                     existing_permanent_delete=_permanent_delete_enabled(
                         profile,
                         reusable.scopes,
@@ -1568,15 +1571,15 @@ def _is_superseded_connection(
         and connection.health not in {ConnectionHealth.REVOKED, ConnectionHealth.UNKNOWN}
     ):
         return False
-    capability = _try_capability_rank(profile, connection.scopes)
+    capability = _try_connection_capability_rank(profile, connection)
     if capability is None:
         # Unknown historical authority is never deleted as an upgrade side effect.
         return False
     return capability < new_capability or (
         capability == new_capability
-        and not _scopes_satisfy_requirement(
+        and not _connection_scopes_satisfy_requirement(
             profile,
-            connection.scopes,
+            connection,
             required_scopes,
         )
     )
@@ -1656,16 +1659,62 @@ def _capability_rank(profile: ConnectorProfile, scopes: tuple[str, ...]) -> int:
     return 1 if access is ConnectorAccessTier.FULL else 0
 
 
-def _try_capability_rank(
+def _connection_access(
     profile: ConnectorProfile,
-    scopes: tuple[str, ...],
-) -> int | None:
-    """Classify stored OAuth authority without trusting historical metadata."""
+    connection: ConnectionMetadata,
+) -> ConnectorAccessTier:
+    resolved = get_profile_for_connection(
+        connection.provider,
+        connection.source_ids,
+        connection.scopes,
+    )
+    if not (
+        resolved.name == profile.name
+        or (
+            connection.provider == profile.provider
+            and connection.source_ids == profile.source_ids
+            and connection.credential_kind is profile.credential_kind
+        )
+    ):
+        raise ValidationError("connection does not match this logical connector")
+    return resolved.access_for_scopes(connection.scopes)
 
+
+def _connection_capability_rank(
+    profile: ConnectorProfile,
+    connection: ConnectionMetadata,
+) -> int:
+    access = _connection_access(profile, connection)
+    if access is ConnectorAccessTier.FULL and _permanent_delete_enabled(
+        profile,
+        connection.scopes,
+    ):
+        return 2
+    return 1 if access is ConnectorAccessTier.FULL else 0
+
+
+def _try_connection_capability_rank(
+    profile: ConnectorProfile,
+    connection: ConnectionMetadata,
+) -> int | None:
     try:
-        return _capability_rank(profile, scopes)
+        return _connection_capability_rank(profile, connection)
     except ValidationError:
         return None
+
+
+def _connection_scopes_satisfy_requirement(
+    profile: ConnectorProfile,
+    connection: ConnectionMetadata,
+    required_scopes: tuple[str, ...],
+) -> bool:
+    capability = _connection_capability_rank(profile, connection)
+    required_capability = _capability_rank(profile, required_scopes)
+    if capability < required_capability:
+        return False
+    if capability > required_capability and required_capability == 0:
+        return True
+    return frozenset(required_scopes).issubset(connection.scopes)
 
 
 def _permanent_delete_enabled(profile: ConnectorProfile, scopes: tuple[str, ...]) -> bool:
@@ -1682,27 +1731,67 @@ def _gmail_settings_control(profile: ConnectorProfile, scopes: tuple[str, ...]) 
     )
 
 
+def _calendar_list_control(profile: ConnectorProfile, scopes: tuple[str, ...]) -> bool:
+    return (
+        profile.provider == "google"
+        and "google_calendar" in profile.source_ids
+        and bool({_CALENDAR_LIST, _CALENDAR}.intersection(scopes))
+    )
+
+
 def _gmail_settings_status(
-    profile: ConnectorProfile,
     connection: ConnectionMetadata,
     *,
     access: str,
 ) -> dict[str, object]:
-    if profile.name != "gmail":
+    if connection.source_ids != ("gmail",):
         return {}
+    logical_profile = get_connector_profile("gmail")
     if access == ConnectorAccessTier.READ.value:
         return {"settings_control": "read_only"}
-    keep_permanent_delete = _permanent_delete_enabled(profile, connection.scopes)
-    current_scopes = profile.scopes_for(
+    keep_permanent_delete = _permanent_delete_enabled(logical_profile, connection.scopes)
+    current_scopes = logical_profile.scopes_for(
         ConnectorAccessTier.FULL,
         include_supplemental=keep_permanent_delete,
     )
-    if _scopes_satisfy_requirement(profile, connection.scopes, current_scopes):
+    if _connection_scopes_satisfy_requirement(
+        logical_profile,
+        connection,
+        current_scopes,
+    ):
         return {"settings_control": "ready"}
     return {
         "settings_control": "upgrade_required",
         "settings_upgrade": _connect_command(
-            profile,
+            logical_profile,
+            current_scopes,
+            access=ConnectorAccessTier.FULL,
+            connection_id=str(connection.connection_id),
+        ),
+    }
+
+
+def _calendar_list_status(
+    connection: ConnectionMetadata,
+    *,
+    access: str,
+) -> dict[str, object]:
+    if connection.source_ids != ("google_calendar",):
+        return {}
+    logical_profile = get_connector_profile("google_calendar")
+    if access == ConnectorAccessTier.READ.value:
+        return {"calendar_list_control": "read_only"}
+    current_scopes = logical_profile.scopes_for(ConnectorAccessTier.FULL)
+    if _connection_scopes_satisfy_requirement(
+        logical_profile,
+        connection,
+        current_scopes,
+    ):
+        return {"calendar_list_control": "ready"}
+    return {
+        "calendar_list_control": "upgrade_required",
+        "calendar_list_upgrade": _connect_command(
+            logical_profile,
             current_scopes,
             access=ConnectorAccessTier.FULL,
             connection_id=str(connection.connection_id),
@@ -1722,24 +1811,6 @@ def _requested_capability_rank(
     )
 
 
-def _scopes_satisfy_requirement(
-    profile: ConnectorProfile,
-    scopes: tuple[str, ...],
-    required_scopes: tuple[str, ...],
-) -> bool:
-    capability = _capability_rank(profile, scopes)
-    required_capability = _capability_rank(profile, required_scopes)
-    if capability < required_capability:
-        return False
-    if capability > required_capability and required_capability == 0:
-        # Full grants semantically include the provider's Read authority even when the
-        # provider expresses those tiers with different scope strings.
-        return True
-    # Supplemental authority ranks above Full, but it cannot stand in for a newly added
-    # base Full permission. Exact inclusion distinguishes current Full from legacy Full.
-    return frozenset(required_scopes).issubset(scopes)
-
-
 def _sufficient_connections(
     profile: ConnectorProfile,
     connections: Sequence[ConnectionMetadata],
@@ -1748,14 +1819,14 @@ def _sufficient_connections(
 ) -> list[ConnectionMetadata]:
     eligible: list[tuple[ConnectionMetadata, int]] = []
     for connection in connections:
-        capability = _try_capability_rank(profile, connection.scopes)
+        capability = _try_connection_capability_rank(profile, connection)
         if (
             capability is not None
             and connection.health in _REAUTH_HEALTH
             and connection.account.fingerprint is not None
-            and _scopes_satisfy_requirement(
+            and _connection_scopes_satisfy_requirement(
                 profile,
-                connection.scopes,
+                connection,
                 requested_scopes,
             )
         ):
@@ -1781,7 +1852,7 @@ def _select_preflight_candidate(
     recognized = [
         connection
         for connection in connections
-        if _try_capability_rank(profile, connection.scopes) is not None
+        if _try_connection_capability_rank(profile, connection) is not None
     ]
     if not recognized:
         return None
@@ -1802,7 +1873,7 @@ def _preflight_candidate_key(
     requested_capability: int,
     requested_scopes: tuple[str, ...],
 ) -> tuple[object, ...]:
-    capability = _try_capability_rank(profile, connection.scopes)
+    capability = _try_connection_capability_rank(profile, connection)
     if capability is None:
         return (
             False,
@@ -1815,9 +1886,9 @@ def _preflight_candidate_key(
             connection.updated_at,
             str(connection.connection_id),
         )
-    sufficient = _scopes_satisfy_requirement(
+    sufficient = _connection_scopes_satisfy_requirement(
         profile,
-        connection.scopes,
+        connection,
         requested_scopes,
     )
     return (
@@ -1881,7 +1952,7 @@ def _account_selection_row(
     timeout_seconds: float | None,
 ) -> dict[str, object]:
     try:
-        effective_access = profile.access_for_scopes(candidate.scopes).value
+        effective_access = _connection_access(profile, candidate).value
     except ValidationError:
         return {
             "access": "unknown",
@@ -1944,7 +2015,7 @@ def _setup_incomplete_result(
     connection: ConnectionMetadata,
 ) -> dict[str, object]:
     return {
-        "access": profile.access_for_scopes(connection.scopes).value,
+        "access": _connection_access(profile, connection).value,
         "account_label": connection.account.label,
         "connection_id": str(connection.connection_id),
         "connector": profile.name,
@@ -1965,7 +2036,7 @@ def _connection_success_result(
     account_label: str | None = None,
 ) -> dict[str, object]:
     return {
-        "access": profile.access_for_scopes(connection.scopes).value,
+        "access": _connection_access(profile, connection).value,
         "account_label": account_label if account_label is not None else connection.account.label,
         "connection_id": str(connection.connection_id),
         "connector": profile.name,
@@ -1982,7 +2053,7 @@ def _broader_access_result(
     selected_access: ConnectorAccessTier,
     requested_scopes: tuple[str, ...],
 ) -> dict[str, object]:
-    effective_access = profile.access_for_scopes(connection.scopes)
+    effective_access = _connection_access(profile, connection)
     reconnect = _connect_command(
         profile,
         requested_scopes,
@@ -2107,7 +2178,7 @@ def _preserved_authority(
     effective_access = "unknown"
     if len(connections) == 1:
         with suppress(ValidationError):
-            effective_access = profile.access_for_scopes(connections[0].scopes).value
+            effective_access = _connection_access(profile, connections[0]).value
     permanent_delete = any(
         _permanent_delete_enabled(profile, connection.scopes) for connection in connections
     )
@@ -2119,6 +2190,7 @@ def _credential_recovery_result(
     connection: ConnectionMetadata,
     custody_status: CustodyStatus,
 ) -> dict[str, object]:
+    access = _connection_access(profile, connection)
     if custody_status == "missing":
         status = "credential_missing_reconnect_required"
     elif custody_status == "pointer_invalid":
@@ -2136,12 +2208,13 @@ def _credential_recovery_result(
         next_command = _connect_command(
             profile,
             connection.scopes,
+            access=access,
             connection_id=str(connection.connection_id),
         )
     else:
         next_command = f"gsv connectors disconnect {connection.connection_id}"
     return {
-        "access": profile.access_for_scopes(connection.scopes).value,
+        "access": access.value,
         "account_label": connection.account.label,
         "connection_id": str(connection.connection_id),
         "connector": profile.name,
@@ -2152,6 +2225,7 @@ def _credential_recovery_result(
         "reconnect": _connect_command(
             profile,
             connection.scopes,
+            access=access,
             new_account=True,
         ),
         "status": status,
@@ -2175,8 +2249,9 @@ def _identity_binding_recovery_result(
     profile: ConnectorProfile,
     connection: ConnectionMetadata,
 ) -> dict[str, object]:
+    access = _connection_access(profile, connection)
     return {
-        "access": profile.access_for_scopes(connection.scopes).value,
+        "access": access.value,
         "account_label": connection.account.label,
         "connection_id": str(connection.connection_id),
         "connector": profile.name,
@@ -2184,7 +2259,12 @@ def _identity_binding_recovery_result(
         "next": f"gsv connectors disconnect {connection.connection_id}",
         "nothing_saved": True,
         "permanent_delete": _permanent_delete_enabled(profile, connection.scopes),
-        "reconnect": _connect_command(profile, connection.scopes, new_account=True),
+        "reconnect": _connect_command(
+            profile,
+            connection.scopes,
+            access=access,
+            new_account=True,
+        ),
         "status": "identity_binding_missing_reconnect_required",
     }
 
@@ -2313,13 +2393,13 @@ def _browser_mode(value: BrowserMode | None) -> BrowserMode | None:
 
 def _permission_update(
     profile: ConnectorProfile,
-    existing_scopes: tuple[str, ...],
+    connection: ConnectionMetadata,
     access: ConnectorAccessTier,
     *,
     include_permanent_delete: bool,
 ) -> str:
     connector = profile.name.replace("_", " ").title()
-    existing = profile.access_for_scopes(existing_scopes).value.title()
+    existing = _connection_access(profile, connection).value.title()
     tier = access.value.title()
     authority = f"{tier} permissions" if existing == tier else f"{tier} access"
     if include_permanent_delete:

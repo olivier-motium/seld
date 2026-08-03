@@ -34,6 +34,9 @@ decision loop.
 - Complete Gmail user-label lifecycle control with every visibility state,
   provider-owned color validation, system-label refusal, reversible hiding,
   and snapshot-bound permanent purge.
+- Add typed CalendarList user-state CRUD with reversible hiding, ETag-bound
+  preference updates, confirmed non-lossless removal, and an atomic narrow-scope
+  OAuth upgrade for older Full connections.
 - Remove unused deterministic onboarding, Pulse-controller,
   scheduler-planning, and migration modules. The shipped skills own semantic
   orchestration; legacy backup marker recognition remains for safe restore.
