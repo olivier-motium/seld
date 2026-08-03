@@ -979,7 +979,11 @@ def test_companion_call_has_hard_time_and_output_bounds(
         connection_id=CONNECTION_ID,
         expected_revision="absent",
     )
-    monkeypatch.setattr(discord_source_module, "MCP_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(
+        discord_source_module,
+        "MCP_TIMEOUT_SECONDS",
+        2.0 if mode == "overflow" else 0.1,
+    )
     monkeypatch.setattr(discord_source_module, "MAX_MCP_OUTPUT_BYTES", 1024)
     vault.select_sources(expected_revision="absent", sources=("discord",))
     _provider(monkeypatch)

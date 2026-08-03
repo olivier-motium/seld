@@ -680,13 +680,13 @@ def test_attachment_metadata_select_is_concrete_and_content_bytes_are_stripped()
     assert transport.calls[0]["query"] == (
         (
             "$select",
-            "id,lastModifiedDateTime,name,contentType,size,isInline,contentId,contentLocation",
+            "id,lastModifiedDateTime,name,contentType,size,isInline",
         ),
     )
 
 
 def test_attachment_continuation_preserves_the_exact_metadata_projection() -> None:
-    select = "id,lastModifiedDateTime,name,contentType,size,isInline,contentId,contentLocation"
+    select = "id,lastModifiedDateTime,name,contentType,size,isInline"
     next_link = (
         "https://graph.microsoft.com/v1.0/me/messages/message-1/attachments"
         f"?$skiptoken=next-page&$select={select}"

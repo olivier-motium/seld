@@ -283,18 +283,11 @@ def _call(
         requested_event_id = _string(values, "event_id")
         if requested_event_id != event_id:
             raise ValidationError("operation event is outside this guided-review MCP binding")
-    if name in CONNECTOR_TOOL_NAMES and connector_runtime is not None:
+    if name in CONNECTOR_TOOL_NAMES:
+        if connector_runtime is None:
+            raise ValidationError("connector runtime is unavailable")
         return connector_runtime.call_tool(name, values)
     vault = vault or Vault(resolve_vault())
-    if name in CONNECTOR_TOOL_NAMES:
-        runtime = ConnectorRuntime(
-            vault,
-            adapters=default_connector_adapters(),
-        )
-        try:
-            return runtime.call_tool(name, values)
-        finally:
-            runtime.close()
     if name in OPERATION_TOOL_NAMES:
         if operation_session is not None:
             if operation_session.binding is None:

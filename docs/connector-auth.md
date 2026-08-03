@@ -25,6 +25,11 @@ stop before OAuth and save nothing. Provider implementation alone is not
 sign-in readiness, and an ordinary user should not have to create a developer
 application to repair the distribution.
 
+Google's desktop flow uses PKCE and the packaged client ID. Seld intentionally
+omits Google's optional installed-app client secret, so connect, refresh,
+reauthorize, and migration use the same public-client path without a developer
+credential prompt.
+
 `list` shows the finite connector catalog and redacted local state. It never
 returns a token, OAuth endpoint, raw account identifier, client identifier,
 scope secret, keyring reference, or account fingerprint.

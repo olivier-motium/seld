@@ -62,9 +62,7 @@ _OUTLOOK_UPLOAD_HOST: Final = "outlook.office.com"
 _ATTACHMENT_METADATA_SELECT: Final = (
     "id,lastModifiedDateTime,name,contentType,size,isInline,contentId,contentLocation"
 )
-_ATTACHMENT_COLLECTION_SELECT: Final = (
-    "id,lastModifiedDateTime,name,contentType,size,isInline"
-)
+_ATTACHMENT_COLLECTION_SELECT: Final = "id,lastModifiedDateTime,name,contentType,size,isInline"
 _MESSAGE_FIELD_MAP: Final = {
     "bcc_recipients": "bccRecipients",
     "body": "body",
@@ -1192,17 +1190,6 @@ def _mail_shape(name: str, data: dict[str, object]) -> _RequestShape:
         return _move_shape(
             _message_path(_text(data, "message_id")),
             _text(data, "destination_folder_id"),
-        )
-    if name == "messages.trash":
-        return _RequestShape(
-            _message_path(_text(data, "message_id")),
-            ConnectorMethod.DELETE,
-            expected_statuses=frozenset({204}),
-        )
-    if name == "messages.restore":
-        return _move_shape(
-            _message_path(_text(data, "message_id")),
-            _optional_text(data, "parent_folder_id") or "inbox",
         )
     if name == "messages.purge":
         return _permanent_delete_shape(_message_path(_text(data, "message_id")))

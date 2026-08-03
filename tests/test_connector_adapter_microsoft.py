@@ -43,9 +43,7 @@ _CONFIRMATION_MESSAGE_SELECT = (
     "replyTo,body,importance,hasAttachments,from,sender,isDeliveryReceiptRequested,"
     "isReadReceiptRequested,internetMessageHeaders"
 )
-_CONFIRMATION_ATTACHMENT_SELECT = (
-    "id,lastModifiedDateTime,name,contentType,size,isInline"
-)
+_CONFIRMATION_ATTACHMENT_SELECT = "id,lastModifiedDateTime,name,contentType,size,isInline"
 _CONFIRMATION_CALENDAR_SELECT = "id,name,owner,canEdit,isDefaultCalendar,isTallyingResponses"
 
 

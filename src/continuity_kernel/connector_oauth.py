@@ -92,8 +92,7 @@ class OAuthClientConfig:
             not self.client_secret
             or len(self.client_secret.encode("utf-8")) > 2 * 1024
             or any(
-                ord(character) < 0x20 or ord(character) == 0x7F
-                for character in self.client_secret
+                ord(character) < 0x20 or ord(character) == 0x7F for character in self.client_secret
             )
         ):
             raise OAuthConfigurationError("OAuth client_secret is invalid")
@@ -390,9 +389,7 @@ def _parse_token_set(
     if not isinstance(access_token, str) or not access_token:
         raise OAuthTransportError("OAuth token response has no usable access_token")
     token_type = payload.get("token_type")
-    accepted_token_types = (
-        {"bearer", "user"} if dialect is OAuthDialect.SLACK_USER else {"bearer"}
-    )
+    accepted_token_types = {"bearer", "user"} if dialect is OAuthDialect.SLACK_USER else {"bearer"}
     if not isinstance(token_type, str) or token_type.casefold() not in accepted_token_types:
         raise OAuthTransportError("OAuth token response has unsupported token_type")
 
@@ -571,9 +568,7 @@ _MICROSOFT_CANONICAL_SCOPES: Final = {
     "calendars.read": "Calendars.Read",
     "calendars.readwrite": "Calendars.ReadWrite",
 }
-_MICROSOFT_NON_RESOURCE_SCOPES: Final = frozenset(
-    {"offline_access", "openid", "profile", "email"}
-)
+_MICROSOFT_NON_RESOURCE_SCOPES: Final = frozenset({"offline_access", "openid", "profile", "email"})
 
 
 def canonicalize_microsoft_scopes(scopes: tuple[str, ...]) -> tuple[str, ...]:

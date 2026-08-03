@@ -46,11 +46,6 @@ from continuity_kernel.config import (
     save_config,
 )
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
-from continuity_kernel.connector_client_registration import load_public_client_registration
-from continuity_kernel.connector_client_secret import (
-    load_oauth_client_secret,
-    store_oauth_client_secret,
-)
 from continuity_kernel.connector_identifiers import parse_connection_id
 from continuity_kernel.connector_onboarding import (
     BrowserMode,
@@ -62,7 +57,6 @@ from continuity_kernel.connector_operations import CONNECTOR_PROFILE
 from continuity_kernel.connector_profiles import (
     CONNECTOR_PROFILES,
     ConnectorAccessTier,
-    get_connector_profile,
 )
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
@@ -666,6 +660,7 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
                 "that cannot be undone."
             )
         if args.connector == "discord":
+            manager.probe_credential_custody()
             if not sys.stdin.isatty():
                 raise SetupError(
                     "Discord bot onboarding needs an interactive terminal so the token stays "
@@ -679,7 +674,6 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
                 new_account=args.new_account,
                 alias=args.alias,
             )
-        _ensure_oauth_client_secret(manager, args.connector)
         opener = _connector_browser_opener(args)
         return onboarding.connect_oauth(
             args.connector,
@@ -743,36 +737,6 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
             "status": "instructions_only",
         }
     raise AssertionError("unreachable connectors command")
-
-
-def _ensure_oauth_client_secret(manager: ConnectorAuthManager, connector: str) -> None:
-    profile = get_connector_profile(connector)
-    if profile.provider != "google":
-        return
-    registration = load_public_client_registration(profile.provider)
-    if (
-        load_oauth_client_secret(
-            manager.secret_store,
-            provider=profile.provider,
-            client_id=registration.client_id,
-        )
-        is not None
-    ):
-        return
-    if not sys.stdin.isatty():
-        raise SetupError(
-            "Google connector setup needs an interactive terminal so its desktop-client "
-            "secret can be stored in the OS keyring"
-        )
-    client_secret = getpass.getpass(
-        "Google OAuth client secret (input hidden; stored only in OS keyring): "
-    )
-    store_oauth_client_secret(
-        manager.secret_store,
-        provider=profile.provider,
-        client_id=registration.client_id,
-        client_secret=client_secret,
-    )
 
 
 def _connector_registration_status(

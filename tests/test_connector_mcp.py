@@ -133,26 +133,22 @@ def test_cli_accepts_connector_profile_without_guided_review_event() -> None:
     assert args.event_id is None
 
 
-def test_one_shot_connector_runtime_is_always_closed(
+def test_connector_profile_requires_its_process_runtime(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="One-shot connector runtime")
-    runtime = _Runtime()
-    monkeypatch.setattr(mcp_server, "ConnectorRuntime", lambda *args, **kwargs: runtime)
-    result = mcp_server._call(
-        "gsv_gmail_read",
-        {
-            "connection_id": "con-" + "a" * 32,
-            "input": {"page_size": 5},
-            "operation": "messages.list",
-        },
-        vault=vault,
-        profile=CONNECTOR_PROFILE,
-    )
-    assert result["status"] == "synthetic-ok"
-    assert runtime.closed is True
+    with pytest.raises(ValidationError, match="runtime is unavailable"):
+        mcp_server._call(
+            "gsv_gmail_read",
+            {
+                "connection_id": "con-" + "a" * 32,
+                "input": {"page_size": 5},
+                "operation": "messages.list",
+            },
+            vault=vault,
+            profile=CONNECTOR_PROFILE,
+        )
 
 
 def test_connector_server_closes_process_runtime_on_shutdown(
