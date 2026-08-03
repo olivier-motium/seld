@@ -209,6 +209,13 @@ def _input(operation: OperationSpec) -> dict[str, object]:
         ("slack", "conversations.get"): {"channel": "C123"},
         ("slack", "messages.list"): {"channel": "C123", "limit": 50},
         ("slack", "messages.get"): {"channel": "C123", "ts": "1712345678.000001"},
+        ("slack", "search.messages"): {
+            "count": 50,
+            "page": 1,
+            "query": "after:2026-08-01",
+            "sort": "timestamp",
+            "sort_direction": "descending",
+        },
         ("slack", "threads.list"): {
             "channel": "C123",
             "limit": 50,
@@ -351,7 +358,7 @@ def test_adapter_executes_every_catalog_operation_through_fixed_provider_routes(
                 for operation in COLLABORATION_OPERATIONS
             }
         )
-        == 64
+        == 65
     )
     assert all(cast(str, request["path"]).startswith("/api/") for request in transport.requests)
     assert all("url" not in request and "headers" not in request for request in transport.requests)
@@ -389,6 +396,45 @@ def test_adapter_requires_the_exact_canonical_operation_and_rejects_unknown_quer
         )
 
     assert not transport.requests
+
+
+def test_slack_message_search_uses_one_fixed_bounded_provider_route() -> None:
+    adapter = CollaborationConnectorAdapter()
+    operation = _operation("slack", ConnectorMode.READ, "search.messages")
+    transport = _FakeTransport()
+
+    adapter.execute(
+        operation,
+        {
+            "count": 25,
+            "page": 1,
+            "query": "after:2026-08-01",
+            "sort": "timestamp",
+            "sort_direction": "descending",
+        },
+        continuation=None,
+        credential=_credential(operation),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert transport.requests == [
+        {
+            "credential": _credential(operation).credential,
+            "expected_statuses": frozenset({200}),
+            "json_body": None,
+            "method": ConnectorMethod.GET,
+            "origin": ConnectorOrigin.SLACK,
+            "path": "/api/search.messages",
+            "query": (
+                ("query", "after:2026-08-01"),
+                ("highlight", "false"),
+                ("count", "25"),
+                ("page", "1"),
+                ("sort", "timestamp"),
+                ("sort_dir", "desc"),
+            ),
+        }
+    ]
 
 
 def test_local_file_limit_hook_accepts_only_the_two_sanitized_upload_shapes() -> None:

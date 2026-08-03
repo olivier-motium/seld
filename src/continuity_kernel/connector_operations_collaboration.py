@@ -173,6 +173,7 @@ _SLACK_FILES_WRITE: Final = (frozenset({"files:write"}),)
 _SLACK_FILES_UPLOAD: Final = (frozenset({"files:read", "files:write"}),)
 _SLACK_REACTIONS_READ: Final = (frozenset({"reactions:read"}),)
 _SLACK_REACTIONS_WRITE: Final = (frozenset({"reactions:write"}),)
+_SLACK_SEARCH: Final = (frozenset({"search:read"}),)
 _DISCORD_BOT: Final[tuple[frozenset[str], ...]] = (frozenset(),)
 
 _SLACK_TEXT = _text(40_000, minimum=1)
@@ -475,6 +476,23 @@ COLLABORATION_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.READ,
         _SLACK_HISTORY,
         _object({"channel": _SLACK_ID, "ts": _SLACK_TIMESTAMP}, ("channel", "ts")),
+    ),
+    _operation(
+        "slack",
+        ConnectorMode.READ,
+        "search.messages",
+        ConnectorEffect.READ,
+        _SLACK_SEARCH,
+        _object(
+            {
+                "count": _LIMIT,
+                "page": {"maximum": 100, "minimum": 1, "type": "integer"},
+                "query": _text(512, minimum=1),
+                "sort": {"enum": ["score", "timestamp"], "type": "string"},
+                "sort_direction": {"enum": ["ascending", "descending"], "type": "string"},
+            },
+            ("query",),
+        ),
     ),
     _operation(
         "slack",
