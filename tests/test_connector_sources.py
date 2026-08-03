@@ -374,9 +374,8 @@ def test_write_scope_is_rejected_before_secret_resolution(
     connection = snapshot.connection(connection_id)
     assert connection is not None
     unsafe = replace(connection, scopes=(*connection.scopes, "chat:write"))
-    (vault.root / "CONNECTIONS.md").write_text(
-        render_connection_snapshot(replace(snapshot, connections=(unsafe,))),
-        encoding="utf-8",
+    (vault.root / "CONNECTIONS.md").write_bytes(
+        render_connection_snapshot(replace(snapshot, connections=(unsafe,))).encode("utf-8"),
     )
     monkeypatch.setenv("SLACK_CHANNEL_ID", "C123456789")
 

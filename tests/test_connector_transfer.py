@@ -199,7 +199,8 @@ def test_transfer_handles_are_opaque_bound_single_use_and_ttl_expiring() -> None
 def test_artifact_store_is_private_atomic_bounded_and_cleans_up(tmp_path: Path) -> None:
     now = [100.0]
     artifacts = ArtifactStore(tmp_path / "artifacts", clock=lambda: now[0], max_bytes=32)
-    assert stat.S_IMODE(os.lstat(artifacts.root).st_mode) == 0o700
+    if os.name != "nt":
+        assert stat.S_IMODE(os.lstat(artifacts.root).st_mode) == 0o700
 
     writer = artifacts.start("../report.txt", expected_size=3)
     assert list(artifacts.root.glob("*.part"))
@@ -209,7 +210,8 @@ def test_artifact_store_is_private_atomic_bounded_and_cleans_up(tmp_path: Path) 
     assert receipt.size == 3
     assert receipt.sha256 == hashlib.sha256(b"abc").hexdigest()
     assert final.read_bytes() == b"abc"
-    assert stat.S_IMODE(os.lstat(final).st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(os.lstat(final).st_mode) == 0o600
     assert not list(artifacts.root.glob("*.part"))
     assert "report.txt" not in repr(receipt)
     assert str(final) not in repr(receipt)

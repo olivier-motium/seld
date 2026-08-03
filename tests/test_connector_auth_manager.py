@@ -645,9 +645,8 @@ def test_refresh_sink_rejects_a_connection_swap_and_unpinned_endpoint(
         ),
         version=2,
     )
-    (manager.vault.root / "CONNECTIONS.md").write_text(
-        render_connection_snapshot(replace(safe_snapshot, connections=(tampered,))),
-        encoding="utf-8",
+    (manager.vault.root / "CONNECTIONS.md").write_bytes(
+        render_connection_snapshot(replace(safe_snapshot, connections=(tampered,))).encode("utf-8"),
     )
 
     def leak_refresh_token(
@@ -1006,9 +1005,8 @@ def test_authorize_rejects_binding_drift_without_mutating_metadata_or_token(
             ),
             version=current.version + 1,
         )
-        (manager.vault.root / "CONNECTIONS.md").write_text(
-            render_connection_snapshot(replace(snapshot, connections=(drifted,))),
-            encoding="utf-8",
+        (manager.vault.root / "CONNECTIONS.md").write_bytes(
+            render_connection_snapshot(replace(snapshot, connections=(drifted,))).encode("utf-8"),
         )
         return replacement
 

@@ -43,9 +43,8 @@ _ARTIFACT_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 _PART_NAME = re.compile(r"^\.seld-artifact-[A-Za-z0-9_-]+\.part$")
 _STAGE_NAME = re.compile(r"^\.seld-upload-[A-Za-z0-9_-]+\.stage$")
 _FINAL_NAME = re.compile(r"^(art_[A-Za-z0-9_-]{24})--([0-9]{1,13})--([A-Za-z0-9._-]{1,160})$")
-_SECURE_ARTIFACT_STORE_SUPPORTED: Final = (
-    os.name != "nt"
-    and hasattr(os, "O_NOFOLLOW")
+_SECURE_ARTIFACT_STORE_SUPPORTED: Final = os.name == "nt" or (
+    hasattr(os, "O_NOFOLLOW")
     and os.open in os.supports_dir_fd
     and os.link in os.supports_dir_fd
     and os.link in os.supports_follow_symlinks
@@ -53,6 +52,9 @@ _SECURE_ARTIFACT_STORE_SUPPORTED: Final = (
     and os.stat in os.supports_follow_symlinks
     and os.unlink in os.supports_dir_fd
 )
+_BINARY_OPEN: Final = getattr(os, "O_BINARY", 0)
+_NOINHERIT_OPEN: Final = getattr(os, "O_NOINHERIT", 0)
+_TEMPORARY_OPEN: Final = getattr(os, "O_TEMPORARY", 0)
 
 Clock = Callable[[], float]
 ConnectorInputPath = tuple[str | int, ...]
@@ -217,6 +219,7 @@ class PreparedUpload:
         sha256: str,
         descriptor: int,
     ) -> None:
+        _set_binary_mode(descriptor)
         self.filename = filename
         self.media_type = media_type
         self.size = size
@@ -786,7 +789,8 @@ class ArtifactWriter:
             raise ValidationError("artifact size does not match its declared length")
         try:
             os.fsync(self._descriptor)
-            _POSIX_OS.fchmod(self._descriptor, 0o600)
+            if os.name != "nt":
+                _POSIX_OS.fchmod(self._descriptor, 0o600)
             os.close(self._descriptor)
             self._descriptor = -1
             self._finalizer.detach()
@@ -873,7 +877,7 @@ class ArtifactStore:
 
     @staticmethod
     def supported() -> bool:
-        """Report whether this host can enforce descriptor-pinned artifact storage."""
+        """Report whether this host can enforce private atomic artifact storage."""
 
         return _SECURE_ARTIFACT_STORE_SUPPORTED
 
@@ -909,12 +913,18 @@ class ArtifactStore:
                 ttl_seconds=ttl,
             )
             try:
-                descriptor = os.open(
-                    part_name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                    dir_fd=self._root_fd,
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | _BINARY_OPEN
+                    | _NOINHERIT_OPEN
                 )
+                if os.name == "nt":
+                    descriptor = os.open(self.root / part_name, flags, 0o600)
+                else:
+                    descriptor = os.open(part_name, flags, 0o600, dir_fd=self._root_fd)
             except OSError as exc:
                 raise ValidationError("artifact temporary file could not be created") from exc
             self._pending[pending_id] = pending
@@ -952,13 +962,19 @@ class ArtifactStore:
         with self._lock:
             self._ensure_root()
             try:
-                root_descriptor = os.dup(self._root_fd)
-                descriptor = os.open(
-                    stage_name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                    dir_fd=root_descriptor,
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | _BINARY_OPEN
+                    | _NOINHERIT_OPEN
                 )
+                if os.name == "nt":
+                    descriptor = os.open(self.root / stage_name, flags, 0o600)
+                else:
+                    root_descriptor = os.dup(self._root_fd)
+                    descriptor = os.open(stage_name, flags, 0o600, dir_fd=root_descriptor)
             except OSError as exc:
                 if root_descriptor >= 0:
                     with suppress(OSError):
@@ -989,18 +1005,23 @@ class ArtifactStore:
             ):
                 raise ValidationError("local file changed while its upload was prepared")
             os.fsync(descriptor)
-            _POSIX_OS.fchmod(descriptor, 0o600)
+            if os.name != "nt":
+                _POSIX_OS.fchmod(descriptor, 0o600)
             os.close(descriptor)
             descriptor = -1
-            read_descriptor = os.open(
-                stage_name,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=root_descriptor,
-            )
+            read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _BINARY_OPEN | _NOINHERIT_OPEN
+            if os.name == "nt":
+                read_descriptor = os.open(
+                    self.root / stage_name,
+                    read_flags | _TEMPORARY_OPEN,
+                )
+            else:
+                read_descriptor = os.open(stage_name, read_flags, dir_fd=root_descriptor)
             metadata = os.fstat(read_descriptor)
             if not stat.S_ISREG(metadata.st_mode) or int(metadata.st_size) != total:
                 raise ValidationError("prepared upload snapshot is invalid")
-            os.unlink(stage_name, dir_fd=root_descriptor)
+            if os.name != "nt":
+                os.unlink(stage_name, dir_fd=root_descriptor)
         except Exception:
             if descriptor >= 0:
                 with suppress(OSError):
@@ -1010,7 +1031,10 @@ class ArtifactStore:
                     os.close(read_descriptor)
                 read_descriptor = -1
             with suppress(FileNotFoundError, OSError):
-                os.unlink(stage_name, dir_fd=root_descriptor)
+                if os.name == "nt":
+                    os.unlink(self.root / stage_name)
+                else:
+                    os.unlink(stage_name, dir_fd=root_descriptor)
             raise
         finally:
             with self._lock:
@@ -1056,11 +1080,12 @@ class ArtifactStore:
             ):
                 raise ValidationError("artifact receipt does not belong to this store")
             try:
-                metadata = os.stat(final_name, dir_fd=self._root_fd, follow_symlinks=False)
+                metadata = self._entry_stat(final_name)
                 if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                     raise ValidationError("artifact receipt does not name a regular file")
-                os.unlink(final_name, dir_fd=self._root_fd)
-                os.fsync(self._root_fd)
+                self._entry_unlink(final_name)
+                if os.name != "nt":
+                    os.fsync(self._root_fd)
             except FileNotFoundError as exc:
                 raise ValidationError("artifact receipt is no longer available") from exc
             except OSError as exc:
@@ -1092,8 +1117,13 @@ class ArtifactStore:
     def _open_root(self) -> None:
         if not os.path.lexists(self.root):
             self.root.mkdir(parents=True, mode=0o700)
-            if os.name != "nt":
-                self.root.chmod(0o700)
+        if os.name == "nt":
+            try:
+                _harden_windows_directory(self.root)
+            except OSError as exc:
+                raise ValidationError("artifact store root could not be made private") from exc
+        else:
+            self.root.chmod(0o700)
         try:
             metadata = os.lstat(self.root)
         except OSError as exc:
@@ -1101,9 +1131,13 @@ class ArtifactStore:
         if (
             stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISDIR(metadata.st_mode)
+            or _is_windows_reparse_point(metadata)
             or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077)
         ):
             raise ValidationError("artifact store root must be an owner-only directory")
+        if os.name == "nt":
+            self._root_identity = (int(metadata.st_dev), int(metadata.st_ino))
+            return
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
             self._root_fd = os.open(self.root, flags)
@@ -1116,17 +1150,18 @@ class ArtifactStore:
         self._root_identity = (int(opened.st_dev), int(opened.st_ino))
 
     def _ensure_root(self) -> None:
-        if self._root_fd < 0 or self._root_identity is None:
+        if self._closed or self._root_identity is None or (os.name != "nt" and self._root_fd < 0):
             raise ValidationError("artifact store is closed")
         try:
-            opened = os.fstat(self._root_fd)
             listed = os.lstat(self.root)
+            opened = listed if os.name == "nt" else os.fstat(self._root_fd)
         except OSError as exc:
             raise ValidationError("artifact store root changed") from exc
         if (
             not stat.S_ISDIR(opened.st_mode)
             or not stat.S_ISDIR(listed.st_mode)
             or stat.S_ISLNK(listed.st_mode)
+            or _is_windows_reparse_point(listed)
             or (int(opened.st_dev), int(opened.st_ino)) != self._root_identity
             or (int(listed.st_dev), int(listed.st_ino)) != self._root_identity
             or (os.name != "nt" and stat.S_IMODE(listed.st_mode) & 0o077)
@@ -1142,7 +1177,7 @@ class ArtifactStore:
             if _FINAL_NAME.fullmatch(final_name) is None:
                 raise ValidationError("artifact destination name is invalid")
             try:
-                existing = os.stat(final_name, dir_fd=self._root_fd, follow_symlinks=False)
+                existing = self._entry_stat(final_name)
             except FileNotFoundError:
                 existing = None
             except OSError as exc:
@@ -1150,15 +1185,18 @@ class ArtifactStore:
             if existing is not None:
                 raise ConflictError("artifact destination already exists")
             try:
-                os.link(
-                    pending.part_name,
-                    final_name,
-                    src_dir_fd=self._root_fd,
-                    dst_dir_fd=self._root_fd,
-                    follow_symlinks=False,
-                )
-                os.unlink(pending.part_name, dir_fd=self._root_fd)
-                os.fsync(self._root_fd)
+                if os.name == "nt":
+                    os.rename(self.root / pending.part_name, self.root / final_name)
+                else:
+                    os.link(
+                        pending.part_name,
+                        final_name,
+                        src_dir_fd=self._root_fd,
+                        dst_dir_fd=self._root_fd,
+                        follow_symlinks=False,
+                    )
+                    os.unlink(pending.part_name, dir_fd=self._root_fd)
+                    os.fsync(self._root_fd)
             except OSError as exc:
                 raise ValidationError("artifact could not be published atomically") from exc
             pending.final_name = final_name
@@ -1191,13 +1229,13 @@ class ArtifactStore:
 
     def _unlink_part(self, part_name: str) -> None:
         with suppress(FileNotFoundError):
-            os.unlink(part_name, dir_fd=self._root_fd)
+            self._entry_unlink(part_name)
 
     def _prune_orphan_parts_locked(self, now: float) -> int:
         tracked = {pending.part_name for pending in self._pending.values()} | self._active_stages
         removed = 0
         try:
-            names = os.listdir(self._root_fd)
+            names = self._entry_names()
         except OSError as exc:
             raise ValidationError("artifact store entries could not be inspected") from exc
         for name in names:
@@ -1206,14 +1244,14 @@ class ArtifactStore:
             if _PART_NAME.fullmatch(name) is None and _STAGE_NAME.fullmatch(name) is None:
                 continue
             try:
-                metadata = os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
+                metadata = self._entry_stat(name)
                 max_age = (
                     DEFAULT_TRANSFER_TTL_SECONDS
                     if _STAGE_NAME.fullmatch(name) is not None
                     else MAX_ARTIFACT_TTL_SECONDS
                 )
                 if stat.S_ISREG(metadata.st_mode) and float(metadata.st_mtime) + max_age <= now:
-                    os.unlink(name, dir_fd=self._root_fd)
+                    self._entry_unlink(name)
                     removed += 1
             except FileNotFoundError:
                 continue
@@ -1238,7 +1276,7 @@ class ArtifactStore:
         removed = 0
         current: set[str] = set()
         try:
-            names = os.listdir(self._root_fd)
+            names = self._entry_names()
         except OSError as exc:
             raise ValidationError("artifact store entries could not be inspected") from exc
         for name in names:
@@ -1253,10 +1291,10 @@ class ArtifactStore:
                 current.add(name)
                 continue
             try:
-                metadata = os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
+                metadata = self._entry_stat(name)
                 if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                     raise ValidationError("expired artifact is not a regular file")
-                os.unlink(name, dir_fd=self._root_fd)
+                self._entry_unlink(name)
             except FileNotFoundError:
                 pass
             except OSError as exc:
@@ -1267,6 +1305,20 @@ class ArtifactStore:
             if name not in current:
                 self._completed.pop(name, None)
         return removed
+
+    def _entry_names(self) -> list[str]:
+        return os.listdir(self.root if os.name == "nt" else self._root_fd)
+
+    def _entry_stat(self, name: str) -> os.stat_result:
+        if os.name == "nt":
+            return os.lstat(self.root / name)
+        return os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
+
+    def _entry_unlink(self, name: str) -> None:
+        if os.name == "nt":
+            os.unlink(self.root / name)
+        else:
+            os.unlink(name, dir_fd=self._root_fd)
 
     def _reschedule_locked(self, now: float) -> None:
         self._timer_generation += 1
@@ -1554,6 +1606,129 @@ def _binding_digest(value: object) -> str:
     if not encoded or len(encoded) > MAX_TRANSFER_STATE_BYTES:
         raise ValidationError("transfer binding is invalid")
     return hashlib.sha256(b"seld-transfer-binding\0" + encoded).hexdigest()
+
+
+def _set_binary_mode(descriptor: int) -> None:
+    if os.name != "nt":
+        return
+    try:
+        import msvcrt
+
+        cast(Any, msvcrt).setmode(descriptor, _BINARY_OPEN)
+    except (ImportError, OSError) as exc:
+        raise ValidationError("prepared upload could not enter binary mode") from exc
+
+
+def _is_windows_reparse_point(metadata: os.stat_result) -> bool:
+    return os.name == "nt" and bool(int(getattr(metadata, "st_file_attributes", 0)) & 0x400)
+
+
+def _harden_windows_directory(path: Path) -> None:
+    """Install a protected inheritable DACL for the current Windows user."""
+
+    if os.name != "nt":
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    loader = cast(Any, getattr(ctypes, "WinDLL", None))
+    win_error = cast(Any, getattr(ctypes, "WinError", OSError))
+    get_last_error = cast(Any, getattr(ctypes, "get_last_error", lambda: 0))
+    if loader is None:
+        raise OSError("Windows security APIs are unavailable")
+    advapi32 = loader("advapi32", use_last_error=True)
+    kernel32 = loader("kernel32", use_last_error=True)
+
+    class _SidAndAttributes(ctypes.Structure):
+        _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
+
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("user", _SidAndAttributes)]
+
+    open_process_token = advapi32.OpenProcessToken
+    open_process_token.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    )
+    open_process_token.restype = wintypes.BOOL
+    get_token_information = advapi32.GetTokenInformation
+    get_token_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    get_token_information.restype = wintypes.BOOL
+    convert_sid = advapi32.ConvertSidToStringSidW
+    convert_sid.argtypes = (ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR))
+    convert_sid.restype = wintypes.BOOL
+    convert_descriptor = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert_descriptor.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    convert_descriptor.restype = wintypes.BOOL
+    set_file_security = advapi32.SetFileSecurityW
+    set_file_security.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p)
+    set_file_security.restype = wintypes.BOOL
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.argtypes = ()
+    get_current_process.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    local_free = kernel32.LocalFree
+    local_free.argtypes = (ctypes.c_void_p,)
+    local_free.restype = ctypes.c_void_p
+
+    token = wintypes.HANDLE()
+    sid_text = wintypes.LPWSTR()
+    descriptor = ctypes.c_void_p()
+    try:
+        if not open_process_token(get_current_process(), 0x0008, ctypes.byref(token)):
+            raise win_error(get_last_error())
+        required = wintypes.DWORD()
+        get_token_information(token, 1, None, 0, ctypes.byref(required))
+        if required.value == 0:
+            raise win_error(get_last_error())
+        buffer = ctypes.create_string_buffer(required.value)
+        if not get_token_information(
+            token,
+            1,
+            buffer,
+            required.value,
+            ctypes.byref(required),
+        ):
+            raise win_error(get_last_error())
+        user = _TokenUser.from_buffer(buffer)
+        if not convert_sid(user.user.sid, ctypes.byref(sid_text)):
+            raise win_error(get_last_error())
+        sid = sid_text.value
+        if not sid:
+            raise OSError("Windows user SID is unavailable")
+        sddl = f"D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        descriptor_size = wintypes.DWORD()
+        if not convert_descriptor(
+            sddl,
+            1,
+            ctypes.byref(descriptor),
+            ctypes.byref(descriptor_size),
+        ):
+            raise win_error(get_last_error())
+        if not set_file_security(str(path), 0x00000004, descriptor):
+            raise win_error(get_last_error())
+    finally:
+        if descriptor.value:
+            local_free(descriptor)
+        if sid_text:
+            local_free(ctypes.cast(sid_text, ctypes.c_void_p))
+        if token:
+            close_handle(token)
 
 
 def _write_all(descriptor: int, content: bytes) -> None:

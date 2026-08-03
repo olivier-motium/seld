@@ -490,6 +490,7 @@ def test_date_header_migration_returns_the_parsed_effective_date(tmp_path: Path)
         b"To: owner@example.test\r\n"
         + b"\r\n".join(f"X-Pad-{index}: ".encode("ascii") + b"x" * 900 for index in range(300)),
     ),
+    ids=("line-length", "field-count", "total-size"),
 )
 def test_raw_message_preview_enforces_line_field_and_total_header_bounds(
     tmp_path: Path,
@@ -503,6 +504,7 @@ def test_raw_message_preview_enforces_line_field_and_total_header_bounds(
     assert opaque["headers_parsed"] is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot unlink a file held open for reading")
 def test_raw_message_preview_reads_one_bounded_chunk_and_never_reopens_the_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
