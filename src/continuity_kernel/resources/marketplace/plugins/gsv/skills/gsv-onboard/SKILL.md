@@ -52,8 +52,10 @@ from the accepted context rather than presenting a generic checklist. The
 person chooses the sources and accounts.
 
 When `local_files` is selected, read [local file access](references/local-files.md).
-Logical source selection does not grant a directory; create an exact host-local
-root grant only after showing the path and receiving fresh approval.
+Logical source selection does not itself grant a directory. Use the current
+outcome-scoped approval for every necessary host-local root grant inside the
+selected `local_files` scope; do not ask again per root unless the selected
+source, path consequence, or outcome changes.
 
 Use one setup wave:
 
