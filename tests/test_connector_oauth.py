@@ -693,7 +693,7 @@ def test_slack_user_authorization_and_token_response_use_the_official_dialect() 
                 {
                     "ok": True,
                     "access_token": "xoxp-portable-user-token",
-                    "token_type": "user",
+                    "token_type": "Bearer",
                     "refresh_token": "xoxe-portable-refresh",
                     "expires_in": 43200,
                     "authed_user": {"scope": "channels:history,groups:history"},

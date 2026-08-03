@@ -390,8 +390,10 @@ def _parse_token_set(
     if not isinstance(access_token, str) or not access_token:
         raise OAuthTransportError("OAuth token response has no usable access_token")
     token_type = payload.get("token_type")
-    expected_token_type = "user" if dialect is OAuthDialect.SLACK_USER else "bearer"
-    if not isinstance(token_type, str) or token_type.casefold() != expected_token_type:
+    accepted_token_types = (
+        {"bearer", "user"} if dialect is OAuthDialect.SLACK_USER else {"bearer"}
+    )
+    if not isinstance(token_type, str) or token_type.casefold() not in accepted_token_types:
         raise OAuthTransportError("OAuth token response has unsupported token_type")
 
     if "refresh_token" not in payload:
