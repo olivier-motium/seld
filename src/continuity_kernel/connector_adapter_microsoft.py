@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import re
 import secrets
@@ -16,10 +17,16 @@ from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
 
 from continuity_kernel.connector_adapter import (
     ConnectorAdapterResult,
+    ConnectorConfirmationTarget,
     ConnectorRuntimeCredential,
     ConnectorTransferContext,
 )
-from continuity_kernel.connector_contract import ConnectorEffect, ConnectorMode, OperationSpec
+from continuity_kernel.connector_contract import (
+    ConnectorEffect,
+    ConnectorMode,
+    OperationSpec,
+    canonical_json,
+)
 from continuity_kernel.connector_operations_microsoft import MICROSOFT_OPERATIONS
 from continuity_kernel.connector_transfer import (
     ConnectorInputPath,
@@ -141,6 +148,29 @@ _MESSAGE_DETAIL_FIELDS: Final = (
     "web_link",
 )
 _ATTACHMENT_METADATA_RESPONSE_BOUND: Final = 256 * 1024
+_CONFIRMATION_KIND: Final = "outlook_mail.drafts.send"
+_CONFIRMATION_MESSAGE_SELECT: Final = (
+    "id,changeKey,isDraft,parentFolderId,subject,toRecipients,ccRecipients,bccRecipients,"
+    "replyTo,body,importance,hasAttachments,from,sender,isDeliveryReceiptRequested,"
+    "isReadReceiptRequested,internetMessageHeaders"
+)
+_CONFIRMATION_MESSAGE_RESPONSE_BOUND: Final = 16 * 1024 * 1024
+_CONFIRMATION_MAX_ATTACHMENT_PAGES: Final = 250
+_CONFIRMATION_MAX_ATTACHMENTS: Final = 250
+_CONFIRMATION_MAX_RECIPIENTS: Final = 1_000
+_CONFIRMATION_MAX_ATTACHMENT_SIZE: Final = 2_147_483_647
+_CONFIRMATION_MIME_TOKEN: Final = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+"
+_CONFIRMATION_MIME: Final = re.compile(
+    rf"^{_CONFIRMATION_MIME_TOKEN}/{_CONFIRMATION_MIME_TOKEN}"
+    rf"(?:\s*;\s*[^;\x00-\x1f\x7f]+)*$"
+)
+_CONFIRMATION_EMAIL: Final = re.compile(r"^[^@\s]+@[^@\s]+$")
+_CONFIRMATION_HEADER_NAME: Final = re.compile(rf"^{_CONFIRMATION_MIME_TOKEN}$")
+_CONFIRMATION_ATTACHMENT_KINDS: Final = {
+    "#microsoft.graph.fileattachment": "file",
+    "#microsoft.graph.itemattachment": "item",
+    "#microsoft.graph.referenceattachment": "reference",
+}
 _SESSION_RESPONSE_BOUND: Final = 64 * 1024
 _NEXT_EXPECTED_RANGE: Final = re.compile(r"^(0|[1-9][0-9]*)(-)?$")
 _ATTACHMENT_LOCATION_EXPRESSION: Final = re.compile(
@@ -343,6 +373,221 @@ class MicrosoftConnectorAdapter:
         ):
             return ConnectorEffect.OUTWARD
         return known.effect
+
+    def resolve_confirmation_target(
+        self,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+        transfer: ConnectorTransferContext | None = None,
+    ) -> ConnectorConfirmationTarget | None:
+        """Bind an Outlook draft send to the exact live draft projection."""
+
+        known, data = _known_operation(operation, input_value, transfer=transfer)
+        if known.provider != "outlook_mail" or known.name != "drafts.send":
+            return None
+        if not isinstance(credential, ConnectorRuntimeCredential):
+            raise ValidationError("connector runtime credential is invalid")
+
+        message_id = _text(data, "message_id")
+        message_path = _message_path(message_id)
+        message_headers = _headers({}, time_zone=None, body_format="html")
+        message_headers["Prefer"] += ", outlook.allow-unsafe-html"
+        message_response = transport.request(
+            origin=_ORIGIN,
+            method=ConnectorMethod.GET,
+            path=message_path,
+            credential=credential.credential,
+            query=(("$select", _CONFIRMATION_MESSAGE_SELECT),),
+            headers=message_headers,
+            expected_statuses=frozenset({200}),
+            response_bound=_CONFIRMATION_MESSAGE_RESPONSE_BOUND,
+        )
+        message = _provider_mapping(message_response, "Outlook draft confirmation message")
+        if "@odata.nextLink" in message:
+            raise ConnectorProviderError(
+                origin=_ORIGIN,
+                status=message_response.status,
+                code="invalid_confirmation_message_pagination",
+            )
+        returned_message_id = _confirmation_required_text(
+            message.get("id"),
+            status=message_response.status,
+            code="invalid_confirmation_message",
+        )
+        if returned_message_id != message_id:
+            raise ConnectorProviderError(
+                origin=_ORIGIN,
+                status=message_response.status,
+                code="draft_confirmation_identity_mismatch",
+            )
+        is_draft = message.get("isDraft")
+        if type(is_draft) is not bool:
+            raise ConnectorProviderError(
+                origin=_ORIGIN,
+                status=message_response.status,
+                code="invalid_confirmation_draft_state",
+            )
+        if not is_draft:
+            raise ConnectorProviderError(
+                origin=_ORIGIN,
+                status=message_response.status,
+                code="confirmation_target_is_not_a_draft",
+            )
+
+        change_key = _confirmation_required_text(
+            message.get("changeKey"),
+            status=message_response.status,
+            code="invalid_confirmation_message",
+        )
+        parent_folder_id = _confirmation_required_text(
+            message.get("parentFolderId"),
+            status=message_response.status,
+            code="invalid_confirmation_message",
+        )
+        requested_change_key = data.get("change_key")
+        if requested_change_key is not None and _text(data, "change_key") != change_key:
+            raise _stale_outlook_resource_error(known)
+
+        raw_subject = message.get("subject")
+        subject = (
+            ""
+            if raw_subject is None
+            else _confirmation_required_text(
+                raw_subject,
+                status=message_response.status,
+                code="invalid_confirmation_message",
+                allow_empty=True,
+            )
+        )
+        importance = message.get("importance")
+        if importance not in {"low", "normal", "high"}:
+            raise ConnectorProviderError(
+                origin=_ORIGIN,
+                status=message_response.status,
+                code="invalid_confirmation_message",
+            )
+        has_attachments = message.get("hasAttachments")
+        if type(has_attachments) is not bool:
+            raise ConnectorProviderError(
+                origin=_ORIGIN,
+                status=message_response.status,
+                code="invalid_confirmation_message",
+            )
+
+        from_recipient = _confirmation_optional_recipient(
+            message,
+            "from",
+            status=message_response.status,
+        )
+        sender_recipient = _confirmation_optional_recipient(
+            message,
+            "sender",
+            status=message_response.status,
+        )
+        recipients = {
+            name: _confirmation_recipients(
+                message,
+                provider_name,
+                status=message_response.status,
+            )
+            for name, provider_name in (
+                ("to", "toRecipients"),
+                ("cc", "ccRecipients"),
+                ("bcc", "bccRecipients"),
+            )
+        }
+        if (
+            sum(len(recipients[name]) for name in ("to", "cc", "bcc"))
+            > _CONFIRMATION_MAX_RECIPIENTS
+        ):
+            raise _confirmation_error(
+                message_response.status,
+                "confirmation_recipient_limit_exceeded",
+            )
+        reply_to = _confirmation_recipients(
+            message,
+            "replyTo",
+            status=message_response.status,
+            allow_absent=True,
+        )
+        delivery_receipt = _confirmation_optional_bool(
+            message.get("isDeliveryReceiptRequested"),
+            status=message_response.status,
+            code="invalid_confirmation_delivery_receipt_state",
+        )
+        read_receipt = _confirmation_optional_bool(
+            message.get("isReadReceiptRequested"),
+            status=message_response.status,
+            code="invalid_confirmation_read_receipt_state",
+        )
+        internet_headers = _confirmation_internet_headers(
+            message.get("internetMessageHeaders"),
+            status=message_response.status,
+        )
+        body = _confirmation_body(message.get("body"), status=message_response.status)
+
+        attachment_path = f"{message_path}/attachments"
+        attachment_query = (("$select", _ATTACHMENT_METADATA_SELECT),)
+        attachments = _resolve_confirmation_attachments(
+            attachment_path,
+            attachment_query,
+            credential=credential,
+            transport=transport,
+        )
+
+        binding: dict[str, object] = {
+            "kind": _CONFIRMATION_KIND,
+            "message_id": message_id,
+            "change_key": change_key,
+            "parent_folder_id": parent_folder_id,
+            "subject": subject,
+            "importance": importance,
+            "has_attachments": has_attachments,
+            "to": recipients["to"],
+            "cc": recipients["cc"],
+            "bcc": recipients["bcc"],
+            "reply_to": reply_to,
+            "delivery_receipt_requested": delivery_receipt,
+            "read_receipt_requested": read_receipt,
+            "internet_headers": internet_headers,
+            "body": body,
+            "attachments": attachments,
+        }
+        if from_recipient is not None:
+            binding["from"] = from_recipient
+        if sender_recipient is not None:
+            binding["sender"] = sender_recipient
+
+        public_attachments = [
+            {
+                "name": attachment["name"] or "(empty name)",
+                "kind": attachment["kind"],
+                "content_type": attachment.get("content_type") or "(unspecified)",
+                "size": attachment["size"],
+                "is_inline": attachment["is_inline"],
+            }
+            for attachment in attachments
+        ]
+        preview: dict[str, object] = {
+            "subject": subject if subject else "(empty subject)",
+            "importance": importance,
+            "from": from_recipient,
+            "sender": sender_recipient,
+            "to": recipients["to"],
+            "cc": recipients["cc"],
+            "bcc": recipients["bcc"],
+            "reply_to": reply_to,
+            "delivery_receipt_requested": delivery_receipt,
+            "read_receipt_requested": read_receipt,
+            "internet_headers": internet_headers,
+            "body": body,
+            "attachment_count": len(public_attachments),
+            "attachments": public_attachments,
+        }
+        return ConnectorConfirmationTarget(binding=binding, preview=preview)
 
     def execute(
         self,
@@ -1864,6 +2109,286 @@ def _graph_recurrence(value: object) -> dict[str, object]:
     if "recurrence_time_zone" in event_range:
         graph_range["recurrenceTimeZone"] = _text(event_range, "recurrence_time_zone")
     return {"pattern": graph_pattern, "range": graph_range}
+
+
+def _confirmation_error(status: int, code: str) -> ConnectorProviderError:
+    return ConnectorProviderError(origin=_ORIGIN, status=status, code=code)
+
+
+def _confirmation_required_text(
+    value: object,
+    *,
+    status: int,
+    code: str,
+    allow_empty: bool = False,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or (not allow_empty and not value)
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise _confirmation_error(status, code)
+    return value
+
+
+def _confirmation_optional_recipient(
+    data: Mapping[str, object],
+    name: str,
+    *,
+    status: int,
+) -> dict[str, str] | None:
+    value = data.get(name)
+    if value is None:
+        return None
+    return _confirmation_recipient(value, status=status)
+
+
+def _confirmation_recipients(
+    data: Mapping[str, object],
+    name: str,
+    *,
+    status: int,
+    allow_absent: bool = False,
+) -> list[dict[str, str]]:
+    value = data.get(name)
+    if value is None and allow_absent:
+        return []
+    if not isinstance(value, list):
+        raise _confirmation_error(status, "invalid_confirmation_recipients")
+    recipients = [_confirmation_recipient(item, status=status) for item in value]
+    return sorted(
+        recipients,
+        key=lambda item: (
+            item["email"].casefold(),
+            item["email"],
+            item.get("name", "").casefold(),
+            item.get("name", ""),
+        ),
+    )
+
+
+def _confirmation_recipient(value: object, *, status: int) -> dict[str, str]:
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise _confirmation_error(status, "invalid_confirmation_recipient")
+    email_address = value.get("emailAddress")
+    if not isinstance(email_address, Mapping) or any(
+        not isinstance(key, str) for key in email_address
+    ):
+        raise _confirmation_error(status, "invalid_confirmation_recipient")
+    address = _confirmation_required_text(
+        email_address.get("address"),
+        status=status,
+        code="invalid_confirmation_recipient",
+    )
+    if address != address.strip() or _CONFIRMATION_EMAIL.fullmatch(address) is None:
+        raise _confirmation_error(status, "invalid_confirmation_recipient")
+    recipient = {"email": address}
+    raw_name = email_address.get("name")
+    if raw_name is not None:
+        normalized_name = _confirmation_required_text(
+            raw_name,
+            status=status,
+            code="invalid_confirmation_recipient",
+            allow_empty=True,
+        )
+        if normalized_name:
+            recipient["name"] = normalized_name
+    return recipient
+
+
+def _confirmation_optional_bool(value: object, *, status: int, code: str) -> bool:
+    if value is None:
+        return False
+    if type(value) is not bool:
+        raise _confirmation_error(status, code)
+    return value
+
+
+def _confirmation_internet_headers(value: object, *, status: int) -> list[dict[str, object]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise _confirmation_error(status, "invalid_confirmation_internet_headers")
+    headers: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, Mapping) or any(not isinstance(key, str) for key in item):
+            raise _confirmation_error(status, "invalid_confirmation_internet_header")
+        name = _confirmation_required_text(
+            item.get("name"),
+            status=status,
+            code="invalid_confirmation_internet_header",
+        ).casefold()
+        if _CONFIRMATION_HEADER_NAME.fullmatch(name) is None:
+            raise _confirmation_error(status, "invalid_confirmation_internet_header")
+        raw_value = item.get("value")
+        if not isinstance(raw_value, str):
+            raise _confirmation_error(status, "invalid_confirmation_internet_header")
+        try:
+            value_bytes = raw_value.encode("utf-8")
+        except UnicodeError as exc:
+            raise _confirmation_error(status, "invalid_confirmation_internet_header") from exc
+        headers.append(
+            {
+                "name": name,
+                "value_bytes": len(value_bytes),
+                "value_sha256": "sha256:" + hashlib.sha256(value_bytes).hexdigest(),
+            }
+        )
+    return sorted(headers, key=canonical_json)
+
+
+def _confirmation_body(value: object, *, status: int) -> dict[str, object]:
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise _confirmation_error(status, "invalid_confirmation_body")
+    content_type = _confirmation_required_text(
+        value.get("contentType"),
+        status=status,
+        code="invalid_confirmation_body",
+    ).casefold()
+    if content_type not in {"html", "text"}:
+        raise _confirmation_error(status, "invalid_confirmation_body")
+    content = value.get("content")
+    if not isinstance(content, str):
+        raise _confirmation_error(status, "invalid_confirmation_body")
+    try:
+        body_bytes = content.encode("utf-8")
+    except UnicodeError as exc:
+        raise _confirmation_error(status, "invalid_confirmation_body") from exc
+    return {
+        "content_type": content_type,
+        "bytes": len(body_bytes),
+        "sha256": "sha256:" + hashlib.sha256(body_bytes).hexdigest(),
+    }
+
+
+def _resolve_confirmation_attachments(
+    path: str,
+    initial_query: tuple[tuple[str, str], ...],
+    *,
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> list[dict[str, object]]:
+    query = initial_query
+    attachments: list[dict[str, object]] = []
+    attachment_ids: set[str] = set()
+    seen_continuations: set[bytes] = set()
+    for _page in range(_CONFIRMATION_MAX_ATTACHMENT_PAGES):
+        response = transport.request(
+            origin=_ORIGIN,
+            method=ConnectorMethod.GET,
+            path=path,
+            credential=credential.credential,
+            query=query,
+            headers=_headers({}, time_zone=None),
+            expected_statuses=frozenset({200}),
+            response_bound=_ATTACHMENT_METADATA_RESPONSE_BOUND,
+        )
+        payload = _provider_mapping(response, "Outlook draft confirmation attachments")
+        values = payload.get("value")
+        if not isinstance(values, list):
+            raise _confirmation_error(response.status, "invalid_confirmation_attachments")
+        for value in values:
+            attachment = _confirmation_attachment(value, status=response.status)
+            attachment_id = str(attachment["id"])
+            if attachment_id in attachment_ids:
+                raise _confirmation_error(
+                    response.status,
+                    "duplicate_confirmation_attachment",
+                )
+            attachment_ids.add(attachment_id)
+            attachments.append(attachment)
+            if len(attachments) > _CONFIRMATION_MAX_ATTACHMENTS:
+                raise _confirmation_error(
+                    response.status,
+                    "confirmation_attachment_limit_exceeded",
+                )
+        continuation = _next_link(
+            payload.get("@odata.nextLink"),
+            path=path,
+            status=response.status,
+            initial_query=initial_query,
+            required_select=_ATTACHMENT_METADATA_SELECT,
+        )
+        if continuation is None:
+            return sorted(attachments, key=lambda item: str(item["id"]))
+        continuation_key = canonical_json(continuation)
+        if continuation_key in seen_continuations:
+            raise _confirmation_error(response.status, "cyclic_confirmation_attachment_page")
+        seen_continuations.add(continuation_key)
+        query = _continuation_query(
+            continuation,
+            path=path,
+            initial_query=initial_query,
+            required_select=_ATTACHMENT_METADATA_SELECT,
+        )
+    raise _confirmation_error(200, "confirmation_attachment_page_limit_exceeded")
+
+
+def _confirmation_attachment(value: object, *, status: int) -> dict[str, object]:
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise _confirmation_error(status, "invalid_confirmation_attachment")
+    if "contentBytes" in value:
+        raise _confirmation_error(status, "unexpected_confirmation_attachment_content")
+    raw_type = _confirmation_required_text(
+        value.get("@odata.type"),
+        status=status,
+        code="invalid_confirmation_attachment",
+    ).casefold()
+    try:
+        kind = _CONFIRMATION_ATTACHMENT_KINDS[raw_type]
+    except KeyError as exc:
+        raise _confirmation_error(status, "unsupported_confirmation_attachment_kind") from exc
+    attachment_id = _confirmation_required_text(
+        value.get("id"),
+        status=status,
+        code="invalid_confirmation_attachment",
+    )
+    name = _confirmation_required_text(
+        value.get("name"),
+        status=status,
+        code="invalid_confirmation_attachment",
+        allow_empty=True,
+    )
+    size = value.get("size")
+    if type(size) is not int or not 0 <= size <= _CONFIRMATION_MAX_ATTACHMENT_SIZE:
+        raise _confirmation_error(status, "invalid_confirmation_attachment")
+    is_inline = value.get("isInline")
+    if type(is_inline) is not bool:
+        raise _confirmation_error(status, "invalid_confirmation_attachment")
+    attachment: dict[str, object] = {
+        "id": attachment_id,
+        "kind": kind,
+        "name": name,
+        "size": size,
+        "is_inline": is_inline,
+    }
+    raw_content_type = value.get("contentType")
+    if raw_content_type is not None:
+        content_type = _confirmation_required_text(
+            raw_content_type,
+            status=status,
+            code="invalid_confirmation_attachment",
+        )
+        if _CONFIRMATION_MIME.fullmatch(content_type) is None:
+            raise _confirmation_error(status, "invalid_confirmation_attachment")
+        attachment["content_type"] = content_type
+    for provider_name, public_name in (
+        ("lastModifiedDateTime", "last_modified_at"),
+        ("contentId", "content_id"),
+        ("contentLocation", "content_location"),
+    ):
+        raw = value.get(provider_name)
+        if raw is None:
+            continue
+        normalized = _confirmation_required_text(
+            raw,
+            status=status,
+            code="invalid_confirmation_attachment",
+            allow_empty=True,
+        )
+        if normalized:
+            attachment[public_name] = normalized
+    return attachment
 
 
 def _preflight_message(

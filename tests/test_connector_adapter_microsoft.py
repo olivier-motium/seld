@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from types import MappingProxyType
 from typing import cast
@@ -7,7 +8,10 @@ from urllib.parse import urlencode
 
 import pytest
 
-from continuity_kernel.connector_adapter import ConnectorRuntimeCredential
+from continuity_kernel.connector_adapter import (
+    ConnectorConfirmationTarget,
+    ConnectorRuntimeCredential,
+)
 from continuity_kernel.connector_adapter_microsoft import MicrosoftConnectorAdapter
 from continuity_kernel.connector_contract import ConnectorEffect, ConnectorMode, OperationSpec
 from continuity_kernel.connector_operations_microsoft import MICROSOFT_OPERATIONS
@@ -33,6 +37,14 @@ _MESSAGE_DETAIL_SELECT = (
     "internetMessageId,isDeliveryReceiptRequested,isDraft,isRead,isReadReceiptRequested,"
     "lastModifiedDateTime,parentFolderId,receivedDateTime,replyTo,sender,sentDateTime,subject,"
     "toRecipients,uniqueBody,webLink"
+)
+_CONFIRMATION_MESSAGE_SELECT = (
+    "id,changeKey,isDraft,parentFolderId,subject,toRecipients,ccRecipients,bccRecipients,"
+    "replyTo,body,importance,hasAttachments,from,sender,isDeliveryReceiptRequested,"
+    "isReadReceiptRequested,internetMessageHeaders"
+)
+_CONFIRMATION_ATTACHMENT_SELECT = (
+    "id,lastModifiedDateTime,name,contentType,size,isInline,contentId,contentLocation"
 )
 
 
@@ -100,6 +112,48 @@ class _FakeTransport:
         )
 
 
+class _DraftConfirmationTransport:
+    def __init__(
+        self,
+        message: dict[str, object],
+        attachment_pages: list[dict[str, object]],
+    ) -> None:
+        self.message = message
+        self.attachment_pages = list(attachment_pages)
+        self.calls: list[dict[str, object]] = []
+
+    def request(self, **kwargs: object) -> ConnectorResponse:
+        self.calls.append(kwargs)
+        path = kwargs.get("path")
+        query = kwargs.get("query")
+        if path == "/v1.0/me/messages/message-1" and query == (
+            ("$select", _CONFIRMATION_MESSAGE_SELECT),
+        ):
+            payload = self.message
+        elif path == "/v1.0/me/messages/message-1/attachments":
+            if (
+                not isinstance(query, tuple)
+                or not query
+                or query[0]
+                != (
+                    "$select",
+                    _CONFIRMATION_ATTACHMENT_SELECT,
+                )
+            ):
+                raise AssertionError("confirmation attachment query is not fixed")
+            if not self.attachment_pages:
+                raise AssertionError("confirmation attachment page was not scripted")
+            payload = self.attachment_pages.pop(0)
+        else:
+            raise AssertionError(f"unexpected confirmation request: {path!r} {query!r}")
+        return ConnectorResponse(
+            origin=ConnectorOrigin.MICROSOFT_GRAPH,
+            status=200,
+            headers=MappingProxyType({}),
+            body=json.dumps(payload).encode(),
+        )
+
+
 def _credential() -> ConnectorRuntimeCredential:
     return ConnectorRuntimeCredential(
         credential=ConnectorCredential(AuthorizationScheme.BEARER, "test-secret"),
@@ -121,6 +175,58 @@ def _attachment() -> dict[str, object]:
         "content_base64": "aGVsbG8=",
         "content_type": "text/plain",
         "name": "hello.txt",
+    }
+
+
+def _confirmation_message(
+    *,
+    has_attachments: bool = True,
+    subject: str = "Quarterly plan",
+) -> dict[str, object]:
+    return {
+        "id": "message-1",
+        "changeKey": "draft-version-1",
+        "isDraft": True,
+        "parentFolderId": "drafts-folder",
+        "subject": subject,
+        "toRecipients": [
+            {"emailAddress": {"address": "Ada@Example.test", "name": "Ada"}},
+            {"emailAddress": {"address": "bob@example.test", "name": "Bob"}},
+        ],
+        "ccRecipients": [{"emailAddress": {"address": "carol@example.test", "name": "Carol"}}],
+        "bccRecipients": [{"emailAddress": {"address": "dave@example.test", "name": "Dave"}}],
+        "replyTo": [{"emailAddress": {"address": "Replies@Example.test", "name": "Replies"}}],
+        "body": {"contentType": "html", "content": "<p>Private draft body</p>"},
+        "importance": "normal",
+        "hasAttachments": has_attachments,
+        "isDeliveryReceiptRequested": True,
+        "isReadReceiptRequested": False,
+        "internetMessageHeaders": [
+            {"name": "X-Workflow", "value": "private-routing-value"},
+        ],
+        "from": {"emailAddress": {"address": "Alice@Example.test", "name": "Alice Sender"}},
+        "sender": {"emailAddress": {"address": "delegate@example.test", "name": "Delegate"}},
+    }
+
+
+def _confirmation_attachment(
+    attachment_id: str,
+    name: str,
+    *,
+    inline: bool,
+    size: int,
+    kind: str = "file",
+) -> dict[str, object]:
+    return {
+        "@odata.type": f"#microsoft.graph.{kind}Attachment",
+        "id": attachment_id,
+        "lastModifiedDateTime": "2026-08-03T05:00:00Z",
+        "name": name,
+        "contentType": "image/png" if inline else "application/pdf",
+        "size": size,
+        "isInline": inline,
+        "contentId": f"cid-{attachment_id}" if inline else None,
+        "contentLocation": f"inline/{name}" if inline else None,
     }
 
 
@@ -333,6 +439,570 @@ def _operation(provider: str, mode: ConnectorMode, name: str) -> OperationSpec:
         for operation in MICROSOFT_OPERATIONS
         if operation.provider == provider and operation.mode is mode and operation.name == name
     )
+
+
+def test_draft_send_confirmation_target_binds_complete_private_projection() -> None:
+    message = _confirmation_message()
+    inline = _confirmation_attachment("attachment-2", "logo.png", inline=True, size=512)
+    document = _confirmation_attachment(
+        "attachment-1",
+        "plan.pdf",
+        inline=False,
+        size=2_048,
+    )
+    transport = _DraftConfirmationTransport(message, [{"value": [inline, document]}])
+    adapter = MicrosoftConnectorAdapter()
+
+    target = adapter.resolve_confirmation_target(
+        _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+        {"message_id": "message-1", "change_key": "draft-version-1"},
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert isinstance(target, ConnectorConfirmationTarget)
+    body_bytes = b"<p>Private draft body</p>"
+    body_binding = {
+        "content_type": "html",
+        "bytes": len(body_bytes),
+        "sha256": "sha256:" + hashlib.sha256(body_bytes).hexdigest(),
+    }
+    binding = cast(dict[str, object], target.binding)
+    assert binding["kind"] == "outlook_mail.drafts.send"
+    assert binding["message_id"] == "message-1"
+    assert binding["change_key"] == "draft-version-1"
+    assert binding["parent_folder_id"] == "drafts-folder"
+    assert binding["subject"] == "Quarterly plan"
+    assert binding["body"] == body_binding
+    assert binding["to"] == [
+        {"email": "Ada@Example.test", "name": "Ada"},
+        {"email": "bob@example.test", "name": "Bob"},
+    ]
+    assert binding["reply_to"] == [
+        {"email": "Replies@Example.test", "name": "Replies"},
+    ]
+    assert binding["delivery_receipt_requested"] is True
+    assert binding["read_receipt_requested"] is False
+    header_value = b"private-routing-value"
+    assert binding["internet_headers"] == [
+        {
+            "name": "x-workflow",
+            "value_bytes": len(header_value),
+            "value_sha256": "sha256:" + hashlib.sha256(header_value).hexdigest(),
+        }
+    ]
+    bound_attachments = cast(list[dict[str, object]], binding["attachments"])
+    assert [attachment["id"] for attachment in bound_attachments] == [
+        "attachment-1",
+        "attachment-2",
+    ]
+    assert bound_attachments[1]["content_id"] == "cid-attachment-2"
+    assert bound_attachments[1]["content_location"] == "inline/logo.png"
+    assert all(attachment["kind"] == "file" for attachment in bound_attachments)
+
+    preview = cast(dict[str, object], target.preview)
+    assert preview["subject"] == "Quarterly plan"
+    assert preview["attachment_count"] == 2
+    assert preview["body"] == body_binding
+    assert preview["reply_to"] == binding["reply_to"]
+    assert preview["delivery_receipt_requested"] is True
+    assert preview["read_receipt_requested"] is False
+    assert preview["internet_headers"] == binding["internet_headers"]
+    assert preview["from"] == {"email": "Alice@Example.test", "name": "Alice Sender"}
+    assert preview["sender"] == {"email": "delegate@example.test", "name": "Delegate"}
+    public_attachments = cast(list[dict[str, object]], preview["attachments"])
+    assert public_attachments == [
+        {
+            "content_type": "application/pdf",
+            "is_inline": False,
+            "kind": "file",
+            "name": "plan.pdf",
+            "size": 2_048,
+        },
+        {
+            "content_type": "image/png",
+            "is_inline": True,
+            "kind": "file",
+            "name": "logo.png",
+            "size": 512,
+        },
+    ]
+    assert "Private draft body" not in repr(target)
+    public_text = repr(target.preview)
+    for private_value in (
+        "message-1",
+        "draft-version-1",
+        "drafts-folder",
+        "attachment-1",
+        "attachment-2",
+        "private-routing-value",
+        "test-secret",
+    ):
+        assert private_value not in public_text
+
+    assert len(transport.calls) == 2
+    assert all(call["method"] is ConnectorMethod.GET for call in transport.calls)
+    assert transport.calls[0]["path"] == "/v1.0/me/messages/message-1"
+    assert transport.calls[0]["query"] == (("$select", _CONFIRMATION_MESSAGE_SELECT),)
+    assert transport.calls[1]["path"] == "/v1.0/me/messages/message-1/attachments"
+    assert transport.calls[1]["query"] == (("$select", _CONFIRMATION_ATTACHMENT_SELECT),)
+    for call in transport.calls:
+        headers = cast(dict[str, str], call["headers"])
+        assert headers["Prefer"].startswith('IdType="ImmutableId"')
+        if call["path"] == "/v1.0/me/messages/message-1":
+            assert 'outlook.body-content-type="html"' in headers["Prefer"]
+            assert "outlook.allow-unsafe-html" in headers["Prefer"]
+        assert "json_body" not in call
+
+
+def test_draft_confirmation_always_enumerates_inline_only_attachments() -> None:
+    message = _confirmation_message(has_attachments=False)
+    inline = _confirmation_attachment("inline-1", "signature.png", inline=True, size=128)
+    transport = _DraftConfirmationTransport(message, [{"value": [inline]}])
+
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+        {"message_id": "message-1"},
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert isinstance(target, ConnectorConfirmationTarget)
+    binding = cast(dict[str, object], target.binding)
+    assert binding["has_attachments"] is False
+    assert len(cast(list[object], binding["attachments"])) == 1
+    assert cast(dict[str, object], target.preview)["attachment_count"] == 1
+    assert len(transport.calls) == 2
+
+
+def test_draft_confirmation_is_deterministic_across_provider_collection_order() -> None:
+    first_message = _confirmation_message()
+    second_message = json.loads(json.dumps(first_message))
+    assert isinstance(second_message, dict)
+    for name in ("toRecipients", "ccRecipients", "bccRecipients"):
+        recipients = second_message[name]
+        assert isinstance(recipients, list)
+        recipients.reverse()
+    first_attachments = [
+        _confirmation_attachment("attachment-2", "logo.png", inline=True, size=512),
+        _confirmation_attachment("attachment-1", "plan.pdf", inline=False, size=2_048),
+    ]
+    second_attachments = list(reversed(first_attachments))
+    operation = _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send")
+
+    first = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        operation,
+        {"message_id": "message-1"},
+        credential=_credential(),
+        transport=cast(
+            ConnectorTransport,
+            _DraftConfirmationTransport(first_message, [{"value": first_attachments}]),
+        ),
+    )
+    second = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        operation,
+        {"message_id": "message-1"},
+        credential=_credential(),
+        transport=cast(
+            ConnectorTransport,
+            _DraftConfirmationTransport(second_message, [{"value": second_attachments}]),
+        ),
+    )
+
+    assert first == second
+
+
+def test_draft_confirmation_preserves_case_distinct_and_internationalized_local_parts() -> None:
+    message = _confirmation_message()
+    message["toRecipients"] = [
+        {"emailAddress": {"address": "User@example.test", "name": "Case upper"}},
+        {"emailAddress": {"address": "user@example.test", "name": "Case lower"}},
+        {"emailAddress": {"address": "Straße@example.test", "name": "Unicode"}},
+        {"emailAddress": {"address": "strasse@example.test", "name": "ASCII"}},
+    ]
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+        {"message_id": "message-1"},
+        credential=_credential(),
+        transport=cast(
+            ConnectorTransport,
+            _DraftConfirmationTransport(message, [{"value": []}]),
+        ),
+    )
+
+    assert isinstance(target, ConnectorConfirmationTarget)
+    recipients = cast(list[dict[str, str]], cast(dict[str, object], target.binding)["to"])
+    assert {recipient["email"] for recipient in recipients} == {
+        "User@example.test",
+        "user@example.test",
+        "Straße@example.test",
+        "strasse@example.test",
+    }
+
+
+def test_draft_confirmation_enforces_provider_total_recipient_limit() -> None:
+    message = _confirmation_message()
+    message["toRecipients"] = [
+        {"emailAddress": {"address": f"person-{index}@example.test"}} for index in range(999)
+    ]
+    message["ccRecipients"] = [{"emailAddress": {"address": "cc@example.test"}}]
+    message["bccRecipients"] = [{"emailAddress": {"address": "bcc@example.test"}}]
+    transport = _DraftConfirmationTransport(message, [{"value": []}])
+
+    with pytest.raises(ConnectorProviderError) as caught:
+        MicrosoftConnectorAdapter().resolve_confirmation_target(
+            _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+            {"message_id": "message-1"},
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+    assert caught.value.code == "confirmation_recipient_limit_exceeded"
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    (
+        ("replyTo", "not-a-list", "invalid_confirmation_recipients"),
+        (
+            "isDeliveryReceiptRequested",
+            "yes",
+            "invalid_confirmation_delivery_receipt_state",
+        ),
+        ("isReadReceiptRequested", [], "invalid_confirmation_read_receipt_state"),
+        (
+            "internetMessageHeaders",
+            [{"name": "invalid header", "value": "value"}],
+            "invalid_confirmation_internet_header",
+        ),
+    ),
+)
+def test_draft_confirmation_rejects_malformed_outward_routing_projection(
+    field: str,
+    value: object,
+    code: str,
+) -> None:
+    message = _confirmation_message()
+    message[field] = value
+    transport = _DraftConfirmationTransport(message, [{"value": []}])
+
+    with pytest.raises(ConnectorProviderError) as caught:
+        MicrosoftConnectorAdapter().resolve_confirmation_target(
+            _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+            {"message_id": "message-1"},
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+    assert caught.value.code == code
+    assert len(transport.calls) == 1
+
+
+def test_draft_confirmation_maps_absent_nullable_outward_fields_to_empty_state() -> None:
+    message = _confirmation_message()
+    for field in (
+        "subject",
+        "replyTo",
+        "isDeliveryReceiptRequested",
+        "isReadReceiptRequested",
+        "internetMessageHeaders",
+    ):
+        message.pop(field)
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+        {"message_id": "message-1"},
+        credential=_credential(),
+        transport=cast(
+            ConnectorTransport,
+            _DraftConfirmationTransport(message, [{"value": []}]),
+        ),
+    )
+
+    assert isinstance(target, ConnectorConfirmationTarget)
+    binding = cast(dict[str, object], target.binding)
+    assert binding["subject"] == ""
+    assert binding["reply_to"] == []
+    assert binding["delivery_receipt_requested"] is False
+    assert binding["read_receipt_requested"] is False
+    assert binding["internet_headers"] == []
+    preview = cast(dict[str, object], target.preview)
+    assert preview["subject"] == "(empty subject)"
+
+
+def test_draft_confirmation_displays_empty_embedded_item_name_explicitly() -> None:
+    embedded = _confirmation_attachment(
+        "attachment-1",
+        "",
+        inline=False,
+        size=128,
+        kind="item",
+    )
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+        {"message_id": "message-1"},
+        credential=_credential(),
+        transport=cast(
+            ConnectorTransport,
+            _DraftConfirmationTransport(_confirmation_message(), [{"value": [embedded]}]),
+        ),
+    )
+
+    assert isinstance(target, ConnectorConfirmationTarget)
+    binding = cast(dict[str, object], target.binding)
+    attachment = cast(list[dict[str, object]], binding["attachments"])[0]
+    assert attachment["name"] == ""
+    preview = cast(dict[str, object], target.preview)
+    public_attachment = cast(list[dict[str, object]], preview["attachments"])[0]
+    assert public_attachment["name"] == "(empty name)"
+    assert public_attachment["kind"] == "item"
+
+
+def test_draft_confirmation_binds_reference_attachment_kind_without_upload_cap() -> None:
+    reference = _confirmation_attachment(
+        "attachment-1",
+        "linked-document",
+        inline=False,
+        size=200 * 1024**2,
+        kind="reference",
+    )
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+        {"message_id": "message-1"},
+        credential=_credential(),
+        transport=cast(
+            ConnectorTransport,
+            _DraftConfirmationTransport(_confirmation_message(), [{"value": [reference]}]),
+        ),
+    )
+
+    assert isinstance(target, ConnectorConfirmationTarget)
+    binding = cast(dict[str, object], target.binding)
+    attachments = cast(list[dict[str, object]], binding["attachments"])
+    assert attachments[0]["kind"] == "reference"
+    assert attachments[0]["size"] == 200 * 1024**2
+    preview = cast(dict[str, object], target.preview)
+    public_attachments = cast(list[dict[str, object]], preview["attachments"])
+    assert public_attachments[0]["kind"] == "reference"
+
+
+def test_draft_confirmation_follows_only_valid_fixed_attachment_pages() -> None:
+    next_link = "https://graph.microsoft.com/v1.0/me/messages/message-1/attachments?" + urlencode(
+        (
+            ("$select", _CONFIRMATION_ATTACHMENT_SELECT),
+            ("$skiptoken", "opaque-page-2"),
+        )
+    )
+    transport = _DraftConfirmationTransport(
+        _confirmation_message(),
+        [
+            {
+                "@odata.nextLink": next_link,
+                "value": [_confirmation_attachment("attachment-2", "b.pdf", inline=False, size=2)],
+            },
+            {"value": [_confirmation_attachment("attachment-1", "a.pdf", inline=False, size=1)]},
+        ],
+    )
+
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+        {"message_id": "message-1"},
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert isinstance(target, ConnectorConfirmationTarget)
+    attachments = cast(
+        list[dict[str, object]], cast(dict[str, object], target.binding)["attachments"]
+    )
+    assert [attachment["id"] for attachment in attachments] == [
+        "attachment-1",
+        "attachment-2",
+    ]
+    assert transport.calls[2]["query"] == (
+        ("$select", _CONFIRMATION_ATTACHMENT_SELECT),
+        ("$skiptoken", "opaque-page-2"),
+    )
+
+
+@pytest.mark.parametrize(
+    "next_link",
+    (
+        "https://evil.example/v1.0/me/messages/message-1/attachments?"
+        + urlencode((("$select", _CONFIRMATION_ATTACHMENT_SELECT), ("$skiptoken", "opaque"))),
+        "https://graph.microsoft.com/v1.0/me/messages/other/attachments?"
+        + urlencode((("$select", _CONFIRMATION_ATTACHMENT_SELECT), ("$skiptoken", "opaque"))),
+        "https://graph.microsoft.com/v1.0/me/messages/message-1/attachments?"
+        + urlencode((("$skiptoken", "opaque"),)),
+    ),
+)
+def test_draft_confirmation_rejects_hostile_or_partial_attachment_pages(
+    next_link: str,
+) -> None:
+    transport = _DraftConfirmationTransport(
+        _confirmation_message(),
+        [{"@odata.nextLink": next_link, "value": []}],
+    )
+
+    with pytest.raises(ConnectorProviderError) as caught:
+        MicrosoftConnectorAdapter().resolve_confirmation_target(
+            _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+            {"message_id": "message-1"},
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+    assert caught.value.code == "invalid_next_link"
+    assert all(call["method"] is ConnectorMethod.GET for call in transport.calls)
+
+
+def test_draft_confirmation_rejects_cyclic_attachment_pages() -> None:
+    next_link = "https://graph.microsoft.com/v1.0/me/messages/message-1/attachments?" + urlencode(
+        (("$select", _CONFIRMATION_ATTACHMENT_SELECT), ("$skiptoken", "same"))
+    )
+    transport = _DraftConfirmationTransport(
+        _confirmation_message(),
+        [
+            {"@odata.nextLink": next_link, "value": []},
+            {"@odata.nextLink": next_link, "value": []},
+        ],
+    )
+
+    with pytest.raises(ConnectorProviderError) as caught:
+        MicrosoftConnectorAdapter().resolve_confirmation_target(
+            _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+            {"message_id": "message-1"},
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+    assert caught.value.code == "cyclic_confirmation_attachment_page"
+    assert len(transport.calls) == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    (
+        ("id", "other-message", "draft_confirmation_identity_mismatch"),
+        ("isDraft", False, "confirmation_target_is_not_a_draft"),
+        ("isDraft", None, "invalid_confirmation_draft_state"),
+    ),
+)
+def test_draft_confirmation_rejects_wrong_or_non_draft_message(
+    field: str,
+    value: object,
+    code: str,
+) -> None:
+    message = _confirmation_message()
+    message[field] = value
+    transport = _DraftConfirmationTransport(message, [{"value": []}])
+
+    with pytest.raises(ConnectorProviderError) as caught:
+        MicrosoftConnectorAdapter().resolve_confirmation_target(
+            _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+            {"message_id": "message-1"},
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+    assert caught.value.code == code
+    assert len(transport.calls) == 1
+
+
+def test_draft_confirmation_rejects_stale_caller_change_key_before_attachment_read() -> None:
+    transport = _DraftConfirmationTransport(_confirmation_message(), [{"value": []}])
+
+    with pytest.raises(ValidationError, match="changed"):
+        MicrosoftConnectorAdapter().resolve_confirmation_target(
+            _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+            {"message_id": "message-1", "change_key": "stale-version"},
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["method"] is ConnectorMethod.GET
+
+
+@pytest.mark.parametrize("case", ("recipient", "body", "subject"))
+def test_draft_confirmation_rejects_malformed_message_projection(case: str) -> None:
+    message = _confirmation_message()
+    if case == "recipient":
+        message["toRecipients"] = [{"emailAddress": {"address": "not-an-address"}}]
+    elif case == "body":
+        message["body"] = {"contentType": "html", "content": 42}
+    else:
+        message["subject"] = "unsafe\x00subject"
+    transport = _DraftConfirmationTransport(message, [{"value": []}])
+
+    with pytest.raises(ConnectorProviderError) as caught:
+        MicrosoftConnectorAdapter().resolve_confirmation_target(
+            _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+            {"message_id": "message-1"},
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+    assert isinstance(caught.value.code, str)
+    assert caught.value.code.startswith("invalid_confirmation_")
+    assert all(call["method"] is ConnectorMethod.GET for call in transport.calls)
+
+
+@pytest.mark.parametrize("case", ("duplicate", "content", "size", "kind"))
+def test_draft_confirmation_rejects_ambiguous_or_malformed_attachment(case: str) -> None:
+    attachment = _confirmation_attachment("attachment-1", "plan.pdf", inline=False, size=10)
+    values = [attachment]
+    if case == "duplicate":
+        values.append(dict(attachment))
+    elif case == "content":
+        attachment["contentBytes"] = "secret-content"
+    elif case == "size":
+        attachment["size"] = -1
+    else:
+        attachment["@odata.type"] = "#microsoft.graph.unknownAttachment"
+    transport = _DraftConfirmationTransport(_confirmation_message(), [{"value": values}])
+
+    with pytest.raises(ConnectorProviderError):
+        MicrosoftConnectorAdapter().resolve_confirmation_target(
+            _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+            {"message_id": "message-1"},
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+
+    assert all(call["method"] is ConnectorMethod.GET for call in transport.calls)
+
+
+def test_draft_confirmation_displays_empty_subject_explicitly() -> None:
+    transport = _DraftConfirmationTransport(
+        _confirmation_message(subject=""),
+        [{"value": []}],
+    )
+
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_mail", ConnectorMode.WRITE, "drafts.send"),
+        {"message_id": "message-1"},
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert isinstance(target, ConnectorConfirmationTarget)
+    assert cast(dict[str, object], target.binding)["subject"] == ""
+    assert cast(dict[str, object], target.preview)["subject"] == "(empty subject)"
+
+
+def test_non_draft_send_confirmation_target_returns_none_without_provider_read() -> None:
+    transport = _DraftConfirmationTransport(_confirmation_message(), [{"value": []}])
+
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_mail", ConnectorMode.WRITE, "messages.trash"),
+        {"message_id": "message-1"},
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert target is None
+    assert transport.calls == []
 
 
 def test_every_microsoft_operation_uses_its_fixed_final_graph_route() -> None:

@@ -172,7 +172,7 @@ class _ConfirmationTargetAdapter(_Adapter):
         ] = []
         self.remove_hook_after: int | None = None
         self.mutate_input_after: int | None = None
-        self.target_errors: dict[int, ConnectorProviderError] = {}
+        self.target_errors: dict[int, Exception] = {}
 
     def resolve_confirmation_target(
         self,
@@ -777,6 +777,26 @@ def test_provider_confirmation_target_final_hook_cannot_mutate_dispatched_input(
     assert adapter.confirmation_target_calls[-1][1] == {"draft_id": "mutated-by-target-hook"}
 
 
+def test_provider_confirmation_target_preserves_actionable_initial_validation_error(
+    tmp_path: Path,
+) -> None:
+    adapter = _ConfirmationTargetAdapter([])
+    adapter.target_errors[1] = ValidationError(
+        "Outlook message changed; read it again and request a fresh preview"
+    )
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+
+    with pytest.raises(ValidationError, match="read it again and request a fresh preview"):
+        runtime.call_tool("gsv_gmail_write", values)
+
+    assert adapter.calls == []
+
+
 def test_provider_confirmation_target_final_auth_failure_requires_reauthorization(
     tmp_path: Path,
 ) -> None:
@@ -941,7 +961,11 @@ def test_provider_confirmation_target_preview_bound_is_checked_after_sanitizatio
 ) -> None:
     target = ConnectorConfirmationTarget(
         binding={"resource_id": "provider-resource-1"},
-        preview={"items": ["x" * 2_000 for _ in range(9)]},
+        preview={
+            "first": ["x" * 2_000 for _ in range(1_000)],
+            "second": ["x" * 2_000 for _ in range(1_000)],
+            "third": ["x" * 2_000 for _ in range(1_000)],
+        },
     )
     adapter = _ConfirmationTargetAdapter([target])
     _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
@@ -953,6 +977,32 @@ def test_provider_confirmation_target_preview_bound_is_checked_after_sanitizatio
 
     with pytest.raises(ValidationError, match="too large to show safely"):
         runtime.call_tool("gsv_gmail_write", values)
+    assert adapter.calls == []
+
+
+def test_provider_confirmation_target_keeps_complete_large_recipient_preview(
+    tmp_path: Path,
+) -> None:
+    recipients = [f"person-{index:04d}@example.test" for index in range(1_000)]
+    target = ConnectorConfirmationTarget(
+        binding={"recipients": recipients},
+        preview={"recipients": recipients},
+    )
+    adapter = _ConfirmationTargetAdapter([target])
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+
+    preview = runtime.call_tool("gsv_gmail_write", values)
+
+    assert preview["status"] == "confirmation_required"
+    provider_target = cast(
+        dict[str, object], cast(dict[str, object], preview["preview"])["provider_target"]
+    )
+    assert provider_target["recipients"] == recipients
     assert adapter.calls == []
 
 
@@ -1481,7 +1531,11 @@ def test_invalid_prepared_preview_fails_before_token_and_closes_snapshot(
     error_match: str,
 ) -> None:
     if failure == "oversized":
-        enrichment: object = {"items": ["x" * 2_000 for _ in range(9)]}
+        enrichment: object = {
+            "first": ["x" * 2_000 for _ in range(1_000)],
+            "second": ["x" * 2_000 for _ in range(1_000)],
+            "third": ["x" * 2_000 for _ in range(1_000)],
+        }
     elif failure == "non_json":
         enrichment = object()
     else:

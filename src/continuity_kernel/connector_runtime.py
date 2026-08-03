@@ -91,7 +91,7 @@ _EFFECT_ORDER: Final = {
 _PREVIEW_TEXT_CHARS: Final = 2_000
 _PREPARED_CONTENT_KEY: Final = "prepared_content"
 _PROVIDER_TARGET_KEY: Final = "provider_target"
-_PREPARED_PREVIEW_MAX_BYTES: Final = 16 * 1_024
+_PREPARED_PREVIEW_MAX_BYTES: Final = 4 * 1_024 * 1_024
 _LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
 _OPERATION_WARNINGS: Final = {
     (
@@ -1385,6 +1385,8 @@ def _resolve_confirmation_target(
             transfer=transfer,
         )
     except ConnectorProviderError:
+        raise
+    except ValidationError:
         raise
     except Exception as exc:
         raise ValidationError("connector adapter confirmation target hook failed") from exc
