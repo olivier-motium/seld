@@ -2816,7 +2816,7 @@ def _next_link(
         or parsed.password is not None
         or port not in {None, 443}
         or parsed.fragment
-        or parsed.path != path
+        or not _matches_graph_continuation_path(parsed.path, path)
     ):
         raise ConnectorProviderError(origin=_ORIGIN, status=status, code="invalid_next_link")
     try:
@@ -2911,6 +2911,19 @@ def _next_link(
             code="invalid_next_link",
         )
     return {"path": path, "query": [[key, item] for key, item in continuation_pairs]}
+
+
+def _matches_graph_continuation_path(candidate: str, requested: str) -> bool:
+    if candidate == requested:
+        return True
+    match = re.fullmatch(
+        rf"{re.escape(_ROOT)}/mailFolders/([A-Za-z]+)/(childFolders|messages)",
+        requested,
+    )
+    if match is None:
+        return False
+    folder, collection = match.groups()
+    return candidate == f"{_ROOT}/mailFolders('{folder}')/{collection}"
 
 
 def _continuation_query(

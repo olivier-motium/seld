@@ -1268,6 +1268,29 @@ def test_immutable_ids_and_continuations_are_internal_and_stripped_from_payload(
         "query": [["$skip", "1"]],
     }
 
+    well_known_folder = _FakeTransport(
+        json.dumps(
+            {
+                "@odata.nextLink": (
+                    "https://graph.microsoft.com/v1.0/me/mailFolders('inbox')/messages"
+                    f"?$skip=1&$top=1&$select={_MESSAGE_SUMMARY_SELECT}"
+                ),
+                "value": [],
+            }
+        ).encode()
+    )
+    folder_result = adapter.execute(
+        operation,
+        {"folder_id": "inbox", "page_size": 1},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, well_known_folder),
+    )
+    assert folder_result.continuation == {
+        "path": "/v1.0/me/mailFolders/inbox/messages",
+        "query": [["$skip", "1"]],
+    }
+
     custom_transport = _FakeTransport(
         json.dumps(
             {
