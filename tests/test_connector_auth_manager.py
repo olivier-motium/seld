@@ -1500,7 +1500,7 @@ def test_microsoft_accepts_canonical_short_grants_without_offline_access(
     )
 
 
-def test_microsoft_publish_canonicalizes_access_scopes_and_omits_offline_access(
+def test_microsoft_publish_canonicalizes_access_scopes_and_omits_non_resource_scopes(
     tmp_path: Path,
 ) -> None:
     manager = _microsoft_manager(tmp_path)
@@ -1518,6 +1518,9 @@ def test_microsoft_publish_canonicalizes_access_scopes_and_omits_offline_access(
             "USER.READ",
             "https://graph.microsoft.com/CALENDARS.READ",
             "offline_access",
+            "openid",
+            "profile",
+            "email",
         ),
         issued_at=BASE_TIME,
         expires_at=None,

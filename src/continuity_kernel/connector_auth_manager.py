@@ -1049,12 +1049,18 @@ class ConnectorAuthManager:
             if metadata.provider == "microsoft"
             else metadata.scopes
         )
-        configured_access = frozenset(
-            scope for scope in configured if scope.casefold() != "offline_access"
-        )
-        granted_access = frozenset(
-            scope for scope in granted if scope.casefold() != "offline_access"
-        )
+        if metadata.provider == "microsoft":
+            configured_access = frozenset(
+                canonicalize_microsoft_access_scopes(tuple(configured))
+            )
+            granted_access = frozenset(canonicalize_microsoft_access_scopes(tuple(granted)))
+        else:
+            configured_access = frozenset(
+                scope for scope in configured if scope.casefold() != "offline_access"
+            )
+            granted_access = frozenset(
+                scope for scope in granted if scope.casefold() != "offline_access"
+            )
         profile = get_profile_for_connection(
             metadata.provider,
             metadata.source_ids,
@@ -1110,7 +1116,7 @@ class ConnectorAuthManager:
         if provider == "google":
             canonical = canonicalize_google_scopes(scopes)
         elif provider == "microsoft":
-            canonical = canonicalize_microsoft_scopes(scopes)
+            canonical = canonicalize_microsoft_access_scopes(scopes)
         else:
             canonical = scopes
         return frozenset(scope for scope in canonical if scope.casefold() != "offline_access")

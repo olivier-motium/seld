@@ -574,6 +574,7 @@ def test_microsoft_authorization_uses_only_select_account() -> None:
                     "refresh_token": "microsoft-refresh",
                     "token_type": "Bearer",
                     "scope": (
+                        "openid profile email "
                         "HTTPS://GRAPH.MICROSOFT.COM/user.read "
                         "https://graph.microsoft.com/MAIL.READ offline_access"
                     ),

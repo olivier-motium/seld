@@ -571,6 +571,9 @@ _MICROSOFT_CANONICAL_SCOPES: Final = {
     "calendars.read": "Calendars.Read",
     "calendars.readwrite": "Calendars.ReadWrite",
 }
+_MICROSOFT_NON_RESOURCE_SCOPES: Final = frozenset(
+    {"offline_access", "openid", "profile", "email"}
+)
 
 
 def canonicalize_microsoft_scopes(scopes: tuple[str, ...]) -> tuple[str, ...]:
@@ -592,7 +595,7 @@ def canonicalize_microsoft_access_scopes(scopes: tuple[str, ...]) -> tuple[str, 
     return tuple(
         scope
         for scope in canonicalize_microsoft_scopes(scopes)
-        if scope.casefold() != "offline_access"
+        if scope.casefold() not in _MICROSOFT_NON_RESOURCE_SCOPES
     )
 
 
