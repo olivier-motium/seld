@@ -20,6 +20,7 @@ from continuity_kernel.connector_auth import (
     ConnectionMetadata,
     CredentialKind,
 )
+from continuity_kernel.connector_client_secret import load_oauth_client_secret
 from continuity_kernel.connector_credentials import (
     OAuthCredential,
     credential_from_token_set,
@@ -961,8 +962,8 @@ class ConnectorAuthManager:
         self._assert_not_revoked(metadata)
         return metadata
 
-    @staticmethod
     def _oauth_config(
+        self,
         metadata: ConnectionMetadata,
         *,
         redirect_uri: str | None = None,
@@ -986,6 +987,13 @@ class ConnectorAuthManager:
             authorization_endpoint=client.authorization_endpoint,
             token_endpoint=client.token_endpoint,
             client_id=client.identifier,
+            client_secret=load_oauth_client_secret(
+                self.secret_store,
+                provider=metadata.provider,
+                client_id=client.identifier,
+            )
+            if metadata.provider == "google"
+            else None,
             redirect_uri=redirect_uri or client.redirect_uris[0],
             scopes=metadata.scopes,
             dialect={

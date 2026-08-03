@@ -8,7 +8,7 @@ import hmac
 import json
 import math
 import secrets
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Final, Protocol, cast
 from urllib.error import HTTPError, URLError
@@ -81,12 +81,22 @@ class OAuthClientConfig:
     redirect_uri: str
     scopes: tuple[str, ...] = ()
     dialect: OAuthDialect = OAuthDialect.STANDARD
+    client_secret: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _validate_https_endpoint(self.authorization_endpoint, "authorization endpoint")
         _validate_https_endpoint(self.token_endpoint, "token endpoint")
         if not self.client_id:
             raise OAuthConfigurationError("OAuth client_id must not be empty")
+        if self.client_secret is not None and (
+            not self.client_secret
+            or len(self.client_secret.encode("utf-8")) > 2 * 1024
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in self.client_secret
+            )
+        ):
+            raise OAuthConfigurationError("OAuth client_secret is invalid")
         _validate_loopback_redirect(self.redirect_uri)
         _validate_scopes(self.scopes)
         if self.dialect is OAuthDialect.GOOGLE:
@@ -235,15 +245,18 @@ def exchange_authorization_code(
     if not authorization_code:
         raise OAuthConfigurationError("authorization code must not be empty")
     _validate_code_verifier(code_verifier)
+    fields = {
+        "grant_type": "authorization_code",
+        "client_id": config.client_id,
+        "code": authorization_code,
+        "redirect_uri": config.redirect_uri,
+        "code_verifier": code_verifier,
+    }
+    if config.client_secret is not None:
+        fields["client_secret"] = config.client_secret
     token_set = _request_token(
         config,
-        {
-            "grant_type": "authorization_code",
-            "client_id": config.client_id,
-            "code": authorization_code,
-            "redirect_uri": config.redirect_uri,
-            "code_verifier": code_verifier,
-        },
+        fields,
         timeout_seconds=timeout_seconds,
         post_form=post_form,
         preserved_refresh_token=None,
@@ -273,6 +286,8 @@ def refresh_access_token(
         "client_id": config.client_id,
         "refresh_token": refresh_token,
     }
+    if config.client_secret is not None:
+        fields["client_secret"] = config.client_secret
     if scopes is not None and config.dialect is OAuthDialect.STANDARD:
         _validate_scopes(scopes)
         if scopes:

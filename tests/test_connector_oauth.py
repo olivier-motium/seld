@@ -465,6 +465,7 @@ def test_google_authorization_requires_a_refreshable_offline_grant() -> None:
         redirect_uri="http://127.0.0.1:49152",
         scopes=("https://www.googleapis.com/auth/gmail.readonly",),
         dialect=OAuthDialect.GOOGLE,
+        client_secret="desktop-client-secret",
     )
     pkce = pkce_pair_from_verifier("v" * 64)
     query = parse_qs(urlsplit(build_authorization_url(config, state="expected", pkce=pkce)).query)
@@ -472,19 +473,30 @@ def test_google_authorization_requires_a_refreshable_offline_grant() -> None:
     assert query["access_type"] == ["offline"]
     assert query["prompt"] == ["consent select_account"]
     with pytest.raises(OAuthTransportError, match="refresh_token"):
+        transport = RecordingTransport(
+            (
+                200,
+                b'{"access_token":"temporary","token_type":"Bearer",'
+                b'"scope":"https://www.googleapis.com/auth/gmail.readonly",'
+                b'"expires_in":3600}',
+            )
+        )
         exchange_authorization_code(
             config,
             authorization_code="one-time-code",
             code_verifier=pkce.code_verifier,
-            post_form=RecordingTransport(
-                (
-                    200,
-                    b'{"access_token":"temporary","token_type":"Bearer",'
-                    b'"scope":"https://www.googleapis.com/auth/gmail.readonly",'
-                    b'"expires_in":3600}',
-                )
-            ),
+            post_form=transport,
         )
+    assert transport.fields["client_secret"] == "desktop-client-secret"
+    assert "desktop-client-secret" not in repr(config)
+
+    refresh_transport = RecordingTransport(token_response())
+    refresh_access_token(
+        config,
+        refresh_token="existing-refresh-token",
+        post_form=refresh_transport,
+    )
+    assert refresh_transport.fields["client_secret"] == "desktop-client-secret"
 
 
 def test_google_userinfo_email_scope_is_canonicalized_during_token_parsing() -> None:

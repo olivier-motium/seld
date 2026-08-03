@@ -72,6 +72,36 @@ def _install_fake_onboarding(
 ) -> None:
     monkeypatch.setattr(cli, "ConnectorAuthManager", lambda vault: object())
     monkeypatch.setattr(cli, "ConnectorOnboarding", lambda manager: fake)
+    monkeypatch.setattr(cli, "_ensure_oauth_client_secret", lambda manager, connector: None)
+
+
+def test_google_client_secret_is_prompted_once_and_kept_in_secret_custody(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemorySecretStore()
+    manager = SimpleNamespace(secret_store=store)
+    prompts: list[str] = []
+    monkeypatch.setattr(cli.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(
+        cli.getpass,
+        "getpass",
+        lambda prompt: prompts.append(prompt) or "desktop-client-secret",
+    )
+
+    cli._ensure_oauth_client_secret(manager, "gmail")  # type: ignore[arg-type]
+    cli._ensure_oauth_client_secret(manager, "gmail")  # type: ignore[arg-type]
+
+    registration = cli.load_public_client_registration("google")
+    assert (
+        cli.load_oauth_client_secret(
+            store,
+            provider="google",
+            client_id=registration.client_id,
+        )
+        == "desktop-client-secret"
+    )
+    assert len(prompts) == 1
+    assert "input hidden" in prompts[0]
 
 
 def test_connector_list_and_status_are_first_class_json_commands(
