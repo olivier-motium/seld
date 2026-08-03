@@ -16,6 +16,7 @@ from continuity_kernel.connector_adapter import (
     ConnectorAdapter,
     ConnectorAdapterRegistry,
     ConnectorAdapterResult,
+    ConnectorConfirmationTarget,
     ConnectorPreparedConfirmationPreviewAdapter,
     ConnectorProviderUploadLimitAdapter,
     ConnectorRuntimeCredential,
@@ -89,6 +90,7 @@ _EFFECT_ORDER: Final = {
 }
 _PREVIEW_TEXT_CHARS: Final = 2_000
 _PREPARED_CONTENT_KEY: Final = "prepared_content"
+_PROVIDER_TARGET_KEY: Final = "provider_target"
 _PREPARED_PREVIEW_MAX_BYTES: Final = 16 * 1_024
 _LOCAL_FILE_LIMIT_MARKER: Final = "opaque-local-file"
 _OPERATION_WARNINGS: Final = {
@@ -472,7 +474,28 @@ class ConnectorRuntime:
                             connection_revision=connection_snapshot.revision,
                         )
                     else:
+                        _reject_provider_target_key(prepared.confirmation_input)
+                        transfer = _prepared_transfer_context(prepared.bundle)
+                        target = self._resolve_confirmation_target(
+                            adapter,
+                            operation,
+                            prepared.adapter_input,
+                            credential=credential,
+                            transfer=transfer,
+                            connection_id=connection_id,
+                            connection_revision=connection_snapshot.revision,
+                        )
+                        confirmation_input = prepared.confirmation_input
                         preview_value = prepared.preview_input
+                        if target is not None:
+                            confirmation_input = _merge_provider_target(
+                                confirmation_input,
+                                target.binding,
+                            )
+                            preview_value = _merge_provider_target(
+                                preview_value,
+                                target.preview,
+                            )
                         if preview_bundle is not None:
                             preview_value = _prepared_confirmation_preview(
                                 adapter,
@@ -480,12 +503,14 @@ class ConnectorRuntime:
                                 preview_value,
                                 bundle=preview_bundle,
                             )
+                        if target is not None:
+                            _enforce_confirmation_preview_bound(preview_value)
                         preview = self._confirmation_preview(
                             provider=provider,
                             operation=operation_name,
                             connection_id=connection_id,
                             account_label=connection.account.label,
-                            mutation_value=prepared.confirmation_input,
+                            mutation_value=confirmation_input,
                             preview_value=preview_value,
                             effect=effect,
                             access=access,
@@ -535,6 +560,22 @@ class ConnectorRuntime:
                     effect = _promote_prepared_upload_effect(effect, prepared.bundle)
                     if effect is ConnectorEffect.SAFE_MUTATION:
                         raise ValidationError("this operation does not use a confirmation token")
+                    _reject_provider_target_key(prepared.confirmation_input)
+                    target = self._resolve_confirmation_target(
+                        adapter,
+                        operation,
+                        prepared.adapter_input,
+                        credential=credential,
+                        transfer=_prepared_transfer_context(prepared.bundle),
+                        connection_id=connection_id,
+                        connection_revision=connection_snapshot.revision,
+                    )
+                    confirmation_input = prepared.confirmation_input
+                    if target is not None:
+                        confirmation_input = _merge_provider_target(
+                            confirmation_input,
+                            target.binding,
+                        )
                     write_idempotency_key = self.session.consume_confirmation(
                         confirmation,
                         provider=provider,
@@ -543,7 +584,7 @@ class ConnectorRuntime:
                         effect=effect,
                         authorization_tier=access.value,
                         granted_scopes=credential.granted_scopes,
-                        mutation=prepared.confirmation_input,
+                        mutation=confirmation_input,
                         connection_version=connection.version,
                         credential_version=credential.version,
                     )
@@ -553,6 +594,17 @@ class ConnectorRuntime:
                             confirmed_bundle = self.prepared_uploads.take(
                                 confirmation,
                                 expected=cached,
+                            )
+                        if target is not None:
+                            self._assert_confirmation_target_stable(
+                                adapter,
+                                operation,
+                                canonicalize_json(prepared.adapter_input),
+                                target,
+                                credential=credential,
+                                transfer=_prepared_transfer_context(confirmed_bundle),
+                                connection_id=connection_id,
+                                connection_revision=connection_snapshot.revision,
                             )
                         result = self._execute_adapter(
                             adapter,
@@ -642,6 +694,64 @@ class ConnectorRuntime:
             )
             raise
         return _classified_effect(catalog_effect, adapter_effect)
+
+    def _resolve_confirmation_target(
+        self,
+        adapter: ConnectorAdapter,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        credential: ConnectorRuntimeCredential,
+        transfer: ConnectorTransferContext | None,
+        connection_id: str,
+        connection_revision: str,
+    ) -> ConnectorConfirmationTarget | None:
+        try:
+            return _resolve_confirmation_target(
+                adapter,
+                operation,
+                input_value,
+                credential=credential,
+                transport=self.transport,
+                transfer=transfer,
+            )
+        except ConnectorProviderError as exc:
+            self._project_auth_failure(
+                exc,
+                connection_id=connection_id,
+                connection_revision=connection_revision,
+                credential_version=credential.version,
+            )
+            raise
+
+    def _assert_confirmation_target_stable(
+        self,
+        adapter: ConnectorAdapter,
+        operation: OperationSpec,
+        input_value: object,
+        expected: ConnectorConfirmationTarget,
+        *,
+        credential: ConnectorRuntimeCredential,
+        transfer: ConnectorTransferContext | None,
+        connection_id: str,
+        connection_revision: str,
+    ) -> None:
+        try:
+            actual = self._resolve_confirmation_target(
+                adapter,
+                operation,
+                input_value,
+                credential=credential,
+                transfer=transfer,
+                connection_id=connection_id,
+                connection_revision=connection_revision,
+            )
+        except ValidationError as exc:
+            raise ConflictError(
+                "provider confirmation target could not be re-verified before execution"
+            ) from exc
+        if actual is None or canonical_json(actual.binding) != canonical_json(expected.binding):
+            raise ConflictError("provider confirmation target changed before execution")
 
     def _prepare_input(
         self,
@@ -1246,6 +1356,75 @@ def _prepared_transfer_context(
     if bundle is None:
         return None
     return ConnectorTransferContext(uploads=bundle.uploads)
+
+
+def _resolve_confirmation_target(
+    adapter: ConnectorAdapter,
+    operation: OperationSpec,
+    input_value: object,
+    *,
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+    transfer: ConnectorTransferContext | None,
+) -> ConnectorConfirmationTarget | None:
+    try:
+        method = getattr(adapter, "resolve_confirmation_target", None)
+    except Exception as exc:
+        raise ValidationError("connector adapter confirmation target hook is invalid") from exc
+    if method is None:
+        return None
+    if not callable(method):
+        raise ValidationError("connector adapter confirmation target hook is invalid")
+    target_method = cast(Callable[..., object], method)
+    try:
+        result = target_method(
+            operation,
+            input_value,
+            credential=credential,
+            transport=transport,
+            transfer=transfer,
+        )
+    except ConnectorProviderError:
+        raise
+    except Exception as exc:
+        raise ValidationError("connector adapter confirmation target hook failed") from exc
+    if result is None:
+        return None
+    if not isinstance(result, ConnectorConfirmationTarget):
+        raise ValidationError("connector adapter returned an invalid confirmation target")
+    try:
+        return ConnectorConfirmationTarget(
+            binding=result.binding,
+            preview=result.preview,
+        )
+    except ValidationError as exc:
+        raise ValidationError("connector adapter returned an invalid confirmation target") from exc
+
+
+def _reject_provider_target_key(value: object) -> None:
+    if isinstance(value, dict) and _PROVIDER_TARGET_KEY in value:
+        raise ValidationError("connector input uses the reserved provider target key")
+
+
+def _merge_provider_target(value: object, target_value: object) -> object:
+    if not isinstance(value, dict):
+        raise ValidationError("provider confirmation target requires an object input")
+    if _PROVIDER_TARGET_KEY in value:
+        raise ValidationError("connector input uses the reserved provider target key")
+    return canonicalize_json(
+        {
+            **value,
+            _PROVIDER_TARGET_KEY: canonicalize_json(target_value),
+        }
+    )
+
+
+def _enforce_confirmation_preview_bound(value: object) -> None:
+    if len(canonical_json(_preview_value(value))) > _PREPARED_PREVIEW_MAX_BYTES:
+        raise ValidationError(
+            "provider confirmation preview is too large to show safely; reduce its target "
+            "metadata so every consequential detail can be shown"
+        )
 
 
 def _prepared_confirmation_preview(

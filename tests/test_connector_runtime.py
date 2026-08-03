@@ -17,6 +17,7 @@ from continuity_kernel import connector_runtime as connector_runtime_module
 from continuity_kernel.connector_adapter import (
     ConnectorAdapterRegistry,
     ConnectorAdapterResult,
+    ConnectorConfirmationTarget,
     ConnectorRuntimeCredential,
     ConnectorTransferContext,
 )
@@ -34,6 +35,7 @@ from continuity_kernel.connector_contract import (
     ConnectorMode,
     OperationCatalog,
     OperationSpec,
+    canonical_json_digest,
 )
 from continuity_kernel.connector_credentials import OAuthCredential
 from continuity_kernel.connector_identifiers import parse_connection_id
@@ -159,6 +161,43 @@ class _Adapter:
             continuation=self.continuation,
             artifact=artifact,
         )
+
+
+class _ConfirmationTargetAdapter(_Adapter):
+    def __init__(self, target_results: list[object | None]) -> None:
+        super().__init__()
+        self.target_results = target_results
+        self.confirmation_target_calls: list[
+            tuple[str, object, ConnectorTransferContext | None]
+        ] = []
+        self.remove_hook_after: int | None = None
+        self.mutate_input_after: int | None = None
+        self.target_errors: dict[int, ConnectorProviderError] = {}
+
+    def resolve_confirmation_target(
+        self,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+        transfer: ConnectorTransferContext | None = None,
+    ) -> ConnectorConfirmationTarget | None:
+        del credential, transport
+        self.confirmation_target_calls.append((operation.name, input_value, transfer))
+        call_number = len(self.confirmation_target_calls)
+        error = self.target_errors.get(call_number)
+        if error is not None:
+            raise error
+        if self.mutate_input_after == call_number:
+            assert isinstance(input_value, dict)
+            input_value["draft_id"] = "mutated-by-target-hook"
+        if self.remove_hook_after == call_number:
+            object.__setattr__(self, "resolve_confirmation_target", None)
+        if not self.target_results:
+            return None
+        result = self.target_results[min(call_number - 1, len(self.target_results) - 1)]
+        return cast(ConnectorConfirmationTarget | None, result)
 
 
 class _PreflightAdapter(_Adapter):
@@ -318,6 +357,7 @@ def _install_local_upload_catalog(
     *,
     effect: ConnectorEffect = ConnectorEffect.OUTWARD,
     allow_reserved_preview_key: bool = False,
+    allow_provider_target_key: bool = False,
 ) -> None:
     local_file = {
         "additionalProperties": False,
@@ -349,6 +389,12 @@ def _install_local_upload_catalog(
     }
     if allow_reserved_preview_key:
         input_properties["prepared_content"] = {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string",
+        }
+    if allow_provider_target_key:
+        input_properties["provider_target"] = {
             "maxLength": 64,
             "minLength": 1,
             "type": "string",
@@ -462,11 +508,13 @@ def _prepared_local_upload_runtime(
     *,
     adapter: _Adapter | None = None,
     allow_reserved_preview_key: bool = False,
+    allow_provider_target_key: bool = False,
 ) -> tuple[_Adapter, ConnectorRuntime, dict[str, object]]:
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host-data"))
     _install_local_upload_catalog(
         monkeypatch,
         allow_reserved_preview_key=allow_reserved_preview_key,
+        allow_provider_target_key=allow_provider_target_key,
     )
     artifacts = ArtifactStore(tmp_path / "artifacts")
     vault, _manager, prepared_adapter, runtime = _prepared(
@@ -590,6 +638,322 @@ def test_safe_mutation_executes_once_but_outward_effect_requires_bound_confirmat
             {**values, "confirmation_token": preview["confirmation_token"]},
         )
     assert [call[0] for call in adapter.calls] == ["drafts.create", "drafts.send"]
+
+
+def test_provider_confirmation_target_enriches_preview_and_mutation_digest(
+    tmp_path: Path,
+) -> None:
+    target = ConnectorConfirmationTarget(
+        binding={"resource_id": "provider-resource-1", "etag": "etag-1"},
+        preview={"label": "Reviewed provider resource", "resource_id": "provider-resource-1"},
+    )
+    adapter = _ConfirmationTargetAdapter([target, target, target])
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+
+    preview = runtime.call_tool("gsv_gmail_write", values)
+
+    enriched_confirmation = {
+        "draft_id": "draft-one",
+        "provider_target": target.binding,
+    }
+    assert preview["preview"] == {
+        "draft_id": "draft-one",
+        "provider_target": target.preview,
+    }
+    assert preview["mutation_digest"] == canonical_json_digest(enriched_confirmation)
+
+    completed = runtime.call_tool(
+        "gsv_gmail_write",
+        {**values, "confirmation_token": preview["confirmation_token"]},
+    )
+    assert completed["status"] == "ok"
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0][1] == {"draft_id": "draft-one"}
+    assert len(adapter.confirmation_target_calls) == 3
+    assert all(call[1] == {"draft_id": "draft-one"} for call in adapter.confirmation_target_calls)
+
+
+def test_provider_confirmation_target_preconsume_drift_is_retryable(
+    tmp_path: Path,
+) -> None:
+    first = ConnectorConfirmationTarget(
+        binding={"resource_id": "provider-resource-1"},
+        preview={"label": "First resource"},
+    )
+    drifted = ConnectorConfirmationTarget(
+        binding={"resource_id": "provider-resource-2"},
+        preview={"label": "Second resource"},
+    )
+    adapter = _ConfirmationTargetAdapter([first, drifted, first, first])
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+    preview = runtime.call_tool("gsv_gmail_write", values)
+    token = preview["confirmation_token"]
+
+    with pytest.raises(ConflictError, match="binding"):
+        runtime.call_tool(
+            "gsv_gmail_write",
+            {**values, "confirmation_token": token},
+        )
+    assert adapter.calls == []
+
+    completed = runtime.call_tool(
+        "gsv_gmail_write",
+        {**values, "confirmation_token": token},
+    )
+    assert completed["status"] == "ok"
+    assert len(adapter.calls) == 1
+
+
+def test_provider_confirmation_target_final_drift_spends_token_without_execution(
+    tmp_path: Path,
+) -> None:
+    first = ConnectorConfirmationTarget(
+        binding={"resource_id": "provider-resource-1"},
+        preview={"label": "First resource"},
+    )
+    drifted = ConnectorConfirmationTarget(
+        binding={"resource_id": "provider-resource-2"},
+        preview={"label": "Second resource"},
+    )
+    adapter = _ConfirmationTargetAdapter([first, first, drifted, first])
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+    preview = runtime.call_tool("gsv_gmail_write", values)
+    token = preview["confirmation_token"]
+
+    with pytest.raises(ConflictError, match="target changed"):
+        runtime.call_tool(
+            "gsv_gmail_write",
+            {**values, "confirmation_token": token},
+        )
+    assert adapter.calls == []
+    with pytest.raises(ConflictError, match="already been consumed"):
+        runtime.call_tool(
+            "gsv_gmail_write",
+            {**values, "confirmation_token": token},
+        )
+    assert adapter.calls == []
+
+
+def test_provider_confirmation_target_final_hook_cannot_mutate_dispatched_input(
+    tmp_path: Path,
+) -> None:
+    target = ConnectorConfirmationTarget(
+        binding={"resource_id": "provider-resource-1"},
+        preview={"label": "First resource"},
+    )
+    adapter = _ConfirmationTargetAdapter([target, target, target])
+    adapter.mutate_input_after = 3
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+    preview = runtime.call_tool("gsv_gmail_write", values)
+
+    completed = runtime.call_tool(
+        "gsv_gmail_write",
+        {**values, "confirmation_token": preview["confirmation_token"]},
+    )
+
+    assert completed["status"] == "ok"
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0][1] == {"draft_id": "draft-one"}
+    assert adapter.confirmation_target_calls[-1][1] == {"draft_id": "mutated-by-target-hook"}
+
+
+def test_provider_confirmation_target_final_auth_failure_requires_reauthorization(
+    tmp_path: Path,
+) -> None:
+    target = ConnectorConfirmationTarget(
+        binding={"resource_id": "provider-resource-1"},
+        preview={"label": "First resource"},
+    )
+    adapter = _ConfirmationTargetAdapter([target, target, target])
+    adapter.target_errors[3] = ConnectorProviderError(
+        origin=ConnectorOrigin.GMAIL,
+        status=401,
+        code="UNAUTHENTICATED",
+    )
+    vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+    preview = runtime.call_tool("gsv_gmail_write", values)
+    token = preview["confirmation_token"]
+
+    with pytest.raises(ConnectorProviderError) as caught:
+        runtime.call_tool(
+            "gsv_gmail_write",
+            {**values, "confirmation_token": token},
+        )
+
+    assert caught.value.status == 401
+    assert adapter.calls == []
+    connection = vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert connection is not None
+    assert connection.health is ConnectionHealth.REAUTHORIZATION_REQUIRED
+    with pytest.raises(ValidationError, match="verified before interactive use"):
+        runtime.call_tool(
+            "gsv_gmail_write",
+            {**values, "confirmation_token": token},
+        )
+
+
+def test_provider_confirmation_target_disappearance_at_final_boundary_spends_token(
+    tmp_path: Path,
+) -> None:
+    target = ConnectorConfirmationTarget(
+        binding={"resource_id": "provider-resource-1"},
+        preview={"label": "First resource"},
+    )
+    adapter = _ConfirmationTargetAdapter([target, target])
+    adapter.remove_hook_after = 2
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+    preview = runtime.call_tool("gsv_gmail_write", values)
+    token = preview["confirmation_token"]
+
+    with pytest.raises(ConflictError, match="target changed"):
+        runtime.call_tool(
+            "gsv_gmail_write",
+            {**values, "confirmation_token": token},
+        )
+    assert adapter.calls == []
+
+
+def test_safe_mutation_bypasses_provider_confirmation_target_hook(
+    tmp_path: Path,
+) -> None:
+    target = ConnectorConfirmationTarget(
+        binding={"resource_id": "provider-resource-1"},
+        preview={"label": "Provider resource"},
+    )
+    adapter = _ConfirmationTargetAdapter([target])
+    adapter.effect = ConnectorEffect.SAFE_MUTATION
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+
+    result = runtime.call_tool(
+        "gsv_gmail_write",
+        {
+            "connection_id": str(CONNECTION_ID),
+            "input": {"subject": "Draft"},
+            "operation": "drafts.create",
+        },
+    )
+
+    assert result["status"] == "ok"
+    assert adapter.confirmation_target_calls == []
+    assert len(adapter.calls) == 1
+
+
+@pytest.mark.parametrize("with_none_hook", (False, True))
+def test_no_hook_and_none_confirmation_target_keep_existing_path(
+    tmp_path: Path,
+    with_none_hook: bool,
+) -> None:
+    adapter: _Adapter = _ConfirmationTargetAdapter([None, None]) if with_none_hook else _Adapter()
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+
+    preview = runtime.call_tool("gsv_gmail_write", values)
+    assert preview["preview"] == {"draft_id": "draft-one"}
+    assert preview["mutation_digest"] == canonical_json_digest(values["input"])
+    result = runtime.call_tool(
+        "gsv_gmail_write",
+        {**values, "confirmation_token": preview["confirmation_token"]},
+    )
+    assert result["status"] == "ok"
+    assert len(adapter.calls) == 1
+
+
+def test_malformed_confirmation_target_hook_and_result_are_rejected(
+    tmp_path: Path,
+) -> None:
+    malformed_hook = _Adapter()
+    object.__setattr__(malformed_hook, "resolve_confirmation_target", object())
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=malformed_hook)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+    with pytest.raises(ValidationError, match="target hook is invalid"):
+        runtime.call_tool("gsv_gmail_write", values)
+    assert malformed_hook.calls == []
+
+    malformed_result = _ConfirmationTargetAdapter([{"binding": "bad"}])
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path / "result", adapter=malformed_result)
+    with pytest.raises(ValidationError, match="invalid confirmation target"):
+        runtime.call_tool("gsv_gmail_write", values)
+    assert malformed_result.calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
+def test_provider_confirmation_target_rejects_reserved_input_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _ConfirmationTargetAdapter([])
+    _prepared_adapter, runtime, values = _prepared_local_upload_runtime(
+        tmp_path,
+        monkeypatch,
+        adapter=adapter,
+        allow_provider_target_key=True,
+    )
+    input_value = values["input"]
+    assert isinstance(input_value, dict)
+    values = {**values, "input": {**input_value, "provider_target": "caller-owned"}}
+
+    with pytest.raises(ValidationError, match="reserved provider target key"):
+        runtime.call_tool("gsv_gmail_write", values)
+    assert adapter.confirmation_target_calls == []
+    assert adapter.calls == []
+
+
+def test_provider_confirmation_target_preview_bound_is_checked_after_sanitization(
+    tmp_path: Path,
+) -> None:
+    target = ConnectorConfirmationTarget(
+        binding={"resource_id": "provider-resource-1"},
+        preview={"items": ["x" * 2_000 for _ in range(9)]},
+    )
+    adapter = _ConfirmationTargetAdapter([target])
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter)
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"draft_id": "draft-one"},
+        "operation": "drafts.send",
+    }
+
+    with pytest.raises(ValidationError, match="too large to show safely"):
+        runtime.call_tool("gsv_gmail_write", values)
+    assert adapter.calls == []
 
 
 def test_drive_inline_upload_requires_bound_confirmation_and_dispatches_once(
@@ -1011,6 +1375,56 @@ def test_prepared_preview_hook_only_runs_with_bundle_and_cannot_replace_base_pre
     }
     assert prepared_content["recipients"] == ["alice@example.test"]
     assert prepared_content["subject"] == "Reviewed invoice"
+    runtime.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-pinned transfer proof is POSIX-only")
+def test_provider_confirmation_target_keeps_prepared_upload_bound_and_displayed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = ConnectorConfirmationTarget(
+        binding={"provider_file_id": "provider-file-1", "etag": "etag-1"},
+        preview={"label": "Provider attachment target", "provider_file_id": "provider-file-1"},
+    )
+    adapter = _ConfirmationTargetAdapter([target, target, target])
+    prepared_adapter, runtime, values = _prepared_local_upload_runtime(
+        tmp_path,
+        monkeypatch,
+        adapter=adapter,
+    )
+
+    preview = runtime.call_tool("gsv_gmail_write", values)
+    public_preview = preview["preview"]
+    assert isinstance(public_preview, dict)
+    assert public_preview["provider_target"] == target.preview
+    attachments = public_preview["attachments"]
+    assert isinstance(attachments, list)
+    assert attachments[0]["local_file"]["bytes"] == len(b"reviewed bytes")
+    assert len(adapter.confirmation_target_calls) == 1
+    assert adapter.confirmation_target_calls[0][2] is not None
+    assert len(adapter.confirmation_target_calls[0][2].uploads) == 1
+
+    result = runtime.call_tool(
+        "gsv_gmail_write",
+        {**values, "confirmation_token": preview["confirmation_token"]},
+    )
+    assert result["status"] == "ok"
+    assert prepared_adapter is adapter
+    assert len(adapter.confirmation_target_calls) == 3
+    assert all(call[2] is not None for call in adapter.confirmation_target_calls)
+    assert all(len(call[2].uploads) == 1 for call in adapter.confirmation_target_calls if call[2])
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0][1] == {
+        "attachments": [
+            {
+                "filename": "invoice.pdf",
+                "mime_type": "application/pdf",
+            }
+        ],
+        "subject": "Reviewed invoice",
+    }
+    assert adapter.transferred[-1] == {("attachments", 0, "local_file"): b"reviewed bytes"}
     runtime.close()
 
 

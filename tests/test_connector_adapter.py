@@ -5,6 +5,7 @@ import pytest
 from continuity_kernel.connector_adapter import (
     ConnectorAdapterRegistry,
     ConnectorAdapterResult,
+    ConnectorConfirmationTarget,
     ConnectorRuntimeCredential,
 )
 from continuity_kernel.connector_contract import ConnectorEffect, OperationSpec
@@ -79,3 +80,17 @@ def test_runtime_credential_and_adapter_result_are_bounded_and_redacted() -> Non
             granted_scopes=("scope with whitespace",),
             version=1,
         )
+
+
+def test_confirmation_target_canonicalizes_detached_binding_and_preview() -> None:
+    binding = {"resource": {"id": "provider-1"}}
+    preview = {"label": "Provider item"}
+    target = ConnectorConfirmationTarget(binding=binding, preview=preview)
+
+    binding["resource"]["id"] = "changed"
+    preview["label"] = "changed"
+
+    assert target.binding == {"resource": {"id": "provider-1"}}
+    assert target.preview == {"label": "Provider item"}
+    with pytest.raises(ValidationError, match="not JSON"):
+        ConnectorConfirmationTarget(binding=object(), preview={})

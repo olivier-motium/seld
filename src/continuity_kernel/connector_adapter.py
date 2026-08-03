@@ -122,6 +122,18 @@ class ConnectorAdapterResult:
             raise ValidationError("connector adapter returned an invalid artifact receipt")
 
 
+@dataclass(frozen=True)
+class ConnectorConfirmationTarget:
+    """Detached provider target facts bound to an interactive confirmation."""
+
+    binding: object
+    preview: object
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "binding", canonicalize_json(self.binding))
+        object.__setattr__(self, "preview", canonicalize_json(self.preview))
+
+
 class ConnectorAdapter(Protocol):
     """Closed provider implementation with the backward-compatible effect boundary."""
 
@@ -196,6 +208,20 @@ class ConnectorProviderUploadLimitAdapter(Protocol):
         credential: ConnectorRuntimeCredential,
         transport: ConnectorTransport,
     ) -> int: ...
+
+
+class ConnectorConfirmationTargetAdapter(Protocol):
+    """Optional provider-owned target lookup for consequential confirmations."""
+
+    def resolve_confirmation_target(
+        self,
+        operation: OperationSpec,
+        input_value: object,
+        *,
+        credential: ConnectorRuntimeCredential,
+        transport: ConnectorTransport,
+        transfer: ConnectorTransferContext | None = None,
+    ) -> ConnectorConfirmationTarget | None: ...
 
 
 class ConnectorPreparedConfirmationPreviewAdapter(Protocol):
