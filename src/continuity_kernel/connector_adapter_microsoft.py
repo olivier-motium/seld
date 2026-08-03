@@ -62,6 +62,9 @@ _OUTLOOK_UPLOAD_HOST: Final = "outlook.office.com"
 _ATTACHMENT_METADATA_SELECT: Final = (
     "id,lastModifiedDateTime,name,contentType,size,isInline,contentId,contentLocation"
 )
+_ATTACHMENT_COLLECTION_SELECT: Final = (
+    "id,lastModifiedDateTime,name,contentType,size,isInline"
+)
 _MESSAGE_FIELD_MAP: Final = {
     "bcc_recipients": "bccRecipients",
     "body": "body",
@@ -545,7 +548,7 @@ class MicrosoftConnectorAdapter:
         body = _confirmation_body(message.get("body"), status=message_response.status)
 
         attachment_path = f"{message_path}/attachments"
-        attachment_query = (("$select", _ATTACHMENT_METADATA_SELECT),)
+        attachment_query = (("$select", _ATTACHMENT_COLLECTION_SELECT),)
         attachments = _resolve_confirmation_attachments(
             attachment_path,
             attachment_query,
@@ -1079,9 +1082,9 @@ def _mail_shape(name: str, data: dict[str, object]) -> _RequestShape:
         return _RequestShape(
             f"{_message_path(_text(data, 'message_id'))}/attachments",
             ConnectorMethod.GET,
-            query=(("$select", _ATTACHMENT_METADATA_SELECT),),
+            query=(("$select", _ATTACHMENT_COLLECTION_SELECT),),
             metadata_only=True,
-            required_select=_ATTACHMENT_METADATA_SELECT,
+            required_select=_ATTACHMENT_COLLECTION_SELECT,
             response_bound=_ATTACHMENT_METADATA_RESPONSE_BOUND,
         )
     if name == "attachments.get":
@@ -1247,9 +1250,9 @@ def _calendar_shape(name: str, data: dict[str, object]) -> _RequestShape:
         return _RequestShape(
             f"{_event_path(_text(data, 'calendar_id'), _text(data, 'event_id'))}/attachments",
             ConnectorMethod.GET,
-            query=(("$select", _ATTACHMENT_METADATA_SELECT),),
+            query=(("$select", _ATTACHMENT_COLLECTION_SELECT),),
             metadata_only=True,
-            required_select=_ATTACHMENT_METADATA_SELECT,
+            required_select=_ATTACHMENT_COLLECTION_SELECT,
             response_bound=_ATTACHMENT_METADATA_RESPONSE_BOUND,
         )
     if name == "attachments.get":
@@ -2436,7 +2439,7 @@ def _resolve_confirmation_attachments(
             path=path,
             status=response.status,
             initial_query=initial_query,
-            required_select=_ATTACHMENT_METADATA_SELECT,
+            required_select=_ATTACHMENT_COLLECTION_SELECT,
         )
         if continuation is None:
             return sorted(attachments, key=lambda item: str(item["id"]))
@@ -2448,7 +2451,7 @@ def _resolve_confirmation_attachments(
             continuation,
             path=path,
             initial_query=initial_query,
-            required_select=_ATTACHMENT_METADATA_SELECT,
+            required_select=_ATTACHMENT_COLLECTION_SELECT,
         )
     raise _confirmation_error(200, "confirmation_attachment_page_limit_exceeded")
 
