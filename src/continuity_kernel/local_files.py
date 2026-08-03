@@ -47,14 +47,15 @@ MAX_LOCAL_GRANT_STORE_BYTES: Final = 512 * 1024
 MAX_FILE_TRANSFER_BYTES: Final = 5 * 1024**4
 FILE_TRANSFER_CHUNK_BYTES: Final = 1024 * 1024
 _POSIX_OS = cast(Any, os)
-_PINNED_FILE_TRANSFER_SUPPORTED: Final = (
-    os.name != "nt"
-    and hasattr(os, "O_DIRECTORY")
+_PINNED_FILE_TRANSFER_SUPPORTED: Final = os.name == "nt" or (
+    hasattr(os, "O_DIRECTORY")
     and hasattr(os, "O_NOFOLLOW")
     and os.open in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
     and os.stat in os.supports_follow_symlinks
 )
+_BINARY_OPEN: Final = getattr(os, "O_BINARY", 0)
+_NOINHERIT_OPEN: Final = getattr(os, "O_NOINHERIT", 0)
 _GRANT_KEYS: Final = frozenset(
     {
         "created_at",
@@ -858,6 +859,11 @@ def _open_granted_file(grant: LocalFileGrant, relative: Path) -> Iterator[int]:
     ):
         raise ValidationError("local file is not eligible for binary transfer")
 
+    if os.name == "nt":
+        with _open_granted_file_windows(grant, relative) as descriptor:
+            yield descriptor
+        return
+
     directory_flags = os.O_RDONLY | _POSIX_OS.O_DIRECTORY | _POSIX_OS.O_NOFOLLOW
     root_descriptor = -1
     directory_descriptors: list[int] = []
@@ -945,6 +951,85 @@ def _open_granted_file(grant: LocalFileGrant, relative: Path) -> Iterator[int]:
             os.close(descriptor)
         if root_descriptor >= 0:
             os.close(root_descriptor)
+
+
+@contextmanager
+def _open_granted_file_windows(grant: LocalFileGrant, relative: Path) -> Iterator[int]:
+    """Open one Windows grant through checked real ancestry and a binary handle."""
+
+    root = Path(grant.root)
+    ancestors: list[tuple[Path, tuple[int, int]]] = []
+    descriptor = -1
+    try:
+        root_metadata = os.lstat(root)
+        if (
+            _is_link_or_reparse(root_metadata)
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or _identity(root_metadata) != (grant.device, grant.inode)
+        ):
+            raise ValidationError("granted local file root changed before transfer")
+
+        parent = root
+        for component in relative.parts[:-1]:
+            parent /= component
+            metadata = os.lstat(parent)
+            if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                raise ValidationError("local file transfer ancestry is unavailable")
+            ancestors.append((parent, _identity(metadata)))
+
+        target = root / relative
+        listed = os.lstat(target)
+        if _is_cloud_placeholder_metadata(target.name, listed):
+            raise ValidationError("local file is a cloud placeholder")
+        if _is_link_or_reparse(listed) or not stat.S_ISREG(listed.st_mode):
+            raise ValidationError("local file transfer requires a regular file, not a link")
+        descriptor = os.open(
+            target,
+            os.O_RDONLY | _BINARY_OPEN | _NOINHERIT_OPEN,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _identity(listed) != _identity(opened)
+            or _is_cloud_placeholder_metadata(target.name, opened)
+        ):
+            raise ValidationError("local file changed before transfer")
+        yield descriptor
+
+        finished = os.fstat(descriptor)
+        current = os.lstat(target)
+        if (
+            not stat.S_ISREG(finished.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or _is_link_or_reparse(current)
+            or _stable_file_metadata(finished) != _stable_file_metadata(opened)
+            or _identity(current) != _identity(opened)
+            or _is_cloud_placeholder_metadata(target.name, finished)
+            or _is_cloud_placeholder_metadata(target.name, current)
+        ):
+            raise ValidationError("local file changed while it was transferred")
+        for path, identity in ancestors:
+            metadata = os.lstat(path)
+            if (
+                _is_link_or_reparse(metadata)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or _identity(metadata) != identity
+            ):
+                raise ValidationError("local file transfer ancestry changed while it ran")
+        current_root = os.lstat(root)
+        if (
+            _is_link_or_reparse(current_root)
+            or not stat.S_ISDIR(current_root.st_mode)
+            or _identity(current_root) != (grant.device, grant.inode)
+        ):
+            raise ValidationError("granted local file root changed while it was transferred")
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError("local file transfer could not verify its stable path") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _hash_descriptor(descriptor: int, *, label: str, max_bytes: int) -> str:
