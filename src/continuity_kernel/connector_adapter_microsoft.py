@@ -149,11 +149,14 @@ _MESSAGE_DETAIL_FIELDS: Final = (
 )
 _ATTACHMENT_METADATA_RESPONSE_BOUND: Final = 256 * 1024
 _CONFIRMATION_KIND: Final = "outlook_mail.drafts.send"
+_CONFIRMATION_EVENT_CREATE_KIND: Final = "outlook_calendar.events.create"
 _CONFIRMATION_MESSAGE_SELECT: Final = (
     "id,changeKey,isDraft,parentFolderId,subject,toRecipients,ccRecipients,bccRecipients,"
     "replyTo,body,importance,hasAttachments,from,sender,isDeliveryReceiptRequested,"
     "isReadReceiptRequested,internetMessageHeaders"
 )
+_CONFIRMATION_CALENDAR_SELECT: Final = "id,name,owner,canEdit,isDefaultCalendar,isTallyingResponses"
+_CONFIRMATION_CALENDAR_RESPONSE_BOUND: Final = 64 * 1024
 _CONFIRMATION_MESSAGE_RESPONSE_BOUND: Final = 16 * 1024 * 1024
 _CONFIRMATION_MAX_ATTACHMENT_PAGES: Final = 250
 _CONFIRMATION_MAX_ATTACHMENTS: Final = 250
@@ -383,9 +386,21 @@ class MicrosoftConnectorAdapter:
         transport: ConnectorTransport,
         transfer: ConnectorTransferContext | None = None,
     ) -> ConnectorConfirmationTarget | None:
-        """Bind an Outlook draft send to the exact live draft projection."""
+        """Bind a consequential Outlook action to its exact live provider target."""
 
         known, data = _known_operation(operation, input_value, transfer=transfer)
+        if (
+            known.provider == "outlook_calendar"
+            and known.name == "events.create"
+            and _event_mutation_is_outward(data)
+        ):
+            if not isinstance(credential, ConnectorRuntimeCredential):
+                raise ValidationError("connector runtime credential is invalid")
+            return _resolve_event_create_confirmation_target(
+                data,
+                credential=credential,
+                transport=transport,
+            )
         if known.provider != "outlook_mail" or known.name != "drafts.send":
             return None
         if not isinstance(credential, ConnectorRuntimeCredential):
@@ -790,6 +805,114 @@ class MicrosoftConnectorAdapter:
             self._message_restores.restore(handle, record)
             raise
         return _result(response, path=shape.path, mime=False)
+
+
+def _resolve_event_create_confirmation_target(
+    data: Mapping[str, object],
+    *,
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+) -> ConnectorConfirmationTarget:
+    requested_calendar_id = _text(data, "calendar_id")
+    response = transport.request(
+        origin=_ORIGIN,
+        method=ConnectorMethod.GET,
+        path=_calendar_path(requested_calendar_id),
+        credential=credential.credential,
+        query=(("$select", _CONFIRMATION_CALENDAR_SELECT),),
+        headers=_headers({}, time_zone=None),
+        expected_statuses=frozenset({200}),
+        response_bound=_CONFIRMATION_CALENDAR_RESPONSE_BOUND,
+    )
+    calendar = _provider_mapping(response, "Outlook event-create confirmation calendar")
+    if "@odata.nextLink" in calendar:
+        raise _confirmation_error(
+            response.status,
+            "invalid_event_create_confirmation_calendar_pagination",
+        )
+
+    resolved_calendar_id = _confirmation_required_text(
+        calendar.get("id"),
+        status=response.status,
+        code="invalid_event_create_confirmation_calendar",
+    )
+    if (
+        requested_calendar_id != _PRIMARY_CALENDAR_ALIAS
+        and resolved_calendar_id != requested_calendar_id
+    ):
+        raise _confirmation_error(
+            response.status,
+            "event_create_confirmation_calendar_identity_mismatch",
+        )
+    name = _confirmation_required_text(
+        calendar.get("name"),
+        status=response.status,
+        code="invalid_event_create_confirmation_calendar",
+    )
+    raw_owner = calendar.get("owner")
+    owner = (
+        None
+        if raw_owner is None
+        else _confirmation_recipient(
+            {"emailAddress": raw_owner},
+            status=response.status,
+        )
+    )
+    can_edit = _confirmation_required_bool(
+        calendar.get("canEdit"),
+        status=response.status,
+        code="invalid_event_create_confirmation_calendar",
+    )
+    is_default = _confirmation_required_bool(
+        calendar.get("isDefaultCalendar"),
+        status=response.status,
+        code="invalid_event_create_confirmation_calendar",
+    )
+    is_tallying_responses = _confirmation_required_bool(
+        calendar.get("isTallyingResponses"),
+        status=response.status,
+        code="invalid_event_create_confirmation_calendar",
+    )
+    if not can_edit:
+        raise ValidationError(
+            "Outlook reports that the selected calendar is not editable; choose a calendar "
+            "you can edit."
+        )
+
+    has_attendees = isinstance(data.get("attendees"), list) and bool(data["attendees"])
+    is_non_primary = requested_calendar_id != _PRIMARY_CALENDAR_ALIAS
+    if has_attendees and is_non_primary:
+        consequence = (
+            "Outlook will create this event on the shown secondary, shared, or delegated "
+            "calendar and send meeting invitations to the confirmed attendee list."
+        )
+    elif has_attendees:
+        consequence = "Outlook will send meeting invitations to the confirmed attendee list."
+    else:
+        consequence = (
+            "Outlook will create this event on the shown secondary, shared, or delegated "
+            "calendar; confirm that you intend to change that calendar."
+        )
+
+    binding = {
+        "kind": _CONFIRMATION_EVENT_CREATE_KIND,
+        "requested_calendar_id": requested_calendar_id,
+        "resolved_calendar_id": resolved_calendar_id,
+        "name": name,
+        "owner": owner,
+        "can_edit": can_edit,
+        "is_default_calendar": is_default,
+        "is_tallying_responses": is_tallying_responses,
+    }
+    preview = {
+        "calendar_name": name,
+        "calendar_owner": owner,
+        "can_edit": can_edit,
+        "is_default_calendar": is_default,
+        "is_tallying_responses": is_tallying_responses,
+        "consequence": consequence,
+    }
+    return ConnectorConfirmationTarget(binding=binding, preview=preview)
 
 
 def _known_operation(
@@ -2199,6 +2322,12 @@ def _confirmation_recipient(value: object, *, status: int) -> dict[str, str]:
 def _confirmation_optional_bool(value: object, *, status: int, code: str) -> bool:
     if value is None:
         return False
+    if type(value) is not bool:
+        raise _confirmation_error(status, code)
+    return value
+
+
+def _confirmation_required_bool(value: object, *, status: int, code: str) -> bool:
     if type(value) is not bool:
         raise _confirmation_error(status, code)
     return value

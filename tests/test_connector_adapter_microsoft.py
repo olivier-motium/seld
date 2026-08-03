@@ -46,6 +46,7 @@ _CONFIRMATION_MESSAGE_SELECT = (
 _CONFIRMATION_ATTACHMENT_SELECT = (
     "id,lastModifiedDateTime,name,contentType,size,isInline,contentId,contentLocation"
 )
+_CONFIRMATION_CALENDAR_SELECT = "id,name,owner,canEdit,isDefaultCalendar,isTallyingResponses"
 
 
 class _FakeTransport:
@@ -154,6 +155,21 @@ class _DraftConfirmationTransport:
         )
 
 
+class _CalendarConfirmationTransport:
+    def __init__(self, calendar: object) -> None:
+        self.calendar = calendar
+        self.calls: list[dict[str, object]] = []
+
+    def request(self, **kwargs: object) -> ConnectorResponse:
+        self.calls.append(kwargs)
+        return ConnectorResponse(
+            origin=ConnectorOrigin.MICROSOFT_GRAPH,
+            status=200,
+            headers=MappingProxyType({}),
+            body=json.dumps(self.calendar).encode(),
+        )
+
+
 def _credential() -> ConnectorRuntimeCredential:
     return ConnectorRuntimeCredential(
         credential=ConnectorCredential(AuthorizationScheme.BEARER, "test-secret"),
@@ -227,6 +243,21 @@ def _confirmation_attachment(
         "isInline": inline,
         "contentId": f"cid-{attachment_id}" if inline else None,
         "contentLocation": f"inline/{name}" if inline else None,
+    }
+
+
+def _confirmation_calendar(
+    calendar_id: str = "resolved-primary-calendar",
+    *,
+    default: bool = False,
+) -> dict[str, object]:
+    return {
+        "id": calendar_id,
+        "name": "Work Calendar",
+        "owner": {"address": "owner@example.test", "name": "Calendar Owner"},
+        "canEdit": True,
+        "isDefaultCalendar": default,
+        "isTallyingResponses": True,
     }
 
 
@@ -439,6 +470,147 @@ def _operation(provider: str, mode: ConnectorMode, name: str) -> OperationSpec:
         for operation in MICROSOFT_OPERATIONS
         if operation.provider == provider and operation.mode is mode and operation.name == name
     )
+
+
+def test_event_create_confirmation_target_binds_live_primary_calendar() -> None:
+    calendar = _confirmation_calendar()
+    transport = _CalendarConfirmationTransport(calendar)
+
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_calendar", ConnectorMode.WRITE, "events.create"),
+        _event(),
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert target == ConnectorConfirmationTarget(
+        binding={
+            "kind": "outlook_calendar.events.create",
+            "requested_calendar_id": "primary",
+            "resolved_calendar_id": "resolved-primary-calendar",
+            "name": "Work Calendar",
+            "owner": {"email": "owner@example.test", "name": "Calendar Owner"},
+            "can_edit": True,
+            "is_default_calendar": False,
+            "is_tallying_responses": True,
+        },
+        preview={
+            "calendar_name": "Work Calendar",
+            "calendar_owner": {
+                "email": "owner@example.test",
+                "name": "Calendar Owner",
+            },
+            "can_edit": True,
+            "is_default_calendar": False,
+            "is_tallying_responses": True,
+            "consequence": (
+                "Outlook will send meeting invitations to the confirmed attendee list."
+            ),
+        },
+    )
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["method"] is ConnectorMethod.GET
+    assert transport.calls[0]["path"] == _PRIMARY_CALENDAR
+    assert transport.calls[0]["query"] == (("$select", _CONFIRMATION_CALENDAR_SELECT),)
+    assert transport.calls[0]["headers"] == {"Prefer": 'IdType="ImmutableId"'}
+    assert transport.calls[0]["response_bound"] == 64 * 1024
+    assert "resolved-primary-calendar" not in json.dumps(target.preview)
+
+
+def test_event_create_confirmation_target_binds_non_primary_calendar() -> None:
+    transport = _CalendarConfirmationTransport(_confirmation_calendar("calendar-1", default=False))
+
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_calendar", ConnectorMode.WRITE, "events.create"),
+        _event("calendar-1", attendees=False),
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert target is not None
+    binding = cast(dict[str, object], target.binding)
+    preview = cast(dict[str, object], target.preview)
+    assert binding["requested_calendar_id"] == "calendar-1"
+    assert binding["resolved_calendar_id"] == "calendar-1"
+    assert "secondary, shared, or delegated calendar" in str(preview["consequence"])
+    assert transport.calls[0]["path"] == _CALENDAR
+
+
+def test_event_create_confirmation_target_changes_with_live_calendar() -> None:
+    before = _confirmation_calendar()
+    after = {**before, "name": "Renamed Calendar"}
+    first = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_calendar", ConnectorMode.WRITE, "events.create"),
+        _event(),
+        credential=_credential(),
+        transport=cast(ConnectorTransport, _CalendarConfirmationTransport(before)),
+    )
+    second = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_calendar", ConnectorMode.WRITE, "events.create"),
+        _event(),
+        credential=_credential(),
+        transport=cast(ConnectorTransport, _CalendarConfirmationTransport(after)),
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first.binding != second.binding
+
+
+@pytest.mark.parametrize(
+    ("input_value", "calendar"),
+    (
+        (_event(), []),
+        (_event(), {**_confirmation_calendar(), "canEdit": None}),
+        (_event(), {**_confirmation_calendar(), "@odata.nextLink": "opaque"}),
+        (
+            _event("calendar-1", attendees=False),
+            _confirmation_calendar("different-calendar", default=False),
+        ),
+    ),
+)
+def test_event_create_confirmation_target_rejects_invalid_live_calendar(
+    input_value: dict[str, object],
+    calendar: object,
+) -> None:
+    transport = _CalendarConfirmationTransport(calendar)
+
+    with pytest.raises(ConnectorProviderError):
+        MicrosoftConnectorAdapter().resolve_confirmation_target(
+            _operation("outlook_calendar", ConnectorMode.WRITE, "events.create"),
+            input_value,
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+    assert len(transport.calls) == 1
+
+
+def test_event_create_confirmation_target_rejects_noneditable_calendar() -> None:
+    calendar = {**_confirmation_calendar(), "canEdit": False}
+    transport = _CalendarConfirmationTransport(calendar)
+
+    with pytest.raises(ValidationError, match="calendar is not editable"):
+        MicrosoftConnectorAdapter().resolve_confirmation_target(
+            _operation("outlook_calendar", ConnectorMode.WRITE, "events.create"),
+            _event(),
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+    assert len(transport.calls) == 1
+
+
+def test_safe_event_create_has_no_confirmation_target_provider_read() -> None:
+    transport = _CalendarConfirmationTransport(_confirmation_calendar())
+
+    target = MicrosoftConnectorAdapter().resolve_confirmation_target(
+        _operation("outlook_calendar", ConnectorMode.WRITE, "events.create"),
+        _event(attendees=False),
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert target is None
+    assert transport.calls == []
 
 
 def test_draft_send_confirmation_target_binds_complete_private_projection() -> None:
