@@ -4,6 +4,10 @@
     "google": {
       "client_id": "240673742355-jleuolkeoleii87un844sa2gmd548do7.apps.googleusercontent.com",
       "redirect_template": "http://127.0.0.1:0"
+    },
+    "slack": {
+      "client_id": "8699719993504.11763118985744",
+      "redirect_template": "http://localhost:8767/oauth/callback"
     }
   }
 }
