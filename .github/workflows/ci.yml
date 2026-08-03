@@ -34,7 +34,7 @@ jobs:
       - if: runner.os != 'Windows'
         run: uv run pytest --cov=continuity_kernel --cov-report=term-missing
       - if: runner.os == 'Windows'
-        run: uv run pytest --no-cov --tb=short
+        run: uv run pytest --no-cov --tb=line
       - run: uv run python scripts/privacy_check.py --self-test
       - run: uv run python scripts/privacy_check.py .
 
