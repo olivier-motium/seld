@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -177,6 +178,23 @@ class _CalendarListTransport(ConnectorTransport):
         return ConnectorResponse(kwargs["origin"], 200, {}, body)
 
 
+class _DriveLifecycleTransport(ConnectorTransport):
+    def __init__(self, bodies: tuple[dict[str, object], ...]) -> None:
+        self.bodies = list(bodies)
+        self.requests: list[dict[str, Any]] = []
+
+    def request(self, **kwargs: Any) -> ConnectorResponse:
+        self.requests.append(kwargs)
+        if not self.bodies:
+            raise AssertionError("unexpected Google Drive lifecycle request")
+        return ConnectorResponse(
+            kwargs["origin"],
+            200,
+            {},
+            json.dumps(self.bodies.pop(0)).encode(),
+        )
+
+
 class _AmbiguousGmailSendTransport(_GmailModifyTransport):
     def request(self, **kwargs: Any) -> ConnectorResponse:
         self.requests.append(kwargs)
@@ -309,6 +327,42 @@ def _calendar_list_entry(*, summary: str = "Team") -> dict[str, object]:
         "kind": "calendar#calendarListEntry",
         "primary": False,
         "summary": summary,
+    }
+
+
+def _drive_lifecycle_snapshot(
+    *,
+    file_id: str = "file",
+    mime_type: str = "text/plain",
+    parents: tuple[str, ...] = ("parent",),
+    resource_key: str | None = None,
+    trashed: bool = False,
+    explicitly_trashed: bool = False,
+    version: str = "7",
+    capabilities: dict[str, bool | None] | None = None,
+) -> dict[str, object]:
+    capability_values: dict[str, bool | None] = {
+        "canAddChildren": None,
+        "canAddFolderFromAnotherDrive": None,
+        "canDelete": None,
+        "canMoveItemOutOfDrive": None,
+        "canMoveItemWithinDrive": None,
+        "canTrash": None,
+        "canUntrash": None,
+    }
+    capability_values.update(capabilities or {})
+    return {
+        "capabilities": capability_values,
+        "driveId": None,
+        "explicitlyTrashed": explicitly_trashed,
+        "id": file_id,
+        "mimeType": mime_type,
+        "name": "File" if file_id == "file" else "Destination",
+        "ownedByMe": True,
+        "parents": list(parents),
+        "resourceKey": resource_key,
+        "trashed": trashed,
+        "version": version,
     }
 
 
@@ -1014,6 +1068,268 @@ def test_gmail_label_purge_preview_rechecks_at_execution_and_never_deletes_drift
             ConnectorMethod.GET,
         ]
         assert all(request["method"] is not ConnectorMethod.DELETE for request in raced.requests)
+    finally:
+        runtime.close()
+
+
+def test_drive_trash_preview_rechecks_at_execution_and_returns_a_verified_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    target = _drive_lifecycle_snapshot(
+        resource_key="target-key",
+        capabilities={"canTrash": True},
+    )
+    returned = {
+        **target,
+        "explicitlyTrashed": True,
+        "trashed": True,
+        "version": "8",
+    }
+    transport = _DriveLifecycleTransport((target, target, target, returned))
+    runtime.transport = transport
+    input_value = {"expected_file": target, "file_id": "file"}
+    try:
+        preview = runtime.call_tool(
+            "gsv_google_drive_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "files.trash",
+            },
+        )
+        assert preview["status"] == "confirmation_required"
+        assert preview["effect"] == ConnectorEffect.DESTRUCTIVE.value
+        preview_value = preview["preview"]
+        assert isinstance(preview_value, Mapping)
+        expected_file_preview = preview_value["expected_file"]
+        assert isinstance(expected_file_preview, Mapping)
+        assert expected_file_preview["resourceKey"] == {
+            "characters": 10,
+            "digest": "sha256:" + hashlib.sha256(b"target-key").hexdigest(),
+            "omitted": True,
+        }
+        warning = str(preview["warning"])
+        for phrase in ("recoverable", "30 days", "retention rules"):
+            assert phrase in warning
+
+        completed = runtime.call_tool(
+            "gsv_google_drive_write",
+            {
+                "confirmation_token": preview["confirmation_token"],
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "files.trash",
+            },
+        )
+        assert completed["status"] == "ok"
+        assert completed["result"] == returned
+        assert [request["method"] for request in transport.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.PATCH,
+        ]
+        assert all("resourceKey" not in dict(request["query"]) for request in transport.requests)
+        assert all(
+            request["headers"] == {"X-Goog-Drive-Resource-Keys": "file/target-key"}
+            for request in transport.requests
+        )
+    finally:
+        runtime.close()
+
+
+def test_drive_confirmation_drift_preserves_the_unconsumed_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    target = _drive_lifecycle_snapshot(capabilities={"canTrash": True})
+    changed = _drive_lifecycle_snapshot(capabilities={"canTrash": False})
+    returned = {
+        **target,
+        "explicitlyTrashed": True,
+        "trashed": True,
+        "version": "8",
+    }
+    transport = _DriveLifecycleTransport((target, changed))
+    runtime.transport = transport
+    input_value = {"expected_file": target, "file_id": "file"}
+    try:
+        preview = runtime.call_tool(
+            "gsv_google_drive_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "files.trash",
+            },
+        )
+        token = preview["confirmation_token"]
+        with pytest.raises(ConflictError, match="file changed"):
+            runtime.call_tool(
+                "gsv_google_drive_write",
+                {
+                    "confirmation_token": token,
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": input_value,
+                    "operation": "files.trash",
+                },
+            )
+        assert [request["method"] for request in transport.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+        ]
+
+        transport.bodies.extend((target, target, returned))
+        completed = runtime.call_tool(
+            "gsv_google_drive_write",
+            {
+                "confirmation_token": token,
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "files.trash",
+            },
+        )
+        assert completed["status"] == "ok"
+        assert [request["method"] for request in transport.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.PATCH,
+        ]
+    finally:
+        runtime.close()
+
+
+def test_drive_move_destination_drift_at_execution_spends_no_provider_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    target = _drive_lifecycle_snapshot(
+        resource_key="target-key",
+        capabilities={"canMoveItemWithinDrive": True},
+    )
+    destination = _drive_lifecycle_snapshot(
+        file_id="destination",
+        mime_type="application/vnd.google-apps.folder",
+        parents=("destination-parent",),
+        resource_key="destination-key",
+        capabilities={"canAddChildren": True},
+    )
+    changed_destination = {**destination, "version": "8"}
+    transport = _DriveLifecycleTransport(
+        (
+            target,
+            destination,
+            target,
+            destination,
+            target,
+            changed_destination,
+        )
+    )
+    runtime.transport = transport
+    input_value = {
+        "current_parent_resource_key": "parent-key",
+        "expected_destination": destination,
+        "expected_file": target,
+        "file_id": "file",
+    }
+    try:
+        preview = runtime.call_tool(
+            "gsv_google_drive_write",
+            {
+                "connection_id": str(_CONNECTION_ID),
+                "input": input_value,
+                "operation": "files.move",
+            },
+        )
+        assert preview["status"] == "confirmation_required"
+        assert preview["effect"] == ConnectorEffect.OUTWARD.value
+        assert "inherited access" in str(preview["warning"])
+        preview_value = preview["preview"]
+        assert isinstance(preview_value, Mapping)
+        parent_key_preview = preview_value["current_parent_resource_key"]
+        assert isinstance(parent_key_preview, Mapping)
+        assert parent_key_preview["omitted"] is True
+
+        with pytest.raises(ConflictError, match="destination changed"):
+            runtime.call_tool(
+                "gsv_google_drive_write",
+                {
+                    "confirmation_token": preview["confirmation_token"],
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": input_value,
+                    "operation": "files.move",
+                },
+            )
+        assert [request["method"] for request in transport.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+        ]
+        assert all(request["method"] is not ConnectorMethod.PATCH for request in transport.requests)
+    finally:
+        runtime.close()
+
+
+def test_drive_restore_and_folder_purge_previews_explain_their_distinct_consequences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, runtime, _preview_transport = _runtime(tmp_path, monkeypatch)
+    restore = _drive_lifecycle_snapshot(
+        capabilities={"canUntrash": True},
+        explicitly_trashed=True,
+        trashed=True,
+    )
+    purge = _drive_lifecycle_snapshot(
+        file_id="folder",
+        mime_type="application/vnd.google-apps.folder",
+        capabilities={"canDelete": True},
+        explicitly_trashed=True,
+        trashed=True,
+    )
+    transport = _DriveLifecycleTransport((restore, purge))
+    runtime.transport = transport
+    try:
+        cases = (
+            (
+                "files.restore",
+                {"expected_file": restore, "file_id": "file"},
+                ConnectorEffect.OUTWARD,
+                ("visible again", "parent hierarchy", "direct permissions"),
+            ),
+            (
+                "files.purge",
+                {"expected_file": purge, "file_id": "folder"},
+                ConnectorEffect.PERMANENT,
+                ("permanently", "descendants owned by you", "limited-access"),
+            ),
+        )
+        for operation, input_value, effect, phrases in cases:
+            preview = runtime.call_tool(
+                "gsv_google_drive_write",
+                {
+                    "connection_id": str(_CONNECTION_ID),
+                    "input": input_value,
+                    "operation": operation,
+                },
+            )
+            assert preview["status"] == "confirmation_required"
+            assert preview["effect"] == effect.value
+            warning = str(preview["warning"])
+            for phrase in phrases:
+                assert phrase in warning
+        assert [request["method"] for request in transport.requests] == [
+            ConnectorMethod.GET,
+            ConnectorMethod.GET,
+        ]
     finally:
         runtime.close()
 

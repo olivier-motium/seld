@@ -129,6 +129,36 @@ def _operation(provider: str, mode: ConnectorMode, name: str) -> OperationSpec:
     return _catalog().lookup(provider, mode, name)
 
 
+def _drive_snapshot(
+    *,
+    file_id: str = "file",
+    drive_id: str | None = None,
+    owned_by_me: bool | None = True,
+    version: str = "7",
+) -> dict[str, object]:
+    return {
+        "capabilities": {
+            "canAddChildren": None,
+            "canAddFolderFromAnotherDrive": None,
+            "canDelete": None,
+            "canMoveItemOutOfDrive": None,
+            "canMoveItemWithinDrive": None,
+            "canTrash": None,
+            "canUntrash": None,
+        },
+        "driveId": drive_id,
+        "explicitlyTrashed": False,
+        "id": file_id,
+        "mimeType": "text/plain",
+        "name": "File",
+        "ownedByMe": owned_by_me,
+        "parents": ["parent"],
+        "resourceKey": None,
+        "trashed": False,
+        "version": version,
+    }
+
+
 def _expected_event() -> dict[str, object]:
     return {
         "end": None,
@@ -225,9 +255,9 @@ def test_google_effects_and_gmail_purge_scope_are_explicit() -> None:
         ("google_drive", "files.create"): ConnectorEffect.SAFE_MUTATION,
         ("google_drive", "files.update"): ConnectorEffect.SAFE_MUTATION,
         ("google_drive", "files.copy"): ConnectorEffect.SAFE_MUTATION,
-        ("google_drive", "files.move"): ConnectorEffect.SAFE_MUTATION,
+        ("google_drive", "files.move"): ConnectorEffect.OUTWARD,
         ("google_drive", "files.trash"): ConnectorEffect.DESTRUCTIVE,
-        ("google_drive", "files.restore"): ConnectorEffect.SAFE_MUTATION,
+        ("google_drive", "files.restore"): ConnectorEffect.OUTWARD,
         ("google_drive", "files.purge"): ConnectorEffect.PERMANENT,
         ("google_drive", "permissions.create"): ConnectorEffect.OUTWARD,
         ("google_drive", "permissions.update"): ConnectorEffect.OUTWARD,
@@ -1314,11 +1344,39 @@ def test_drive_closed_comment_reply_permission_and_move_shapes() -> None:
                 "role": "reader",
             }
         )
+    target = _drive_snapshot()
+    destination = {
+        **_drive_snapshot(file_id="destination"),
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    move = {
+        "current_parent_resource_key": "parent-key",
+        "expected_destination": destination,
+        "expected_file": target,
+        "file_id": "file",
+    }
+    assert catalog.validate_input("google_drive", ConnectorMode.WRITE, "files.move", move) == move
+    assert catalog.validate_input(
+        "google_drive",
+        ConnectorMode.WRITE,
+        "files.trash",
+        {"expected_file": target, "file_id": "file"},
+    ) == {"expected_file": target, "file_id": "file"}
+
+    shared = _drive_snapshot(drive_id="shared", owned_by_me=None)
+    assert catalog.validate_input(
+        "google_drive",
+        ConnectorMode.WRITE,
+        "files.purge",
+        {"expected_file": shared, "file_id": "file"},
+    ) == {"expected_file": shared, "file_id": "file"}
+
     for invalid_move in (
         {"file_id": "file"},
-        {"add_parent_ids": [], "file_id": "file"},
-        {"add_parent_ids": ["one", "two"], "file_id": "file"},
-        {"file_id": "file", "remove_parent_ids": ["one", "two"]},
+        {"expected_file": target, "file_id": "file"},
+        {**move, "add_parent_ids": ["destination"]},
+        {**move, "expected_file": {**target, "version": 7}},
+        {**move, "expected_file": {**target, "unknown": True}},
     ):
         with pytest.raises(ValidationError):
             catalog.validate_input("google_drive", ConnectorMode.WRITE, "files.move", invalid_move)

@@ -252,6 +252,45 @@ def _expected_calendar(
     }
 
 
+def _drive_snapshot(
+    *,
+    file_id: str = "file",
+    name: str = "File",
+    mime_type: str = "text/plain",
+    parents: list[str] | None = None,
+    drive_id: str | None = None,
+    owned_by_me: bool | None = True,
+    resource_key: str | None = None,
+    trashed: bool = False,
+    explicitly_trashed: bool = False,
+    version: str = "7",
+    capabilities: Mapping[str, bool | None] | None = None,
+) -> dict[str, object]:
+    capability_values: dict[str, bool | None] = {
+        "canAddChildren": None,
+        "canAddFolderFromAnotherDrive": None,
+        "canDelete": None,
+        "canMoveItemOutOfDrive": None,
+        "canMoveItemWithinDrive": None,
+        "canTrash": None,
+        "canUntrash": None,
+    }
+    capability_values.update(capabilities or {})
+    return {
+        "capabilities": capability_values,
+        "driveId": drive_id,
+        "explicitlyTrashed": explicitly_trashed,
+        "id": file_id,
+        "mimeType": mime_type,
+        "name": name,
+        "ownedByMe": owned_by_me,
+        "parents": ["parent"] if parents is None else parents,
+        "resourceKey": resource_key,
+        "trashed": trashed,
+        "version": version,
+    }
+
+
 def _calendar_list_resource(
     *,
     access_role: str = "reader",
@@ -681,9 +720,40 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
         if name == "files.copy":
             return {"file_id": "file"}
         if name == "files.move":
-            return {"add_parent_ids": ["parent"], "file_id": "file"}
-        if name in {"files.trash", "files.restore", "files.purge"}:
-            return {"file_id": "file"}
+            return {
+                "expected_destination": _drive_snapshot(
+                    file_id="destination",
+                    mime_type="application/vnd.google-apps.folder",
+                    name="Destination",
+                    parents=["destination-parent"],
+                    capabilities={"canAddChildren": True},
+                ),
+                "expected_file": _drive_snapshot(capabilities={"canMoveItemWithinDrive": True}),
+                "file_id": "file",
+            }
+        if name == "files.trash":
+            return {
+                "expected_file": _drive_snapshot(capabilities={"canTrash": True}),
+                "file_id": "file",
+            }
+        if name == "files.restore":
+            return {
+                "expected_file": _drive_snapshot(
+                    capabilities={"canUntrash": True},
+                    explicitly_trashed=True,
+                    trashed=True,
+                ),
+                "file_id": "file",
+            }
+        if name == "files.purge":
+            return {
+                "expected_file": _drive_snapshot(
+                    capabilities={"canDelete": True},
+                    explicitly_trashed=True,
+                    trashed=True,
+                ),
+                "file_id": "file",
+            }
         if name == "permissions.create":
             return {
                 "email_address": "person@example.test",
@@ -797,6 +867,39 @@ def test_every_google_operation_uses_only_bounded_fixed_adapter_requests(tmp_pat
                     response=_drive_download_response(partial=True),
                 )
                 expected_requests = 2
+            if operation.provider == "google_drive" and operation.name in {
+                "files.move",
+                "files.purge",
+                "files.restore",
+                "files.trash",
+            }:
+                sample = _sample(operation)
+                target = sample["expected_file"]
+                assert isinstance(target, Mapping)
+                write_idempotency_key = "confirmed-drive-lifecycle"
+                expected_requests = 2
+                if operation.name == "files.move":
+                    destination = sample["expected_destination"]
+                    assert isinstance(destination, Mapping)
+                    returned = {**target, "parents": [destination["id"]], "version": "8"}
+                    transport.bodies = [
+                        json.dumps(target).encode(),
+                        json.dumps(destination).encode(),
+                        json.dumps(returned).encode(),
+                    ]
+                    expected_requests = 3
+                elif operation.name == "files.purge":
+                    transport.bodies = [json.dumps(target).encode(), b"{}"]
+                else:
+                    returned = {
+                        **target,
+                        "trashed": operation.name == "files.trash",
+                        "version": "8",
+                    }
+                    transport.bodies = [
+                        json.dumps(target).encode(),
+                        json.dumps(returned).encode(),
+                    ]
             if operation.provider == "gmail" and operation.name in {
                 "messages.import",
                 "messages.insert",
@@ -4283,39 +4386,559 @@ def test_drive_rejects_empty_updates_and_serializes_app_property_deletion() -> N
     assert transport.calls[-1]["json_body"] == {"appProperties": {"obsolete": None}}
 
 
-def test_drive_move_renders_one_distinct_parent_transition() -> None:
+def test_drive_lifecycle_snapshot_is_replayable_and_uses_the_resource_key_header() -> None:
     adapter = GoogleConnectorAdapter()
-    transport = _Transport()
-    operation = _operation("google_drive", "files.move")
-    adapter.execute(
-        operation,
+    transport = _Transport(
+        body=json.dumps(
+            {
+                "explicitlyTrashed": False,
+                "id": "file",
+                "mimeType": "text/plain",
+                "name": "File",
+                "trashed": False,
+                "version": "7",
+            }
+        ).encode()
+    )
+    result = adapter.execute(
+        _operation("google_drive", "files.get"),
         {
-            "add_parent_ids": ["new-parent"],
             "file_id": "file",
-            "remove_parent_ids": ["old-parent"],
+            "lifecycle_snapshot": True,
+            "resource_key": "target-key",
         },
         continuation=None,
         credential=_credential(),
         transport=transport,
     )
-    assert transport.calls[-1]["query"] == (
-        ("addParents", "new-parent"),
-        ("removeParents", "old-parent"),
+    assert result.payload == _drive_snapshot(
+        parents=[],
+        owned_by_me=None,
+        resource_key="target-key",
     )
+    call = transport.calls[-1]
+    assert call["headers"] == {"X-Goog-Drive-Resource-Keys": "file/target-key"}
+    assert "resourceKey" not in dict(call["query"])
+    assert "fields" in dict(call["query"])
 
-    with pytest.raises(ValidationError, match="same parent"):
-        adapter.execute(
-            operation,
-            {
-                "add_parent_ids": ["same-parent"],
-                "file_id": "file",
-                "remove_parent_ids": ["same-parent"],
-            },
+
+@pytest.mark.parametrize("omitted", ("trashed", "explicitlyTrashed"))
+def test_drive_lifecycle_snapshot_fails_closed_when_provider_omits_state(
+    omitted: str,
+) -> None:
+    provider = _drive_snapshot()
+    provider.pop(omitted)
+    transport = _Transport(body=json.dumps(provider).encode())
+    with pytest.raises(ValidationError, match=omitted):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.get"),
+            {"file_id": "file", "lifecycle_snapshot": True},
             continuation=None,
             credential=_credential(),
             transport=transport,
         )
-    assert len(transport.calls) == 1
+
+
+def test_drive_lifecycle_rejects_resource_key_conflicts_in_reads_and_receipts() -> None:
+    adapter = GoogleConnectorAdapter()
+    conflicting_read = _Transport(
+        body=json.dumps(_drive_snapshot(resource_key="provider-key")).encode()
+    )
+    with pytest.raises(ConflictError, match="different resource key"):
+        adapter.execute(
+            _operation("google_drive", "files.get"),
+            {
+                "file_id": "file",
+                "lifecycle_snapshot": True,
+                "resource_key": "bound-key",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=conflicting_read,
+        )
+
+    target = _drive_snapshot(resource_key="bound-key", capabilities={"canTrash": True})
+    returned = {
+        **target,
+        "explicitlyTrashed": True,
+        "resourceKey": "provider-key",
+        "trashed": True,
+        "version": "8",
+    }
+    conflicting_receipt = _Transport(
+        bodies=[json.dumps(target).encode(), json.dumps(returned).encode()]
+    )
+    with pytest.raises(ConnectorOutcomeUnknown, match="do not retry"):
+        adapter.execute(
+            _operation("google_drive", "files.trash"),
+            {"expected_file": target, "file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=conflicting_receipt,
+            write_idempotency_key="confirmed-drive-trash",
+        )
+
+
+def test_drive_lifecycle_rejects_drift_and_missing_capability_before_dispatch() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_drive", "files.trash")
+    wrong_target = _drive_snapshot(file_id="other", capabilities={"canTrash": True})
+    untouched = _Transport()
+    with pytest.raises(ValidationError, match="expected file ID"):
+        adapter.execute(
+            operation,
+            {"expected_file": wrong_target, "file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=untouched,
+            write_idempotency_key="confirmed-drive-trash",
+        )
+    assert untouched.calls == []
+
+    expected = _drive_snapshot(capabilities={"canTrash": True})
+    drifted = {**expected, "version": "8"}
+    drift_transport = _Transport(body=json.dumps(drifted).encode())
+    with pytest.raises(ConflictError, match="changed"):
+        adapter.execute(
+            operation,
+            {"expected_file": expected, "file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=drift_transport,
+            write_idempotency_key="confirmed-drive-trash",
+        )
+    assert [call["method"] for call in drift_transport.calls] == [ConnectorMethod.GET]
+
+    no_capability = _drive_snapshot()
+    capability_transport = _Transport(body=json.dumps(no_capability).encode())
+    with pytest.raises(ValidationError, match="canTrash=true"):
+        adapter.execute(
+            operation,
+            {"expected_file": no_capability, "file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=capability_transport,
+            write_idempotency_key="confirmed-drive-trash",
+        )
+    assert [call["method"] for call in capability_transport.calls] == [ConnectorMethod.GET]
+
+
+def test_drive_lifecycle_requires_a_usable_patch_receipt_and_returns_a_purge_receipt() -> None:
+    adapter = GoogleConnectorAdapter()
+    trash_target = _drive_snapshot(capabilities={"canTrash": True})
+    unusable = _Transport(bodies=[json.dumps(trash_target).encode(), b"{}"])
+    with pytest.raises(ConnectorOutcomeUnknown, match="do not retry"):
+        adapter.execute(
+            _operation("google_drive", "files.trash"),
+            {"expected_file": trash_target, "file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=unusable,
+            write_idempotency_key="confirmed-drive-trash",
+        )
+    assert [call["method"] for call in unusable.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.PATCH,
+    ]
+
+    purge_target = _drive_snapshot(
+        capabilities={"canDelete": True},
+        explicitly_trashed=True,
+        trashed=True,
+    )
+    purge_transport = _Transport(bodies=[json.dumps(purge_target).encode(), b"{}"])
+    result = adapter.execute(
+        _operation("google_drive", "files.purge"),
+        {"expected_file": purge_target, "file_id": "file"},
+        continuation=None,
+        credential=_credential(),
+        transport=purge_transport,
+        write_idempotency_key="confirmed-drive-purge",
+    )
+    assert result.payload == {"file_id": "file", "previous_version": "7", "purged": True}
+    assert [call["method"] for call in purge_transport.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.DELETE,
+    ]
+
+
+def test_drive_lifecycle_unparseable_2xx_receipts_are_outcome_unknown() -> None:
+    adapter = GoogleConnectorAdapter()
+    cases = (
+        (
+            "files.trash",
+            _drive_snapshot(capabilities={"canTrash": True}),
+            ConnectorMethod.PATCH,
+        ),
+        (
+            "files.purge",
+            _drive_snapshot(capabilities={"canDelete": True}, trashed=True),
+            ConnectorMethod.DELETE,
+        ),
+    )
+    for operation_name, target, mutation_method in cases:
+        transport = _Transport(bodies=[json.dumps(target).encode(), b"not-json"])
+        with pytest.raises(ConnectorOutcomeUnknown, match="do not retry"):
+            adapter.execute(
+                _operation("google_drive", operation_name),
+                {"expected_file": target, "file_id": "file"},
+                continuation=None,
+                credential=_credential(),
+                transport=transport,
+                write_idempotency_key=f"confirmed-{operation_name}",
+            )
+        assert [call["method"] for call in transport.calls] == [
+            ConnectorMethod.GET,
+            mutation_method,
+        ]
+
+
+def test_drive_move_unparseable_2xx_receipt_is_outcome_unknown() -> None:
+    target = _drive_snapshot(
+        drive_id="shared-one",
+        owned_by_me=None,
+        capabilities={"canMoveItemOutOfDrive": True},
+    )
+    destination = _drive_snapshot(
+        file_id="new-parent",
+        mime_type="application/vnd.google-apps.folder",
+        drive_id="shared-two",
+        owned_by_me=None,
+        capabilities={"canAddChildren": True},
+    )
+    transport = _Transport(
+        bodies=[
+            json.dumps(target).encode(),
+            json.dumps(destination).encode(),
+            b"not-json",
+        ]
+    )
+    with pytest.raises(ConnectorOutcomeUnknown, match="do not retry"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.move"),
+            {
+                "expected_destination": destination,
+                "expected_file": target,
+                "file_id": "file",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-drive-move",
+        )
+    assert [call["method"] for call in transport.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.GET,
+        ConnectorMethod.PATCH,
+    ]
+
+
+def test_drive_restore_requires_explicit_trash_and_purge_requires_trashed() -> None:
+    adapter = GoogleConnectorAdapter()
+    inherited_trash = _drive_snapshot(
+        capabilities={"canUntrash": True},
+        trashed=True,
+    )
+    restore_transport = _Transport(body=json.dumps(inherited_trash).encode())
+    with pytest.raises(ValidationError, match="explicitly trashed"):
+        adapter.execute(
+            _operation("google_drive", "files.restore"),
+            {"expected_file": inherited_trash, "file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=restore_transport,
+            write_idempotency_key="confirmed-drive-restore",
+        )
+    assert [call["method"] for call in restore_transport.calls] == [ConnectorMethod.GET]
+
+    live_target = _drive_snapshot(capabilities={"canDelete": True})
+    purge_transport = _Transport(body=json.dumps(live_target).encode())
+    with pytest.raises(ValidationError, match="requires a trashed file"):
+        adapter.execute(
+            _operation("google_drive", "files.purge"),
+            {"expected_file": live_target, "file_id": "file"},
+            continuation=None,
+            credential=_credential(),
+            transport=purge_transport,
+            write_idempotency_key="confirmed-drive-purge",
+        )
+    assert [call["method"] for call in purge_transport.calls] == [ConnectorMethod.GET]
+
+
+def test_drive_move_renders_one_distinct_parent_transition() -> None:
+    adapter = GoogleConnectorAdapter()
+    operation = _operation("google_drive", "files.move")
+    target = _drive_snapshot(
+        drive_id="shared-one",
+        owned_by_me=None,
+        resource_key="target-key",
+        capabilities={
+            "canMoveItemOutOfDrive": True,
+        },
+    )
+    destination = _drive_snapshot(
+        file_id="new-parent",
+        name="New parent",
+        mime_type="application/vnd.google-apps.folder",
+        parents=["destination-root"],
+        drive_id="shared-two",
+        owned_by_me=None,
+        resource_key="destination-key",
+        capabilities={"canAddChildren": True},
+    )
+    returned = {
+        **target,
+        "driveId": "shared-two",
+        "parents": ["new-parent"],
+        "version": "8",
+    }
+    transport = _Transport(
+        bodies=[
+            json.dumps(target).encode(),
+            json.dumps(destination).encode(),
+            json.dumps(returned).encode(),
+        ]
+    )
+    result = adapter.execute(
+        operation,
+        {
+            "current_parent_resource_key": "old-parent-key",
+            "expected_destination": destination,
+            "expected_file": target,
+            "file_id": "file",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        write_idempotency_key="confirmed-drive-move",
+    )
+    assert result.payload == returned
+    assert [call["method"] for call in transport.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.GET,
+        ConnectorMethod.PATCH,
+    ]
+    mutation = transport.calls[-1]
+    assert mutation["query"] == (
+        ("addParents", "new-parent"),
+        ("removeParents", "parent"),
+        ("fields", mutation["query"][2][1]),
+        ("supportsAllDrives", "true"),
+    )
+    assert "resourceKey" not in dict(mutation["query"])
+    assert mutation["headers"] == {
+        "X-Goog-Drive-Resource-Keys": (
+            "file/target-key,parent/old-parent-key,new-parent/destination-key"
+        )
+    }
+
+    target_capabilities = target["capabilities"]
+    assert isinstance(target_capabilities, Mapping)
+    same_destination = {
+        **target,
+        "id": "parent",
+        "mimeType": "application/vnd.google-apps.folder",
+        "capabilities": {
+            **target_capabilities,
+            "canAddChildren": True,
+        },
+    }
+    unchanged = _Transport(
+        bodies=[json.dumps(target).encode(), json.dumps(same_destination).encode()]
+    )
+    with pytest.raises(ValidationError, match="current parent"):
+        adapter.execute(
+            operation,
+            {
+                "expected_destination": same_destination,
+                "expected_file": target,
+                "file_id": "file",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=unchanged,
+            write_idempotency_key="confirmed-drive-move",
+        )
+    assert [call["method"] for call in unchanged.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.GET,
+    ]
+
+
+@pytest.mark.parametrize(
+    "receipt_change",
+    (
+        {"id": "other-file"},
+        {"version": "7"},
+        {"parents": ["other-parent"]},
+        {"driveId": "shared-three"},
+    ),
+)
+def test_drive_move_rejects_unbound_receipt_state_as_outcome_unknown(
+    receipt_change: Mapping[str, object],
+) -> None:
+    target = _drive_snapshot(
+        drive_id="shared-one",
+        owned_by_me=None,
+        capabilities={"canMoveItemOutOfDrive": True},
+    )
+    destination = _drive_snapshot(
+        file_id="new-parent",
+        mime_type="application/vnd.google-apps.folder",
+        drive_id="shared-two",
+        owned_by_me=None,
+        capabilities={"canAddChildren": True},
+    )
+    returned = {
+        **target,
+        "driveId": "shared-two",
+        "parents": ["new-parent"],
+        "version": "8",
+        **receipt_change,
+    }
+    transport = _Transport(
+        bodies=[
+            json.dumps(target).encode(),
+            json.dumps(destination).encode(),
+            json.dumps(returned).encode(),
+        ]
+    )
+    with pytest.raises(ConnectorOutcomeUnknown, match="do not retry"):
+        GoogleConnectorAdapter().execute(
+            _operation("google_drive", "files.move"),
+            {
+                "expected_destination": destination,
+                "expected_file": target,
+                "file_id": "file",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=transport,
+            write_idempotency_key="confirmed-drive-move",
+        )
+    assert [call["method"] for call in transport.calls] == [
+        ConnectorMethod.GET,
+        ConnectorMethod.GET,
+        ConnectorMethod.PATCH,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source_drive", "destination_drive"),
+    ((None, "shared-two"), ("shared-one", None)),
+)
+def test_drive_move_uses_documented_cross_drive_capability(
+    source_drive: str | None,
+    destination_drive: str | None,
+) -> None:
+    target = _drive_snapshot(
+        drive_id=source_drive,
+        owned_by_me=True if source_drive is None else None,
+        capabilities={"canMoveItemOutOfDrive": True},
+    )
+    destination = _drive_snapshot(
+        file_id="new-parent",
+        mime_type="application/vnd.google-apps.folder",
+        drive_id=destination_drive,
+        owned_by_me=True if destination_drive is None else None,
+        capabilities={"canAddChildren": True},
+    )
+    returned = {
+        **target,
+        "driveId": destination_drive,
+        "ownedByMe": True if destination_drive is None else None,
+        "parents": ["new-parent"],
+        "version": "8",
+    }
+    transport = _Transport(
+        bodies=[
+            json.dumps(target).encode(),
+            json.dumps(destination).encode(),
+            json.dumps(returned).encode(),
+        ]
+    )
+    result = GoogleConnectorAdapter().execute(
+        _operation("google_drive", "files.move"),
+        {
+            "expected_destination": destination,
+            "expected_file": target,
+            "file_id": "file",
+        },
+        continuation=None,
+        credential=_credential(),
+        transport=transport,
+        write_idempotency_key="confirmed-drive-move",
+    )
+    assert result.payload == returned
+
+
+def test_drive_move_rejects_unsupported_or_unauthorized_cross_drive_folders() -> None:
+    adapter = GoogleConnectorAdapter()
+    my_drive_folder = _drive_snapshot(
+        mime_type="application/vnd.google-apps.folder",
+        capabilities={"canMoveItemOutOfDrive": True},
+    )
+    shared_destination = _drive_snapshot(
+        file_id="new-parent",
+        mime_type="application/vnd.google-apps.folder",
+        drive_id="shared-two",
+        owned_by_me=None,
+        capabilities={
+            "canAddChildren": True,
+            "canAddFolderFromAnotherDrive": True,
+        },
+    )
+    unsupported = _Transport(
+        bodies=[json.dumps(my_drive_folder).encode(), json.dumps(shared_destination).encode()]
+    )
+    with pytest.raises(ValidationError, match="does not support moving a My Drive folder"):
+        adapter.execute(
+            _operation("google_drive", "files.move"),
+            {
+                "expected_destination": shared_destination,
+                "expected_file": my_drive_folder,
+                "file_id": "file",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=unsupported,
+            write_idempotency_key="confirmed-drive-move",
+        )
+    assert all(call["method"] is not ConnectorMethod.PATCH for call in unsupported.calls)
+
+    shared_folder = _drive_snapshot(
+        mime_type="application/vnd.google-apps.folder",
+        drive_id="shared-one",
+        owned_by_me=None,
+        capabilities={"canMoveItemOutOfDrive": True},
+    )
+    missing_destination_capability = _drive_snapshot(
+        file_id="new-parent",
+        mime_type="application/vnd.google-apps.folder",
+        drive_id="shared-two",
+        owned_by_me=None,
+        capabilities={"canAddChildren": True},
+    )
+    unauthorized = _Transport(
+        bodies=[
+            json.dumps(shared_folder).encode(),
+            json.dumps(missing_destination_capability).encode(),
+        ]
+    )
+    with pytest.raises(ValidationError, match="canAddFolderFromAnotherDrive=true"):
+        adapter.execute(
+            _operation("google_drive", "files.move"),
+            {
+                "expected_destination": missing_destination_capability,
+                "expected_file": shared_folder,
+                "file_id": "file",
+            },
+            continuation=None,
+            credential=_credential(),
+            transport=unauthorized,
+            write_idempotency_key="confirmed-drive-move",
+        )
+    assert all(call["method"] is not ConnectorMethod.PATCH for call in unauthorized.calls)
 
 
 def test_drive_comment_requests_use_required_valid_field_projections() -> None:

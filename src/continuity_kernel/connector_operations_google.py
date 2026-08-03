@@ -78,6 +78,15 @@ def _drive_resource_key() -> dict[str, object]:
     }
 
 
+def _drive_version() -> dict[str, object]:
+    return {
+        "maxLength": 32,
+        "minLength": 1,
+        "pattern": "^[0-9]+$",
+        "type": "string",
+    }
+
+
 def _array(items: dict[str, object], *, maximum: int = 32, minimum: int = 0) -> dict[str, object]:
     return {"items": items, "maxItems": maximum, "minItems": minimum, "type": "array"}
 
@@ -1095,6 +1104,78 @@ def _shared_drive_list() -> dict[str, object]:
     )
 
 
+def _drive_capabilities_snapshot() -> dict[str, object]:
+    marker = _nullable({"type": "boolean"})
+    return _object(
+        {
+            "canAddChildren": marker,
+            "canAddFolderFromAnotherDrive": marker,
+            "canDelete": marker,
+            "canMoveItemOutOfDrive": marker,
+            "canMoveItemWithinDrive": marker,
+            "canTrash": marker,
+            "canUntrash": marker,
+        },
+        required=(
+            "canAddChildren",
+            "canAddFolderFromAnotherDrive",
+            "canDelete",
+            "canMoveItemOutOfDrive",
+            "canMoveItemWithinDrive",
+            "canTrash",
+            "canUntrash",
+        ),
+    )
+
+
+def _drive_file_snapshot() -> dict[str, object]:
+    return _object(
+        {
+            "capabilities": _drive_capabilities_snapshot(),
+            "driveId": _nullable(_id()),
+            "explicitlyTrashed": {"type": "boolean"},
+            "id": _id(),
+            "mimeType": _text(256),
+            "name": _text(1_024, minimum=0),
+            "ownedByMe": _nullable({"type": "boolean"}),
+            "parents": _array(_id(), maximum=32),
+            "resourceKey": _nullable(_drive_resource_key()),
+            "trashed": {"type": "boolean"},
+            "version": _drive_version(),
+        },
+        required=(
+            "capabilities",
+            "driveId",
+            "explicitlyTrashed",
+            "id",
+            "mimeType",
+            "name",
+            "ownedByMe",
+            "parents",
+            "resourceKey",
+            "trashed",
+            "version",
+        ),
+    )
+
+
+def _drive_lifecycle_schema(*, move: bool) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "expected_file": _drive_file_snapshot(),
+        "file_id": _id(),
+    }
+    required = ["expected_file", "file_id"]
+    if move:
+        properties.update(
+            {
+                "current_parent_resource_key": _drive_resource_key(),
+                "expected_destination": _drive_file_snapshot(),
+            }
+        )
+        required.append("expected_destination")
+    return _object(properties, required=tuple(required))
+
+
 def _permission_create_schema() -> dict[str, object]:
     common: dict[str, object] = {
         "file_id": _id(),
@@ -1197,30 +1278,7 @@ def _reply_create_schema() -> dict[str, object]:
 
 
 def _drive_move_schema() -> dict[str, object]:
-    identifiers = {
-        "file_id": _id(),
-        "supports_all_drives": {"type": "boolean"},
-    }
-    add = {**identifiers, "add_parent_ids": _array(_id(), maximum=1, minimum=1)}
-    remove = {**identifiers, "remove_parent_ids": _array(_id(), maximum=1, minimum=1)}
-    both = {
-        **add,
-        "remove_parent_ids": _array(_id(), maximum=1, minimum=1),
-    }
-    schema = _object(
-        {
-            **identifiers,
-            "add_parent_ids": _array(_id(), maximum=1, minimum=1),
-            "remove_parent_ids": _array(_id(), maximum=1, minimum=1),
-        },
-        required=("file_id",),
-    )
-    schema["oneOf"] = [
-        _object(add, required=("add_parent_ids", "file_id")),
-        _object(remove, required=("file_id", "remove_parent_ids")),
-        _object(both, required=("add_parent_ids", "file_id", "remove_parent_ids")),
-    ]
-    return schema
+    return _drive_lifecycle_schema(move=True)
 
 
 _GMAIL_READ_SCOPES: Final = _scopes(_GMAIL_READONLY, _GMAIL_MODIFY, _MAIL)
@@ -1988,7 +2046,12 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         ConnectorEffect.READ,
         _DRIVE_METADATA_SCOPES,
         _object(
-            {"file_id": _id(), "supports_all_drives": {"type": "boolean"}},
+            {
+                "file_id": _id(),
+                "lifecycle_snapshot": {"type": "boolean"},
+                "resource_key": _drive_resource_key(),
+                "supports_all_drives": {"type": "boolean"},
+            },
             required=("file_id",),
         ),
     ),
@@ -2175,7 +2238,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "google_drive",
         ConnectorMode.WRITE,
         "files.move",
-        ConnectorEffect.SAFE_MUTATION,
+        ConnectorEffect.OUTWARD,
         _DRIVE_WRITE_SCOPES,
         _drive_move_schema(),
     ),
@@ -2185,27 +2248,15 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.trash",
         ConnectorEffect.DESTRUCTIVE,
         _DRIVE_WRITE_SCOPES,
-        _object(
-            {
-                "file_id": _id(),
-                "supports_all_drives": {"type": "boolean"},
-            },
-            required=("file_id",),
-        ),
+        _drive_lifecycle_schema(move=False),
     ),
     _operation(
         "google_drive",
         ConnectorMode.WRITE,
         "files.restore",
-        ConnectorEffect.SAFE_MUTATION,
+        ConnectorEffect.OUTWARD,
         _DRIVE_WRITE_SCOPES,
-        _object(
-            {
-                "file_id": _id(),
-                "supports_all_drives": {"type": "boolean"},
-            },
-            required=("file_id",),
-        ),
+        _drive_lifecycle_schema(move=False),
     ),
     _operation(
         "google_drive",
@@ -2213,13 +2264,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         "files.purge",
         ConnectorEffect.PERMANENT,
         _DRIVE_WRITE_SCOPES,
-        _object(
-            {
-                "file_id": _id(),
-                "supports_all_drives": {"type": "boolean"},
-            },
-            required=("file_id",),
-        ),
+        _drive_lifecycle_schema(move=False),
     ),
     _operation(
         "google_drive",

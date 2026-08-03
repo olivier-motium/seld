@@ -5,6 +5,10 @@
 - Added standalone connector authentication with portable non-secret metadata,
   OS-keyring secret custody, native public-client OAuth with PKCE, serialized
   refresh, redacted MCP status, and resumable age-encrypted credential transfer.
+- Bound Google Drive move, trash, restore, and purge to normalized provider
+  snapshots, capability checks, confirmation-time and execute-time rereads,
+  resource-key headers, recoverable-delete defaults, explicit purge receipts,
+  and verified move/trash/restore response state.
 - Migrated the Discord source bridge to an explicit bot-only portable
   connection, rejecting ambient and normal-user tokens and failing closed on
   connection or credential rotation during poll and acknowledgement.

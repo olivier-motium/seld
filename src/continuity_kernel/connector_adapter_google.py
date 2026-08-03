@@ -125,6 +125,15 @@ _DRIVE_DOWNLOAD_RESPONSE_TYPE: Final = (
     "type.googleapis.com/google.apps.drive.v3.DownloadFileResponse"
 )
 _DRIVE_DOWNLOAD_RETRY_SECONDS: Final = 10
+_DRIVE_LIFECYCLE_OPERATIONS: Final = frozenset(
+    {"files.move", "files.purge", "files.restore", "files.trash"}
+)
+_DRIVE_LIFECYCLE_FIELDS: Final = (
+    "id,name,mimeType,parents,driveId,ownedByMe,trashed,explicitlyTrashed,version,resourceKey,"
+    "capabilities(canAddChildren,canAddFolderFromAnotherDrive,canDelete,"
+    "canMoveItemOutOfDrive,canMoveItemWithinDrive,canTrash,canUntrash)"
+)
+_DRIVE_FOLDER_MIME_TYPE: Final = "application/vnd.google-apps.folder"
 _DRIVE_DOWNLOAD_ERROR_STATUS: Final = {
     1: (499, "cancelled"),
     2: (500, "unknown"),
@@ -358,6 +367,18 @@ class GoogleConnectorAdapter:
             and _drive_has_binary_upload(values, transfer)
         ):
             return ConnectorEffect.OUTWARD
+        if operation.provider == "google_drive" and operation.name in _DRIVE_LIFECYCLE_OPERATIONS:
+            if credential is None or transport is None:
+                raise ValidationError(
+                    "Google Drive lifecycle effect preflight requires credential and transport"
+                )
+            _drive_lifecycle_preflight(
+                values,
+                credential,
+                transport,
+                operation_name=operation.name,
+            )
+            return operation.effect
         if operation.provider == "gmail" and operation.name == "settings.filters.create":
             return _gmail_filter_effect(values)
         if operation.provider == "gmail" and operation.name == "labels.update":
@@ -490,6 +511,14 @@ class GoogleConnectorAdapter:
                 )
             if not write_idempotency_key:
                 raise ValidationError("Gmail raw-message uploads require a fresh confirmation")
+        if (
+            operation.provider == "google_drive"
+            and operation.name in _DRIVE_LIFECYCLE_OPERATIONS
+            and (not isinstance(write_idempotency_key, str) or not write_idempotency_key)
+        ):
+            raise ValidationError(
+                "Google Drive lifecycle writes require a nonempty confirmation idempotency key"
+            )
         if not operation.scope_grant_satisfies(credential.granted_scopes):
             raise ValidationError("connector credential does not satisfy the operation scope")
         if operation.provider == "google_calendar" and operation.name == "calendar_list.update":
@@ -551,12 +580,21 @@ class GoogleConnectorAdapter:
         if operation.provider == "google_calendar":
             return _execute_calendar(operation, values, continuation, credential, transport)
         if operation.provider == "google_drive":
+            drive_lifecycle_current = None
+            if operation.name in _DRIVE_LIFECYCLE_OPERATIONS:
+                drive_lifecycle_current = _drive_lifecycle_preflight(
+                    values,
+                    credential,
+                    transport,
+                    operation_name=operation.name,
+                )
             return _execute_drive(
                 operation,
                 values,
                 continuation,
                 credential,
                 transport,
+                drive_lifecycle_current=drive_lifecycle_current,
                 transfer=transfer,
             )
         raise ValidationError("connector operation is not handled by Google")
@@ -1796,6 +1834,7 @@ def _execute_drive(
     credential: ConnectorRuntimeCredential,
     transport: ConnectorTransport,
     *,
+    drive_lifecycle_current: Mapping[str, object] | None = None,
     transfer: ConnectorTransferContext | None,
 ) -> ConnectorAdapterResult:
     base = "/drive/v3"
@@ -1871,13 +1910,26 @@ def _execute_drive(
         )
     _reject_continuation(continuation)
     if name == "files.get":
-        return _json_request(
+        lifecycle_snapshot = values.get("lifecycle_snapshot") is True
+        result = _json_request(
             transport,
             origin=ConnectorOrigin.GOOGLE,
             method=ConnectorMethod.GET,
             path=f"{base}/files/{_segment(_required(values, 'file_id'))}",
             credential=credential,
-            query=_with_supports_all_drives(values),
+            query=(
+                _drive_lifecycle_get_query()
+                if lifecycle_snapshot
+                else _with_supports_all_drives(values)
+            ),
+            headers=_drive_resource_key_headers(values, _drive_input_resource_key(values)),
+        )
+        if not lifecycle_snapshot:
+            return result
+        return _drive_lifecycle_snapshot_result(
+            result,
+            values,
+            context="Google Drive lifecycle snapshot",
         )
     if name in {"files.content", "revisions.download"}:
         path = f"{base}/files/{_segment(_required(values, 'file_id'))}"
@@ -1951,35 +2003,72 @@ def _execute_drive(
             expected_statuses=_JSON_STATUSES,
         )
     if name == "files.move":
-        return _json_request(
+        if drive_lifecycle_current is None:
+            raise ValidationError("Google Drive move dispatch is missing its lifecycle preflight")
+        result = _drive_lifecycle_mutation_request(
             transport,
-            origin=ConnectorOrigin.GOOGLE,
+            action="move",
             method=ConnectorMethod.PATCH,
             path=f"{base}/files/{_segment(_required(values, 'file_id'))}",
             credential=credential,
-            query=_with_supports_all_drives(values, _drive_move_query(values)),
+            query=_drive_lifecycle_query(
+                (
+                    *_drive_move_query(values, current=drive_lifecycle_current),
+                    ("fields", _DRIVE_LIFECYCLE_FIELDS),
+                )
+            ),
+            headers=_drive_lifecycle_mutation_headers(
+                values,
+                current=drive_lifecycle_current,
+            ),
             expected_statuses=_JSON_STATUSES,
         )
+        return _drive_lifecycle_write_result(
+            result,
+            values,
+            current=drive_lifecycle_current,
+            operation_name=name,
+        )
     if name in {"files.trash", "files.restore"}:
-        return _json_request(
+        if drive_lifecycle_current is None:
+            raise ValidationError("Google Drive lifecycle dispatch is missing its final preflight")
+        action = "trash" if name == "files.trash" else "restore"
+        result = _drive_lifecycle_mutation_request(
             transport,
-            origin=ConnectorOrigin.GOOGLE,
+            action=action,
             method=ConnectorMethod.PATCH,
             path=f"{base}/files/{_segment(_required(values, 'file_id'))}",
             credential=credential,
-            query=_with_supports_all_drives(values),
+            query=_drive_lifecycle_query((("fields", _DRIVE_LIFECYCLE_FIELDS),)),
+            headers=_drive_lifecycle_mutation_headers(values),
             json_body={"trashed": name == "files.trash"},
             expected_statuses=_JSON_STATUSES,
         )
+        return _drive_lifecycle_write_result(
+            result,
+            values,
+            current=drive_lifecycle_current,
+            operation_name=name,
+        )
     if name == "files.purge":
-        return _json_request(
+        if drive_lifecycle_current is None:
+            raise ValidationError("Google Drive purge dispatch is missing its final preflight")
+        _drive_lifecycle_mutation_request(
             transport,
-            origin=ConnectorOrigin.GOOGLE,
+            action="purge",
             method=ConnectorMethod.DELETE,
             path=f"{base}/files/{_segment(_required(values, 'file_id'))}",
             credential=credential,
-            query=_with_supports_all_drives(values),
+            query=_drive_lifecycle_query(),
+            headers=_drive_lifecycle_mutation_headers(values),
             expected_statuses=_DELETE_STATUSES,
+        )
+        return ConnectorAdapterResult(
+            {
+                "file_id": _required(values, "file_id"),
+                "previous_version": drive_lifecycle_current["version"],
+                "purged": True,
+            }
         )
     if name in {"permissions.create", "permissions.update", "permissions.delete"}:
         return _drive_permission_request(name, values, credential, transport)
@@ -2561,7 +2650,22 @@ def _drive_resource_key_headers(
     binding = _drive_resource_key_binding(values, resource_key)
     if binding is None:
         return None
-    return {"X-Goog-Drive-Resource-Keys": f"{binding[0]}/{binding[1]}"}
+    return _drive_combined_resource_key_headers(binding)
+
+
+def _drive_combined_resource_key_headers(
+    *bindings: tuple[object, object | None] | None,
+) -> dict[str, str] | None:
+    encoded: list[str] = []
+    for binding in bindings:
+        if binding is None or binding[1] is None:
+            continue
+        file_id = _drive_resource_component(binding[0], label="file ID")
+        resource_key = _drive_resource_component(binding[1], label="resource key")
+        encoded.append(f"{file_id}/{resource_key}")
+    if not encoded:
+        return None
+    return {"X-Goog-Drive-Resource-Keys": ",".join(encoded)}
 
 
 def _raise_drive_download_error(value: object) -> NoReturn:
@@ -3246,21 +3350,446 @@ def _drive_page_query(
     return tuple(query)
 
 
-def _drive_move_query(values: dict[str, object]) -> tuple[tuple[str, str], ...]:
-    add_parent_ids = _strings(values["add_parent_ids"]) if "add_parent_ids" in values else []
-    remove_parent_ids = (
-        _strings(values["remove_parent_ids"]) if "remove_parent_ids" in values else []
+def _drive_lifecycle_get_query() -> tuple[tuple[str, str], ...]:
+    return _drive_lifecycle_query((("fields", _DRIVE_LIFECYCLE_FIELDS),))
+
+
+def _drive_lifecycle_query(
+    query: Sequence[tuple[str, str]] = (),
+) -> tuple[tuple[str, str], ...]:
+    return (*tuple(query), ("supportsAllDrives", "true"))
+
+
+def _drive_snapshot_text(
+    value: object,
+    *,
+    field: str,
+    context: str,
+    maximum: int,
+    allow_empty: bool = False,
+) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value) or len(value) > maximum:
+        raise ValidationError(f"{context} has an invalid {field}")
+    return value
+
+
+def _drive_file_snapshot(
+    value: object,
+    *,
+    context: str,
+    resource_key_fallback: object | None = None,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValidationError(f"{context} is invalid")
+
+    file_id = _drive_snapshot_text(
+        value.get("id"),
+        field="id",
+        context=context,
+        maximum=512,
     )
-    if not add_parent_ids and not remove_parent_ids:
-        raise ValidationError("Google Drive move requires a parent change")
-    if set(add_parent_ids) & set(remove_parent_ids):
-        raise ValidationError("Google Drive move cannot add and remove the same parent")
-    query: list[tuple[str, str]] = []
-    if add_parent_ids:
-        query.append(("addParents", ",".join(add_parent_ids)))
-    if remove_parent_ids:
-        query.append(("removeParents", ",".join(remove_parent_ids)))
-    return tuple(query)
+    name = _drive_snapshot_text(
+        value.get("name"),
+        field="name",
+        context=context,
+        maximum=1_024,
+        allow_empty=True,
+    )
+    mime_type = _drive_snapshot_text(
+        value.get("mimeType"),
+        field="mimeType",
+        context=context,
+        maximum=256,
+    )
+
+    raw_parents = value.get("parents", [])
+    if not isinstance(raw_parents, list) or len(raw_parents) > 32:
+        raise ValidationError(f"{context} has an invalid parents list")
+    parents = [
+        _drive_snapshot_text(
+            parent,
+            field="parent ID",
+            context=context,
+            maximum=512,
+        )
+        for parent in raw_parents
+    ]
+
+    raw_drive_id = value.get("driveId")
+    drive_id = None
+    if raw_drive_id is not None:
+        drive_id = _drive_snapshot_text(
+            raw_drive_id,
+            field="driveId",
+            context=context,
+            maximum=512,
+        )
+
+    raw_owned_by_me = value.get("ownedByMe")
+    if raw_owned_by_me is not None and type(raw_owned_by_me) is not bool:
+        raise ValidationError(f"{context} has an invalid ownedByMe marker")
+
+    if "trashed" not in value or type(value["trashed"]) is not bool:
+        raise ValidationError(f"{context} has an invalid trashed marker")
+    raw_trashed = value["trashed"]
+    if "explicitlyTrashed" not in value or type(value["explicitlyTrashed"]) is not bool:
+        raise ValidationError(f"{context} has an invalid explicitlyTrashed marker")
+    raw_explicitly_trashed = value["explicitlyTrashed"]
+
+    raw_version = value.get("version")
+    if (
+        not isinstance(raw_version, str)
+        or not raw_version
+        or len(raw_version) > 32
+        or not raw_version.isascii()
+        or not raw_version.isdigit()
+    ):
+        raise ValidationError(f"{context} has an invalid version")
+
+    raw_resource_key = value.get("resourceKey", resource_key_fallback)
+    resource_key = None
+    if raw_resource_key is not None:
+        resource_key = _drive_resource_component(raw_resource_key, label="resource key")
+    if value.get("resourceKey") is not None and resource_key_fallback is not None:
+        fallback = _drive_resource_component(resource_key_fallback, label="resource key")
+        if resource_key != fallback:
+            raise ConflictError(f"{context} returned a different resource key")
+
+    if "capabilities" not in value:
+        capabilities: Mapping[str, object] = {}
+    else:
+        raw_capabilities = value["capabilities"]
+        if not isinstance(raw_capabilities, Mapping):
+            raise ValidationError(f"{context} has an invalid capabilities object")
+        capabilities = raw_capabilities
+    capability_snapshot: dict[str, object] = {}
+    for capability_name in (
+        "canAddChildren",
+        "canAddFolderFromAnotherDrive",
+        "canDelete",
+        "canMoveItemOutOfDrive",
+        "canMoveItemWithinDrive",
+        "canTrash",
+        "canUntrash",
+    ):
+        capability_present = capability_name in capabilities
+        capability = None if not capability_present else capabilities[capability_name]
+        if capability is not None and type(capability) is not bool:
+            raise ValidationError(f"{context} has an invalid capabilities.{capability_name} marker")
+        capability_snapshot[capability_name] = capability
+
+    return {
+        "id": file_id,
+        "name": name,
+        "mimeType": mime_type,
+        "parents": parents,
+        "driveId": drive_id,
+        "ownedByMe": raw_owned_by_me,
+        "trashed": raw_trashed,
+        "explicitlyTrashed": raw_explicitly_trashed,
+        "version": raw_version,
+        "resourceKey": resource_key,
+        "capabilities": capability_snapshot,
+    }
+
+
+def _drive_lifecycle_snapshot_result(
+    result: ConnectorAdapterResult,
+    values: Mapping[str, object],
+    *,
+    context: str,
+) -> ConnectorAdapterResult:
+    snapshot = _drive_file_snapshot(
+        _provider_mapping(result, context=context),
+        context=context,
+        resource_key_fallback=_drive_input_resource_key(values),
+    )
+    return ConnectorAdapterResult(snapshot)
+
+
+def _drive_lifecycle_mutation_headers(
+    values: Mapping[str, object],
+    *,
+    current: Mapping[str, object] | None = None,
+) -> dict[str, str] | None:
+    expected = _drive_file_snapshot(
+        values.get("expected_file"),
+        context="Google Drive expected file snapshot",
+    )
+    bindings: list[tuple[object, object | None] | None] = [
+        (expected["id"], expected["resourceKey"])
+    ]
+    if current is not None:
+        expected_destination = _drive_file_snapshot(
+            values.get("expected_destination"),
+            context="Google Drive expected destination snapshot",
+        )
+        parents = current.get("parents")
+        if not isinstance(parents, list) or len(parents) != 1:
+            raise ValidationError("Google Drive move requires exactly one current target parent")
+        bindings.extend(
+            (
+                (parents[0], values.get("current_parent_resource_key")),
+                (expected_destination["id"], expected_destination["resourceKey"]),
+            )
+        )
+    return _drive_combined_resource_key_headers(*bindings)
+
+
+def _drive_lifecycle_write_result(
+    result: ConnectorAdapterResult,
+    values: Mapping[str, object],
+    *,
+    current: Mapping[str, object],
+    operation_name: str,
+) -> ConnectorAdapterResult:
+    action = {
+        "files.move": "move",
+        "files.restore": "restore",
+        "files.trash": "trash",
+    }[operation_name]
+    unusable_receipt = _drive_lifecycle_unusable_receipt(action)
+    try:
+        returned = _drive_file_snapshot(
+            _provider_mapping(result, context=f"Google Drive {action} receipt"),
+            context=f"Google Drive {action} receipt",
+            resource_key_fallback=current.get("resourceKey"),
+        )
+        if returned["id"] != current["id"]:
+            raise ValidationError(f"Google Drive {action} returned a different file")
+        if int(cast(str, returned["version"])) <= int(cast(str, current["version"])):
+            raise ValidationError(f"Google Drive {action} returned a stale file version")
+        if operation_name == "files.move":
+            destination = _drive_file_snapshot(
+                values.get("expected_destination"),
+                context="Google Drive expected destination snapshot",
+            )
+            if returned["parents"] != [destination["id"]]:
+                raise ValidationError("Google Drive move returned a different parent")
+            if returned["driveId"] != destination["driveId"]:
+                raise ValidationError("Google Drive move returned a different drive")
+        elif operation_name == "files.trash" and returned["trashed"] is not True:
+            raise ValidationError("Google Drive trash returned a file that is not trashed")
+        elif operation_name == "files.restore" and returned["trashed"] is not False:
+            raise ValidationError("Google Drive restore returned a file that is still trashed")
+    except ContinuityError as exc:
+        raise ConnectorOutcomeUnknown(unusable_receipt) from exc
+    return ConnectorAdapterResult(returned)
+
+
+def _drive_lifecycle_unusable_receipt(action: str) -> str:
+    return (
+        f"Google Drive accepted the {action} request but returned no usable lifecycle receipt; "
+        "the outcome is unknown, so do not retry automatically and inspect the file first"
+    )
+
+
+def _drive_lifecycle_mutation_request(
+    transport: ConnectorTransport,
+    *,
+    action: str,
+    method: ConnectorMethod,
+    path: str,
+    credential: ConnectorRuntimeCredential,
+    query: Sequence[tuple[str, str]],
+    headers: Mapping[str, str] | None,
+    expected_statuses: frozenset[int],
+    json_body: object | None = None,
+) -> ConnectorAdapterResult:
+    try:
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=method,
+            path=path,
+            credential=credential,
+            query=query,
+            headers=headers,
+            json_body=json_body,
+            expected_statuses=expected_statuses,
+        )
+    except ConnectorProviderError as exc:
+        if exc.status in expected_statuses:
+            raise ConnectorOutcomeUnknown(_drive_lifecycle_unusable_receipt(action)) from exc
+        raise
+
+
+def _drive_require_capability(
+    snapshot: Mapping[str, object],
+    capability_name: str,
+    *,
+    action: str,
+) -> None:
+    capabilities = snapshot.get("capabilities")
+    if not isinstance(capabilities, Mapping) or capabilities.get(capability_name) is not True:
+        raise ValidationError(
+            f"Google Drive {action} requires target capability {capability_name}=true"
+        )
+
+
+def _drive_lifecycle_preflight(
+    values: Mapping[str, object],
+    credential: ConnectorRuntimeCredential,
+    transport: ConnectorTransport,
+    *,
+    operation_name: str,
+) -> dict[str, object]:
+    file_id = _required(values, "file_id")
+    expected = _drive_file_snapshot(
+        values.get("expected_file"),
+        context="Google Drive expected file snapshot",
+    )
+    if expected["id"] != file_id:
+        raise ValidationError("Google Drive expected file ID does not match the lifecycle target")
+
+    current = _drive_file_snapshot(
+        _provider_mapping(
+            _json_request(
+                transport,
+                origin=ConnectorOrigin.GOOGLE,
+                method=ConnectorMethod.GET,
+                path=f"/drive/v3/files/{_segment(file_id)}",
+                credential=credential,
+                query=_drive_lifecycle_get_query(),
+                headers=_drive_combined_resource_key_headers(
+                    (file_id, expected["resourceKey"]),
+                ),
+            ),
+            context="Google Drive lifecycle target preflight",
+        ),
+        context="Google Drive lifecycle target preflight",
+        resource_key_fallback=expected["resourceKey"],
+    )
+    if current["id"] != file_id:
+        raise ValidationError("Google Drive lifecycle preflight returned a different target file")
+
+    action = {
+        "files.move": "moving it",
+        "files.trash": "trashing it",
+        "files.restore": "restoring it",
+        "files.purge": "purging it",
+    }.get(operation_name, "changing it")
+    if current != expected:
+        raise ConflictError(f"Google Drive file changed; read it again before {action}")
+
+    if operation_name == "files.trash":
+        if current["trashed"] is True:
+            raise ValidationError("Google Drive trash requires a file that is not trashed")
+        _drive_require_capability(current, "canTrash", action="trashing a file")
+        return current
+    if operation_name == "files.restore":
+        if current["trashed"] is not True:
+            raise ValidationError("Google Drive restore requires a trashed file")
+        if current["explicitlyTrashed"] is not True:
+            raise ValidationError(
+                "Google Drive restore requires a file that was explicitly trashed"
+            )
+        _drive_require_capability(current, "canUntrash", action="restoring a file")
+        return current
+    if operation_name == "files.purge":
+        if current["trashed"] is not True:
+            raise ValidationError("Google Drive purge requires a trashed file")
+        _drive_require_capability(current, "canDelete", action="purging a file")
+        return current
+
+    if operation_name != "files.move":
+        raise ValidationError("Google Drive lifecycle operation is invalid")
+    if current["trashed"] is True:
+        raise ValidationError("Google Drive move requires a target file that is not trashed")
+
+    expected_destination = _drive_file_snapshot(
+        values.get("expected_destination"),
+        context="Google Drive expected destination snapshot",
+    )
+    destination_id = cast(str, expected_destination["id"])
+    if destination_id == file_id:
+        raise ValidationError("Google Drive move destination must differ from the target file")
+    destination = _drive_file_snapshot(
+        _provider_mapping(
+            _json_request(
+                transport,
+                origin=ConnectorOrigin.GOOGLE,
+                method=ConnectorMethod.GET,
+                path=f"/drive/v3/files/{_segment(destination_id)}",
+                credential=credential,
+                query=_drive_lifecycle_get_query(),
+                headers=_drive_combined_resource_key_headers(
+                    (destination_id, expected_destination["resourceKey"]),
+                ),
+            ),
+            context="Google Drive move destination preflight",
+        ),
+        context="Google Drive move destination preflight",
+        resource_key_fallback=expected_destination["resourceKey"],
+    )
+    if destination["id"] != destination_id:
+        raise ValidationError("Google Drive move preflight returned a different destination")
+    if destination != expected_destination:
+        raise ConflictError("Google Drive destination changed; read it again before moving")
+    if destination["trashed"] is True:
+        raise ValidationError("Google Drive move destination must not be trashed")
+    if destination["mimeType"] != _DRIVE_FOLDER_MIME_TYPE:
+        raise ValidationError("Google Drive move destination must be a folder")
+    _drive_require_capability(
+        destination,
+        "canAddChildren",
+        action="moving into the destination folder",
+    )
+
+    parents = current["parents"]
+    if not isinstance(parents, list) or len(parents) != 1:
+        raise ValidationError("Google Drive move requires exactly one current target parent")
+    current_parent = parents[0]
+    if not isinstance(current_parent, str):
+        raise ValidationError("Google Drive move target parent ID is invalid")
+    if current_parent == destination_id:
+        raise ValidationError(
+            "Google Drive move destination is already the target's current parent"
+        )
+
+    source_drive_id = current["driveId"]
+    destination_drive_id = destination["driveId"]
+    if (
+        current["mimeType"] == _DRIVE_FOLDER_MIME_TYPE
+        and source_drive_id is None
+        and destination_drive_id is not None
+    ):
+        raise ValidationError(
+            "Google Drive does not support moving a My Drive folder into a shared drive"
+        )
+    if current["mimeType"] == _DRIVE_FOLDER_MIME_TYPE and source_drive_id != destination_drive_id:
+        _drive_require_capability(
+            destination,
+            "canAddFolderFromAnotherDrive",
+            action="moving a folder from another drive into the destination",
+        )
+    if source_drive_id == destination_drive_id:
+        movement_capability = "canMoveItemWithinDrive"
+    else:
+        movement_capability = "canMoveItemOutOfDrive"
+    _drive_require_capability(current, movement_capability, action="moving a file")
+    return current
+
+
+def _drive_move_query(
+    values: Mapping[str, object],
+    *,
+    current: Mapping[str, object],
+) -> tuple[tuple[str, str], ...]:
+    expected_destination = _drive_file_snapshot(
+        values.get("expected_destination"),
+        context="Google Drive expected destination snapshot",
+    )
+    destination_id = cast(str, expected_destination["id"])
+    parents = current.get("parents")
+    if not isinstance(parents, list) or len(parents) != 1 or not isinstance(parents[0], str):
+        raise ValidationError("Google Drive move requires exactly one current target parent")
+    current_parent = parents[0]
+    if current_parent == destination_id:
+        raise ValidationError(
+            "Google Drive move destination is already the target's current parent"
+        )
+    return (("addParents", destination_id), ("removeParents", current_parent))
 
 
 def _optional_query(

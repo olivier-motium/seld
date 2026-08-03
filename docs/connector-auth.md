@@ -88,6 +88,36 @@ A same-account Read connection stays ready until a Full upgrade is verified
 and published. Pulse remains a separate bounded read-only lane; the small read
 used to prove source coverage does not limit the interactive connector.
 
+### Google Drive moves and deletion
+
+Before `files.move`, `files.trash`, `files.restore`, or `files.purge`, the agent
+calls `files.get` with `lifecycle_snapshot: true` and replays the returned
+normalized snapshot as `expected_file`. A move also snapshots the destination
+folder as `expected_destination`. The person sees names, parents, trash state,
+version, and relevant capabilities in the confirmation preview; access-bearing
+Drive resource keys stay bound to the confirmation but are displayed only as a
+digest.
+
+Seld reads the target and destination again when it creates the preview, when
+the person confirms, and immediately before dispatch. Drift or a missing
+provider capability stops the write and asks for a fresh preview. Shared-drive
+routing is inferred from the snapshots. Move derives the one current parent to
+remove and one reviewed destination to add; it does not ask the agent to invent
+the parent transition. Link-shared target, current-parent, and destination keys
+are sent only through Google's `X-Goog-Drive-Resource-Keys` header.
+
+`files.trash` is the everyday delete path. `files.restore` works only for an
+explicitly trashed item. `files.purge` works only for a currently trashed item
+and has a separate permanent confirmation. Move and restore also require
+confirmation because hierarchy changes can change inherited access and restore
+can re-expose content. Successful move, trash, and restore calls validate the
+provider's returned file ID, version, and resulting state; an unusable success
+response is reported as outcome unknown and must not be retried automatically.
+
+Drive v3 does not document a conditional file update/delete primitive for the
+returned `version`. Seld therefore uses repeated application-side comparison,
+not a claimed provider CAS guarantee; a small final read-to-write race remains.
+
 ## Discord bot onboarding
 
 Discord is Full-only because the bot token is the authority boundary:

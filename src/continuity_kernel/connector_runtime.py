@@ -192,6 +192,35 @@ _OPERATION_WARNINGS: Final = {
         "affects Google Chat and related products."
     ),
     (
+        "google_drive",
+        "files.move",
+    ): (
+        "Moving a file or folder changes its inherited access: the destination can grant, "
+        "revoke, upgrade, or downgrade access recursively, while direct permissions can remain."
+    ),
+    (
+        "google_drive",
+        "files.trash",
+    ): (
+        "This is the recoverable delete path. Drive normally keeps trashed content for 30 days "
+        "before permanent deletion; organization retention rules can differ."
+    ),
+    (
+        "google_drive",
+        "files.restore",
+    ): (
+        "Restoring the item can make it visible again through its parent hierarchy and retained "
+        "direct permissions."
+    ),
+    (
+        "google_drive",
+        "files.purge",
+    ): (
+        "This permanently deletes the trashed target. If it is a folder, Drive also deletes all "
+        "descendants owned by you; other-owned or limited-access descendants can be retained or "
+        "moved by Drive instead."
+    ),
+    (
         "outlook_calendar",
         "events.cancel",
     ): "Outlook will email event attendees a cancellation notice.",
@@ -1389,6 +1418,16 @@ def _preview_field(name: str, value: object) -> object:
         return {
             "bytes": len(decoded),
             "digest": "sha256:" + hashlib.sha256(decoded).hexdigest(),
+            "omitted": True,
+        }
+    if name in {
+        "current_parent_resource_key",
+        "resource_key",
+        "resourceKey",
+    } and isinstance(value, str):
+        return {
+            "characters": len(value),
+            "digest": "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest(),
             "omitted": True,
         }
     return _preview_value(value)
