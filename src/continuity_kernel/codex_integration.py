@@ -1988,11 +1988,21 @@ def _marketplace_contents(
     if not isinstance(raw_mcp, bytes):
         raise ValidationError("packaged marketplace is missing plugins/gsv/.mcp.json")
     payload = json.loads(raw_mcp.decode("utf-8"))
-    server = payload["mcpServers"]["gsv"]
+    servers = payload.get("mcpServers")
+    if not isinstance(servers, dict) or set(servers) != {"gsv", "gsv_connectors"}:
+        raise ValidationError("packaged marketplace has an invalid MCP server set")
     command, arguments = runtime or _runtime_command()
-    server["command"] = command
-    server["args"] = [*arguments, "mcp", "serve"]
-    server["env"] = _generated_mcp_environment(vault)
+    environment = _generated_mcp_environment(vault)
+    for name, suffix in (
+        ("gsv", []),
+        ("gsv_connectors", ["--profile", "connectors"]),
+    ):
+        server = servers[name]
+        if not isinstance(server, dict):
+            raise ValidationError("packaged marketplace has an invalid MCP server")
+        server["command"] = command
+        server["args"] = [*arguments, "mcp", "serve", *suffix]
+        server["env"] = environment
     contents[mcp_relative] = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
     manifest = {
         relative: _marketplace_manifest_value(content)

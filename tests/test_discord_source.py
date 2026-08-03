@@ -1,15 +1,31 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 import continuity_kernel.discord_source as discord_source_module
-from continuity_kernel import mcp_server
+import continuity_kernel.mcp_server as mcp_server
+from continuity_kernel.connector_auth import (
+    AccountMetadata,
+    ClientKind,
+    ClientMetadata,
+    ConnectionHealth,
+    ConnectionMetadata,
+    CredentialKind,
+)
+from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_identifiers import ConnectionId, parse_connection_id
+from continuity_kernel.connector_secrets import InMemorySecretStore
+from continuity_kernel.connector_token_store import ResolvedToken, TokenState
 from continuity_kernel.discord_source import (
     ABSENT_BINDING_REVISION,
     DiscordSourceBridge,
@@ -19,12 +35,89 @@ from continuity_kernel.vault import Vault
 
 CHANNEL = "111111111111111111"
 TOKEN = "unit-test-secret-that-must-not-persist"
-ACCOUNT = f"discord-user-v1:sha256:{'a' * 64}"
-TOOL = "seld-discord-source:readonly:v2"
-WARNING = (
+ACCOUNT = f"discord-bot-v1:sha256:{'a' * 64}"
+CONNECTION_FINGERPRINT = "sha256:" + "c" * 64
+USER_ACCOUNT = f"discord-user-v1:sha256:{'b' * 64}"
+USER_WARNING = (
     "Discord forbids normal-user self-bot automation and may terminate the account; "
     "GET-only access does not remove that risk."
 )
+TOOL = "seld-discord-source:readonly:v2"
+BASE_TIME = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
+CONNECTION_ID = parse_connection_id("con-" + "d" * 32)
+
+
+def _auth_manager(
+    vault: Vault,
+    tmp_path: Path,
+    *,
+    provider: str = "discord",
+    source_ids: tuple[str, ...] = ("discord",),
+    credential_kind: CredentialKind = CredentialKind.BEARER,
+    health: ConnectionHealth = ConnectionHealth.READY,
+    store_credential: bool = True,
+) -> ConnectorAuthManager:
+    metadata = ConnectionMetadata(
+        connection_id=CONNECTION_ID,
+        provider=provider,
+        source_ids=source_ids,
+        credential_kind=credential_kind,
+        account=AccountMetadata(
+            fingerprint=CONNECTION_FINGERPRINT,
+            label="Synthetic Discord bot",
+        ),
+        scopes=("seld.discord.full",),
+        client=ClientMetadata(kind=ClientKind.EXTERNAL),
+        health=health,
+        created_at=BASE_TIME,
+        updated_at=BASE_TIME,
+        version=1,
+        last_verified_at=(
+            BASE_TIME
+            if health
+            in {
+                ConnectionHealth.READY,
+                ConnectionHealth.DEGRADED,
+                ConnectionHealth.REAUTHORIZATION_REQUIRED,
+            }
+            else None
+        ),
+    )
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=metadata,
+        observed_at=BASE_TIME,
+    )
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / f"connector-auth-{vault.root.name}",
+    )
+    if store_credential:
+        manager.tokens.update(CONNECTION_ID, value=TOKEN.encode(), expected_version=0)
+    return manager
+
+
+def _bridge(
+    vault: Vault,
+    tmp_path: Path,
+    *,
+    provider: str = "discord",
+    source_ids: tuple[str, ...] = ("discord",),
+    credential_kind: CredentialKind = CredentialKind.BEARER,
+    health: ConnectionHealth = ConnectionHealth.READY,
+    store_credential: bool = True,
+) -> DiscordSourceBridge:
+    manager = _auth_manager(
+        vault,
+        tmp_path,
+        provider=provider,
+        source_ids=source_ids,
+        credential_kind=credential_kind,
+        health=health,
+        store_credential=store_credential,
+    )
+    return DiscordSourceBridge(vault, auth_manager=manager)
 
 
 def _runtime(
@@ -38,6 +131,7 @@ def _runtime(
     corrupt_delivery: bool = False,
     corrupt_ack: bool = False,
     extra_items: bool = False,
+    user_mode: bool = False,
     protocol_version: str = "2025-03-26",
 ) -> Path:
     inventory_extra = (
@@ -57,9 +151,10 @@ import time
 from pathlib import Path
 
 STATE = Path(os.environ["DISCORD_STATE_FILE"])
-ACCOUNT = "{ACCOUNT}"
+ACCOUNT = {USER_ACCOUNT if user_mode else ACCOUNT!r}
+AUTH_TYPE = {"user" if user_mode else "bot"!r}
 TOOL = "{TOOL}"
-WARNING = {WARNING!r}
+WARNING = {USER_WARNING if user_mode else None!r}
 CHANNEL_DIGEST = "sha256:" + "1" * 64
 STALL = {stall!r}
 OVERFLOW = {overflow!r}
@@ -83,6 +178,9 @@ def load():
 def save(state):
     STATE.parent.mkdir(parents=True, exist_ok=True)
     state["private_channels"] = os.environ["DISCORD_CHANNEL_IDS"].split(",")
+    state["bot_token_digest"] = hashlib.sha256(
+        os.environ["DISCORD_BOT_TOKEN"].encode()
+    ).hexdigest()
     STATE.write_text(json.dumps(state))
     STATE.with_suffix(".envkeys").write_text(json.dumps(sorted(os.environ)))
 
@@ -162,7 +260,7 @@ def tool_result(name, arguments):
     if name == "discord_source_status":
         return {{
             "source":"discord","recipeVersion":"2","available":True,
-            "attemptedAt":attempted,"authType":"user","accountLabel":"Synthetic account",
+            "attemptedAt":attempted,"authType":AUTH_TYPE,"accountLabel":"Synthetic account",
             "termsWarning":WARNING,
             "accountBinding":ACCOUNT,"configuredChannelSetDigest":CHANNEL_DIGEST,
             "configuredChannelCount":1,"toolBinding":TOOL,"checkpoint":checkpoint(state)
@@ -196,7 +294,7 @@ def tool_result(name, arguments):
             "source":"discord","recipeVersion":"2","attemptedAt":pending["attempted"],
             "lastSuccessAt":pending["attempted"],"result":pending["result"],
             "completeness":pending["completeness"],"coveredThrough":pending["covered"],
-            "authType":"user","accountBinding":ACCOUNT,"toolBinding":TOOL,
+            "authType":AUTH_TYPE,"accountBinding":ACCOUNT,"toolBinding":TOOL,
             "channelSetDigest":CHANNEL_DIGEST,
             "cursorBinding":pending["cursor"],"evidenceRefs":[pending["delivery"]],
             "deliveryBinding":pending["delivery"],"baseline":state["sequence"] == 0,
@@ -253,17 +351,21 @@ def prepared(
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Discord source test")
-    bridge = DiscordSourceBridge(vault)
+    bridge = _bridge(vault, tmp_path)
     runtime = _runtime(tmp_path / "synthetic-discord")
-    bridge.bind(runtime, expected_revision=ABSENT_BINDING_REVISION)
+    bridge.bind(
+        runtime,
+        connection_id=CONNECTION_ID,
+        expected_revision=ABSENT_BINDING_REVISION,
+    )
     selected = vault.select_sources(expected_revision="absent", sources=("discord",))
     assert selected["revision"] != "absent"
     return vault, bridge, runtime
 
 
 def _provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DISCORD_USER_TOKEN", TOKEN)
-    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("DISCORD_USER_TOKEN", "ambient-user-token-must-be-ignored")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "ambient-bot-token-must-be-ignored")
     monkeypatch.setenv("DISCORD_CHANNEL_IDS", CHANNEL)
 
 
@@ -292,15 +394,21 @@ def test_binding_is_cas_bound_owner_only_and_contains_no_provider_secret(
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Binding test")
-    bridge = DiscordSourceBridge(vault)
+    bridge = _bridge(vault, tmp_path)
     runtime = _runtime(tmp_path / "synthetic-discord")
     assert bridge.binding_status() == {
         "bound": False,
         "bindingRevision": "absent",
         "runtimeCurrent": False,
     }
-    bound = bridge.bind(runtime, expected_revision="absent")
+    bound = bridge.bind(
+        runtime,
+        connection_id=CONNECTION_ID,
+        expected_revision="absent",
+    )
     assert bound["bound"] is True
+    assert bound["connectionId"] == CONNECTION_ID
+    assert bound["migrationRequired"] is False
     assert bound["runtimeCurrent"] is True
     encoded = bridge.binding_path.read_text()
     assert TOKEN not in encoded
@@ -308,14 +416,22 @@ def test_binding_is_cas_bound_owner_only_and_contains_no_provider_secret(
     if os.name != "nt":
         assert bridge.binding_path.stat().st_mode & 0o777 == 0o600
     with pytest.raises(ConflictError):
-        bridge.bind(runtime, expected_revision="absent")
+        bridge.bind(
+            runtime,
+            connection_id=CONNECTION_ID,
+            expected_revision="absent",
+        )
 
     link = tmp_path / "runtime-link"
     link.symlink_to(runtime)
     other_vault = Vault(tmp_path / "other-vault")
     other_vault.initialize(name="Other")
     with pytest.raises(ValidationError, match="non-symlinked"):
-        DiscordSourceBridge(other_vault).bind(link, expected_revision="absent")
+        _bridge(other_vault, tmp_path).bind(
+            link,
+            connection_id=CONNECTION_ID,
+            expected_revision="absent",
+        )
 
     native = tmp_path / "native-runtime"
     native.write_text("not a supported companion runtime\n")
@@ -323,7 +439,11 @@ def test_binding_is_cas_bound_owner_only_and_contains_no_provider_secret(
     native_vault = Vault(tmp_path / "native-vault")
     native_vault.initialize(name="Native")
     with pytest.raises(ValidationError, match="pinned interpreter"):
-        DiscordSourceBridge(native_vault).bind(native, expected_revision="absent")
+        _bridge(native_vault, tmp_path).bind(
+            native,
+            connection_id=CONNECTION_ID,
+            expected_revision="absent",
+        )
 
     runtime.write_text(runtime.read_text() + "\n# drift\n")
     assert bridge.binding_status()["runtimeCurrent"] is False
@@ -331,10 +451,185 @@ def test_binding_is_cas_bound_owner_only_and_contains_no_provider_secret(
     assert unbound == {"bound": False, "bindingRevision": "absent"}
 
 
+def test_legacy_binding_requires_explicit_connection_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Legacy Discord binding")
+    bridge = _bridge(vault, tmp_path)
+    runtime = _runtime(tmp_path / "runtime")
+    bridge.bind(
+        runtime,
+        connection_id=CONNECTION_ID,
+        expected_revision="absent",
+    )
+    vault.select_sources(expected_revision="absent", sources=("discord",))
+    _provider(monkeypatch)
+    delivery = bridge.poll()
+    receipt_revision = _record(vault, delivery)
+    state_before = bridge.state_path.read_bytes()
+    payload = json.loads(bridge.binding_path.read_text(encoding="ascii"))
+    payload.pop("connection_id")
+    payload["format_version"] = 1
+    bridge.binding_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="ascii",
+    )
+
+    legacy = bridge.binding_status()
+    assert legacy["bound"] is True
+    assert legacy["connectionId"] is None
+    assert legacy["migrationRequired"] is True
+    status = bridge.status()
+    assert status["available"] is False
+    assert status["errorCode"] == "auth_required"
+    with pytest.raises(ContinuityError, match="legacy Discord binding"):
+        bridge.poll()
+    with pytest.raises(ContinuityError, match="legacy Discord binding"):
+        bridge.acknowledge(
+            ack_token=str(delivery["ackToken"]),
+            expected_source_revision=receipt_revision,
+        )
+    assert bridge.state_path.read_bytes() == state_before
+
+    unbound = bridge.unbind(expected_revision=str(legacy["bindingRevision"]))
+    assert unbound == {"bound": False, "bindingRevision": "absent"}
+
+    rebound = bridge.bind(
+        runtime,
+        connection_id=CONNECTION_ID,
+        expected_revision="absent",
+    )
+    assert rebound["connectionId"] == CONNECTION_ID
+    assert rebound["migrationRequired"] is False
+
+
+@pytest.mark.parametrize(
+    ("provider", "source_ids", "credential_kind", "health", "message"),
+    [
+        (
+            "google",
+            ("discord",),
+            CredentialKind.BEARER,
+            ConnectionHealth.UNKNOWN,
+            "requires a Discord connection",
+        ),
+        (
+            "discord",
+            ("gmail",),
+            CredentialKind.BEARER,
+            ConnectionHealth.UNKNOWN,
+            "does not authorize",
+        ),
+        (
+            "discord",
+            ("discord",),
+            CredentialKind.API_KEY,
+            ConnectionHealth.UNKNOWN,
+            "bearer bot token",
+        ),
+        (
+            "discord",
+            ("discord",),
+            CredentialKind.BEARER,
+            ConnectionHealth.UNVERIFIED,
+            "identity is not confirmed",
+        ),
+        (
+            "discord",
+            ("discord",),
+            CredentialKind.BEARER,
+            ConnectionHealth.REVOKED,
+            "connection is revoked",
+        ),
+    ],
+    ids=("wrong-provider", "wrong-source", "wrong-kind", "unverified", "revoked"),
+)
+def test_binding_preflights_exact_portable_discord_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    source_ids: tuple[str, ...],
+    credential_kind: CredentialKind,
+    health: ConnectionHealth,
+    message: str,
+) -> None:
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Discord connection preflight")
+    bridge = _bridge(
+        vault,
+        tmp_path,
+        provider=provider,
+        source_ids=source_ids,
+        credential_kind=credential_kind,
+        health=health,
+        store_credential=health is not ConnectionHealth.REVOKED,
+    )
+    with pytest.raises(ValidationError, match=message):
+        bridge.bind(
+            _runtime(tmp_path / "runtime"),
+            connection_id=CONNECTION_ID,
+            expected_revision="absent",
+        )
+
+
+def test_status_and_poll_recheck_connection_health_and_token_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Discord operation preflight")
+    bridge = _bridge(vault, tmp_path, store_credential=False)
+    bridge.auth_manager.tokens.update(
+        CONNECTION_ID,
+        value=b"credential with whitespace",
+        expected_version=0,
+    )
+    bridge.bind(
+        _runtime(tmp_path / "runtime"),
+        connection_id=CONNECTION_ID,
+        expected_revision="absent",
+    )
+    vault.select_sources(expected_revision="absent", sources=("discord",))
+    _provider(monkeypatch)
+    invalid_token = bridge.status()
+    assert invalid_token["available"] is False
+    assert invalid_token["errorCode"] == "auth_required"
+    with pytest.raises(ContinuityError, match="bot credential is unavailable"):
+        bridge.poll()
+    assert not bridge.state_path.exists()
+
+    bridge.auth_manager.tokens.delete(CONNECTION_ID)
+    bridge.auth_manager.tokens.update(
+        CONNECTION_ID,
+        value=TOKEN.encode(),
+        expected_version=0,
+    )
+    snapshot = vault.get_connection_snapshot()
+    vault.mark_connection_health(
+        expected_revision=snapshot.revision,
+        connection_id=CONNECTION_ID,
+        health=ConnectionHealth.REVOKED,
+    )
+    revoked = bridge.status()
+    assert revoked["available"] is False
+    assert revoked["errorCode"] == "auth_required"
+    with pytest.raises(ContinuityError, match="portable connection is unavailable"):
+        bridge.poll()
+    assert not bridge.state_path.exists()
+
+
 def test_status_reports_setup_failures_without_exposing_paths_or_ids(
     prepared: tuple[Vault, DiscordSourceBridge, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _vault, bridge, _runtime_path = prepared
+    bridge.auth_manager.tokens.delete(CONNECTION_ID)
+    _provider(monkeypatch)
     status = bridge.status()
     assert status["available"] is False
     assert status["errorCode"] == "auth_required"
@@ -349,8 +644,12 @@ def test_status_never_touches_discord_until_the_source_is_selected(
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Unselected Discord")
-    bridge = DiscordSourceBridge(vault)
-    bridge.bind(_runtime(tmp_path / "runtime"), expected_revision="absent")
+    bridge = _bridge(vault, tmp_path)
+    bridge.bind(
+        _runtime(tmp_path / "runtime"),
+        connection_id=CONNECTION_ID,
+        expected_revision="absent",
+    )
     _provider(monkeypatch)
     status = bridge.status()
     assert status["selected"] is False
@@ -368,7 +667,8 @@ def test_baseline_record_ack_and_fresh_process_idempotence(
     status = bridge.status()
     assert status["available"] is True
     assert status["accountLabel"] == "Synthetic account"
-    assert "may terminate the account" in status["termsWarning"]
+    assert status["authType"] == "bot"
+    assert status["termsWarning"] is None
     assert status["configuredChannelCount"] == 1
     delivery = bridge.poll(limit=5, max_content_chars=100)
     assert delivery["result"] == "explicit_empty"
@@ -386,7 +686,7 @@ def test_baseline_record_ack_and_fresh_process_idempotence(
         expected_source_revision=receipt_revision,
     )
     assert acknowledged["alreadyAcknowledged"] is False
-    restarted = DiscordSourceBridge(vault).acknowledge(
+    restarted = DiscordSourceBridge(vault, auth_manager=bridge.auth_manager).acknowledge(
         ack_token=str(delivery["ackToken"]),
         expected_source_revision=receipt_revision,
     )
@@ -456,14 +756,16 @@ def test_child_environment_is_minimized(
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-cross")
     bridge.poll()
     keys = json.loads(bridge.state_path.with_suffix(".envkeys").read_text())
+    state = json.loads(bridge.state_path.read_text())
     assert "NODE_OPTIONS" not in keys
     assert "AWS_SECRET_ACCESS_KEY" not in keys
-    assert "DISCORD_USER_TOKEN" in keys
-    assert "DISCORD_BOT_TOKEN" not in keys
+    assert "DISCORD_USER_TOKEN" not in keys
+    assert "DISCORD_BOT_TOKEN" in keys
+    assert state["bot_token_digest"] == hashlib.sha256(TOKEN.encode()).hexdigest()
     assert set(keys) <= {
         "DISCORD_CHANNEL_IDS",
         "DISCORD_STATE_FILE",
-        "DISCORD_USER_TOKEN",
+        "DISCORD_BOT_TOKEN",
         "HOME",
         "LANG",
         "LC_ALL",
@@ -476,6 +778,140 @@ def test_child_environment_is_minimized(
     }
 
 
+def test_user_token_companion_payload_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Discord user-token rejection")
+    bridge = _bridge(vault, tmp_path)
+    bridge.bind(
+        _runtime(tmp_path / "user-runtime", user_mode=True),
+        connection_id=CONNECTION_ID,
+        expected_revision="absent",
+    )
+    vault.select_sources(expected_revision="absent", sources=("discord",))
+    _provider(monkeypatch)
+
+    with pytest.raises(ValidationError, match="account binding is invalid"):
+        bridge.poll()
+
+
+def test_poll_discards_provider_result_if_credential_rotates_during_read(
+    prepared: tuple[Vault, DiscordSourceBridge, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, bridge, _runtime_path = prepared
+    _provider(monkeypatch)
+    original_state = bridge.auth_manager.tokens.state
+    current = original_state(CONNECTION_ID)
+    assert current is not None
+    rotated = False
+
+    def state_with_rotation(connection_id: ConnectionId) -> TokenState | None:
+        nonlocal rotated
+        if not rotated:
+            rotated = True
+            bridge.auth_manager.tokens.update(
+                CONNECTION_ID,
+                expected_version=current.version,
+                value=b"rotated-discord-bot-token",
+            )
+        return original_state(connection_id)
+
+    monkeypatch.setattr(bridge.auth_manager.tokens, "state", state_with_rotation)
+    with pytest.raises(ConflictError, match="credential changed during"):
+        bridge.poll()
+
+
+def test_acknowledgement_cannot_cross_credential_rotation(
+    prepared: tuple[Vault, DiscordSourceBridge, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, bridge, _runtime_path = prepared
+    _provider(monkeypatch)
+    delivery = bridge.poll()
+    receipt_revision = _record(vault, delivery)
+    original_read = bridge.auth_manager.tokens.read
+    calls = 0
+
+    def read_with_rotation(connection_id: ConnectionId) -> ResolvedToken:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            current = bridge.auth_manager.tokens.state(CONNECTION_ID)
+            assert current is not None
+            bridge.auth_manager.tokens.update(
+                CONNECTION_ID,
+                expected_version=current.version,
+                value=b"rotated-before-acknowledgement",
+            )
+        return original_read(connection_id)
+
+    monkeypatch.setattr(
+        bridge.auth_manager.tokens,
+        "read",
+        read_with_rotation,
+    )
+    with pytest.raises(ConflictError, match="credential changed before acknowledgement"):
+        bridge.acknowledge(
+            ack_token=str(delivery["ackToken"]),
+            expected_source_revision=receipt_revision,
+        )
+    assert bridge.status()["checkpoint"]["pending"] is True
+
+
+def test_discord_poll_lock_order_releases_binding_snapshot_before_lifecycle(
+    prepared: tuple[Vault, DiscordSourceBridge, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault, bridge, _runtime_path = prepared
+    _provider(monkeypatch)
+    events: list[tuple[str, str, bool]] = []
+    lifecycle_held = False
+    global_path = bridge.vault.state / "locks/global.lock"
+
+    @contextmanager
+    def observed_lock(path: Path) -> Iterator[None]:
+        label = "global" if path == global_path else "binding"
+        events.append((label, "acquire", lifecycle_held))
+        try:
+            yield
+        finally:
+            events.append((label, "release", lifecycle_held))
+
+    @contextmanager
+    def observed_lifecycle(_connection_id: ConnectionId) -> Iterator[None]:
+        nonlocal lifecycle_held
+        events.append(("lifecycle", "acquire", lifecycle_held))
+        lifecycle_held = True
+        try:
+            yield
+        finally:
+            lifecycle_held = False
+            events.append(("lifecycle", "release", lifecycle_held))
+
+    monkeypatch.setattr(discord_source_module, "exclusive_lock", observed_lock)
+    monkeypatch.setattr(
+        bridge.auth_manager.tokens,
+        "exclusive_lifecycle",
+        observed_lifecycle,
+    )
+
+    assert bridge.poll()["result"] == "explicit_empty"
+    assert events == [
+        ("binding", "acquire", False),
+        ("binding", "release", False),
+        ("lifecycle", "acquire", False),
+        ("global", "acquire", True),
+        ("binding", "acquire", True),
+        ("binding", "release", True),
+        ("global", "release", True),
+        ("lifecycle", "release", False),
+    ]
+
+
 def test_binding_rejects_extra_tools_and_malformed_protocol(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -484,29 +920,33 @@ def test_binding_rejects_extra_tools_and_malformed_protocol(
     first = Vault(tmp_path / "first")
     first.initialize(name="First")
     with pytest.raises(ValidationError, match="exactly the three"):
-        DiscordSourceBridge(first).bind(
+        _bridge(first, tmp_path).bind(
             _runtime(tmp_path / "extra", extra_tool=True),
+            connection_id=CONNECTION_ID,
             expected_revision="absent",
         )
     second = Vault(tmp_path / "second")
     second.initialize(name="Second")
     with pytest.raises(ValidationError, match="malformed MCP"):
-        DiscordSourceBridge(second).bind(
+        _bridge(second, tmp_path).bind(
             _runtime(tmp_path / "malformed", malformed=True),
+            connection_id=CONNECTION_ID,
             expected_revision="absent",
         )
     third = Vault(tmp_path / "third")
     third.initialize(name="Third")
     with pytest.raises(ValidationError, match="invalid names"):
-        DiscordSourceBridge(third).bind(
+        _bridge(third, tmp_path).bind(
             _runtime(tmp_path / "invalid-name", invalid_tool_name=True),
+            connection_id=CONNECTION_ID,
             expected_revision="absent",
         )
     fourth = Vault(tmp_path / "fourth")
     fourth.initialize(name="Fourth")
     with pytest.raises(ValidationError, match="identity is invalid"):
-        DiscordSourceBridge(fourth).bind(
+        _bridge(fourth, tmp_path).bind(
             _runtime(tmp_path / "wrong-protocol", protocol_version="2099-01-01"),
+            connection_id=CONNECTION_ID,
             expected_revision="absent",
         )
 
@@ -528,14 +968,22 @@ def test_companion_call_has_hard_time_and_output_bounds(
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Bounded companion")
-    bridge = DiscordSourceBridge(vault)
+    bridge = _bridge(vault, tmp_path)
     runtime = _runtime(
         tmp_path / "bounded-runtime",
         stall=mode == "stall",
         overflow=mode == "overflow",
     )
-    bridge.bind(runtime, expected_revision="absent")
-    monkeypatch.setattr(discord_source_module, "MCP_TIMEOUT_SECONDS", 0.1)
+    bridge.bind(
+        runtime,
+        connection_id=CONNECTION_ID,
+        expected_revision="absent",
+    )
+    monkeypatch.setattr(
+        discord_source_module,
+        "MCP_TIMEOUT_SECONDS",
+        2.0 if mode == "overflow" else 0.1,
+    )
     monkeypatch.setattr(discord_source_module, "MAX_MCP_OUTPUT_BYTES", 1024)
     vault.select_sources(expected_revision="absent", sources=("discord",))
     _provider(monkeypatch)
@@ -550,9 +998,10 @@ def test_poll_rejects_a_delivery_binding_that_does_not_attest_its_projection(
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Delivery binding")
-    bridge = DiscordSourceBridge(vault)
+    bridge = _bridge(vault, tmp_path)
     bridge.bind(
         _runtime(tmp_path / "corrupt-runtime", corrupt_delivery=True),
+        connection_id=CONNECTION_ID,
         expected_revision="absent",
     )
     vault.select_sources(expected_revision="absent", sources=("discord",))
@@ -578,9 +1027,10 @@ def test_poll_rechecks_the_exact_requested_output_bounds(
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Action bound")
-    bridge = DiscordSourceBridge(vault)
+    bridge = _bridge(vault, tmp_path)
     bridge.bind(
         _runtime(tmp_path / "ignores-bound", extra_items=extra_items),
+        connection_id=CONNECTION_ID,
         expected_revision="absent",
     )
     vault.select_sources(expected_revision="absent", sources=("discord",))
@@ -602,9 +1052,10 @@ def test_acknowledgement_rechecks_the_committed_checkpoint(
     monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Corrupt acknowledgement")
-    bridge = DiscordSourceBridge(vault)
+    bridge = _bridge(vault, tmp_path)
     bridge.bind(
         _runtime(tmp_path / "corrupt-ack", corrupt_ack=True),
+        connection_id=CONNECTION_ID,
         expected_revision="absent",
     )
     vault.select_sources(expected_revision="absent", sources=("discord",))
@@ -633,18 +1084,21 @@ def test_seld_mcp_exposes_only_the_three_operational_discord_surfaces() -> None:
     assert "gsv_discord_source_reset" not in tools
 
 
-def test_fresh_process_cli_runs_bind_baseline_record_ack_and_restart(
+def test_fresh_process_cli_binds_connection_and_rejects_ambient_tokens(
     tmp_path: Path,
 ) -> None:
     vault_path = tmp_path / "vault"
     host_path = tmp_path / "host"
-    Vault(vault_path).initialize(name="Fresh Discord CLI")
+    vault = Vault(vault_path)
+    vault.initialize(name="Fresh Discord CLI")
+    _auth_manager(vault, tmp_path, store_credential=False)
     runtime = _runtime(tmp_path / "synthetic-discord")
     environment = os.environ.copy()
     environment.update(
         {
             "DISCORD_CHANNEL_IDS": CHANNEL,
-            "DISCORD_USER_TOKEN": TOKEN,
+            "DISCORD_USER_TOKEN": "ambient-user-token-must-be-ignored",
+            "DISCORD_BOT_TOKEN": "ambient-bot-token-must-be-ignored",
             "GSV_DATA_DIR": str(host_path),
         }
     )
@@ -678,62 +1132,19 @@ def test_fresh_process_cli_runs_bind_baseline_record_ack_and_restart(
         "bind",
         "--runtime",
         str(runtime),
+        "--connection-id",
+        str(CONNECTION_ID),
         "--expected-revision",
         "absent",
     )
-    selected = run("source", "select", "--expected-revision", "absent", "--source", "discord")
+    bound = run("discord-source", "binding-status")
+    assert bound["connectionId"] == CONNECTION_ID
+    assert bound["migrationRequired"] is False
+    run("source", "select", "--expected-revision", "absent", "--source", "discord")
     status = run("discord-source", "status")
-    assert status["available"] is True
-    assert status["configuredChannelCount"] == 1
-    delivery = run(
-        "discord-source",
-        "poll",
-        "--limit",
-        "5",
-        "--max-content-chars",
-        "100",
-    )
-    assert delivery["result"] == "explicit_empty"
-    record = delivery["record"]
-    assert isinstance(record, dict)
-    recorded = run(
-        "source",
-        "record",
-        "--expected-revision",
-        str(selected["revision"]),
-        "--source",
-        "discord",
-        "--actor-ref",
-        "codex:fresh-cli-test",
-        "--result",
-        str(record["result"]),
-        "--covered-through",
-        str(record["coveredThrough"]),
-        "--completeness",
-        str(record["completeness"]),
-        "--account-binding",
-        str(record["accountBinding"]),
-        "--tool-binding",
-        str(record["toolBinding"]),
-        "--cursor",
-        str(record["cursor"]),
-        "--evidence-ref",
-        str(record["evidenceRefs"][0]),
-    )
-    acknowledged = run(
-        "discord-source",
-        "acknowledge",
-        "--ack-token",
-        str(delivery["ackToken"]),
-        "--expected-source-revision",
-        str(recorded["revision"]),
-    )
-    assert acknowledged["acknowledged"] is True
-    restarted = run("discord-source", "status")
-    checkpoint = restarted["checkpoint"]
-    assert isinstance(checkpoint, dict)
-    assert checkpoint["pending"] is False
-    assert checkpoint["coveredThrough"] == delivery["coveredThrough"]
+    assert status["available"] is False
+    assert status["errorCode"] == "auth_required"
+    assert not (host_path / "discord-source" / "state").exists()
 
     durable = b"".join(
         path.read_bytes()
@@ -741,5 +1152,6 @@ def test_fresh_process_cli_runs_bind_baseline_record_ack_and_restart(
         for path in root.rglob("*")
         if path.is_file()
     )
-    assert TOKEN.encode() not in durable
+    assert b"ambient-user-token-must-be-ignored" not in durable
+    assert b"ambient-bot-token-must-be-ignored" not in durable
     assert CHANNEL.encode() not in (vault_path / "SOURCES.md").read_bytes()

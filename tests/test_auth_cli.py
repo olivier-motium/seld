@@ -1,0 +1,451 @@
+from __future__ import annotations
+
+import io
+import json
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from continuity_kernel import auth_cli
+from continuity_kernel.connector_auth import (
+    AccountMetadata,
+    ClientKind,
+    ClientMetadata,
+    ConnectionHealth,
+    ConnectionMetadata,
+    CredentialKind,
+)
+from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_identifiers import new_connection_id
+from continuity_kernel.connector_profiles import (
+    ConnectorAccessTier,
+    format_connector_command,
+    get_profile,
+)
+from continuity_kernel.connector_secrets import InMemorySecretStore
+from continuity_kernel.errors import ValidationError
+from continuity_kernel.vault import Vault
+
+
+class BinaryInput:
+    def __init__(self, value: bytes) -> None:
+        self.buffer = io.BytesIO(value)
+
+    def isatty(self) -> bool:
+        return False
+
+
+def test_gsv_auth_add_and_stdin_credential_path_never_serializes_the_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Auth CLI")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+    added = auth_cli._dispatch(
+        parser.parse_args(
+            [
+                "add",
+                "--provider",
+                "github",
+                "--source",
+                "github",
+                "--kind",
+                "api_key",
+                "--label",
+                "Synthetic",
+            ]
+        ),
+        manager,
+    )
+    connections = added["connections"]
+    assert isinstance(connections, list)
+    first_connection = connections[0]
+    assert isinstance(first_connection, dict)
+    connection_id = first_connection["connection_id"]
+    assert isinstance(connection_id, str)
+    sentinel = b"cli-secret-from-stdin"
+    monkeypatch.setattr(sys, "stdin", BinaryInput(sentinel))
+
+    result = auth_cli._dispatch(
+        parser.parse_args(["credential", connection_id]),
+        manager,
+    )
+
+    connection = result["connection"]
+    assert isinstance(connection, dict)
+    assert connection["host_credential"] == "available"
+    assert sentinel.decode() not in json.dumps(result, sort_keys=True)
+    assert sentinel not in (vault.root / "CONNECTIONS.md").read_bytes()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["credential", connection_id, "--token", sentinel.decode()])
+
+
+def test_profile_add_creates_exact_google_oauth_metadata(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Google profile")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+
+    auth_cli._dispatch(
+        parser.parse_args(
+            [
+                "add",
+                "--profile",
+                "google",
+                "--client-id",
+                "public-google-client",
+                "--redirect-uri",
+                "http://127.0.0.1:0",
+                "--label",
+                "Personal Google",
+            ]
+        ),
+        manager,
+    )
+
+    connection = vault.get_connection_snapshot().connections[0]
+    assert connection.provider == "google"
+    assert connection.source_ids == ("gmail", "google_calendar", "google_drive")
+    assert connection.credential_kind is CredentialKind.OAUTH2
+    assert set(connection.scopes) == set(get_profile("google").read_scopes)
+    assert get_profile("google").access_for_scopes(connection.scopes) is ConnectorAccessTier.READ
+    assert connection.client.identifier == "public-google-client"
+    assert connection.client.redirect_uris == ("http://127.0.0.1:0",)
+    assert connection.client.authorization_endpoint == (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+    )
+    assert connection.client.token_endpoint == "https://oauth2.googleapis.com/token"
+
+
+def test_discord_profile_rejects_oauth_fields_and_keeps_external_custody(
+    tmp_path: Path,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Discord profile")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+
+    with pytest.raises(ValidationError, match="OAuth client arguments"):
+        auth_cli._dispatch(
+            parser.parse_args(["add", "--profile", "discord", "--client-id", "not-allowed"]),
+            manager,
+        )
+    auth_cli._dispatch(parser.parse_args(["add", "--profile", "discord"]), manager)
+
+    connection = vault.get_connection_snapshot().connections[0]
+    assert connection.provider == "discord"
+    assert connection.source_ids == ("discord",)
+    assert connection.credential_kind is CredentialKind.BEARER
+    assert connection.client.identifier is None
+
+
+def test_raw_cli_cannot_replace_a_verified_bearer_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Verified Discord identity")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+    now = datetime.now(UTC)
+    connection_id = new_connection_id()
+    manager.publish_new_bearer_connection(
+        ConnectionMetadata(
+            connection_id=connection_id,
+            provider="discord",
+            source_ids=("discord",),
+            credential_kind=CredentialKind.BEARER,
+            account=AccountMetadata(
+                fingerprint="sha256:" + "a" * 64,
+                label="Verified Discord bot",
+            ),
+            scopes=("seld.discord.full",),
+            client=ClientMetadata(kind=ClientKind.EXTERNAL),
+            health=ConnectionHealth.UNVERIFIED,
+            created_at=now,
+            updated_at=now,
+            version=1,
+        ),
+        b"original-discord-bot-token",
+    )
+    monkeypatch.setattr(sys, "stdin", BinaryInput(b"different-discord-bot-token"))
+
+    with pytest.raises(ValidationError, match="verified connector onboarding"):
+        auth_cli._dispatch(
+            parser.parse_args(["credential", str(connection_id), "--replace"]),
+            manager,
+        )
+
+    assert manager.tokens.read(connection_id).value == b"original-discord-bot-token"
+
+
+def test_manual_oauth_requires_a_built_in_profile(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Manual OAuth")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+
+    with pytest.raises(ValidationError, match="use a built-in profile"):
+        auth_cli._dispatch(
+            parser.parse_args(
+                [
+                    "add",
+                    "--provider",
+                    "example",
+                    "--source",
+                    "example",
+                    "--kind",
+                    "oauth2",
+                    "--client-id",
+                    "client",
+                    "--redirect-uri",
+                    "http://127.0.0.1:49152/callback",
+                    "--authorization-endpoint",
+                    "https://example.test/authorize",
+                    "--token-endpoint",
+                    "https://example.test/token",
+                ]
+            ),
+            manager,
+        )
+
+
+def test_explicit_restored_vault_is_kept_in_status_and_import_recovery_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    restored = tmp_path / "gsv-auth restored vault"
+    vault = Vault(restored)
+    vault.initialize(name="Restored auth CLI")
+    now = datetime.now(UTC)
+    connection_id = new_connection_id()
+    profile = get_profile("google")
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=ConnectionMetadata(
+            connection_id=connection_id,
+            provider="google",
+            source_ids=("gmail",),
+            credential_kind=CredentialKind.OAUTH2,
+            account=AccountMetadata(
+                fingerprint="sha256:" + "a" * 64,
+                label="Restored Gmail",
+            ),
+            scopes=profile.read_scopes,
+            client=ClientMetadata(
+                kind=ClientKind.PUBLIC,
+                identifier="synthetic-client",
+                redirect_uris=("http://127.0.0.1:0",),
+                authorization_endpoint=profile.authorization_endpoint,
+                token_endpoint=profile.token_endpoint,
+            ),
+            health=ConnectionHealth.UNVERIFIED,
+            created_at=now,
+            updated_at=now,
+            version=1,
+        ),
+        observed_at=now,
+    )
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+    expected = format_connector_command(
+        ("gsv", "--vault", str(restored), "connectors", "resume", str(connection_id))
+    )
+
+    status = auth_cli._dispatch(
+        parser.parse_args(["--vault", str(restored), "status"]),
+        manager,
+    )
+    rows = status["connections"]
+    assert isinstance(rows, list) and isinstance(rows[0], dict)
+    assert rows[0]["next"] == expected
+
+    monkeypatch.setattr(
+        auth_cli,
+        "import_auth_archive",
+        lambda *_args, **_kwargs: {
+            "connection_count": 1,
+            "connection_ids": [str(connection_id)],
+            "imported": True,
+            "next_action": "resume_identity",
+            "requires_verification": True,
+            "vault_id": manager.vault_id,
+        },
+    )
+    imported = auth_cli._dispatch(
+        parser.parse_args(
+            [
+                "--vault",
+                str(restored),
+                "import",
+                str(tmp_path / "auth.age"),
+                "--identity",
+                str(tmp_path / "identity.txt"),
+            ]
+        ),
+        manager,
+    )
+    assert imported["resume_commands"] == [expected]
+
+
+def test_profile_owned_fields_cannot_be_overridden(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Profile override")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+
+    with pytest.raises(ValidationError, match="cannot be overridden"):
+        auth_cli._dispatch(
+            parser.parse_args(
+                [
+                    "add",
+                    "--profile",
+                    "slack",
+                    "--scope",
+                    "chat:write",
+                    "--client-id",
+                    "public-slack-client",
+                    "--redirect-uri",
+                    "http://127.0.0.1:49152/oauth/callback",
+                ]
+            ),
+            manager,
+        )
+
+    with pytest.raises(ValidationError, match="exact registered"):
+        auth_cli._dispatch(
+            parser.parse_args(
+                [
+                    "add",
+                    "--profile",
+                    "slack",
+                    "--client-id",
+                    "public-slack-client",
+                    "--redirect-uri",
+                    "http://localhost:0/oauth/callback",
+                ]
+            ),
+            manager,
+        )
+
+    with pytest.raises(ValidationError, match="Google profile requires"):
+        auth_cli._dispatch(
+            parser.parse_args(
+                [
+                    "add",
+                    "--profile",
+                    "google",
+                    "--client-id",
+                    "public-google-client",
+                    "--redirect-uri",
+                    "http://localhost:49152/oauth/callback",
+                ]
+            ),
+            manager,
+        )
+
+
+def test_microsoft_profile_accepts_dynamic_and_concrete_loopback_ports(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Microsoft redirects")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+
+    for port in (0, 49152):
+        auth_cli._dispatch(
+            parser.parse_args(
+                [
+                    "add",
+                    "--profile",
+                    "microsoft",
+                    "--client-id",
+                    f"microsoft-client-{port}",
+                    "--redirect-uri",
+                    f"http://localhost:{port}/oauth/callback",
+                ]
+            ),
+            manager,
+        )
+
+    assert len(vault.get_connection_snapshot().connections) == 2
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "http://127.0.0.1:49152/oauth/callback",
+        "http://localhost/oauth/callback",
+        "http://localhost:not-a-port/oauth/callback",
+        "http://localhost:65536/oauth/callback",
+        "http://localhost:49152/callback",
+        "http://user@localhost:49152/oauth/callback",
+        "http://localhost:49152/oauth/callback?code=leak",
+        "http://localhost:49152/oauth/callback#fragment",
+    ],
+)
+def test_microsoft_profile_rejects_noncontract_loopback_redirects(
+    tmp_path: Path,
+    redirect_uri: str,
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Microsoft redirect validation")
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    parser = auth_cli._parser()
+
+    with pytest.raises(ValidationError, match="Microsoft profile"):
+        auth_cli._dispatch(
+            parser.parse_args(
+                [
+                    "add",
+                    "--profile",
+                    "microsoft",
+                    "--client-id",
+                    "microsoft-client",
+                    "--redirect-uri",
+                    redirect_uri,
+                ]
+            ),
+            manager,
+        )
+
+    assert vault.get_connection_snapshot().connections == ()

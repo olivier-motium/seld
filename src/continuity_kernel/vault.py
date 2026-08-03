@@ -31,6 +31,26 @@ from continuity_kernel.atomic import (
     sha256_file,
 )
 from continuity_kernel.config import local_host_id
+from continuity_kernel.connections import (
+    ABSENT_CONNECTION_REVISION,
+    MAX_CONNECTION_STATE_BYTES,
+    ConnectionSnapshot,
+    connection_snapshot_dict,
+    empty_connection_snapshot,
+    parse_connection_snapshot,
+    render_connection_snapshot,
+)
+from continuity_kernel.connections import (
+    mark_connection_health as mark_connection_health_in_snapshot,
+)
+from continuity_kernel.connections import (
+    put_connection as put_connection_in_snapshot,
+)
+from continuity_kernel.connections import (
+    remove_connection as remove_connection_from_snapshot,
+)
+from continuity_kernel.connector_auth import ConnectionHealth, ConnectionMetadata
+from continuity_kernel.connector_identifiers import ConnectionId
 from continuity_kernel.direction import (
     ABSENT_DIRECTION_REVISION,
     DIRECTION_RICH_FORMAT_VERSION,
@@ -130,6 +150,7 @@ from continuity_kernel.resident_signals import (
     signal_dict,
     signal_view_dict,
 )
+from continuity_kernel.source_recipes import get_recipe
 from continuity_kernel.source_state import (
     ABSENT_SOURCE_REVISION,
     MAX_SOURCE_STATE_BYTES,
@@ -202,6 +223,7 @@ This folder contains your local Seld record. Markdown is authoritative.
 
 - `MIND.md` describes durable purpose and working preferences.
 - `NOW.md` is the bounded current orientation.
+- `CONNECTIONS.md` contains portable non-secret connector metadata when configured.
 - `tasks/`, `entities/`, and `threads/` contain typed Markdown records.
 - `journal/events.jsonl` is a compact mutation audit log.
 
@@ -2216,6 +2238,153 @@ class Vault:
             return empty_source_snapshot()
         return parse_source_snapshot(self._read_bytes(path, max_bytes=MAX_SOURCE_STATE_BYTES))
 
+    def get_connection_snapshot(self) -> ConnectionSnapshot:
+        """Read portable non-secret connector metadata, or one absent revision."""
+
+        path = self.root / "CONNECTIONS.md"
+        if not os.path.lexists(path):
+            return empty_connection_snapshot()
+        snapshot = parse_connection_snapshot(
+            self._read_bytes(path, max_bytes=MAX_CONNECTION_STATE_BYTES)
+        )
+        self._validate_connection_sources(snapshot)
+        return snapshot
+
+    def connection_status(self) -> dict[str, Any]:
+        """Return only the portable redacted view; host custody is projected elsewhere."""
+
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("connection", "registry")),
+        ):
+            return connection_snapshot_dict(self.get_connection_snapshot())
+
+    def put_connection(
+        self,
+        *,
+        expected_revision: str,
+        connection: ConnectionMetadata,
+        observed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        path = self.root / "CONNECTIONS.md"
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("connection", "registry")),
+        ):
+            before = self.get_connection_snapshot()
+            self._expect(before.revision, expected_revision)
+            self._validate_connection_sources(
+                ConnectionSnapshot(1, (connection,), None, ABSENT_CONNECTION_REVISION)
+            )
+            after = put_connection_in_snapshot(before, connection, observed_at=observed_at)
+            self._persist_connection_snapshot(path, before, after, operation="connection.put")
+            return connection_snapshot_dict(after)
+
+    def mark_connection_health(
+        self,
+        *,
+        expected_revision: str,
+        connection_id: ConnectionId | str,
+        health: ConnectionHealth,
+        verified: bool = False,
+        observed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        path = self.root / "CONNECTIONS.md"
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("connection", "registry")),
+        ):
+            before = self.get_connection_snapshot()
+            self._expect(before.revision, expected_revision)
+            after = mark_connection_health_in_snapshot(
+                before,
+                connection_id,
+                health,
+                verified=verified,
+                observed_at=observed_at,
+            )
+            if after == before:
+                return connection_snapshot_dict(before)
+            self._persist_connection_snapshot(path, before, after, operation="connection.health")
+            return connection_snapshot_dict(after)
+
+    def remove_connection(
+        self,
+        *,
+        expected_revision: str,
+        connection_id: ConnectionId | str,
+        observed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Remove metadata after the caller has revoked host-local custody."""
+
+        path = self.root / "CONNECTIONS.md"
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("connection", "registry")),
+        ):
+            before = self.get_connection_snapshot()
+            self._expect(before.revision, expected_revision)
+            after = remove_connection_from_snapshot(
+                before,
+                connection_id,
+                observed_at=observed_at,
+            )
+            self._persist_connection_snapshot(path, before, after, operation="connection.remove")
+            return connection_snapshot_dict(after)
+
+    def replace_connections(
+        self,
+        *,
+        expected_revision: str,
+        snapshot: ConnectionSnapshot,
+        operation: str = "connection.import",
+    ) -> dict[str, Any]:
+        """Publish one already validated complete snapshot for encrypted restore."""
+
+        path = self.root / "CONNECTIONS.md"
+        encoded = render_connection_snapshot(snapshot).encode("utf-8")
+        after = parse_connection_snapshot(encoded)
+        self._validate_connection_sources(after)
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("connection", "registry")),
+        ):
+            before = self.get_connection_snapshot()
+            self._expect(before.revision, expected_revision)
+            self._persist_connection_snapshot(path, before, after, operation=operation)
+            return connection_snapshot_dict(after)
+
+    def _persist_connection_snapshot(
+        self,
+        path: Path,
+        before: ConnectionSnapshot,
+        after: ConnectionSnapshot,
+        *,
+        operation: str,
+    ) -> None:
+        previous = (
+            None
+            if before.revision == ABSENT_CONNECTION_REVISION
+            else self._read_bytes(path, max_bytes=MAX_CONNECTION_STATE_BYTES)
+        )
+        self._persist_with_event(
+            path=path,
+            content=render_connection_snapshot(after).encode("utf-8"),
+            previous=previous,
+            operation=operation,
+            identifier="CONNECTIONS.md",
+            before_revision=(
+                None if before.revision == ABSENT_CONNECTION_REVISION else before.revision
+            ),
+            after_revision=after.revision,
+        )
+
+    @staticmethod
+    def _validate_connection_sources(snapshot: ConnectionSnapshot) -> None:
+        for connection in snapshot.connections:
+            for source_id in connection.source_ids:
+                get_recipe(source_id)
+
     def source_status(self) -> dict[str, Any]:
         with (
             exclusive_lock(self.state / "locks/global.lock"),
@@ -2546,6 +2715,19 @@ class Vault:
                 )
             except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
                 issues.append(DoctorIssue("invalid-sources", "SOURCES.md", str(exc)))
+
+        connection_path = self.root / "CONNECTIONS.md"
+        if os.path.lexists(connection_path):
+            try:
+                connections = parse_connection_snapshot(
+                    self._read_bytes(
+                        connection_path,
+                        max_bytes=MAX_CONNECTION_STATE_BYTES,
+                    )
+                )
+                self._validate_connection_sources(connections)
+            except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
+                issues.append(DoctorIssue("invalid-connections", "CONNECTIONS.md", str(exc)))
 
         signal_counts = {"signals": 0, "signals_pending": 0}
         try:

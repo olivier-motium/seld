@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shlex
 import subprocess
 import sys
+import webbrowser
+from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import continuity_kernel.update as self_update
 from continuity_kernel import __version__, resident_import, whatsapp
@@ -41,6 +44,19 @@ from continuity_kernel.config import (
     resolve_vault,
     restore_config,
     save_config,
+)
+from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_identifiers import parse_connection_id
+from continuity_kernel.connector_onboarding import (
+    BrowserMode,
+    ConnectorIdentityReview,
+    ConnectorOnboarding,
+    provider_revocation_guidance,
+)
+from continuity_kernel.connector_operations import CONNECTOR_PROFILE
+from continuity_kernel.connector_profiles import (
+    CONNECTOR_PROFILES,
+    ConnectorAccessTier,
 )
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
@@ -114,11 +130,66 @@ def main(arguments: list[str] | None = None) -> int:
             return failure[0]
         return 0
     except ContinuityError as exc:
+        oauth_guidance = (
+            _connector_oauth_failure_guidance(args)
+            if exc.provider_authorization_may_remain
+            else None
+        )
         if getattr(args, "json", False):
-            print(json.dumps({"error": str(exc), "ok": False}, ensure_ascii=False), file=sys.stderr)
+            payload: dict[str, object] = {"error": str(exc), "ok": False}
+            if oauth_guidance is not None:
+                payload.update(
+                    {
+                        "provider_access_may_remain": True,
+                        "revocation_help": oauth_guidance,
+                    }
+                )
+            print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
         else:
             print(f"Error: {exc}", file=sys.stderr)
+            if oauth_guidance is not None:
+                print(
+                    "If provider sign-in completed, provider access may remain. "
+                    f"{oauth_guidance} Run `gsv connectors list` before retrying.",
+                    file=sys.stderr,
+                )
         return 2
+    except KeyboardInterrupt as exc:
+        authorization_may_remain = bool(getattr(exc, "provider_authorization_may_remain", False))
+        guidance = _connector_oauth_failure_guidance(args) if authorization_may_remain else None
+        if getattr(args, "json", False):
+            interrupted_payload: dict[str, object] = {"error": "cancelled", "ok": False}
+            if guidance is not None:
+                interrupted_payload.update(
+                    {
+                        "provider_access_may_remain": True,
+                        "revocation_help": guidance,
+                    }
+                )
+            print(json.dumps(interrupted_payload, ensure_ascii=False), file=sys.stderr)
+        elif guidance is not None:
+            print(
+                "Cancelled locally after provider sign-in may have started. "
+                f"{guidance} Run `gsv connectors list` before retrying or reauthorizing.",
+                file=sys.stderr,
+            )
+        else:
+            print("Cancelled.", file=sys.stderr)
+        return 130
+
+
+def _connector_oauth_failure_guidance(args: argparse.Namespace) -> str | None:
+    if getattr(args, "command", None) != "connectors" or getattr(
+        args, "connectors_command", None
+    ) not in {"connect", "reauthorize"}:
+        return None
+    connector = getattr(args, "connector", None)
+    if connector == "discord":
+        return None
+    profile = CONNECTOR_PROFILES.get(connector) if isinstance(connector, str) else None
+    if profile is not None:
+        return provider_revocation_guidance(profile.provider)
+    return "Review the provider's connected-app settings."
 
 
 def _dispatch(args: argparse.Namespace) -> Any:
@@ -128,10 +199,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
         vault = Vault(vault_path)
         initialized = vault.initialize(name=args.name, command="gsv")
         doctor = doctor_dict(vault.doctor())
+        connector_registration = _connector_registration_status(vault)
         if not doctor["healthy"]:
             return {
                 "bridge": None,
                 "codex": None,
+                "connectors": connector_registration,
                 "doctor": doctor,
                 "next": _doctor_next(vault_path, doctor),
                 "setup_complete": False,
@@ -185,6 +258,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return {
             "bridge": bridge,
             "codex": integration,
+            "connectors": connector_registration,
             "doctor": doctor,
             "next": _setup_next(
                 no_codex=args.no_codex,
@@ -327,6 +401,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             result["codex"] = {"available": True, **codex_status(codex_home=codex_home())}
         except ContinuityError as exc:
             result["codex"] = {"available": False, "error": str(exc)}
+        result["connectors"] = _connector_registration_status(vault)
         return result
     if args.command == "context":
         context = vault.context_pack(max_characters=args.max_characters)
@@ -340,6 +415,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         raise AssertionError("unreachable resident-context command")
     if args.command == "execution-bindings":
         return execution_bindings(vault)
+    if args.command == "connectors":
+        return _connectors(vault, args)
     if args.command == "source":
         if args.source_command == "list":
             return {"catalog": list_recipes(), "state": vault.source_status()}
@@ -370,6 +447,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
         if args.discord_source_command == "bind":
             return discord_bridge.bind(
                 Path(args.runtime).expanduser().absolute(),
+                connection_id=parse_connection_id(args.connection_id),
                 expected_revision=args.expected_revision,
             )
         if args.discord_source_command == "unbind":
@@ -552,9 +630,322 @@ def _dispatch(args: argparse.Namespace) -> Any:
     raise AssertionError("unreachable command")
 
 
+def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
+    manager = ConnectorAuthManager(vault)
+    onboarding = ConnectorOnboarding(manager)
+    if args.connectors_command == "readiness":
+        return _connector_registration_status(vault, onboarding=onboarding)
+    if args.connectors_command == "list":
+        return onboarding.list()
+    if args.connectors_command == "status":
+        return onboarding.status(args.target)
+    if args.connectors_command == "connect":
+        if args.with_permanent_delete and (args.connector != "gmail" or args.access != "full"):
+            raise ValidationError("--with-permanent-delete is available only for Gmail Full access")
+        if args.connector == "discord" and args.connection_id is not None:
+            raise ValidationError("--connection-id is unavailable for Discord bot onboarding")
+        if args.connector == "discord" and (args.browser is not None or args.no_browser):
+            raise ValidationError("browser options are unavailable for Discord bot onboarding")
+        if args.connector == "discord" and args.timeout is not None:
+            raise ValidationError("--timeout is unavailable for Discord bot onboarding")
+        if not args.json:
+            print(
+                f"Connecting {args.connector.replace('_', ' ').title()} with "
+                f"{args.access.title()} access…",
+                file=sys.stderr,
+            )
+        if args.with_permanent_delete:
+            _present_permission_update(
+                "Permanent delete is ON. Seld can erase Gmail messages without Trash, and "
+                "that cannot be undone."
+            )
+        if args.connector == "discord":
+            manager.probe_credential_custody()
+            if not sys.stdin.isatty():
+                raise SetupError(
+                    "Discord bot onboarding needs an interactive terminal so the token stays "
+                    "hidden; it is never accepted on the command line"
+                )
+            token = getpass.getpass("Discord bot token (input hidden): ").encode("utf-8")
+            return onboarding.connect_discord(
+                token,
+                access=args.access,
+                confirm_identity=_confirm_connector_identity,
+                new_account=args.new_account,
+                alias=args.alias,
+            )
+        opener = _connector_browser_opener(args)
+        return onboarding.connect_oauth(
+            args.connector,
+            access=args.access,
+            confirm_identity=_confirm_connector_identity,
+            new_account=args.new_account,
+            connection_id=args.connection_id,
+            alias=args.alias,
+            include_permanent_delete=args.with_permanent_delete,
+            browser_opener=opener,
+            browser_mode=_connector_browser_mode(args),
+            present_authorization_url=_present_authorization_url,
+            present_permission_update=_present_permission_update,
+            timeout_seconds=args.timeout,
+        )
+    if args.connectors_command == "alias":
+        return onboarding.alias(
+            args.connection_id,
+            args.alias,
+            expected_revision=args.expected_revision,
+        )
+    if args.connectors_command == "resume":
+        return onboarding.resume(
+            args.connection_id,
+            confirm_identity=_confirm_connector_identity,
+            alias=args.alias,
+        )
+    if args.connectors_command == "reauthorize":
+        opener = _connector_browser_opener(args)
+        return onboarding.reauthorize_oauth(
+            args.connection_id,
+            confirm_identity=_confirm_connector_identity,
+            alias=args.alias,
+            browser_opener=opener,
+            browser_mode=_connector_browser_mode(args),
+            present_authorization_url=_present_authorization_url,
+            timeout_seconds=args.timeout,
+        )
+    if args.connectors_command == "disconnect":
+        if not args.yes and not _confirm(
+            "Forget this local connection? Provider access will remain authorized. [y/N] "
+        ):
+            return {
+                "connection_id": args.connection_id,
+                "next": f"gsv connectors status {args.connection_id}",
+                "nothing_changed": True,
+                "status": "disconnect_cancelled",
+            }
+        return onboarding.disconnect(args.connection_id)
+    if args.connectors_command == "revocation-help":
+        status = onboarding.status(args.connection_id)
+        rows = cast(list[dict[str, object]], status["connections"])
+        provider = rows[0].get("provider")
+        if not isinstance(provider, str):
+            raise SetupError("connector provider is unavailable")
+        return {
+            "connection_id": args.connection_id,
+            "next": _revocation_guidance(provider),
+            "provider": provider,
+            "provider_access_revoked": False,
+            "status": "instructions_only",
+        }
+    raise AssertionError("unreachable connectors command")
+
+
+def _connector_registration_status(
+    vault: Vault,
+    *,
+    onboarding: ConnectorOnboarding | None = None,
+) -> dict[str, object]:
+    current = onboarding or ConnectorOnboarding(ConnectorAuthManager(vault))
+    readiness = current.registration_readiness()
+    ready = all(row.get("status") == "ready" for row in readiness.values())
+    return {
+        "oauth_registration_ready": ready,
+        "registration_readiness": readiness,
+        "vault_healthy_independent": True,
+    }
+
+
+def _connector_browser_opener(args: argparse.Namespace) -> Callable[[str], bool] | None:
+    if args.no_browser:
+        return None
+    if args.browser in {None, "default"}:
+        return webbrowser.open
+
+    def open_firefox(url: str) -> bool:
+        try:
+            controller = webbrowser.get("firefox")
+            try:
+                if bool(controller.open(url)):
+                    return True
+            except (OSError, RuntimeError, webbrowser.Error):
+                pass
+        except (OSError, RuntimeError, webbrowser.Error):
+            pass
+        if sys.platform != "darwin":
+            return False
+        try:
+            completed = subprocess.run(
+                ["open", "-b", "org.mozilla.firefox", "-u", url],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return completed.returncode == 0
+
+    return open_firefox
+
+
+def _connector_browser_mode(args: argparse.Namespace) -> BrowserMode:
+    if args.no_browser:
+        return "manual"
+    return args.browser or "default"
+
+
+def _present_authorization_url(url: str, browser_opened: bool) -> None:
+    if browser_opened:
+        print("Your browser is open. Finish sign-in there; Seld is waiting…", file=sys.stderr)
+    else:
+        print(
+            "Manual mode: open this sign-in URL on this computer while this command keeps "
+            "running, then finish sign-in there:",
+            file=sys.stderr,
+        )
+    print("Sign-in URL (safe to copy into your browser):", file=sys.stderr)
+    print(url, file=sys.stderr)
+
+
+def _present_permission_update(message: str) -> None:
+    print(f"Permission update before sign-in: {message}", file=sys.stderr)
+
+
+def _confirm_connector_identity(review: ConnectorIdentityReview) -> bool:
+    lines = [
+        f"Provider account: {review.display_label}",
+        f"Connector: {review.connector.replace('_', ' ').title()}",
+        f"Access: {review.access.value.title()}",
+    ]
+    if review.permission_update is not None:
+        lines.append(f"Permission update: {review.permission_update}")
+    if review.connector in {"gmail", "google"}:
+        if review.access is ConnectorAccessTier.FULL:
+            if review.gmail_settings_control:
+                lines.append(
+                    "Gmail Full: mailbox changes plus everyday settings such as filters, "
+                    "signatures, language, POP/IMAP, and vacation replies. Workspace "
+                    "administrator delegation is not requested."
+                )
+            else:
+                lines.append(
+                    "Legacy Gmail Full: mailbox changes only. This reauthorization does not add "
+                    "everyday settings control; after sign-in, run `gsv connectors status gmail` "
+                    "for the separate settings upgrade."
+                )
+        else:
+            lines.append(
+                "Gmail Read: messages and current everyday settings are visible, but settings "
+                "changes are off."
+            )
+    if review.connector == "google_calendar":
+        if review.access is ConnectorAccessTier.FULL:
+            if review.calendar_list_control:
+                lines.append(
+                    "Google Calendar Full: event and calendar changes plus your own calendar-list "
+                    "visibility, color, reminder, notification, and subscription settings."
+                )
+            else:
+                lines.append(
+                    "Legacy Google Calendar Full: event and calendar changes, with calendar-list "
+                    "settings visible but not changeable. This reauthorization keeps the current "
+                    "grant; after sign-in, run `gsv connectors status google_calendar` for the "
+                    "separate calendar-list upgrade."
+                )
+        else:
+            lines.append(
+                "Google Calendar Read: events, calendars, and calendar-list settings are "
+                "visible, but changes are off."
+            )
+    if review.permanent_delete:
+        lines.append(
+            "Explicit Gmail purge: ON — Seld can permanently erase Gmail messages, threads, or "
+            "batches, skipping the Trash. This cannot be undone."
+        )
+    elif review.connector == "gmail":
+        if review.access is ConnectorAccessTier.FULL:
+            lines.append(
+                "Explicit Gmail purge: off — ordinary delete operations use recoverable Trash. "
+                "A separately confirmed raw-message migration can still use deleted=true to "
+                "skip Trash permanently."
+            )
+        else:
+            lines.append("Explicit Gmail purge: not available with Read access.")
+    print("\n".join(lines), file=sys.stderr)
+    return _confirm("Use this account? [y/N] ")
+
+
+def _confirm(prompt: str) -> bool:
+    try:
+        response = input(prompt)
+    except EOFError:
+        return False
+    return response.strip().casefold() in {"y", "yes"}
+
+
+def _revocation_guidance(provider: str) -> str:
+    return (
+        provider_revocation_guidance(provider)
+        + " Then run `gsv connectors disconnect <connection-id>` locally if it still exists."
+    )
+
+
 def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | None:
     if not isinstance(result, dict):
         return None
+    connector_failure_messages = {
+        "account_selection_required": (
+            "Choose one candidate account command from result.candidates and retry."
+        ),
+        "broader_access_already_connected": (
+            "This connector already has broader access than selected. Nothing changed; "
+            "review result.effective_access and result.downgrade_help."
+        ),
+        "broader_access_reauthorization_required": (
+            "This connector has broader access than selected and needs reauthorization. "
+            "Nothing changed; follow result.next or review result.downgrade_help."
+        ),
+        "cancelled": (
+            "Connector sign-in was not approved or was denied; the existing setup is unchanged. "
+            "Follow result.next to inspect or retry."
+        ),
+        "credential_invalid_reconnect_required": (
+            "The saved connector credential is invalid; follow result.next to repair it."
+        ),
+        "credential_missing_reconnect_required": (
+            "The connector credential is missing; follow result.next to reconnect."
+        ),
+        "credential_pointer_invalid_reconnect_required": (
+            "The connector credential pointer is invalid; follow result.next to reconnect."
+        ),
+        "different_account": (
+            "A different account was selected; use result.retry or result.new_account."
+        ),
+        "disconnect_cancelled": "Disconnect cancelled; nothing changed.",
+        "identity_binding_missing_reconnect_required": (
+            "The connector identity binding is missing; follow result.next to reconnect."
+        ),
+        "oauth_permissions_missing": (
+            "The provider approved fewer permissions than the selected access. Nothing was "
+            "saved; follow result.retry."
+        ),
+        "oauth_permissions_outside_selected_tier": (
+            "The provider returned more access than selected. Nothing was saved; follow "
+            "result.retry."
+        ),
+        "oauth_scope_profile_unrecognized": (
+            "This saved connection has unrecognized OAuth permissions. Nothing changed; "
+            "follow result.next to disconnect it safely before reconnecting."
+        ),
+        "setup_incomplete": "Connector setup is incomplete; follow result.next to resume.",
+    }
+    status = result.get("status")
+    if (
+        args.command == "connectors"
+        and isinstance(status, str)
+        and status in connector_failure_messages
+    ):
+        return 3, connector_failure_messages[status]
     if args.command == "setup" and result.get("setup_complete") is False:
         return 3, "Seld setup stopped because the local record is unhealthy; follow result.next."
     if (
@@ -1216,6 +1607,101 @@ def _parser() -> argparse.ArgumentParser:
         help="Read every explicit active ChatGPT hand and focused WorkThread binding.",
     )
 
+    connectors = commands.add_parser(
+        "connectors",
+        help="Connect and inspect full-feature provider accounts without exposing credentials.",
+    )
+    connector_commands = connectors.add_subparsers(
+        dest="connectors_command",
+        required=True,
+    )
+    connector_commands.add_parser("list", help="List redacted connector status.")
+    connector_commands.add_parser(
+        "readiness",
+        help="Show whether this build contains every public OAuth client registration.",
+    )
+    connector_status = connector_commands.add_parser(
+        "status",
+        help="Show all connections for one logical connector or one exact connection ID.",
+    )
+    connector_status.add_argument("target", nargs="?")
+    connector_connect = connector_commands.add_parser(
+        "connect",
+        help="Sign in, verify the exact account, confirm it, and publish only when ready.",
+    )
+    connector_connect.add_argument("connector", choices=tuple(sorted(CONNECTOR_PROFILES)))
+    connector_connect.add_argument("--access", choices=("read", "full"), required=True)
+    connector_selector = connector_connect.add_mutually_exclusive_group()
+    connector_selector.add_argument("--connection-id")
+    connector_selector.add_argument("--new-account", action="store_true")
+    connector_connect.add_argument(
+        "--alias",
+        help=(
+            "Optional privacy-safe local account label; provider email is never stored by default."
+        ),
+    )
+    connector_connect.add_argument(
+        "--with-permanent-delete",
+        action="store_true",
+        help="Gmail Full only: request the separate irreversible-delete permission.",
+    )
+    connector_connect.add_argument("--timeout", type=float)
+    connector_browser = connector_connect.add_mutually_exclusive_group()
+    connector_browser.add_argument("--browser", choices=("default", "firefox"), default=None)
+    connector_browser.add_argument("--no-browser", action="store_true")
+    connector_reauthorize = connector_commands.add_parser(
+        "reauthorize",
+        help="Run OAuth again for one existing verified connection without changing its ID.",
+    )
+    connector_reauthorize.add_argument("connection_id")
+    connector_reauthorize.add_argument(
+        "--alias",
+        help=(
+            "Optional privacy-safe local account label; replaces the stored label for this "
+            "connection."
+        ),
+    )
+    connector_reauthorize.add_argument("--timeout", type=float)
+    reauthorize_browser = connector_reauthorize.add_mutually_exclusive_group()
+    reauthorize_browser.add_argument(
+        "--browser",
+        choices=("default", "firefox"),
+        default=None,
+    )
+    reauthorize_browser.add_argument("--no-browser", action="store_true")
+    connector_alias = connector_commands.add_parser(
+        "alias",
+        help="Change only the local label of one connector connection.",
+    )
+    connector_alias.add_argument("connection_id")
+    connector_alias.add_argument("--alias", required=True, help="Privacy-safe local label.")
+    connector_alias.add_argument(
+        "--expected-revision",
+        help="Expected CONNECTIONS.md revision; defaults to the revision read for this command.",
+    )
+    connector_resume = connector_commands.add_parser(
+        "resume",
+        help="Finish identity confirmation for one retained unverified connection.",
+    )
+    connector_resume.add_argument("connection_id")
+    connector_resume.add_argument(
+        "--alias",
+        help=(
+            "Optional privacy-safe local account label; provider email is never stored by default."
+        ),
+    )
+    connector_disconnect = connector_commands.add_parser(
+        "disconnect",
+        help="Forget one local connection without claiming provider-side revocation.",
+    )
+    connector_disconnect.add_argument("connection_id")
+    connector_disconnect.add_argument("--yes", action="store_true")
+    connector_revoke = connector_commands.add_parser(
+        "revocation-help",
+        help="Show honest provider-side revocation steps without taking remote action.",
+    )
+    connector_revoke.add_argument("connection_id")
+
     source = commands.add_parser(
         "source",
         help="Select sources and record bounded reads made by the resident AI.",
@@ -1262,9 +1748,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     discord_bind = discord_source_commands.add_parser(
         "bind",
-        help="CAS-bind one exact local companion executable; no credentials are stored.",
+        help=(
+            "CAS-bind one exact local companion executable to a portable Discord bot "
+            "connection; no credentials enter the binding."
+        ),
     )
     discord_bind.add_argument("--runtime", required=True)
+    discord_bind.add_argument("--connection-id", required=True)
     discord_bind.add_argument("--expected-revision", required=True)
     discord_unbind = discord_source_commands.add_parser(
         "unbind",
@@ -1865,7 +2355,10 @@ def _parser() -> argparse.ArgumentParser:
     mcp = commands.add_parser("mcp", help="Run the local MCP server.")
     mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
     mcp_serve = mcp_commands.add_parser("serve")
-    mcp_serve.add_argument("--profile", choices=(GUIDED_REVIEW_PROFILE,))
+    mcp_serve.add_argument(
+        "--profile",
+        choices=(CONNECTOR_PROFILE, GUIDED_REVIEW_PROFILE),
+    )
     mcp_serve.add_argument("--event-id")
     rollback_check = commands.add_parser("rollback-check", help=argparse.SUPPRESS)
     rollback_check.add_argument("previous_executable")

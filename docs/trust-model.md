@@ -23,19 +23,29 @@
   manifest-deleted, and destination races preserve both trees.
 - MCP requests are bounded, validated, and mapped to the same kernel as the
   CLI.
+- Connector credentials never enter `CONNECTIONS.md`, an ordinary vault
+  backup, Bridge, MCP output, status output, or a command-line argument.
+- Connector secret custody fails closed unless an approved operating-system
+  keyring backend is available. Concurrent OAuth callers serialize refresh and
+  publish one new token version under compare-and-swap.
+- Credential export is explicit, age-encrypted before publication, bound to one
+  exact vault ID and connection revision, and import refuses a different
+  snapshot or different destination custody while allowing only an exact
+  unverified state with matching already-published credentials to resume.
 - Selecting the `local_files` source grants no path. Directory authority stays
   in an owner-only host record bound to one exact vault-directory identity and
   selected root; grant changes or same-path vault replacement make earlier
   source proof require revalidation, and MCP cannot create or revoke a grant.
 - Selecting `discord` grants no provider authority. A CLI-only host receipt
-  binds one exact bundled GET-only companion runtime. On POSIX the verified
-  open artifact, rather than a later path lookup, is handed to its pinned
-  interpreter. The token exists only in the caller-owned process environment;
-  raw channel IDs remain confined to that environment and the owner-only
-  companion checkpoint. Neither enters the
-  portable vault or generated MCP manifest. Poll cannot advance its
-  cursor until Seld fresh-reads a matching account/tool/cursor/coverage/delivery
-  receipt, and a changed executable, account, or channel set fails closed.
+  binds one exact bundled GET-only companion runtime and one explicit
+  bot-only Seld connection. On POSIX the verified open artifact, rather than a
+  later path lookup, is handed to its pinned interpreter. The bot token is
+  resolved only inside the operation from OS-keyring custody; raw channel IDs
+  remain confined to the host environment and owner-only companion checkpoint.
+  Neither enters the portable vault or generated MCP manifest. Poll cannot
+  advance its cursor until Seld fresh-reads a matching
+  account/tool/cursor/coverage/delivery receipt, and a changed executable,
+  connection, credential version, account, or channel set fails closed.
 - A loopback caller without the current per-launch bearer cannot read the
   Bridge snapshot or health identity.
 - A stale, forged, or PID-reused Bridge receipt cannot cause Seld to signal an
@@ -110,6 +120,47 @@ The bearer restores the intended same-user local-file boundary against casual
 loopback reads. It is not a security boundary against hostile code already
 running as the same OS user, which can inspect the local vault or process-owned
 state.
+
+## Connector authentication boundary
+
+Portable connection metadata and secret custody are separate. The vault keeps
+only provider, source, account label or fingerprint, scopes, public-client
+registration, health, timestamps, and revisions. The host-local pointer files
+name opaque keyring slots and contain no credential bytes. Keyring service names
+are scoped to the logical vault ID.
+
+Only local connector-auth code, including an explicit encrypted transfer, may
+resolve a credential. `gsv-auth status` and the read-only
+`gsv_connection_list` MCP tool return redacted availability. There is no MCP
+method to add, reveal, export, import, authorize, refresh, or remove a
+credential. OAuth token requests refuse redirects, bound response sizes, and
+use one exact loopback origin assembled by Seld rather than trusting the HTTP
+Host header.
+
+Built-in profiles are finite and provider-pinned. Google, Microsoft, and Slack
+reader traffic is limited to concrete read-only HTTPS GET endpoints and fixed
+query shapes; there is no caller-supplied URL or write method. A read resolves
+only its explicit connection ID, rejects ambient provider credentials, and
+rechecks connection plus credential state after the provider call. Slack
+accepts only user OAuth, requires one exact host-private channel ID, and does
+not broaden `conversations.history` into thread replies. Discord accepts only
+an explicitly bound bot credential through its separately pinned companion.
+Provider-reported OAuth grants are constrained to the matching built-in
+read-only profile before storage, import, refresh, or use. Removal commits a
+terminal revoked state before deleting host custody; interrupted removal is
+retryable and no credential publisher may reactivate that record.
+
+The encrypted transfer archive necessarily contains credentials after
+decryption. Seld sends plaintext to `age` over a pipe and never publishes a
+plaintext archive, but the user remains responsible for the age identity and
+destination file. Import accepts only the exact restored portable snapshot or
+its derived in-progress state, requires empty or byte-exact resumable slots,
+and makes provider readiness unverified before secret publication and until a
+bounded real read succeeds.
+
+This boundary trusts the local operating-system user. A hostile process already
+running as that user may invoke the keyring or inspect a connector process; the
+keyring is custody and portability separation, not same-user process isolation.
 
 ## Source-update boundary
 
@@ -196,7 +247,9 @@ does not roll back Codex integration or configuration.
   tamper-proof audit logs.
 - Multi-file atomicity or a complete audit journal across process or operating-
   system death between canonical replacement and event append.
-- Secret storage or credential management.
+- A hosted credential broker, automatic credential synchronization, provider
+  client registration, confidential-client OAuth, OIDC identity, or device
+  authorization flow.
 - Mechanical task prioritization, semantic identity merging, or unattended
   consequential external action.
 - An OS scheduler that decides meaning, priority, or work. Pulse is AI-authored;

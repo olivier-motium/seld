@@ -3,7 +3,10 @@
     "gsv": {
       "command": "{{PYTHON}}",
       "args": ["-m", "continuity_kernel", "mcp", "serve"]
+    },
+    "gsv_connectors": {
+      "command": "{{PYTHON}}",
+      "args": ["-m", "continuity_kernel", "mcp", "serve", "--profile", "connectors"]
     }
   }
 }
-

@@ -14,10 +14,37 @@ Pulse or silently replace another active hand.
 ## Stale or failed source
 
 Preserve the last successful coverage boundary, open one fresh ChatGPT task,
-and repeat the selected source's identity plus bounded-read check. Let the
-person reauthenticate only in the provider-owned app when it requests it. A
-failed recheck is current evidence of stale or unavailable coverage, not an
-empty source.
+and repeat the selected source's identity plus bounded-read check. For a
+host-owned app, let the person reauthenticate only in that provider-owned app.
+For a Seld-managed profile, inspect `gsv connectors status <source-or-id>`.
+Use `gsv connectors reauthorize <connection-id>` for an existing OAuth
+connection; it preserves the prior local alias unless the person supplies a
+replacement. Pass `--browser firefox` or `--no-browser` again when wanted. For a
+Read-to-Full upgrade, rerun `gsv
+connectors connect <logical-source> --access full --alias '<label>'`. The old
+Read connection remains available until the same verified account is
+published. If the returned identity is wrong, answer no; nothing new is saved.
+Use `--new-account` only when the person explicitly wants to keep a different
+account. Use `gsv connectors alias <connection-id> --alias '<label>'` to repair
+only the local label without repeating OAuth. The agent must not perform
+consent, enter or reuse credentials or second factors, or change provider
+account, application, access, permission, or security settings. A restored auth
+archive does not restore host-private Discord Pulse channel policy; the current
+build does not package such a companion. A failed recheck is current evidence
+of stale or unavailable coverage, not an empty source.
+
+After importing an age-encrypted archive into a restored vault, follow each
+vault-qualified resume command printed by the CLI. Optionally add `--alias
+'<label>'` to that command. Identity confirmation makes the connection `ready`.
+Historical source coverage stays
+`needs_revalidation` until a new bounded read succeeds on that host.
+
+An interrupted interactive upload or download is process-local by design. Do
+not reconstruct a provider upload URL or transfer token from logs, the vault,
+or a transcript. Reopen the exact local-file grant or source object and begin a
+fresh preview. Completed download artifacts are owner-only host cache files;
+expired or partial artifacts are removed rather than treated as durable source
+state.
 
 For a same-host migration, read `local-source staged-status`, then use
 `local-source adopt-staged` only with its exact migration and source revisions

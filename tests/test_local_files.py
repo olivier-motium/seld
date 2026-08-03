@@ -5,13 +5,14 @@ import os
 import stat
 from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
+from threading import Event, Thread
 from typing import Any
 
 import pytest
 
 import continuity_kernel.local_files as local_files_module
 from continuity_kernel import bridge
-from continuity_kernel.errors import NotFoundError, PersistenceError, ValidationError
+from continuity_kernel.errors import ConflictError, NotFoundError, PersistenceError, ValidationError
 from continuity_kernel.local_files import LOCAL_FILE_READER_TOOL, LocalFileGrantStore
 from continuity_kernel.privacy import MAX_SCREEN_BYTES
 from continuity_kernel.records import format_time
@@ -320,6 +321,63 @@ def test_local_file_grant_revoke_is_durable_and_idempotent_creation(
     assert store.list()["grants"] == []
     with pytest.raises(NotFoundError, match="not found for this vault"):
         store.read(grant_id=grant_id, relative_path="note.txt")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX grant-lock semantics")
+@pytest.mark.parametrize("action", ("revoke", "deselect"))
+def test_revoke_or_deselect_finishes_only_after_active_transfer_chunk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    vault, store = _grant_store(tmp_path, monkeypatch)
+    _select_local_files(vault)
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    grant_id = vault.grant_local_file_root(selected)["grant"]["grant_id"]
+    invalidated = Event()
+    use = store.register_transfer_authority(
+        (grant_id,),
+        invalidator=invalidated.set,
+    )
+    chunk_started = Event()
+    release_chunk = Event()
+    mutation_started = Event()
+    mutation_finished = Event()
+
+    def stream_chunk() -> None:
+        with use.chunk():
+            chunk_started.set()
+            assert release_chunk.wait(2)
+
+    def mutate_authority() -> None:
+        mutation_started.set()
+        if action == "revoke":
+            vault.revoke_local_file_grant(grant_id)
+        else:
+            vault.select_sources(
+                expected_revision=vault.get_source_snapshot().revision,
+                sources=(),
+            )
+        mutation_finished.set()
+
+    stream = Thread(target=stream_chunk)
+    mutation = Thread(target=mutate_authority)
+    stream.start()
+    assert chunk_started.wait(2)
+    mutation.start()
+    assert mutation_started.wait(2)
+    assert not mutation_finished.wait(0.05)
+    release_chunk.set()
+    stream.join(2)
+    mutation.join(2)
+    assert not stream.is_alive()
+    assert not mutation.is_alive()
+    assert mutation_finished.is_set()
+    assert invalidated.is_set()
+    with pytest.raises(ConflictError, match="revoked"), use.chunk():
+        pass
+    use.close()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="secure descriptor-pinned reads are POSIX-only")

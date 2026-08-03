@@ -411,6 +411,7 @@ def _is_owned_vault_temp(relative: str) -> bool:
     if parent == ".":
         return target_name in {
             "AGENTS.md",
+            "CONNECTIONS.md",
             "DIRECTION.md",
             "MIND.md",
             "NOW.md",

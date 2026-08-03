@@ -1308,6 +1308,7 @@ def test_backup_includes_authoritative_name_containing_tmp_marker(
 def test_backup_excludes_only_exact_writer_owned_atomic_temps(vault: Vault, tmp_path: Path) -> None:
     targets = (
         "AGENTS.md",
+        "CONNECTIONS.md",
         "DIRECTION.md",
         "MIND.md",
         "NOW.md",

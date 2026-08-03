@@ -27,7 +27,9 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
 ]
-dependencies = []
+dependencies = [
+  "keyring>=25.6,<26",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -46,6 +48,7 @@ release = [
 
 [project.scripts]
 gsv = "continuity_kernel.cli:main"
+gsv-auth = "continuity_kernel.auth_cli:main"
 
 [project.urls]
 Homepage = "https://seld.ai"

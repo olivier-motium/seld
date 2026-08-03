@@ -25,6 +25,18 @@ decision loop.
   transport with fail-closed capability checks and durable no-replay receipts.
 - Add context-first onboarding, a source capability catalog, bounded live-read
   guidance, local privacy screening, and an AI-authored Pulse skill.
+- Extend Google Calendar's existing event CRUD with provider-shaped private
+  birthdays, including annual recurrence, safe date-source handling, and no new
+  OAuth scope.
+- Manage Gmail-generated Calendar events through their existing read, bounded
+  update, RSVP, and delete paths while refusing provider-owned create and move
+  operations.
+- Complete Gmail user-label lifecycle control with every visibility state,
+  provider-owned color validation, system-label refusal, reversible hiding,
+  and snapshot-bound permanent purge.
+- Add typed CalendarList user-state CRUD with reversible hiding, ETag-bound
+  preference updates, confirmed non-lossless removal, and an atomic narrow-scope
+  OAuth upgrade for older Full connections.
 - Remove unused deterministic onboarding, Pulse-controller,
   scheduler-planning, and migration modules. The shipped skills own semantic
   orchestration; legacy backup marker recognition remains for safe restore.

@@ -22,6 +22,8 @@ code.
   first useful journey, and consumer acceptance criteria.
 - [Installation](installation.md): supported consumer and developer paths,
   upgrades, offline setup, and reversible removal.
+- [Standalone connector authentication](connector-auth.md): host-independent
+  credential custody, native OAuth, encrypted transfer, and runtime boundary.
 - [Onboarding](onboarding.md): the shipped context-first journey, source
   verification, Pulse registration, and Bridge intent loop.
 - [Architecture](architecture.md): components, ownership boundaries, and write
@@ -40,6 +42,7 @@ code.
 - [Evidence and 1.0 claim boundaries](release-gates.md): exact proof required
   for signed binaries, additional platforms, service levels, and comparative
   claims beyond the current public source distribution.
+- [Changelog](changelog.md): user-visible changes not yet assigned to a release.
 
 The CLI and MCP server expose the same local continuity primitives. The bearer-gated
 Bridge provides read views plus a narrow authenticated, compare-and-swap,
