@@ -557,7 +557,10 @@ def test_concurrent_refresh_uses_a_rotating_provider_token_once(
     assert "fresh-access" not in json.dumps(manager.status(), sort_keys=True)
 
 
-@pytest.mark.parametrize("provider_error", ["invalid_grant", "invalid_refresh_token"])
+@pytest.mark.parametrize(
+    "provider_error",
+    ["invalid_grant", "invalid_refresh_token", "invalid_request"],
+)
 def test_invalid_refresh_preserves_secret_and_marks_reauthorization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -590,6 +593,84 @@ def test_invalid_refresh_preserves_secret_and_marks_reauthorization(
     connection = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
     assert connection is not None
     assert connection.health is ConnectionHealth.REAUTHORIZATION_REQUIRED
+    row = manager.status()["connections"][0]
+    assert row["health"] == ConnectionHealth.REAUTHORIZATION_REQUIRED.value
+    assert row["next"] == f"gsv connectors reauthorize {CONNECTION_ID}"
+
+
+def test_transient_refresh_failure_preserves_degraded_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    _import_oauth_credential(manager, _expired_credential())
+
+    def transient_failure(
+        endpoint: str,
+        fields: dict[str, str],
+        *,
+        timeout_seconds: float,
+    ) -> tuple[int, bytes]:
+        assert endpoint == "https://oauth2.googleapis.com/token"
+        assert fields["refresh_token"] == "single-use-refresh"
+        assert timeout_seconds > 0
+        return 503, b'{"error":"temporarily_unavailable"}'
+
+    monkeypatch.setattr(connector_oauth, "_post_form", transient_failure)
+    with pytest.raises(OAuthTokenEndpointError) as failure:
+        manager.resolve_oauth_access_token_state(
+            CONNECTION_ID,
+            observed_at=BASE_TIME + timedelta(hours=1),
+        )
+
+    assert failure.value.status_code == 503
+    assert manager.tokens.read(CONNECTION_ID).value == _expired_credential().to_bytes()
+    connection = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert connection is not None
+    assert connection.health is ConnectionHealth.DEGRADED
+    row = manager.status()["connections"][0]
+    assert row["health"] == ConnectionHealth.DEGRADED.value
+    assert "next" not in row
+
+
+def test_microsoft_invalid_request_preserves_degraded_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _microsoft_manager(tmp_path)
+    profile = get_profile("microsoft")
+    credential = replace(
+        _expired_credential(),
+        refresh_token="microsoft-refresh",
+        scopes=profile.read_scopes,
+    )
+    _import_oauth_credential(manager, credential)
+
+    def invalid_request(
+        endpoint: str,
+        fields: dict[str, str],
+        *,
+        timeout_seconds: float,
+    ) -> tuple[int, bytes]:
+        assert endpoint == profile.token_endpoint
+        assert fields["refresh_token"] == "microsoft-refresh"
+        assert timeout_seconds > 0
+        return 400, b'{"error":"invalid_request"}'
+
+    monkeypatch.setattr(connector_oauth, "_post_form", invalid_request)
+    with pytest.raises(OAuthTokenEndpointError) as failure:
+        manager.resolve_oauth_access_token_state(
+            CONNECTION_ID,
+            observed_at=BASE_TIME + timedelta(hours=1),
+        )
+
+    assert failure.value.error == "invalid_request"
+    connection = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert connection is not None
+    assert connection.health is ConnectionHealth.DEGRADED
+    row = manager.status()["connections"][0]
+    assert row["health"] == ConnectionHealth.DEGRADED.value
+    assert "next" not in row
 
 
 def test_refresh_error_downgrade_advances_a_stale_observation(
@@ -1495,6 +1576,59 @@ def test_microsoft_accepts_canonical_short_grants_without_offline_access(
         "Mail.Read",
         "User.Read",
         "Calendars.Read",
+    )
+
+
+def test_microsoft_logical_connector_accepts_known_sibling_grants(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Microsoft logical scopes")
+    profile = get_connector_profile("outlook_mail")
+    metadata = ConnectionMetadata(
+        connection_id=CONNECTION_ID,
+        provider=profile.provider,
+        source_ids=profile.source_ids,
+        credential_kind=profile.credential_kind,
+        account=AccountMetadata(label="Synthetic Microsoft"),
+        scopes=profile.full_scopes,
+        client=ClientMetadata(
+            kind=ClientKind.PUBLIC,
+            identifier="public-microsoft-client",
+            redirect_uris=("http://localhost:0/oauth/callback",),
+            authorization_endpoint=profile.authorization_endpoint,
+            token_endpoint=profile.token_endpoint,
+        ),
+        health=ConnectionHealth.UNVERIFIED,
+        created_at=BASE_TIME,
+        updated_at=BASE_TIME,
+        version=1,
+    )
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=metadata,
+        observed_at=BASE_TIME,
+    )
+    manager = ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+    credential = OAuthCredential(
+        access_token="microsoft-access",
+        refresh_token="microsoft-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=(*profile.full_scopes, "Calendars.ReadWrite"),
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    stored = _import_oauth_credential(manager, credential)
+
+    assert stored.version == 1
+    assert OAuthCredential.from_bytes(manager.tokens.read(CONNECTION_ID).value).scopes == (
+        "User.Read",
+        "Mail.ReadWrite",
+        "Mail.Send",
+        "Calendars.ReadWrite",
     )
 
 

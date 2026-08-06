@@ -48,9 +48,9 @@ def test_catalog_has_the_exact_collaboration_operation_surface() -> None:
         operation for operation in COLLABORATION_OPERATIONS if operation.provider == "discord"
     ]
 
-    assert len(slack) == 32
+    assert len(slack) == 33
     assert len(discord) == 32
-    assert len(COLLABORATION_OPERATIONS) == 64
+    assert len(COLLABORATION_OPERATIONS) == 65
     assert {operation.endpoint for operation in COLLABORATION_OPERATIONS} == {
         operation.name for operation in COLLABORATION_OPERATIONS
     }
@@ -86,6 +86,9 @@ def test_effects_and_scopes_preserve_recoverable_and_permanent_boundaries() -> N
     )
     assert _operation("slack", ConnectorMode.READ, "users.get").required_scopes == (
         frozenset({"users:read"}),
+    )
+    assert _operation("slack", ConnectorMode.READ, "search.messages").required_scopes == (
+        frozenset({"search:read"}),
     )
     assert "users:read.email" not in {
         scope

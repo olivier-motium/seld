@@ -336,6 +336,15 @@ class CollaborationConnectorAdapter:
                 "/api/conversations.replies",
                 query=_slack_message_query(value),
             )
+        if name == "search.messages":
+            _reject_continuation(continuation)
+            return self._slack_request(
+                transport,
+                credential,
+                ConnectorMethod.GET,
+                "/api/search.messages",
+                query=_slack_search_messages_query(value),
+            )
         if name == "threads.list":
             return self._slack_request(
                 transport,
@@ -1264,6 +1273,28 @@ def _slack_message_query(value: Mapping[str, object]) -> tuple[tuple[str, str], 
         ("ts", _query_text(value["ts"])),
         ("limit", "1"),
     )
+
+
+def _slack_search_messages_query(
+    value: Mapping[str, object],
+) -> tuple[tuple[str, str], ...]:
+    query = [("query", _query_text(value["query"])), ("highlight", "false")]
+    if "count" in value:
+        query.append(("count", _query_text(value["count"])))
+    if "page" in value:
+        query.append(("page", _query_text(value["page"])))
+    if "sort" in value:
+        query.append(("sort", _query_text(value["sort"])))
+    if "sort_direction" in value:
+        query.append(
+            (
+                "sort_dir",
+                {"ascending": "asc", "descending": "desc"}[
+                    cast(str, value["sort_direction"])
+                ],
+            )
+        )
+    return tuple(query)
 
 
 def _slack_threads_list_query(

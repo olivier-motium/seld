@@ -98,6 +98,7 @@ def test_builtin_connector_profiles_are_finite_and_expose_both_access_tiers() ->
         "mpim:history",
         "files:read",
         "reactions:read",
+        "search:read",
     } == set(slack.scopes_for("read"))
     assert {
         "channels:write",

@@ -1,54 +1,42 @@
 # Register one resident Pulse
 
-Registration is an interactive setup action, never wake behavior. Perform it
-only when the person explicitly asks to enable or repair the resident Pulse.
+Registration is an interactive setup or repair action, never ordinary wake
+behavior.
 
-1. Confirm the exact installed Seld plugin and MCP tools are available in a fresh
-   ChatGPT task. Do not register against source code or a different vault.
-2. Inspect existing ChatGPT heartbeat automations and recent tasks. Reuse or repair
-   one exact matching Pulse; never create a second because an old task is quiet.
-3. In one dedicated ChatGPT task, read the real task UUID. Create canonical Task
-   `task:resident-pulse` if absent by calling `gsv_task_create` with
-   `id="resident-pulse"` and:
+1. Confirm the installed Seld plugin, native tools, and canonical vault in a
+   fresh Codex task.
+2. Inspect existing Codex heartbeat automations and recent tasks. Reuse or
+   repair the one matching Pulse; never create a duplicate because a task is
+   quiet.
+3. Reuse one pinned foreground Chief of Staff task or create it explicitly.
+   It is a conversation surface, not a second memory store.
+4. Create or repair canonical Task `task:resident-pulse` with the single
+   structural ref `system-role:resident-pulse`, its exact Pulse task UUID as
+   `active_thread_id`, and exactly one
+   `codex-chief-of-staff:<foreground-task-uuid>` ref. Require explicit takeover
+   before changing an existing bound hand.
+5. Run `$gsv-pulse` manually once. Prove both identity guards, one bounded
+   context/source read, reversible local CAS and readback, compact NOW, silence
+   when no delivery gate is crossed, and the unattended authority boundary.
+6. Register one active app-native heartbeat targeting that exact Pulse task at
+   a reliable thirty-minute cadence. Its prompt must invoke `$gsv-pulse`, apply
+   the task-birth and delivery gates, route foreground output to the exact Chief
+   of Staff ref. Foreground output must be answer-first, concise, visibly
+   progressive, and state one obvious next move; prohibit guilt-based nudges,
+   Bridge, raw payload persistence, duplicate schedules, parallel memory/task/
+   reminder stores, and consequential external action.
+7. The same heartbeat sends the first post-06:00 Europe/Brussels morning
+   orientation and first post-20:00 evening wrap, with date markers in NOW.
+   Codex permits one heartbeat per task; do not add competing schedulers for
+   these briefs.
+8. Read the automation back, observe one installed wake, and verify the same
+   Pulse UUID, no duplicate automation, no task explosion, no unauthorized
+   external mutation, and honest source freshness.
 
-   - title `Resident Pulse`;
-   - a plain outcome describing one bounded AI check-in that keeps the local Mind
-     current;
-   - nonterminal status, `next_actor=agent`, and a concrete next wake action;
-   - `active_thread_id` equal to this exact ChatGPT task UUID; and
-   - the single structural ref `system-role:resident-pulse`.
+Thirty reliable minutes is the default. Move to fifteen only after connector
+and wake reliability is observed and the additional cadence produces material
+value rather than more stale or noisy checks.
 
-   If the Task already exists, use fresh CAS and require explicit takeover before
-   changing its bound hand. Never add it to Portfolio or a life WorkThread.
-4. Run `$gsv-pulse` manually once. Prove the identity guard, bounded context read,
-   one reversible local CAS/readback, NOW write, and unattended authority limits.
-5. Before asking for approval, explain the tool boundary. Seld's MCP server has
-   no provider-action or Computer Use method. The ordinary ChatGPT task may
-   still receive tools from other installed plugins, and the current heartbeat
-   surface has no Seld-controlled per-task denylist. Read-only connector use and
-   the ban on provider writes and Computer Use are therefore wake policy for
-   those separately owned tools. If the person requires host enforcement, leave
-   Pulse unregistered until the task exposes only read-only source tools or the
-   host supports a task-scoped profile.
-6. Present the exact automation name, ten-minute cadence, target task, prompt,
-   and this boundary, then obtain fresh approval before creating or activating
-   it.
-7. Use the app-native automation surface with kind `heartbeat`, target this exact
-   ChatGPT task, and this bounded prompt:
-
-   `Wake as Seld's resident Mind. Use $gsv-pulse in wake mode. Verify the exact
-   resident-pulse binding, integrate one bounded frozen batch from current Seld
-   canon and selected read-only connector evidence, write only justified native
-   CAS changes and NOW, and finish. Never create another schedule, take external
-   action, use browser or Computer Use, change accounts or permissions, or push.`
-
-8. Read the automation back. Then observe one natural wake and verify the same
-   Task UUID, the expected NOW/document revision, no duplicate automation, no
-   unauthorized external mutation, and honest stale/unknown source coverage.
-
-Start paused when the app surface permits it. Observe one natural installed
-wake before presenting the resident loop as active.
-
-Moving or restoring a vault never proves the machine's task, connector, or
+Moving or restoring a vault never proves the machine's connector, task, or
 automation binding. Re-register on the new host; preserve the Mind but do not
-copy the old machine's automation ID or ChatGPT task UUID.
+copy an old task UUID blindly.
