@@ -34,7 +34,10 @@ Before mutation or delivery:
 The resident Pulse Task is transport identity, not a life outcome. Keep it out
 of Portfolio and ordinary all-open reviews. The Chief of Staff task is the
 single foreground conversation for orientations, alerts, task notices, and
-reminders; it is not a second memory authority.
+reminders; it is not a second memory, task, reminder, inbox, score, or
+dashboard system. Pulse never uses Bridge operations for delivery,
+acknowledgement, or semantic work; the exact Chief of Staff task is its only
+foreground route.
 
 ## Freeze one useful wake
 
@@ -70,6 +73,12 @@ same outcome. Prefer updating the existing record. A justified new Task must
 have a source-grounded outcome, accountable next actor, useful next action, and
 available due or person context. Read it back, then send one concise notice to
 the Chief of Staff task saying what was created and what context is missing.
+Treat the read-back Task identity as the dedupe key: a replay must neither
+create nor re-announce that Task after its notice is confirmed. If delivery is
+uncertain, reattempt only the notice against that exact Task; never create a
+second task, reminder, incident, or memory store. Use the existing Task,
+Entity, WorkThread, or a compact `NOW.md` marker when a delivery marker is
+needed.
 
 Observations, FYIs, ideas, inferred opportunities, stale messages, and things
 that merely look useful are not Tasks. Attach durable non-task context to the
@@ -95,6 +104,8 @@ task only for:
 
 Alert once per incident. Use existing Task, Entity, WorkThread, source state, or
 a compact marker in `NOW.md` to avoid repeats; do not create an incident store.
+Send each scheduled brief once per Europe/Brussels calendar date (one morning
+brief and one evening brief), even when several wakes cross the threshold.
 An alert says what changed, why it matters now, and the smallest useful next
 move. It does not dump the source or manufacture urgency.
 
@@ -110,10 +121,14 @@ what remains open, people or reminders to carry forward, tomorrow's likely
 focus and why, and critical system gaps. Both are curated executive summaries,
 not task or source inventories.
 
-When a focus nudge is useful, name the priority and why it outranks the current
-thread, ask once whether Olivier wants to switch, and respect a deliberate
-choice to continue parallel work. User-authored week, month, and year goals
-outrank learned preferences; a current explicit instruction outranks both.
+Foreground output is answer-first: do not bury the recommendation or status in
+context. Keep lists short and ranked, make one obvious next move explicit, and
+show relevant progress, owner, or wait state. A focus nudge names the priority
+and why it outranks the current thread, asks once whether Olivier wants to
+switch, does so without guilt, pressure, or repeated nudging, and respects a
+deliberate choice to continue parallel work. User-authored week, month, and year
+goals outrank learned preferences; a current explicit instruction outranks
+both.
 
 ## Integrate meaning, then acknowledge
 

@@ -21,8 +21,10 @@ behavior.
 6. Register one active app-native heartbeat targeting that exact Pulse task at
    a reliable thirty-minute cadence. Its prompt must invoke `$gsv-pulse`, apply
    the task-birth and delivery gates, route foreground output to the exact Chief
-   of Staff ref, and prohibit Bridge, raw payload persistence, duplicate
-   schedules, and consequential external action.
+   of Staff ref. Foreground output must be answer-first, concise, visibly
+   progressive, and state one obvious next move; prohibit guilt-based nudges,
+   Bridge, raw payload persistence, duplicate schedules, parallel memory/task/
+   reminder stores, and consequential external action.
 7. The same heartbeat sends the first post-06:00 Europe/Brussels morning
    orientation and first post-20:00 evening wrap, with date markers in NOW.
    Codex permits one heartbeat per task; do not add competing schedulers for

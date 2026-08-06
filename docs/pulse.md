@@ -20,10 +20,20 @@ emergency, a person genuinely blocked on Olivier, a critical source/auth/system
 failure, a newly created Task, a contextually due reminder, or a scheduled
 orientation. It alerts once per incident.
 
+Task notices are deduped by the exact created Task. There is at most one alert
+per incident and one morning plus one evening brief per Europe/Brussels date.
+
 The first wake at or after 06:00 Europe/Brussels sends a concise morning
 orientation; the first wake at or after 20:00 sends an evening wrap. Compact
 markers in NOW prevent duplicates. The same heartbeat owns both because Codex
 allows one heartbeat per task.
+
+Chief of Staff output is answer-first: one obvious next move, short ranked
+lists, and visible progress, owner, or wait state when relevant. Recommendations
+and status do not hide behind source or task inventories. A focus nudge names
+why the priority outranks the current thread, asks once, and carries no guilt.
+The Chief of Staff task is a conversation surface, not a second memory, task,
+reminder, inbox, score, or dashboard system.
 
 ## Runtime shape
 
@@ -38,7 +48,8 @@ allows one heartbeat per task.
    exact readback, then acknowledges inputs and records honest content-free
    coverage.
 6. Chief of Staff receives only curated executive output; Seld remains the sole
-   semantic authority.
+   semantic authority. Pulse never uses Bridge for delivery, acknowledgement,
+   or semantic work.
 
 The structural Pulse task is excluded from life Portfolio and ordinary task
 counts.
