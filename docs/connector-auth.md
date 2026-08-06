@@ -19,16 +19,29 @@ gsv connectors list
 ```
 
 `readiness` reports whether the installed build contains valid public OAuth
-registrations for Google, Microsoft, and Slack. It never prints a client
-identifier. Missing and invalid registrations are distinct failures, but both
-stop before OAuth and save nothing. Provider implementation alone is not
-sign-in readiness, and an ordinary user should not have to create a developer
-application to repair the distribution.
+registrations for Google, Microsoft, and Slack and whether any required
+host-local client secret is configured. It never prints a client identifier or
+secret. Missing, invalid, setup-required, and keyring-unavailable states are
+distinct failures; each stops before OAuth and saves nothing. Provider
+implementation alone is not sign-in readiness.
 
-Google's desktop flow uses PKCE and the packaged client ID. Seld intentionally
-omits Google's optional installed-app client secret, so connect, refresh,
-reauthorize, and migration use the same public-client path without a developer
-credential prompt.
+Google's desktop flow uses PKCE and the packaged client ID. Google's token
+endpoint requires that client's matching secret for both code exchange and
+refresh. A person with access to the owning Google Cloud project configures it
+once for the active vault through hidden input:
+
+```bash
+gsv connectors client-secret set google
+```
+
+The value is stored only in the vault-scoped OS keyring and is shared by Gmail,
+Google Calendar, and Google Drive in that vault. It is never accepted as a
+command-line argument or written to the vault, backup, credential archive,
+logs, receipts, or public registration. A restored vault or another vault or
+host therefore requires the value again. Rotate it with `--replace`; remove it
+with `gsv connectors client-secret clear google`. Rotating the packaged client
+ID or deleting a vault can leave the old, unreachable keyring item behind
+because the secret store deliberately cannot enumerate entries.
 
 `list` shows the finite connector catalog and redacted local state. It never
 returns a token, OAuth endpoint, raw account identifier, client identifier,

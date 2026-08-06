@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import math
 import secrets
 import webbrowser
@@ -19,6 +21,10 @@ from continuity_kernel.connector_auth import (
     ConnectionHealth,
     ConnectionMetadata,
     CredentialKind,
+)
+from continuity_kernel.connector_client_registration import (
+    PublicClientRegistration,
+    load_public_client_registration,
 )
 from continuity_kernel.connector_credentials import (
     OAuthCredential,
@@ -81,6 +87,8 @@ _PINNED_OAUTH_ENDPOINTS: Final = {
 _DEFAULT_BROWSER_OPENER: Final = object()
 _VERIFIED_HEALTH: Final = frozenset({ConnectionHealth.READY, ConnectionHealth.DEGRADED})
 _CUSTODY_PROBE_NAME: Final = parse_secret_name("readiness-probe")
+_OAUTH_CLIENT_SECRET_NAME: Final = parse_secret_name("oauth-client-secret")
+_MAX_OAUTH_CLIENT_SECRET_BYTES: Final = 2 * 1024
 _GMAIL_MODIFY_SCOPE: Final = "https://www.googleapis.com/auth/gmail.modify"
 _GMAIL_READ_SCOPE: Final = "https://www.googleapis.com/auth/gmail.readonly"
 _GMAIL_PURGE_SCOPE: Final = "https://mail.google.com/"
@@ -119,6 +127,78 @@ class ConnectorAuthManager:
             state_root or connector_auth_dir(vault_id),
             self.secret_store,
         )
+
+    def oauth_client_secret_status(
+        self,
+        registration: PublicClientRegistration,
+    ) -> Literal["configured", "invalid", "missing", "not_required"]:
+        """Report only whether one packaged client has its host-local secret."""
+
+        if not registration.client_secret_required:
+            return "not_required"
+        try:
+            stored = self.secret_store.get_secret(
+                _oauth_client_secret_key(registration),
+                _OAUTH_CLIENT_SECRET_NAME,
+            )
+        except ValidationError:
+            return "invalid"
+        if stored is None:
+            return "missing"
+        try:
+            _oauth_client_secret_text(stored, stored=True)
+        except ValidationError:
+            return "invalid"
+        return "configured"
+
+    def store_oauth_client_secret(
+        self,
+        provider: str,
+        value: bytes,
+        *,
+        replace_existing: bool = False,
+    ) -> dict[str, object]:
+        """Put one provider client secret in the vault-scoped OS keyring."""
+
+        registration = load_public_client_registration(provider)
+        if not registration.client_secret_required:
+            raise ValidationError(
+                f"{registration.provider} does not require a host-local OAuth client secret"
+            )
+        secret = _oauth_client_secret_text(value, stored=False).encode("utf-8")
+        key = _oauth_client_secret_key(registration)
+        current = self.secret_store.get_secret(key, _OAUTH_CLIENT_SECRET_NAME)
+        if current is not None and not replace_existing:
+            raise ValidationError(
+                "OAuth client secret is already configured; pass --replace to rotate it"
+            )
+        self.secret_store.set_secret(key, _OAUTH_CLIENT_SECRET_NAME, secret)
+        return {
+            "client_secret": "configured",
+            "next": "gsv connectors readiness",
+            "provider": registration.provider,
+            "status": "configured",
+        }
+
+    def clear_oauth_client_secret(self, provider: str) -> dict[str, object]:
+        """Remove one provider client secret from the vault-scoped OS keyring."""
+
+        registration = load_public_client_registration(provider)
+        if not registration.client_secret_required:
+            raise ValidationError(
+                f"{registration.provider} does not require a host-local OAuth client secret"
+            )
+        key = _oauth_client_secret_key(registration)
+        current = self.secret_store.get_secret(key, _OAUTH_CLIENT_SECRET_NAME)
+        if current is not None:
+            self.secret_store.delete_secret(key, _OAUTH_CLIENT_SECRET_NAME)
+        return {
+            "client_secret": "missing",
+            "next": f"gsv connectors client-secret set {registration.provider}",
+            "nothing_changed": current is None,
+            "provider": registration.provider,
+            "status": "cleared" if current is not None else "already_clear",
+        }
 
     def status(self) -> dict[str, Any]:
         """Project portable metadata plus redacted host-local availability."""
@@ -265,7 +345,6 @@ class ConnectorAuthManager:
             )
             if require_verified_identity:
                 self._assert_verified_identity(metadata)
-            config = self._oauth_config(metadata)
             now = (observed_at or datetime.now(UTC)).astimezone(UTC)
 
             def refresh_if_needed(resolved: ResolvedToken) -> bytes | None:
@@ -280,6 +359,7 @@ class ConnectorAuthManager:
                     return None if canonical == resolved.value else canonical
                 if not previous.refresh_token:
                     raise ValidationError("OAuth connection requires reauthorization")
+                config = self._oauth_config(metadata)
                 token_set = refresh_access_token(
                     config,
                     refresh_token=previous.refresh_token,
@@ -991,11 +1071,29 @@ class ConnectorAuthManager:
             != expected_endpoints
         ):
             raise ValidationError("OAuth endpoints do not match a built-in provider")
+        client_secret: str | None = None
+        if metadata.provider == "google":
+            registration = load_public_client_registration(metadata.provider)
+            if (
+                registration.client_id == client.identifier
+                and registration.client_secret_required
+            ):
+                stored = self.secret_store.get_secret(
+                    _oauth_client_secret_key(registration),
+                    _OAUTH_CLIENT_SECRET_NAME,
+                )
+                if stored is None:
+                    raise SetupError(
+                        "Google sign-in needs its host-local OAuth client secret. Run "
+                        "`gsv connectors client-secret set google` in an interactive terminal; "
+                        "the value stays only in the OS keyring."
+                    )
+                client_secret = _oauth_client_secret_text(stored, stored=True)
         return OAuthClientConfig(
             authorization_endpoint=client.authorization_endpoint,
             token_endpoint=client.token_endpoint,
             client_id=client.identifier,
-            client_secret=None,
+            client_secret=client_secret,
             redirect_uri=redirect_uri or client.redirect_uris[0],
             scopes=metadata.scopes,
             dialect={
@@ -1313,3 +1411,26 @@ class ConnectorAuthManager:
             verified=verified,
             observed_at=observed_at,
         )
+
+
+def _oauth_client_secret_key(registration: PublicClientRegistration) -> ConnectionId:
+    """Fit one stable provider/client coordinate into the SecretStore key grammar."""
+
+    material = (
+        f"seld-oauth-client-secret-v1\x00{registration.provider}\x00{registration.client_id}"
+    ).encode()
+    token = base64.urlsafe_b64encode(hashlib.sha256(material).digest()[:24]).decode("ascii")
+    return parse_connection_id(f"con-{token}")
+
+
+def _oauth_client_secret_text(value: object, *, stored: bool) -> str:
+    label = "stored OAuth client secret" if stored else "OAuth client secret"
+    if not isinstance(value, bytes) or not value or len(value) > _MAX_OAUTH_CLIENT_SECRET_BYTES:
+        raise ValidationError(f"{label} is invalid")
+    try:
+        decoded = value.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValidationError(f"{label} is invalid") from exc
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in decoded):
+        raise ValidationError(f"{label} is invalid")
+    return decoded

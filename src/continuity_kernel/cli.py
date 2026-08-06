@@ -633,6 +633,34 @@ def _dispatch(args: argparse.Namespace) -> Any:
 def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
     manager = ConnectorAuthManager(vault)
     onboarding = ConnectorOnboarding(manager)
+    if args.connectors_command == "client-secret":
+        if args.client_secret_command == "set":
+            manager.probe_credential_custody()
+            if not sys.stdin.isatty():
+                raise SetupError(
+                    "OAuth client-secret setup needs an interactive terminal so the value "
+                    "stays hidden; it is never accepted on the command line"
+                )
+            value = getpass.getpass(
+                f"{args.provider.title()} OAuth client secret (input hidden): "
+            ).strip().encode("utf-8")
+            return manager.store_oauth_client_secret(
+                args.provider,
+                value,
+                replace_existing=args.replace,
+            )
+        if args.client_secret_command == "clear":
+            if not args.yes and not _confirm(
+                f"Remove the host-local {args.provider.title()} OAuth client secret? [y/N] "
+            ):
+                return {
+                    "client_secret": "unchanged",
+                    "nothing_changed": True,
+                    "provider": args.provider,
+                    "status": "clear_cancelled",
+                }
+            return manager.clear_oauth_client_secret(args.provider)
+        raise AssertionError("unreachable client-secret command")
     if args.connectors_command == "readiness":
         return _connector_registration_status(vault, onboarding=onboarding)
     if args.connectors_command == "list":
@@ -1618,8 +1646,28 @@ def _parser() -> argparse.ArgumentParser:
     connector_commands.add_parser("list", help="List redacted connector status.")
     connector_commands.add_parser(
         "readiness",
-        help="Show whether this build contains every public OAuth client registration.",
+        help="Show whether every packaged OAuth client is ready to sign in on this host.",
     )
+    connector_client_secret = connector_commands.add_parser(
+        "client-secret",
+        help="Store or clear a provider OAuth client secret in the host OS keyring.",
+    )
+    connector_client_secret_commands = connector_client_secret.add_subparsers(
+        dest="client_secret_command",
+        required=True,
+    )
+    connector_client_secret_set = connector_client_secret_commands.add_parser(
+        "set",
+        help="Read one OAuth client secret from hidden terminal input.",
+    )
+    connector_client_secret_set.add_argument("provider", choices=("google",))
+    connector_client_secret_set.add_argument("--replace", action="store_true")
+    connector_client_secret_clear = connector_client_secret_commands.add_parser(
+        "clear",
+        help="Remove one OAuth client secret from the host OS keyring.",
+    )
+    connector_client_secret_clear.add_argument("provider", choices=("google",))
+    connector_client_secret_clear.add_argument("--yes", action="store_true")
     connector_status = connector_commands.add_parser(
         "status",
         help="Show all connections for one logical connector or one exact connection ID.",

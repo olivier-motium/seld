@@ -3,7 +3,8 @@
   "providers": {
     "google": {
       "client_id": "240673742355-jleuolkeoleii87un844sa2gmd548do7.apps.googleusercontent.com",
-      "redirect_template": "http://127.0.0.1:0"
+      "redirect_template": "http://127.0.0.1:0",
+      "client_secret_required": true
     },
     "microsoft": {
       "client_id": "e98cbb96-8849-4bb3-a610-4ba2cd5d2b59",

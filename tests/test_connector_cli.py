@@ -102,6 +102,59 @@ def test_connector_list_and_status_are_first_class_json_commands(
     }
 
 
+def test_google_client_secret_setup_uses_hidden_input_and_redacted_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault = tmp_path / "vault"
+    Vault(vault).initialize(name="Connector CLI secret")
+    received: list[tuple[str, bytes, bool]] = []
+
+    class Manager:
+        def probe_credential_custody(self) -> None:
+            return None
+
+        def store_oauth_client_secret(
+            self,
+            provider: str,
+            value: bytes,
+            *,
+            replace_existing: bool,
+        ) -> dict[str, object]:
+            received.append((provider, value, replace_existing))
+            return {
+                "client_secret": "configured",
+                "provider": provider,
+                "status": "configured",
+            }
+
+    manager = Manager()
+    monkeypatch.setattr(cli, "ConnectorAuthManager", lambda _vault: manager)
+    monkeypatch.setattr(cli, "ConnectorOnboarding", lambda _manager: _Onboarding())
+    monkeypatch.setattr(cli.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: "  transient-secret  ")
+
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault),
+                "connectors",
+                "client-secret",
+                "set",
+                "google",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert received == [("google", b"transient-secret", False)]
+    assert "transient-secret" not in output
+    assert json.loads(output)["result"]["client_secret"] == "configured"
+
+
 @pytest.mark.parametrize(
     "status",
     (

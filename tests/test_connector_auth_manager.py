@@ -22,6 +22,7 @@ from continuity_kernel.connector_auth import (
     CredentialKind,
 )
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_client_registration import load_public_client_registration
 from continuity_kernel.connector_credentials import OAuthCredential
 from continuity_kernel.connector_identifiers import (
     ConnectionId,
@@ -29,6 +30,7 @@ from continuity_kernel.connector_identifiers import (
     parse_connection_id,
 )
 from continuity_kernel.connector_oauth import (
+    OAuthClientConfig,
     OAuthTokenEndpointError,
     OAuthTokenSet,
     OAuthTokenType,
@@ -105,6 +107,7 @@ def _manager(
     scopes: tuple[str, ...] = (GOOGLE_SCOPE,),
     fingerprint: str | None = GOOGLE_ACCOUNT_FINGERPRINT,
     health: ConnectionHealth = ConnectionHealth.READY,
+    client_id: str = "public-client",
 ) -> ConnectorAuthManager:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Portable auth")
@@ -120,7 +123,7 @@ def _manager(
         scopes=scopes,
         client=ClientMetadata(
             kind=ClientKind.PUBLIC,
-            identifier="public-client",
+            identifier=client_id,
             redirect_uris=(f"http://127.0.0.1:{redirect_port}",),
             authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
             token_endpoint="https://oauth2.googleapis.com/token",
@@ -871,6 +874,99 @@ def test_oauth_acquisition_survives_browser_failure_without_persisting(
     unchanged = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
     assert unchanged is not None
     assert unchanged.health is ConnectionHealth.READY
+
+
+def test_packaged_google_client_secret_is_required_once_and_used_for_exchange_and_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registration = load_public_client_registration("google")
+    assert registration.client_secret_required is True
+    manager = _manager(tmp_path, client_id=registration.client_id)
+    metadata = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert metadata is not None
+    opened: list[str] = []
+
+    class Listener:
+        redirect_uri = "http://127.0.0.1:48123"
+
+        def configure(self, config: object, attempt: object) -> None:
+            del config, attempt
+
+        def wait_for_code(self, *, timeout_seconds: float) -> str:
+            assert timeout_seconds > 0
+            return "one-time-code"
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.BoundLoopbackCallback.bind",
+        lambda **_values: Listener(),
+    )
+    assert manager.oauth_client_secret_status(registration) == "missing"
+    with pytest.raises(SetupError, match=r"client secret.*client-secret set google"):
+        manager.acquire_oauth_credential(
+            metadata,
+            browser_opener=lambda url: opened.append(url) or True,
+        )
+    assert opened == []
+
+    result = manager.store_oauth_client_secret("google", b"host-only-client-secret")
+    assert result["client_secret"] == "configured"
+    assert "host-only-client-secret" not in repr(result)
+    assert manager.oauth_client_secret_status(registration) == "configured"
+
+    exchange_secrets: list[str | None] = []
+
+    def exchange(config: OAuthClientConfig, **_kwargs: object) -> OAuthTokenSet:
+        exchange_secrets.append(config.client_secret)
+        return OAuthTokenSet(
+            access_token="new-access",
+            refresh_token="new-refresh",
+            token_type=OAuthTokenType.BEARER,
+            expires_in_seconds=3600,
+            scopes=(GOOGLE_SCOPE,),
+        )
+
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.exchange_authorization_code",
+        exchange,
+    )
+    acquired = manager.acquire_oauth_credential(
+        metadata,
+        browser_opener=lambda url: opened.append(url) or True,
+    )
+    assert acquired.access_token == "new-access"
+    assert exchange_secrets == ["host-only-client-secret"]
+
+    _import_oauth_credential(manager, _expired_credential())
+    refresh_secrets: list[str | None] = []
+
+    def refresh(config: OAuthClientConfig, **_kwargs: object) -> OAuthTokenSet:
+        refresh_secrets.append(config.client_secret)
+        return OAuthTokenSet(
+            access_token="refreshed-access",
+            refresh_token=None,
+            token_type=OAuthTokenType.BEARER,
+            expires_in_seconds=3600,
+            scopes=None,
+        )
+
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.refresh_access_token",
+        refresh,
+    )
+    resolved = manager.resolve_oauth_access_token_state(
+        CONNECTION_ID,
+        observed_at=BASE_TIME + timedelta(hours=1),
+    )
+    assert resolved.access_token == "refreshed-access"
+    assert refresh_secrets == ["host-only-client-secret"]
+
+    cleared = manager.clear_oauth_client_secret("google")
+    assert cleared["status"] == "cleared"
+    assert manager.oauth_client_secret_status(registration) == "missing"
 
 
 def test_oauth_failure_is_annotated_only_after_authorization_was_presented(
