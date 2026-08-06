@@ -1130,10 +1130,11 @@ def _http_error_code(status_code: int) -> str:
 
 
 def _token_error_code(error: OAuthTokenEndpointError) -> str:
-    if error.error in {"invalid_grant", "invalid_refresh_token"} or error.status_code in {
-        401,
-        403,
-    }:
+    if (
+        error.error in {"invalid_grant", "invalid_refresh_token"}
+        or error.status_code in {401, 403}
+        or (error.error == "invalid_request" and error.status_code == 400)
+    ):
         return "auth_expired"
     if error.status_code in {408, 504}:
         return "timeout"

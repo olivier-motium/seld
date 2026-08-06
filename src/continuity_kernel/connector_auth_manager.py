@@ -305,7 +305,11 @@ class ConnectorAuthManager:
             except OAuthTokenEndpointError as exc:
                 health = (
                     ConnectionHealth.REAUTHORIZATION_REQUIRED
-                    if exc.error in {"invalid_grant", "invalid_refresh_token"}
+                    if (
+                        exc.error in {"invalid_grant", "invalid_refresh_token"}
+                        or exc.status_code in {401, 403}
+                        or (exc.error == "invalid_request" and exc.status_code == 400)
+                    )
                     else ConnectionHealth.DEGRADED
                 )
                 self._mark_health(

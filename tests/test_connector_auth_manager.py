@@ -557,7 +557,10 @@ def test_concurrent_refresh_uses_a_rotating_provider_token_once(
     assert "fresh-access" not in json.dumps(manager.status(), sort_keys=True)
 
 
-@pytest.mark.parametrize("provider_error", ["invalid_grant", "invalid_refresh_token"])
+@pytest.mark.parametrize(
+    "provider_error",
+    ["invalid_grant", "invalid_refresh_token", "invalid_request"],
+)
 def test_invalid_refresh_preserves_secret_and_marks_reauthorization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -590,6 +593,44 @@ def test_invalid_refresh_preserves_secret_and_marks_reauthorization(
     connection = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
     assert connection is not None
     assert connection.health is ConnectionHealth.REAUTHORIZATION_REQUIRED
+    row = manager.status()["connections"][0]
+    assert row["health"] == ConnectionHealth.REAUTHORIZATION_REQUIRED.value
+    assert row["next"] == f"gsv connectors reauthorize {CONNECTION_ID}"
+
+
+def test_transient_refresh_failure_preserves_degraded_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    _import_oauth_credential(manager, _expired_credential())
+
+    def transient_failure(
+        endpoint: str,
+        fields: dict[str, str],
+        *,
+        timeout_seconds: float,
+    ) -> tuple[int, bytes]:
+        assert endpoint == "https://oauth2.googleapis.com/token"
+        assert fields["refresh_token"] == "single-use-refresh"
+        assert timeout_seconds > 0
+        return 503, b'{"error":"temporarily_unavailable"}'
+
+    monkeypatch.setattr(connector_oauth, "_post_form", transient_failure)
+    with pytest.raises(OAuthTokenEndpointError) as failure:
+        manager.resolve_oauth_access_token_state(
+            CONNECTION_ID,
+            observed_at=BASE_TIME + timedelta(hours=1),
+        )
+
+    assert failure.value.status_code == 503
+    assert manager.tokens.read(CONNECTION_ID).value == _expired_credential().to_bytes()
+    connection = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert connection is not None
+    assert connection.health is ConnectionHealth.DEGRADED
+    row = manager.status()["connections"][0]
+    assert row["health"] == ConnectionHealth.DEGRADED.value
+    assert "next" not in row
 
 
 def test_refresh_error_downgrade_advances_a_stale_observation(
