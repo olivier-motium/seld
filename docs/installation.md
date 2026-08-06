@@ -70,10 +70,13 @@ gsv connectors list
 ```
 
 `readiness` reports whether this exact build packages valid public OAuth
-registrations for Google, Microsoft, and Slack without exposing their client
-identifiers. A missing or invalid registration stops before OAuth and saves
-nothing. Do not ask the person to create a developer application as an ordinary
-installation step.
+registrations for Google, Microsoft, and Slack and whether any required
+host-local client secret is ready, without exposing client identifiers or
+secrets. A missing, invalid, setup-required, or keyring-unavailable result stops
+before OAuth and saves nothing. The packaged Google desktop client currently
+requires the matching secret from its owning Google Cloud project. Its owner
+enters that value once through `gsv connectors client-secret set google`; an
+unrelated developer application does not repair this packaged registration.
 
 When the provider is ready, connect each logical source separately and give it
 a recognizable privacy-safe local label:

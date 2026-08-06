@@ -29,6 +29,7 @@ class PublicClientRegistration:
     provider: str
     client_id: str
     redirect_template: str
+    client_secret_required: bool = False
 
     def __post_init__(self) -> None:
         provider = _provider(self.provider)
@@ -54,7 +55,10 @@ def load_public_client_registrations(
         if provider not in _PROVIDERS:
             raise ValidationError("connector client provider is unsupported")
         entry = _mapping(value, "connector client registration")
-        _exact_keys(entry, {"client_id", "redirect_template"}, "connector client registration")
+        _registration_keys(entry)
+        secret_required = entry.get("client_secret_required", False)
+        if type(secret_required) is not bool:
+            raise ValidationError("client secret requirement must be true or false")
         result[provider] = PublicClientRegistration(
             provider=provider,
             client_id=_client_id(entry["client_id"]),
@@ -62,6 +66,7 @@ def load_public_client_registrations(
                 provider,
                 _text(entry["redirect_template"], "redirect template", _MAX_REDIRECT_BYTES),
             ),
+            client_secret_required=secret_required,
         )
     return result
 
@@ -229,6 +234,16 @@ def _exact_keys(value: Mapping[str, object], expected: set[str], label: str) -> 
         if any(key.casefold() in {"client_secret", "secret"} for key in value):
             raise ValidationError("client secrets are not accepted")
         raise ValidationError(f"{label} has an unsupported shape")
+
+
+def _registration_keys(value: Mapping[str, object]) -> None:
+    required = {"client_id", "redirect_template"}
+    allowed = required | {"client_secret_required"}
+    keys = set(value)
+    if any(key.casefold() in {"client_secret", "secret"} for key in keys):
+        raise ValidationError("client secrets are not accepted")
+    if not required.issubset(keys) or not keys.issubset(allowed):
+        raise ValidationError("connector client registration has an unsupported shape")
 
 
 def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:

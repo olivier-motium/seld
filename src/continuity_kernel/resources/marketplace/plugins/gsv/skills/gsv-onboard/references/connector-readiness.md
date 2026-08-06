@@ -23,6 +23,18 @@ applications, accounts, permissions, access, or security settings. Use `gsv
 connectors alias <connection-id> --alias '<label>'` to change only the local
 label without repeating OAuth.
 
+When Google readiness reports `setup_required`, its packaged desktop client
+needs the matching Google OAuth client secret for token exchange and refresh.
+The person obtains that value from the owning Google Cloud project and runs
+`gsv connectors client-secret set google` in an interactive terminal. Input is
+hidden and the value stays only in the vault-scoped OS keyring; it is never a
+command-line argument, vault field, source receipt, log value, or public client
+registration. One setup covers Gmail, Google Calendar, and Google Drive for
+that vault. The agent may position the terminal but must not create, copy,
+enter, read back, or reuse the client secret. Use `--replace` only when the
+person deliberately rotates it, and `gsv connectors client-secret clear google`
+to remove the local value.
+
 For every selected source in the fresh setup task:
 
 1. Find the actual exposed tool and match it to a logical recipe capability.

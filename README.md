@@ -235,17 +235,19 @@ gsv setup
 ```
 
 The standard source install includes the OS-keyring adapter and guided
-connector commands. Check whether this exact build contains the required public
-OAuth registrations before signing in:
+connector commands. Check whether this exact build and host have the required
+OAuth client setup before signing in:
 
 ```bash
 gsv connectors readiness
 gsv connectors list
 ```
 
-`readiness` never exposes a client identifier. If a registration is missing or
-invalid, OAuth stops before sign-in and saves nothing. Continue with the guided
-commands in [Installation and recovery](docs/installation.md#connector-sign-in).
+`readiness` never exposes a client identifier or secret. If a registration is
+missing or invalid, a required host-local Google client secret is absent, or
+the OS keyring is unavailable, OAuth stops before sign-in and saves nothing.
+Continue with the guided commands in
+[Installation and recovery](docs/installation.md#connector-sign-in).
 
 Setup preserves existing records and unrelated ChatGPT configuration, installs
 Seld's local plugin and skills, and opens Bridge. The install agent then runs
@@ -360,7 +362,7 @@ gsv update check     # Check public main when the six-hour cache is due
 gsv bridge status    # Check the Bridge process
 gsv backup create    # Create a verified backup without overwriting one
 gsv bridge stop      # Stop Bridge
-gsv connectors readiness # Check packaged OAuth registration readiness
+gsv connectors readiness # Check packaged and host-local OAuth client readiness
 gsv connectors list      # Show connectors and redacted local account state
 ```
 

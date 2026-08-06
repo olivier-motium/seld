@@ -26,7 +26,8 @@ inputs, source boundaries, revisions, privacy checks, receipts, and readback.
    account-bound authentication. A Seld-managed Gmail, Google Calendar, Google
    Drive, Outlook Mail, Outlook Calendar, Slack, or Discord connection uses the
    guided `gsv connectors` flow and OS-keyring custody instead. The user checks
-   `gsv connectors readiness` first; missing or invalid OAuth registration means
+   `gsv connectors readiness` first; missing or invalid OAuth registration,
+   missing required host-local client setup, or an unavailable OS keyring means
    sign-in is unavailable and nothing is saved. A local directory gets its own
    path-specific grant after the user reviews the exact root and exclusions.
 5. **Open one fresh ChatGPT task.** The fresh task discovers the tools that are

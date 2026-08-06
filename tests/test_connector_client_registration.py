@@ -25,6 +25,7 @@ def _all_providers() -> dict[str, object]:
         "google": {
             "client_id": "google-public.apps.example",
             "redirect_template": "http://127.0.0.1:0",
+            "client_secret_required": True,
         },
         "microsoft": {
             "client_id": "microsoft-public",
@@ -41,6 +42,7 @@ def test_loader_reads_public_ids_from_injected_bytes_and_never_needs_user_id_inp
     registrations = load_public_client_registrations(source_bytes=_encoded(_all_providers()))
 
     assert registrations["google"].client_id == "google-public.apps.example"
+    assert registrations["google"].client_secret_required is True
     assert registrations["microsoft"].redirect_template.endswith("/oauth/callback")
     assert registrations["slack"].redirect_template == "http://localhost:43127/oauth/callback"
     assert (
@@ -143,3 +145,10 @@ def test_loader_is_strict_bounded_and_rejects_secrets_or_unknown_shapes() -> Non
         load_public_client_registration("google", source_bytes=b"{" + b" " * (64 * 1024) + b"}")
     with pytest.raises(ValidationError, match="valid JSON"):
         load_public_client_registration("google", source_bytes=b"not-json")
+
+    invalid_requirement = _all_providers()
+    google_value = invalid_requirement["google"]
+    assert isinstance(google_value, dict)
+    google_value["client_secret_required"] = "yes"
+    with pytest.raises(ValidationError, match="requirement"):
+        load_public_client_registration("google", source_bytes=_encoded(invalid_requirement))

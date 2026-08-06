@@ -361,6 +361,55 @@ def test_registration_readiness_distinguishes_missing_invalid_and_unrelated_fail
         ).registration_readiness()
 
 
+def test_registration_readiness_routes_keyring_failure_and_invalid_secret_per_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+
+    def registration(provider: str) -> PublicClientRegistration:
+        current = _registration(provider)
+        if provider == "google":
+            return PublicClientRegistration(
+                provider=current.provider,
+                client_id=current.client_id,
+                redirect_template=current.redirect_template,
+                client_secret_required=True,
+            )
+        return current
+
+    def unavailable(current: PublicClientRegistration) -> str:
+        if current.provider == "google":
+            raise SetupError("synthetic keyring unavailable")
+        return "not_required"
+
+    monkeypatch.setattr(manager, "oauth_client_secret_status", unavailable)
+    readiness = ConnectorOnboarding(
+        manager,
+        registration_loader=registration,
+    ).registration_readiness()
+    assert readiness["google"] == {
+        "reason": "synthetic keyring unavailable",
+        "sign_in": "unavailable",
+        "status": "unavailable",
+    }
+    assert readiness["microsoft"] == {"sign_in": "available", "status": "ready"}
+
+    monkeypatch.setattr(
+        manager,
+        "oauth_client_secret_status",
+        lambda current: "invalid" if current.provider == "google" else "not_required",
+    )
+    repaired = ConnectorOnboarding(
+        manager,
+        registration_loader=registration,
+    ).registration_readiness()
+    assert repaired["google"]["status"] == "invalid"
+    assert repaired["google"]["next"] == (
+        "gsv connectors client-secret set google --replace"
+    )
+
+
 def test_browser_and_manual_url_callbacks_pass_through_without_becoming_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

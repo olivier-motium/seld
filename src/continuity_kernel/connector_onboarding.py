@@ -1166,7 +1166,7 @@ class ConnectorOnboarding:
         )
         for provider in providers:
             try:
-                self.registration_loader(provider)
+                registration = self.registration_loader(provider)
             except SetupError as exc:
                 readiness[provider] = {
                     "reason": str(exc),
@@ -1180,7 +1180,31 @@ class ConnectorOnboarding:
                     "status": "invalid",
                 }
             else:
-                readiness[provider] = {"sign_in": "available", "status": "ready"}
+                try:
+                    secret_status = self.manager.oauth_client_secret_status(registration)
+                except SetupError as exc:
+                    readiness[provider] = {
+                        "reason": str(exc),
+                        "sign_in": "unavailable",
+                        "status": "unavailable",
+                    }
+                    continue
+                if secret_status == "missing":
+                    readiness[provider] = {
+                        "next": f"gsv connectors client-secret set {provider}",
+                        "reason": "host-local OAuth client secret is not configured",
+                        "sign_in": "setup_required",
+                        "status": "setup_required",
+                    }
+                elif secret_status == "invalid":
+                    readiness[provider] = {
+                        "next": f"gsv connectors client-secret set {provider} --replace",
+                        "reason": "host-local OAuth client secret is invalid",
+                        "sign_in": "setup_required",
+                        "status": "invalid",
+                    }
+                else:
+                    readiness[provider] = {"sign_in": "available", "status": "ready"}
         return readiness
 
     def _reuse_oauth_connection(
