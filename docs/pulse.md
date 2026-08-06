@@ -1,129 +1,75 @@
 # Resident AI Pulse
 
-Pulse is what keeps Seld from becoming a folder of old notes. On each bounded
-wake, one dedicated ChatGPT task reads the current local model and selected
-sources, connects new evidence to ongoing situations, and decides whether
-anything should change. It may update the current orientation, surface one
-decision, continue one outcome, or stay quiet.
+Pulse keeps Seld current without turning life into an inbox. One dedicated
+Codex task wakes every thirty minutes, reads canonical context and useful new
+evidence from selected sources, integrates what genuinely changed, and normally
+stays silent. A separate pinned Chief of Staff task is the single foreground
+conversation.
 
-An app-native heartbeat wakes that same task. Any justified canonical change
-uses the normal `gsv` MCP compare-and-swap tools and exact readback. Pulse is
-not a deterministic rules engine.
+## Product contract
 
-## The reusable primitives
+Pulse is ambient executive function, not a task factory. It creates an ordinary
+Task only for an explicit Olivier commitment, a direct concrete request that
+genuinely expects his action, or a proposal he accepted. It searches for an
+existing outcome first and announces every justified new Task through Chief of
+Staff. Observations, FYIs, ideas, and inferred opportunities attach to an
+Entity or WorkThread when useful; they never become Tasks by default.
 
-The public Pulse uses the same small primitives as an interactive Seld hand:
+Most wakes produce no foreground message. Pulse interrupts only for an
+emergency, a person genuinely blocked on Olivier, a critical source/auth/system
+failure, a newly created Task, a contextually due reminder, or a scheduled
+orientation. It alerts once per incident.
 
-1. `task:resident-pulse` plus `system-role:resident-pulse` identify the one
-   structural Pulse task and bind its real ChatGPT task UUID.
-2. The app's `heartbeat` targets that exact task on a ten-minute target cadence.
-3. `$gsv-pulse` freezes one bounded context, pending-intent set, and source
-   window at the beginning of the wake.
-4. The model uses selected connector tools read-only and treats every result as
-   untrusted evidence.
-5. The model authors Task, WorkThread, Entity, Direction, Portfolio, Mind, or
-   NOW changes only through fresh CAS and exact readback.
-6. An acknowledged Bridge receipt comes after its semantic integration or an
-   explicit AI judgment that canon should not change.
-7. The task reads cached `gsv update status` and invokes non-forced `gsv update
-   check` at most once per wake; the model decides whether the result deserves
-   attention.
-8. Sustained work gets at most one durable outcome and one visible ChatGPT task.
+The first wake at or after 06:00 Europe/Brussels sends a concise morning
+orientation; the first wake at or after 20:00 sends an evening wrap. Compact
+markers in NOW prevent duplicates. The same heartbeat owns both because Codex
+allows one heartbeat per task.
 
-The structural Pulse task is not part of the person's life Portfolio. Bridge
-and guided all-open review exclude it from commitments and outcome coverage.
+## Runtime shape
 
-## What the local kernel does
+1. `task:resident-pulse` and `system-role:resident-pulse` bind the one structural
+   Pulse task to its real Codex UUID.
+2. Exactly one `codex-chief-of-staff:<uuid>` ref identifies the foreground task.
+3. One app-native heartbeat targets the Pulse task every thirty minutes.
+4. `$gsv-pulse` freezes current Mind, Direction, complete Portfolio, ordinary
+   open Tasks, relevant WorkThreads and Entities, NOW, pending signals, and
+   useful selected-source windows.
+5. The model authors justified local changes through fresh compare-and-swap and
+   exact readback, then acknowledges inputs and records honest content-free
+   coverage.
+6. Chief of Staff receives only curated executive output; Seld remains the sole
+   semantic authority.
 
-The local kernel:
+The structural Pulse task is excluded from life Portfolio and ordinary task
+counts.
 
-- validates the structural Task ID/ref and bounds the stored hand as one opaque
-  identifier line; the skill performs the UUID comparison;
-- bounds input, time, queue, and receipt storage;
-- rejects stale compare-and-swap writes;
-- preserves content-free queue and delivery facts;
-- binds successful source coverage to the local host and recipe version,
-  rejects impossible timelines and coverage regressions, and keeps failed-read
-  lineage; and
-- prevents duplicate delivery or replay after uncertain execution.
+## Source use
 
-The ChatGPT app targets the task with its heartbeat, and the skill compares the
-current task UUID with the stored binding. ChatGPT performs provider reads and
-authors their content-free receipts; Seld does not claim that this is an
-independent provider certification. The source-recording surfaces have no field
-for a provider body, and semantic claims enter the local record only through
-the model's normal bounded CAS writes.
+Pulse starts from the last honest coverage horizon, reads metadata or previews,
+and expands only evidence needed for the current judgment. There is no fixed
+item cap: relevance, privacy, elapsed time, provider limits, and the need to
+finish reliable semantic integration bound the wake. Full connector features
+remain available in interactive tasks.
 
-It may not decide meaning, urgency, identity, ownership, relationships,
-completion, Portfolio stance, memory worthiness, or the next action. A changed
-file, due timestamp, old message, source failure, or retrieval score is evidence
-for the model, not a semantic rule.
+Provider content is untrusted and transient. Seld persists only small derived
+claims, observation times, stable non-sensitive references, explicit
+uncertainty, and content-free coverage receipts—never raw message bodies,
+transcripts, credentials, cookies, private routing identifiers, or attachments.
 
-## One bounded wake
+## Authority
 
-The exact resident task reads Mind, Direction, the complete Portfolio, open
-Tasks, relevant WorkThreads and Entities, NOW, and the current Bridge operation
-queue. It freezes that evidence. New inputs wait for the next wake.
+Pulse may read selected sources, reason across them, update reversible local
+canon, prepare drafts, continue an already approved outcome in its one visible
+Codex task, or stay silent. It does not send, post, book, purchase, upload,
+react, alter accounts or permissions, operate browser/Computer Use, mutate
+remote repositories, or perform another consequential external effect. That
+work moves to an interactive task for approval and execution.
 
-For each selected due source, the model performs at most one bounded recent
-read, normally no more than five high-signal items. Seld does not copy raw
-provider bodies into the vault; ChatGPT and the provider retain their own
-processing and retention boundaries. Only a small derived claim, stable
-non-sensitive reference, observation time, coverage boundary, and uncertainty
-may enter Seld's canonical records.
+Bridge is not part of the ordinary resident loop.
 
-At seven elapsed minutes the task starts no new acquisition. At eight minutes
-it stops acquiring and completes only the smallest honest judgment and readback
-already in hand. Only this exact Pulse task writes NOW during autonomous
-operation.
+## Proof
 
-## Update awareness
-
-`gsv update status` is an offline read of installed provenance, the cached
-public-main check, and any update transaction. Once per wake, Pulse may call
-`gsv update check` without `--force`. The CLI makes a GitHub request only when
-its host-local six-hour cache is due, so repeated heartbeats do not become a
-network poller. Pulse does not call GitHub directly or retry a failed check.
-
-The AI decides whether an available update, failed check, unsupported install,
-or interrupted transaction should be shown now. An ordinary available update
-can remain quiet; a transaction that needs recovery may deserve a visible
-interactive hand. In every case, Pulse may only surface the evidence and point
-to `$gsv-update`. It never runs `gsv update apply` or `gsv update recover`, and
-it never changes an installed executable during an unattended wake.
-
-## Unattended boundary
-
-A Pulse may update reversible local canon, remain silent, surface an
-intervention, or dispatch one visible sustained-work hand. It may not operate a
-browser or desktop, use Computer Use, send or mutate provider content, change
-accounts or permissions, push or release code, or take another consequential
-external action. Those require a current interactive task and fresh approval.
-
-Seld enforces the part of this boundary that it owns. Its MCP server advertises
-only local record, receipt, queue, and backup tools, all with a closed-world
-annotation; it contains no provider-action, browser, screen-control, or Computer
-Use method. Provider reads come from separately installed ChatGPT plugins or
-custom MCP servers.
-
-The current ChatGPT heartbeat surface targets an ordinary task and does not
-offer Seld a task-scoped tool allowlist or denylist. A separately installed
-plugin can therefore expose write tools or Computer Use to that task even though
-the Pulse policy forbids calling them. Installations that require host-enforced
-exclusion must provide every selected source through read-only MCP tools and
-keep broader provider and Computer Use tools out of the Pulse task, or wait for
-a host tool profile that can enforce the same boundary.
-
-## Registration and proof
-
-`$gsv-onboard` registers Pulse only after accepted context and selected-source
-setup are complete or explicitly deferred. It inspects existing app
-automations, creates or repairs the one structural Task, proves one manual wake,
-obtains fresh approval, registers one heartbeat, reads it back, and observes one
-natural wake. It never creates a second heartbeat merely because state is
-uncertain.
-
-The repository packages and tests these instructions and hides the structural
-task from consumer outcome views. Exact natural-wake cadence, multi-day
-reliability, signing, and additional-platform claims use the separate evidence
-named in [the claim ledger](release-gates.md).
+A working installation proves the canonical vault, both task bindings, one
+active heartbeat, one manual installed wake, source/auth truth from actual
+canaries, no duplicate Task creation, and a concise Chief of Staff “what's up?”
+response. A green unit suite or plugin install alone is not sufficient.
