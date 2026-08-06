@@ -100,6 +100,32 @@ class _InterruptedProbeStore(InMemorySecretStore):
         return len(self._values)
 
 
+class _MalformedClientSecretStore(InMemorySecretStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.malformed = True
+
+    def get_secret(self, connection_id: ConnectionId, name: SecretName) -> bytes | None:
+        if name == "oauth-client-secret" and self.malformed:
+            raise ValidationError("stored OS keyring value is invalid")
+        return super().get_secret(connection_id, name)
+
+    def set_secret(
+        self,
+        connection_id: ConnectionId,
+        name: SecretName,
+        value: bytes,
+    ) -> None:
+        super().set_secret(connection_id, name, value)
+        if name == "oauth-client-secret":
+            self.malformed = False
+
+    def delete_secret(self, connection_id: ConnectionId, name: SecretName) -> None:
+        super().delete_secret(connection_id, name)
+        if name == "oauth-client-secret":
+            self.malformed = False
+
+
 def _manager(
     tmp_path: Path,
     *,
@@ -108,6 +134,7 @@ def _manager(
     fingerprint: str | None = GOOGLE_ACCOUNT_FINGERPRINT,
     health: ConnectionHealth = ConnectionHealth.READY,
     client_id: str = "public-client",
+    secret_store: InMemorySecretStore | None = None,
 ) -> ConnectorAuthManager:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Portable auth")
@@ -151,7 +178,7 @@ def _manager(
     )
     return ConnectorAuthManager(
         vault,
-        secret_store=InMemorySecretStore(),
+        secret_store=secret_store if secret_store is not None else InMemorySecretStore(),
         state_root=tmp_path / "host-state",
     )
 
@@ -966,6 +993,34 @@ def test_packaged_google_client_secret_is_required_once_and_used_for_exchange_an
 
     cleared = manager.clear_oauth_client_secret("google")
     assert cleared["status"] == "cleared"
+    assert manager.oauth_client_secret_status(registration) == "missing"
+
+
+def test_malformed_google_client_secret_can_be_replaced_or_cleared(tmp_path: Path) -> None:
+    registration = load_public_client_registration("google")
+    store = _MalformedClientSecretStore()
+    manager = _manager(
+        tmp_path,
+        client_id=registration.client_id,
+        secret_store=store,
+    )
+
+    assert manager.oauth_client_secret_status(registration) == "invalid"
+    with pytest.raises(ValidationError, match=r"--replace"):
+        manager.store_oauth_client_secret("google", b"replacement")
+
+    replaced = manager.store_oauth_client_secret(
+        "google",
+        b"replacement",
+        replace_existing=True,
+    )
+    assert replaced["status"] == "configured"
+    assert manager.oauth_client_secret_status(registration) == "configured"
+
+    store.malformed = True
+    cleared = manager.clear_oauth_client_secret("google")
+    assert cleared["status"] == "cleared"
+    assert cleared["nothing_changed"] is False
     assert manager.oauth_client_secret_status(registration) == "missing"
 
 

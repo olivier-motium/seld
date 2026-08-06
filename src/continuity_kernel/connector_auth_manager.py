@@ -167,11 +167,17 @@ class ConnectorAuthManager:
             )
         secret = _oauth_client_secret_text(value, stored=False).encode("utf-8")
         key = _oauth_client_secret_key(registration)
-        current = self.secret_store.get_secret(key, _OAUTH_CLIENT_SECRET_NAME)
-        if current is not None and not replace_existing:
-            raise ValidationError(
-                "OAuth client secret is already configured; pass --replace to rotate it"
-            )
+        if not replace_existing:
+            try:
+                current = self.secret_store.get_secret(key, _OAUTH_CLIENT_SECRET_NAME)
+            except ValidationError as exc:
+                raise ValidationError(
+                    "stored OAuth client secret is invalid; pass --replace to replace it"
+                ) from exc
+            if current is not None:
+                raise ValidationError(
+                    "OAuth client secret is already configured; pass --replace to rotate it"
+                )
         self.secret_store.set_secret(key, _OAUTH_CLIENT_SECRET_NAME, secret)
         return {
             "client_secret": "configured",
@@ -189,15 +195,20 @@ class ConnectorAuthManager:
                 f"{registration.provider} does not require a host-local OAuth client secret"
             )
         key = _oauth_client_secret_key(registration)
-        current = self.secret_store.get_secret(key, _OAUTH_CLIENT_SECRET_NAME)
-        if current is not None:
+        try:
+            current = self.secret_store.get_secret(key, _OAUTH_CLIENT_SECRET_NAME)
+        except ValidationError:
+            had_value = True
+        else:
+            had_value = current is not None
+        if had_value:
             self.secret_store.delete_secret(key, _OAUTH_CLIENT_SECRET_NAME)
         return {
             "client_secret": "missing",
             "next": f"gsv connectors client-secret set {registration.provider}",
-            "nothing_changed": current is None,
+            "nothing_changed": not had_value,
             "provider": registration.provider,
-            "status": "cleared" if current is not None else "already_clear",
+            "status": "cleared" if had_value else "already_clear",
         }
 
     def status(self) -> dict[str, Any]:
