@@ -633,6 +633,46 @@ def test_transient_refresh_failure_preserves_degraded_health(
     assert "next" not in row
 
 
+def test_microsoft_invalid_request_preserves_degraded_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _microsoft_manager(tmp_path)
+    profile = get_profile("microsoft")
+    credential = replace(
+        _expired_credential(),
+        refresh_token="microsoft-refresh",
+        scopes=profile.read_scopes,
+    )
+    _import_oauth_credential(manager, credential)
+
+    def invalid_request(
+        endpoint: str,
+        fields: dict[str, str],
+        *,
+        timeout_seconds: float,
+    ) -> tuple[int, bytes]:
+        assert endpoint == profile.token_endpoint
+        assert fields["refresh_token"] == "microsoft-refresh"
+        assert timeout_seconds > 0
+        return 400, b'{"error":"invalid_request"}'
+
+    monkeypatch.setattr(connector_oauth, "_post_form", invalid_request)
+    with pytest.raises(OAuthTokenEndpointError) as failure:
+        manager.resolve_oauth_access_token_state(
+            CONNECTION_ID,
+            observed_at=BASE_TIME + timedelta(hours=1),
+        )
+
+    assert failure.value.error == "invalid_request"
+    connection = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert connection is not None
+    assert connection.health is ConnectionHealth.DEGRADED
+    row = manager.status()["connections"][0]
+    assert row["health"] == ConnectionHealth.DEGRADED.value
+    assert "next" not in row
+
+
 def test_refresh_error_downgrade_advances_a_stale_observation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -464,6 +464,54 @@ def test_slack_invalid_refresh_token_returns_expired_auth_receipt(
     assert failure["errorCode"] == "auth_expired"
 
 
+@pytest.mark.parametrize(
+    ("source_id", "provider", "marker", "expected_error"),
+    (
+        ("gmail", "google", "s", "auth_expired"),
+        ("outlook_mail", "microsoft", "t", "auth_required"),
+    ),
+)
+def test_invalid_request_is_terminal_only_for_google_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_id: str,
+    provider: str,
+    marker: str,
+    expected_error: str,
+) -> None:
+    vault, manager, connection_id = _prepared(
+        tmp_path,
+        source_id=source_id,
+        provider=provider,
+        marker=marker,
+    )
+
+    def invalid_request(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OAuthTokenEndpointError(
+            error="invalid_request",
+            description=None,
+            status_code=400,
+        )
+
+    monkeypatch.setattr(manager, "resolve_oauth_access_token_state", invalid_request)
+    _install_reader(
+        monkeypatch,
+        vault=vault,
+        manager=manager,
+        get_json=lambda *_args: pytest.fail("provider read was reached"),
+    )
+
+    failure = read_connector_source(
+        vault,
+        connection_id=str(connection_id),
+        source_id=source_id,
+    )
+
+    assert failure["result"] == "failure"
+    assert failure["errorCode"] == expected_error
+
+
 def test_gmail_uses_one_deadline_across_followup_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

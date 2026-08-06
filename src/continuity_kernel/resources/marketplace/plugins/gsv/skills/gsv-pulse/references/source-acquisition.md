@@ -26,9 +26,11 @@ limits, and the need to finish a reliable semantic integration—not by an
 artificial item count.
 
 Do not sweep broad history merely to fill a wake. Use targeted search and
-pagination when the current outcome requires them. Fetch full bodies or
-attachments only in an interactive task with a concrete need and appropriate
-authority.
+pagination when the current outcome requires them. A Pulse may fetch the full
+body of a specific message, thread, event, or document when its preview shows
+that the content can materially change the current judgment; keep that body
+transient and never persist it raw. Follow links or open attachments only in an
+interactive task with a concrete need and appropriate authority.
 
 A source observation alone is not a Task or a foreground interruption. Apply
 the Pulse task-birth and delivery gates; keep useful non-task context on its

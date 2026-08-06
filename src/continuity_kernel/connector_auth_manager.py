@@ -308,7 +308,11 @@ class ConnectorAuthManager:
                     if (
                         exc.error in {"invalid_grant", "invalid_refresh_token"}
                         or exc.status_code in {401, 403}
-                        or (exc.error == "invalid_request" and exc.status_code == 400)
+                        or (
+                            metadata.provider == "google"
+                            and exc.error == "invalid_request"
+                            and exc.status_code == 400
+                        )
                     )
                     else ConnectionHealth.DEGRADED
                 )
