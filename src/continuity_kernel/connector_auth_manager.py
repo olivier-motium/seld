@@ -1085,10 +1085,7 @@ class ConnectorAuthManager:
         client_secret: str | None = None
         if metadata.provider == "google":
             registration = load_public_client_registration(metadata.provider)
-            if (
-                registration.client_id == client.identifier
-                and registration.client_secret_required
-            ):
+            if registration.client_id == client.identifier and registration.client_secret_required:
                 stored = self.secret_store.get_secret(
                     _oauth_client_secret_key(registration),
                     _OAUTH_CLIENT_SECRET_NAME,

@@ -405,9 +405,7 @@ def test_registration_readiness_routes_keyring_failure_and_invalid_secret_per_pr
         registration_loader=registration,
     ).registration_readiness()
     assert repaired["google"]["status"] == "invalid"
-    assert repaired["google"]["next"] == (
-        "gsv connectors client-secret set google --replace"
-    )
+    assert repaired["google"]["next"] == ("gsv connectors client-secret set google --replace")
 
 
 def test_browser_and_manual_url_callbacks_pass_through_without_becoming_state(
