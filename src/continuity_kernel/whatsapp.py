@@ -390,6 +390,80 @@ def read_whatsapp_delta(
     )
 
 
+def replay_whatsapp_delta(
+    *,
+    cursor: str,
+    target_cursor: str,
+    complete: bool,
+    store_root: Path | None = None,
+    limit: int = MAX_DELTA,
+    observed_at: datetime | None = None,
+    runtime: Path = DEFAULT_RUNTIME,
+    service_label: str = DEFAULT_SERVICE_LABEL,
+    runner: Runner | None = None,
+) -> WhatsAppDelta:
+    """Re-read one prepared historical prefix while leaving later rows for the next poll."""
+
+    if not 1 <= limit <= MAX_DELTA:
+        raise ValidationError(f"WhatsApp delta limit must be between 1 and {MAX_DELTA}")
+    previous = _decode_cursor(cursor)
+    target = _decode_cursor(target_cursor)
+    status = inspect_whatsapp(
+        store_root=store_root,
+        runtime=runtime,
+        service_label=service_label,
+        observed_at=observed_at,
+        runner=runner,
+    )
+    if not status.available:
+        raise ContinuityError(status.error or "standalone WhatsApp source is unavailable")
+    _validate_cursor(previous, status)
+    assert status.schema is not None and status.generation is not None
+    assert status.max_rowid is not None
+    if (
+        target.schema != status.schema
+        or target.generation != status.generation
+        or target.rowid < previous.rowid
+        or target.rowid > status.max_rowid
+    ):
+        raise ContinuityError("standalone WhatsApp prepared delivery prefix is unavailable")
+
+    database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
+    prefix_messages, prefix_rowid, prefix_newest = _prefix_aggregates(
+        database,
+        through_rowid=target.rowid,
+        expected_schema=status.schema,
+        expected_generation=status.generation,
+    )
+    newest_matches = (target.newest is None and prefix_newest is None) or (
+        target.newest is not None
+        and prefix_newest is not None
+        and _parse_iso(target.newest) == _parse_iso(prefix_newest)
+    )
+    if prefix_messages != target.messages or prefix_rowid != target.rowid or not newest_matches:
+        raise ContinuityError("standalone WhatsApp prepared delivery prefix changed")
+
+    rows = _delta_rows(
+        database,
+        after_rowid=previous.rowid,
+        through_rowid=target.rowid,
+        limit=limit + 1,
+        expected_schema=status.schema,
+        expected_generation=status.generation,
+    )
+    messages, last_rowid, budget_complete = _bounded_messages(rows, starting_rowid=previous.rowid)
+    if len(rows) > limit or last_rowid != target.rowid or not budget_complete:
+        raise ContinuityError("standalone WhatsApp prepared delivery exceeds its original bound")
+    return WhatsAppDelta(
+        observed_at=status.observed_at,
+        covered_through=target.newest or status.observed_at,
+        complete=complete,
+        cursor=target_cursor,
+        messages=messages,
+        drift=_cursor_drift(previous, status),
+    )
+
+
 def create_whatsapp_ack_token(
     *, project_root: Path, previous_cursor: str, delta: WhatsAppDelta
 ) -> str:

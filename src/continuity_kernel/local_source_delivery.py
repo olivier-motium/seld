@@ -405,13 +405,21 @@ class LocalSourceDelivery:
             if state.pending_token is not None:
                 prepared = _decode_token(state.pending_token, binding)
                 self._validate_prepared_state(state, prepared)
-                delta = self._read_delta(
+                delta = self._replay_delta(
                     source,
                     cursor=state.cursor,
+                    target_cursor=prepared.target_cursor,
+                    complete=prepared.completeness == "complete",
                     limit=prepared.limit,
                     store_root=store_root,
                 )
                 self._verify_replayed_delta(prepared, delta)
+                if prepared.adapter_token is not None:
+                    self._verify_prepared_delivery(
+                        prepared,
+                        state.cursor,
+                        store_root=store_root,
+                    )
                 token = state.pending_token
             else:
                 snapshot = self._selected_snapshot(source)
@@ -988,6 +996,35 @@ class LocalSourceDelivery:
             limit=limit,
         )
 
+    def _replay_delta(
+        self,
+        source: str,
+        *,
+        cursor: str,
+        target_cursor: str,
+        complete: bool,
+        limit: int,
+        store_root: Path | None,
+    ) -> apple_messages.AppleMessagesDelta | whatsapp.WhatsAppDelta:
+        if source == "apple_messages":
+            return apple_messages.replay_apple_messages_delta(
+                cursor=cursor,
+                target_cursor=target_cursor,
+                complete=complete,
+                store_root=store_root,
+                limit=limit,
+            )
+        return whatsapp.replay_whatsapp_delta(
+            cursor=cursor,
+            target_cursor=target_cursor,
+            complete=complete,
+            store_root=store_root,
+            runtime=self.whatsapp_runtime,
+            service_label=self.whatsapp_service_label,
+            runner=self.whatsapp_runner,
+            limit=limit,
+        )
+
     def _prepare_token(
         self,
         *,
@@ -1044,11 +1081,9 @@ class LocalSourceDelivery:
         prepared: _DeliveryToken,
         delta: apple_messages.AppleMessagesDelta | whatsapp.WhatsAppDelta,
     ) -> None:
-        if (
-            delta.cursor != prepared.target_cursor
-            or _delta_digest(delta) != prepared.delivery_digest
-            or len(delta.messages) != prepared.items_observed
-        ):
+        if delta.cursor != prepared.target_cursor or len(delta.messages) != prepared.items_observed:
+            raise ContinuityError("local source content changed after polling")
+        if prepared.adapter_token is None and _delta_digest(delta) != prepared.delivery_digest:
             raise ContinuityError("local source content changed after polling")
 
     def _verify_prepared_delivery(
@@ -1059,9 +1094,11 @@ class LocalSourceDelivery:
         store_root: Path | None,
     ) -> None:
         if prepared.adapter_token is None:
-            delta = self._read_delta(
+            delta = self._replay_delta(
                 prepared.source,
                 cursor=cursor,
+                target_cursor=prepared.target_cursor,
+                complete=prepared.completeness == "complete",
                 limit=prepared.limit,
                 store_root=store_root,
             )

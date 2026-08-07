@@ -243,7 +243,12 @@ def test_forward_baseline_discard_replay_and_semantic_ack_are_content_free(
     assert "cursor" not in baseline
     _append_apple(database, "new transient body")
 
-    first = delivery.poll("apple_messages", limit=1)
+    first = delivery.poll("apple_messages", limit=2)
+    _append_apple(
+        database,
+        "arrived after the prepared delivery",
+        timestamp=APPLE_TEST_TIMESTAMP + 1,
+    )
     replay = LocalSourceDelivery(vault, store_root=store).poll("apple_messages", limit=99)
     assert first == replay
     assert first["messages"][0]["body"] == "new transient body"
@@ -256,6 +261,14 @@ def test_forward_baseline_discard_replay_and_semantic_ack_are_content_free(
     acknowledged = _ack(delivery, first, disposition="rejected")
     assert acknowledged["sequence"] == 1
     assert acknowledged["disposition"] == "rejected"
+    exact_retry = _ack(LocalSourceDelivery(vault, store_root=store), first, disposition="rejected")
+    assert exact_retry["already_acknowledged"] is True
+    following = delivery.poll("apple_messages", limit=2)
+    assert [message["body"] for message in following["messages"]] == [
+        "arrived after the prepared delivery"
+    ]
+    following_ack = _ack(delivery, following, disposition="rejected")
+    assert following_ack["sequence"] == 2
     state_after = state_path.read_text(encoding="ascii")
     ledger = (vault.root / "SOURCES.md").read_text(encoding="utf-8")
     for body in ("old body must never replay", "new transient body"):
@@ -264,8 +277,6 @@ def test_forward_baseline_discard_replay_and_semantic_ack_are_content_free(
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
 
-    exact_retry = _ack(LocalSourceDelivery(vault, store_root=store), first, disposition="rejected")
-    assert exact_retry["already_acknowledged"] is True
     empty = LocalSourceDelivery(vault, store_root=store).poll("apple_messages")
     assert empty["messages"] == []
     empty_result = _ack(
@@ -273,7 +284,7 @@ def test_forward_baseline_discard_replay_and_semantic_ack_are_content_free(
         empty,
         result_refs=(_result_ref(vault, "empty-proof"),),
     )
-    assert empty_result["sequence"] == 2
+    assert empty_result["sequence"] == 3
     empty_observation = vault.get_source_snapshot().observation("apple_messages")
     assert empty_observation is not None
     assert empty_observation.result.value == "explicit_empty"
@@ -1164,6 +1175,53 @@ def test_whatsapp_delivery_uses_external_companion_without_routing_leaks(tmp_pat
         "provider-media-key",
     ):
         assert private not in durable
+
+
+@_POSIX_STORAGE
+def test_whatsapp_pending_replay_excludes_messages_that_arrive_later(tmp_path: Path) -> None:
+    vault, _selected = _selected_vault(tmp_path, "whatsapp")
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    delivery = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=_runner(runtime),
+    )
+    delivery.baseline("whatsapp")
+    _append_whatsapp(database, "prepared body")
+
+    first = delivery.poll("whatsapp", limit=2)
+    _append_whatsapp(database, "arrived after the prepared delivery")
+    replay = delivery.poll("whatsapp", limit=99)
+
+    assert replay == first
+    _ack(delivery, first, disposition="rejected")
+    following = delivery.poll("whatsapp", limit=2)
+    assert [message["body"] for message in following["messages"]] == [
+        "arrived after the prepared delivery"
+    ]
+
+
+@_POSIX_STORAGE
+def test_empty_pending_replay_leaves_a_later_message_for_the_next_poll(tmp_path: Path) -> None:
+    vault, _selected = _selected_vault(tmp_path, "apple_messages")
+    store = tmp_path / "Messages"
+    database = _apple_store(store)
+    delivery = LocalSourceDelivery(vault, store_root=store)
+    delivery.baseline("apple_messages")
+
+    empty = delivery.poll("apple_messages", limit=2)
+    _append_apple(database, "arrived after the empty delivery")
+    replay = delivery.poll("apple_messages", limit=99)
+
+    assert replay == empty
+    _ack(delivery, empty)
+    following = delivery.poll("apple_messages", limit=2)
+    assert [message["body"] for message in following["messages"]] == [
+        "arrived after the empty delivery"
+    ]
 
 
 def _exchange(
