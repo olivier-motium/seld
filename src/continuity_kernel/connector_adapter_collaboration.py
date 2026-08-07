@@ -1289,9 +1289,7 @@ def _slack_search_messages_query(
         query.append(
             (
                 "sort_dir",
-                {"ascending": "asc", "descending": "desc"}[
-                    cast(str, value["sort_direction"])
-                ],
+                {"ascending": "asc", "descending": "desc"}[cast(str, value["sort_direction"])],
             )
         )
     return tuple(query)

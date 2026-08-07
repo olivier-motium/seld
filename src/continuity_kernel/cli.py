@@ -641,9 +641,11 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
                     "OAuth client-secret setup needs an interactive terminal so the value "
                     "stays hidden; it is never accepted on the command line"
                 )
-            value = getpass.getpass(
-                f"{args.provider.title()} OAuth client secret (input hidden): "
-            ).strip().encode("utf-8")
+            value = (
+                getpass.getpass(f"{args.provider.title()} OAuth client secret (input hidden): ")
+                .strip()
+                .encode("utf-8")
+            )
             return manager.store_oauth_client_secret(
                 args.provider,
                 value,

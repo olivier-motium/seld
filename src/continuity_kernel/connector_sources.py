@@ -1133,11 +1133,7 @@ def _token_error_code(error: OAuthTokenEndpointError, *, provider: str) -> str:
     if (
         error.error in {"invalid_grant", "invalid_refresh_token"}
         or error.status_code in {401, 403}
-        or (
-            provider == "google"
-            and error.error == "invalid_request"
-            and error.status_code == 400
-        )
+        or (provider == "google" and error.error == "invalid_request" and error.status_code == 400)
     ):
         return "auth_expired"
     if error.status_code in {408, 504}:

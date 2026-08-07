@@ -914,6 +914,10 @@ def test_packaged_google_client_secret_is_required_once_and_used_for_exchange_an
     assert metadata is not None
     opened: list[str] = []
 
+    def open_browser(url: str) -> bool:
+        opened.append(url)
+        return True
+
     class Listener:
         redirect_uri = "http://127.0.0.1:48123"
 
@@ -935,7 +939,7 @@ def test_packaged_google_client_secret_is_required_once_and_used_for_exchange_an
     with pytest.raises(SetupError, match=r"client secret.*client-secret set google"):
         manager.acquire_oauth_credential(
             metadata,
-            browser_opener=lambda url: opened.append(url) or True,
+            browser_opener=open_browser,
         )
     assert opened == []
 
@@ -962,7 +966,7 @@ def test_packaged_google_client_secret_is_required_once_and_used_for_exchange_an
     )
     acquired = manager.acquire_oauth_credential(
         metadata,
-        browser_opener=lambda url: opened.append(url) or True,
+        browser_opener=open_browser,
     )
     assert acquired.access_token == "new-access"
     assert exchange_secrets == ["host-only-client-secret"]
