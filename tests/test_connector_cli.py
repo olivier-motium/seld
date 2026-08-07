@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import json
 import subprocess
 import sys
@@ -132,8 +133,8 @@ def test_google_client_secret_setup_uses_hidden_input_and_redacted_output(
     manager = Manager()
     monkeypatch.setattr(cli, "ConnectorAuthManager", lambda _vault: manager)
     monkeypatch.setattr(cli, "ConnectorOnboarding", lambda _manager: _Onboarding())
-    monkeypatch.setattr(cli.sys, "stdin", SimpleNamespace(isatty=lambda: True))
-    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: "  transient-secret  ")
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(getpass, "getpass", lambda _prompt: "  transient-secret  ")
 
     assert (
         cli.main(
