@@ -42,6 +42,7 @@ __all__ = [
     "WhatsAppDelta",
     "WhatsAppMessage",
     "WhatsAppStatus",
+    "account_fingerprint",
     "create_whatsapp_ack_token",
     "default_store_root",
     "inspect_whatsapp",
@@ -59,6 +60,7 @@ MAX_HEARTBEAT_AGE_SECONDS = 86_400
 MAX_CURSOR_CHARS = 8_192
 FINGERPRINT_CHARS = 20
 MAX_TIMESTAMP_CHARS = 40
+MAX_ACCOUNT_ID_CHARS = 512
 MAX_CLOCK_SKEW_SECONDS = 300
 CURSOR_VERSION = 2
 ACK_TOKEN_VERSION = 1
@@ -88,6 +90,7 @@ class WhatsAppStatus:
     chats: int | None
     max_rowid: int | None
     newest_message_at: str | None
+    account_fingerprint: str | None
     available: bool
     error: str | None
 
@@ -141,11 +144,14 @@ class WhatsAppDelta:
     complete: bool
     cursor: str
     messages: tuple[WhatsAppMessage, ...]
+    account_fingerprint: str
     store_reconciled: bool = False
     drift: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
-        return {**asdict(self), "messages": [asdict(message) for message in self.messages]}
+        payload = asdict(self)
+        payload.pop("account_fingerprint")
+        return {**payload, "messages": [asdict(message) for message in self.messages]}
 
 
 @dataclass(frozen=True)
@@ -173,6 +179,7 @@ class _StatusEvidence:
     heartbeat_age: float | None
     heartbeat_error: str | None
     newest: str | None
+    account_error: str | None
     query_error: str | None
 
 
@@ -189,6 +196,24 @@ class _Cursor:
 
 def default_store_root() -> Path:
     return Path.home() / ".wacli"
+
+
+def account_fingerprint(linked_identity: str) -> str:
+    """Return one stable digest for a wacli-linked account without retaining its JID."""
+
+    if not isinstance(linked_identity, str):
+        raise ValidationError("standalone WhatsApp account identity is invalid")
+    value = linked_identity.strip().casefold()
+    if not value or len(value) > MAX_ACCOUNT_ID_CHARS or "\x00" in value or "@" not in value:
+        raise ValidationError("standalone WhatsApp account identity is invalid")
+    local, domain = value.rsplit("@", 1)
+    if not local or not domain:
+        raise ValidationError("standalone WhatsApp account identity is invalid")
+    device_separator = local.rfind(":")
+    if device_separator > 0 and local[device_separator + 1 :].isdigit():
+        local = local[:device_separator]
+    canonical = f"{local}@{domain}"
+    return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def resolve_service_label(explicit: str | None = None) -> str:
@@ -217,6 +242,15 @@ def inspect_whatsapp(
     database = root / "wacli.db"
     heartbeat = root / "HEARTBEAT"
     runtime_present = runtime.expanduser().is_file() and os.access(runtime.expanduser(), os.X_OK)
+    account_digest, account_error = (
+        _runtime_account_fingerprint(
+            runtime=runtime,
+            store_root=root,
+            runner=runner,
+        )
+        if runtime_present
+        else (None, None)
+    )
     database_present = _is_regular_file(database)
     process_running = _process_running(runner=runner)
     service_running = _service_running(service_label, runtime=runtime, runner=runner)
@@ -254,6 +288,7 @@ def inspect_whatsapp(
             heartbeat_age=heartbeat_age,
             heartbeat_error=heartbeat_error,
             newest=newest,
+            account_error=account_error,
             query_error=query_error,
         )
     )
@@ -272,6 +307,7 @@ def inspect_whatsapp(
         chats=chats,
         max_rowid=max_rowid,
         newest_message_at=newest,
+        account_fingerprint=account_digest,
         available=error is None,
         error=error,
     )
@@ -298,6 +334,7 @@ def verify_whatsapp_checkpoint(
     )
     if not status.available:
         raise ContinuityError(status.error or "standalone WhatsApp source is unavailable")
+    assert status.account_fingerprint is not None
     database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
     candidate, _reconciled = _reconcile_cursor(prior, status, database)
     assert status.schema is not None and status.generation is not None
@@ -347,6 +384,7 @@ def read_whatsapp_delta(
     )
     if not status.available:
         raise ContinuityError(status.error or "standalone WhatsApp source is unavailable")
+    assert status.account_fingerprint is not None
     drift = _cursor_drift(previous, status)
     database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
     store_reconciled = False
@@ -364,6 +402,7 @@ def read_whatsapp_delta(
             complete=True,
             cursor=next_cursor,
             messages=(),
+            account_fingerprint=status.account_fingerprint,
             store_reconciled=store_reconciled,
             drift=drift,
         )
@@ -385,6 +424,7 @@ def read_whatsapp_delta(
         complete=complete,
         cursor=next_cursor,
         messages=messages,
+        account_fingerprint=status.account_fingerprint,
         store_reconciled=store_reconciled,
         drift=drift,
     )
@@ -417,6 +457,7 @@ def replay_whatsapp_delta(
     )
     if not status.available:
         raise ContinuityError(status.error or "standalone WhatsApp source is unavailable")
+    assert status.account_fingerprint is not None
     _validate_cursor(previous, status)
     assert status.schema is not None and status.generation is not None
     assert status.max_rowid is not None
@@ -460,6 +501,7 @@ def replay_whatsapp_delta(
         complete=complete,
         cursor=target_cursor,
         messages=messages,
+        account_fingerprint=status.account_fingerprint,
         drift=_cursor_drift(previous, status),
     )
 
@@ -801,6 +843,48 @@ def _service_running(label: str, *, runtime: Path, runner: Runner | None) -> boo
     } <= lines
 
 
+def _runtime_account_fingerprint(
+    *,
+    runtime: Path,
+    store_root: Path,
+    runner: Runner | None,
+) -> tuple[str | None, str | None]:
+    run = runner or subprocess.run
+    try:
+        result = run(
+            [
+                runtime.expanduser(),
+                "--read-only",
+                "--json",
+                "--store",
+                str(store_root),
+                "doctor",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "standalone WhatsApp account identity is unavailable"
+    if result.returncode != 0:
+        return None, "standalone WhatsApp account identity is unavailable"
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return None, "standalone WhatsApp account identity is unavailable"
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None, "standalone WhatsApp account identity is unavailable"
+    data = payload.get("data") if isinstance(payload, dict) else None
+    linked_identity = data.get("linked_jid") if isinstance(data, dict) else None
+    if not isinstance(linked_identity, str):
+        return None, "standalone WhatsApp account identity is unavailable"
+    try:
+        return account_fingerprint(linked_identity), None
+    except ValidationError:
+        return None, "standalone WhatsApp account identity is unavailable"
+
+
 def _heartbeat(path: Path, *, now: datetime) -> tuple[datetime | None, float | None, str | None]:
     if not os.path.lexists(path):
         return None, None, "standalone sync heartbeat is absent"
@@ -833,6 +917,8 @@ def _status_error(evidence: _StatusEvidence) -> str | None:
         return "standalone WhatsApp store is unavailable"
     if evidence.query_error:
         return evidence.query_error
+    if evidence.account_error:
+        return evidence.account_error
     if not evidence.service_running:
         suffix = f"; corpus newest message is {evidence.newest}" if evidence.newest else ""
         return "standalone sync service is not running" + suffix

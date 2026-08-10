@@ -135,7 +135,12 @@ def _runtime(root: Path) -> Path:
     return runtime
 
 
-def _runner(runtime: Path) -> Callable[..., subprocess.CompletedProcess[str]]:
+def _runner(
+    runtime: Path,
+    *,
+    linked_jid: str = "15551234567:3@s.whatsapp.net",
+    expected_store_root: Path | None = None,
+) -> Callable[..., subprocess.CompletedProcess[str]]:
     def run(*args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
         command = args[0]
         assert isinstance(command, list)
@@ -143,6 +148,17 @@ def _runner(runtime: Path) -> Callable[..., subprocess.CompletedProcess[str]]:
             return subprocess.CompletedProcess(command, 0, stdout="71\n", stderr="")
         if command[:2] == ["/bin/launchctl", "print"]:
             output = f"state = running\nprogram = {runtime}\nsync\n--follow\n"
+            return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+        if (
+            len(command) == 6
+            and command[:4] == [runtime, "--read-only", "--json", "--store"]
+            and command[-1] == "doctor"
+        ):
+            if expected_store_root is not None:
+                assert Path(command[4]) == expected_store_root.resolve()
+            output = json.dumps(
+                {"data": {"linked_jid": linked_jid}, "error": None, "success": True}
+            )
             return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
         raise AssertionError(f"unexpected status command: {command}")
 
@@ -190,6 +206,9 @@ def _ack(
 ) -> dict[str, Any]:
     delivery_info = cast(dict[str, Any], poll["delivery"])
     exact_refs = result_refs or (_result_ref(delivery.vault, "local-proof"),)
+    arguments: dict[str, Any] = {}
+    if poll["source"] == "apple_messages":
+        arguments["account_binding"] = "local-account:confirmed"
     return delivery.acknowledge(
         cast(str, poll["source"]),
         token=cast(str, delivery_info["token"]),
@@ -197,7 +216,7 @@ def _ack(
         disposition=disposition,
         result_refs=exact_refs,
         actor_ref="codex-task:local-source-proof",
-        account_binding="local-account:confirmed",
+        **arguments,
     )
 
 
@@ -1156,7 +1175,7 @@ def test_whatsapp_delivery_uses_external_companion_without_routing_leaks(tmp_pat
         vault,
         store_root=store,
         whatsapp_runtime=runtime,
-        whatsapp_runner=_runner(runtime),
+        whatsapp_runner=_runner(runtime, expected_store_root=store),
     )
     delivery.baseline("whatsapp")
     _append_whatsapp(database, "bounded WhatsApp body")
@@ -1176,6 +1195,137 @@ def test_whatsapp_delivery_uses_external_companion_without_routing_leaks(tmp_pat
         "provider-media-key",
     ):
         assert private not in durable
+
+
+@_POSIX_STORAGE
+def test_whatsapp_acknowledgement_uses_the_verified_adapter_identity(tmp_path: Path) -> None:
+    vault, _selected = _selected_vault(tmp_path, "whatsapp")
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    delivery = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=_runner(runtime, expected_store_root=store),
+    )
+    delivery.baseline("whatsapp")
+    _append_whatsapp(database, "first bounded body")
+
+    first = delivery.poll("whatsapp")
+    _ack(delivery, first)
+    observation = vault.get_source_snapshot().observation("whatsapp")
+    assert observation is not None
+    assert observation.account_fingerprint == whatsapp_adapter.account_fingerprint(
+        "15551234567@s.whatsapp.net"
+    )
+
+    _append_whatsapp(database, "second bounded body")
+    second = delivery.poll("whatsapp")
+    delivery_info = cast(dict[str, Any], second["delivery"])
+    result_ref = _result_ref(vault, "local-proof")
+
+    changed_identity = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=_runner(runtime, linked_jid="19995550123:1@s.whatsapp.net"),
+    )
+    with pytest.raises(ConflictError, match="changed after polling"):
+        changed_identity.acknowledge(
+            "whatsapp",
+            token=cast(str, delivery_info["token"]),
+            expected_source_revision=cast(str, delivery_info["source_revision"]),
+            disposition="accepted",
+            result_refs=(result_ref,),
+            actor_ref="codex-task:local-source-proof",
+        )
+    blocked = changed_identity.status("whatsapp")
+    assert blocked["pending"] is True
+    assert blocked["source_health"] == "blocked"
+    assert blocked["error_code"] == "identity_mismatch"
+
+    with pytest.raises(ConflictError, match="verified adapter identity"):
+        delivery.acknowledge(
+            "whatsapp",
+            token=cast(str, delivery_info["token"]),
+            expected_source_revision=cast(str, delivery_info["source_revision"]),
+            disposition="accepted",
+            result_refs=(result_ref,),
+            actor_ref="codex-task:local-source-proof",
+            account_binding="19995550123@s.whatsapp.net",
+        )
+    assert delivery.status("whatsapp")["pending"] is True
+
+    accepted = delivery.acknowledge(
+        "whatsapp",
+        token=cast(str, delivery_info["token"]),
+        expected_source_revision=cast(str, delivery_info["source_revision"]),
+        disposition="accepted",
+        result_refs=(result_ref,),
+        actor_ref="codex-task:local-source-proof",
+        account_binding="15551234567:9@s.whatsapp.net",
+    )
+    assert accepted["sequence"] == 2
+
+
+@_POSIX_STORAGE
+def test_whatsapp_completed_ack_retry_does_not_reopen_the_adapter(tmp_path: Path) -> None:
+    vault, _selected = _selected_vault(tmp_path, "whatsapp")
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    delivery = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=_runner(runtime),
+    )
+    delivery.baseline("whatsapp")
+    _append_whatsapp(database, "bounded body")
+    prepared = delivery.poll("whatsapp")
+    _ack(delivery, prepared)
+
+    def unexpected_adapter_call(
+        *_args: object,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("completed acknowledgement retried the adapter")
+
+    retry = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=unexpected_adapter_call,
+    )
+    assert _ack(retry, prepared)["already_acknowledged"] is True
+
+
+@_POSIX_STORAGE
+def test_whatsapp_recipe_limit_is_one_replay_unit_not_a_wake_cap(tmp_path: Path) -> None:
+    vault, _selected = _selected_vault(tmp_path, "whatsapp")
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    delivery = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=_runner(runtime),
+    )
+    delivery.baseline("whatsapp")
+    for index in range(30):
+        _append_whatsapp(database, f"bounded body {index}")
+
+    first = delivery.poll("whatsapp", limit=100)
+    assert len(first["messages"]) == 25
+    assert first["complete"] is False
+    assert cast(dict[str, Any], first["delivery"])["items_observed"] == 25
+    _ack(delivery, first)
+
+    second = delivery.poll("whatsapp", limit=100)
+    assert len(second["messages"]) == 5
+    assert second["complete"] is True
 
 
 @_POSIX_STORAGE
@@ -1517,6 +1667,7 @@ def test_mcp_local_source_contract_marks_poll_and_ack_as_mutating() -> None:
     assert tools["gsv_local_source_adopt_staged"]["annotations"]["readOnlyHint"] is False
     assert tools["gsv_local_source_rebaseline"]["annotations"]["readOnlyHint"] is False
     assert tools["gsv_local_source_acknowledge"]["annotations"]["readOnlyHint"] is False
+    assert "account_binding" not in tools["gsv_local_source_acknowledge"]["inputSchema"]["required"]
     assert "untrusted evidence" in tools["gsv_local_source_poll"]["description"]
     assert "host-local pending token" in tools["gsv_local_source_poll"]["description"]
     assert "sends" in tools["gsv_local_source_poll"]["description"]

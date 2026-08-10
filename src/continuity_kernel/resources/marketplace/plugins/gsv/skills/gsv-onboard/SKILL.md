@@ -125,8 +125,16 @@ boundary and call `gsv_local_source_baseline` once to begin forward-only. Then
 use `gsv_local_source_poll` for the canary. The poll does not advance its
 checkpoint. After the model has written and read back its explicit semantic
 disposition, call `gsv_local_source_acknowledge` with the exact token,
-source-state revision, result references, actor, and confirmed account binding.
+source-state revision, result references, and actor. WhatsApp derives its
+account identity from the read-only adapter; never invent or submit that
+binding. Apple Messages still requires its confirmed local account binding.
 Never import existing message history merely to establish a baseline.
+
+After an upgrade from the legacy WhatsApp binding, the first replay may report
+that its account identity is unverified. Preserve the pending token and host
+checkpoint. CAS-deselect only WhatsApp, then CAS-reselect the same approved
+source set and replay the pending batch. Do not baseline, rebaseline, reset, or
+discard the delivery for this recipe migration.
 
 For selected Discord, read [Discord setup](references/providers/discord.md)
 before asking the person to enable anything. Discord is bot-only: never accept,

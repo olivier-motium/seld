@@ -142,6 +142,19 @@ def _runner(
         if normalized[:2] == ("/bin/launchctl", "print"):
             output = f"state = running\nprogram = {runtime}\nsync\n--follow\n"
             return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+        if (
+            len(normalized) == 6
+            and normalized[0] == str(runtime)
+            and normalized[1:4] == ("--read-only", "--json", "--store")
+            and normalized[5] == "doctor"
+        ):
+            output = json.dumps(
+                {
+                    "success": True,
+                    "data": {"linked_jid": "synthetic-account@s.whatsapp.net"},
+                }
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
         raise AssertionError(f"unexpected passive status command: {normalized}")
 
     return run
@@ -442,8 +455,25 @@ def test_whatsapp_forward_baseline_replays_until_verified_ack(tmp_path: Path) ->
     )
     assert already_covered and repeated == acknowledgement
     assert calls
-    assert {command[0] for command in calls} <= {"/usr/bin/pgrep", "/bin/launchctl"}
-    assert all(command[0] != str(runtime) for command in calls)
+    assert {command[0] for command in calls} <= {
+        "/usr/bin/pgrep",
+        "/bin/launchctl",
+        str(runtime),
+    }
+    runtime_calls = [command for command in calls if command[0] == str(runtime)]
+    assert runtime_calls
+    assert all(
+        command
+        == (
+            str(runtime),
+            "--read-only",
+            "--json",
+            "--store",
+            str(store),
+            "doctor",
+        )
+        for command in runtime_calls
+    )
 
 
 @pytest.mark.parametrize(

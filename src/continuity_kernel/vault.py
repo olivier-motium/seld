@@ -2539,6 +2539,7 @@ class Vault:
         observed_at: datetime | None = None,
         _before_commit: Callable[[SourceSnapshot], datetime] | None = None,
         _after_commit: Callable[[dict[str, Any]], None] | None = None,
+        _account_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         """CAS-record one AI-performed bounded read without provider content."""
 
@@ -2547,6 +2548,10 @@ class Vault:
             result=result,
             tool_binding=tool_binding,
         )
+        if account_binding is not None and _account_fingerprint is not None:
+            raise ValidationError(
+                "source observation cannot receive both an account binding and fingerprint"
+            )
         path = self.root / "SOURCES.md"
         with (
             exclusive_lock(self.state / "locks/global.lock"),
@@ -2575,7 +2580,11 @@ class Vault:
                 result=result,
                 covered_through=covered_through,
                 completeness=completeness,
-                account_fingerprint=source_fingerprint(account_binding, "account binding"),
+                account_fingerprint=(
+                    _account_fingerprint
+                    if _account_fingerprint is not None
+                    else source_fingerprint(account_binding, "account binding")
+                ),
                 host_fingerprint=source_fingerprint(host_id, "host identity"),
                 tool_fingerprint=persisted_tool_fingerprint,
                 cursor_digest=source_fingerprint(cursor, "source cursor"),
