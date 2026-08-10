@@ -90,6 +90,7 @@ from continuity_kernel.resident_context import (
 )
 from continuity_kernel.scheduler import MacOSScheduler, scheduler_dict
 from continuity_kernel.sense_sweep import heartbeat_status, sense_sweep
+from continuity_kernel.slack_tasks import SlackTaskReader
 from continuity_kernel.source_recipes import list_recipes
 from continuity_kernel.source_state import SOURCE_ERROR_CODES
 from continuity_kernel.vault import Vault, doctor_dict
@@ -417,6 +418,39 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return execution_bindings(vault)
     if args.command == "connectors":
         return _connectors(vault, args)
+    if args.command.startswith("slack-"):
+        if args.command == "slack-capabilities":
+            return SlackTaskReader.capabilities()
+        reader = SlackTaskReader(vault, connection_id=args.connection_id)
+        if args.command == "slack-status":
+            return reader.status()
+        if args.command == "slack-poll":
+            return reader.poll(limit=args.limit)
+        if args.command == "slack-search":
+            return reader.search(
+                args.query,
+                max_pages=args.max_pages,
+                max_results=args.max_results,
+                snippet_chars=args.snippet_chars,
+            )
+        if args.command == "slack-inbox":
+            return reader.inbox(
+                since=args.since,
+                max_pages=args.max_pages,
+                max_results=args.max_results,
+                max_conversations=args.max_conversations,
+                messages_per_conversation=args.messages_per_conversation,
+                snippet_chars=args.snippet_chars,
+            )
+        if args.command == "slack-context":
+            return reader.context(
+                args.ref,
+                before=args.before,
+                after=args.after,
+                include_thread=args.include_thread,
+                snippet_chars=args.snippet_chars,
+            )
+        raise AssertionError("unreachable Slack command")
     if args.command == "source":
         if args.source_command == "list":
             return {"catalog": list_recipes(), "state": vault.source_status()}
@@ -1751,6 +1785,57 @@ def _parser() -> argparse.ArgumentParser:
         help="Show honest provider-side revocation steps without taking remote action.",
     )
     connector_revoke.add_argument("connection_id")
+
+    slack_status = commands.add_parser(
+        "slack-status",
+        help="Verify the live identity of one portable Slack connection.",
+    )
+    slack_status.add_argument("--connection-id")
+    slack_capabilities = commands.add_parser(
+        "slack-capabilities",
+        help="Show the bounded task-shaped Slack read interface.",
+    )
+    slack_capabilities.add_argument("--connection-id")
+    slack_poll = commands.add_parser(
+        "slack-poll",
+        help="Read and record one bounded current Slack projection.",
+    )
+    slack_poll.add_argument("--connection-id")
+    slack_poll.add_argument("--limit", type=int, default=25)
+    slack_search = commands.add_parser(
+        "slack-search",
+        help="Search Slack through one exact portable read connection.",
+    )
+    slack_search.add_argument("--connection-id")
+    slack_search.add_argument("--query", required=True)
+    slack_search.add_argument("--max-pages", type=int, default=1)
+    slack_search.add_argument("--max-results", type=int, default=100)
+    slack_search.add_argument("--snippet-chars", type=int, default=320)
+    slack_inbox = commands.add_parser(
+        "slack-inbox",
+        help="Group bounded recent Slack results by conversation.",
+    )
+    slack_inbox.add_argument("--connection-id")
+    slack_inbox.add_argument("--since")
+    slack_inbox.add_argument("--max-pages", type=int, default=2)
+    slack_inbox.add_argument("--max-results", type=int, default=200)
+    slack_inbox.add_argument("--max-conversations", type=int, default=12)
+    slack_inbox.add_argument("--messages-per-conversation", type=int, default=2)
+    slack_inbox.add_argument("--snippet-chars", type=int, default=240)
+    slack_context = commands.add_parser(
+        "slack-context",
+        help="Expand one short-lived opaque reference from Slack search or inbox.",
+    )
+    slack_context.add_argument("--connection-id")
+    slack_context.add_argument("--ref", required=True)
+    slack_context.add_argument("--before", type=int, default=5)
+    slack_context.add_argument("--after", type=int, default=5)
+    slack_context.add_argument(
+        "--include-thread",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    slack_context.add_argument("--snippet-chars", type=int, default=1_000)
 
     source = commands.add_parser(
         "source",
