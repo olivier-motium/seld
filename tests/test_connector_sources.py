@@ -1153,18 +1153,27 @@ class _SuccessOpener:
         return self.response
 
 
-def test_http_boundary_allows_the_exact_slack_history_read(
+def test_http_boundary_allows_exact_slack_conversation_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opener = _SuccessOpener(_JSONResponse(b'{"ok":true,"messages":[]}'))
     monkeypatch.setattr(connector_http, "build_opener", lambda *handlers: opener)
 
+    listing = connector_http.get_json(
+        (
+            "https://slack.com/api/conversations.list?"
+            "exclude_archived=true&limit=50&types=public_channel,private_channel,mpim,im"
+        ),
+        {"Accept": "application/json", "Authorization": "Bearer synthetic"},
+        3.0,
+    )
     result = connector_http.get_json(
         "https://slack.com/api/conversations.history?channel=C123456789&limit=15",
         {"Accept": "application/json", "Authorization": "Bearer synthetic"},
         3.0,
     )
 
+    assert listing == {"ok": True, "messages": []}
     assert result == {"ok": True, "messages": []}
     assert opener.request is not None
     assert opener.request.get_method() == "GET"
