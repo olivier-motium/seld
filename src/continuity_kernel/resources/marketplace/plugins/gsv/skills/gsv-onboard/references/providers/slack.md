@@ -32,6 +32,13 @@ recent conversation window under the exact host-private source policy. A
 successful empty result counts. This bound proves coverage and does not limit
 the separate interactive connector.
 
+Slack's public-client grant rotates every 12 hours. Seld therefore expires a
+Slack source proof after six hours. When a portable Seld Slack connection is
+configured, reprove through that connection rather than substituting a
+host-owned app: the bounded read is also the content-safe access-token refresh
+that preserves the next rotating refresh token. A missed six-hour reproof is
+an authentication incident, not an empty source.
+
 The isolated `gsv_connectors` server exposes `gsv_slack_read` and
 `gsv_slack_write`. It translates only cataloged operations to fixed Slack API
 methods, treats HTTP 200 with `ok:false` as provider failure, and keeps page

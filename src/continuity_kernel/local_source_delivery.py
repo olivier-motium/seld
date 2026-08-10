@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
@@ -845,7 +846,7 @@ class LocalSourceDelivery:
             if self.store_root is not None and self.store_root != recorded.path:
                 raise ConflictError("local source is bound to a different host-local store root")
             current = _store_root_snapshot(recorded.path)
-            if (current.device, current.inode) != (recorded.device, recorded.inode):
+            if not _same_store_root_identity(recorded, current):
                 raise ConflictError("host-local source store root identity changed")
             return recorded.path, None
         if self.store_root is None:
@@ -1403,6 +1404,21 @@ def _store_root_snapshot(path: Path) -> _StoreRootSnapshot:
     if canonical != path or stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise ValidationError("host-local source store root must be one ordinary directory")
     return _StoreRootSnapshot(canonical, int(metadata.st_dev), int(metadata.st_ino))
+
+
+def _same_store_root_identity(
+    recorded: _StoreRootSnapshot,
+    current: _StoreRootSnapshot,
+    *,
+    platform: str | None = None,
+) -> bool:
+    """Keep a directory binding stable across a macOS APFS device renumbering."""
+
+    if recorded.path != current.path or recorded.inode != current.inode:
+        return False
+    if recorded.device == current.device:
+        return True
+    return (platform or sys.platform) == "darwin"
 
 
 def _adapter_binding_bytes(binding: _Binding, snapshot: _StoreRootSnapshot) -> bytes:

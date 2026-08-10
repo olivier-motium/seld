@@ -11,6 +11,12 @@ Discord, use its source status, poll, record, and acknowledge handshake only
 after the sanctioned bot/source binding exists; never accept a user token or
 self-bot route.
 
+For a selected portable Slack connection, use its bounded Seld read whenever
+the six-hour Slack proof expires. Slack rotates public-client credentials every
+12 hours, so substituting a host-owned Slack app would refresh source coverage
+without preserving the portable connection's next refresh token. Treat a
+missed reproof or refresh failure as an authentication incident.
+
 ## Read enough, not an arbitrary amount
 
 Start from the last honest coverage horizon or provider cursor. Prefer a

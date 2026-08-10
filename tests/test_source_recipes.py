@@ -38,9 +38,12 @@ def test_supported_source_set_is_explicit_and_versioned() -> None:
         "whatsapp",
     }
     assert RECIPES["discord"].recipe_version == "2"
-    assert {recipe.recipe_version for source, recipe in RECIPES.items() if source != "discord"} == {
-        "1"
-    }
+    assert RECIPES["slack"].recipe_version == "2"
+    assert {
+        recipe.recipe_version
+        for source, recipe in RECIPES.items()
+        if source not in {"discord", "slack"}
+    } == {"1"}
     assert all(recipe.read_limit > 0 for recipe in RECIPES.values())
     assert all(recipe.proof_ttl.total_seconds() > 0 for recipe in RECIPES.values())
 
@@ -87,6 +90,12 @@ def test_source_zero_has_long_lived_local_capabilities() -> None:
     assert source_zero.identity_capability == "gsv.vault.identity"
     assert source_zero.read_capability == "gsv.context.bounded_read"
     assert source_zero.proof_ttl.days == 30
+
+
+def test_slack_reproofs_before_its_rotating_oauth_token_expires() -> None:
+    slack = get_recipe("slack")
+
+    assert slack.proof_ttl.total_seconds() == 6 * 60 * 60
 
 
 def test_source_recipes_expose_reads_not_sends() -> None:

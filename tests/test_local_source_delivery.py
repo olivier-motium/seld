@@ -20,6 +20,7 @@ from continuity_kernel import (
 from continuity_kernel import (
     codex_integration,
     config,
+    local_source_delivery,
     mcp_server,
 )
 from continuity_kernel import (
@@ -1377,6 +1378,20 @@ def test_host_local_adapter_binding_rejects_wrong_or_replaced_store_root(
     _apple_store(store, old_body="replacement store")
     with pytest.raises(ConflictError, match="store root identity changed"):
         LocalSourceDelivery(vault).status("apple_messages")
+
+
+def test_macos_store_binding_survives_apfs_device_renumbering() -> None:
+    recorded = local_source_delivery._StoreRootSnapshot(Path("/store"), 10, 42)
+    renumbered = local_source_delivery._StoreRootSnapshot(Path("/store"), 11, 42)
+    replaced = local_source_delivery._StoreRootSnapshot(Path("/store"), 11, 43)
+
+    assert local_source_delivery._same_store_root_identity(recorded, renumbered, platform="darwin")
+    assert not local_source_delivery._same_store_root_identity(
+        recorded, renumbered, platform="linux"
+    )
+    assert not local_source_delivery._same_store_root_identity(
+        recorded, replaced, platform="darwin"
+    )
 
 
 @_POSIX_STORAGE
