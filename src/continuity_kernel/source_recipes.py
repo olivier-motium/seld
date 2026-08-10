@@ -232,7 +232,7 @@ RECIPES: Final = {
         _recipe(
             "whatsapp",
             "WhatsApp",
-            version="1",
+            version="2",
             identity="wacli.account.identity",
             read="wacli.messages.recent_read",
             ttl_hours=6,

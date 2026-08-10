@@ -153,6 +153,22 @@ For selected local sources, use their native poll/acknowledge handshake. Keep
 returned bodies transient. A crash or stale CAS replays the same delivery; it
 never skips evidence or silently advances a checkpoint.
 
+Selected WhatsApp is due on every Pulse wake, regardless of its proof TTL or
+current freshness label. Its small poll limit is one replay unit, not a
+per-wake throughput limit. Poll, judge, persist any justified meaning, read it
+back, and acknowledge that exact batch. If the batch is partial, immediately
+poll the next batch and repeat. Continue until the adapter reports complete
+coverage or the seven-minute no-new-acquisition boundary arrives. Each next
+poll is permitted only after the prior acknowledgement succeeds. If time runs
+out, leave the exact remaining delivery pending for the next wake.
+
+WhatsApp derives account identity from the read-only local adapter. Never
+invent or submit an account binding for it. A binding, adapter, replay, or
+acknowledgement failure is a critical source incident. On its first occurrence,
+send one content-free alert to the exact Chief of Staff task in the same wake.
+Carry a compact incident marker in `NOW.md`, and alert again only when the
+failure materially changes or clears.
+
 ## Keep NOW useful
 
 Only the exact resident Pulse writes `NOW.md` autonomously. Near the end of the

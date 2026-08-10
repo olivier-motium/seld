@@ -1975,7 +1975,13 @@ def _parser() -> argparse.ArgumentParser:
     local_source_ack.add_argument("--disposition", choices=("accepted", "rejected"), required=True)
     local_source_ack.add_argument("--result-ref", action="append", required=True)
     local_source_ack.add_argument("--actor-ref", required=True)
-    local_source_ack.add_argument("--account-binding", required=True)
+    local_source_ack.add_argument(
+        "--account-binding",
+        help=(
+            "Required for Apple Messages. WhatsApp derives its account identity from the "
+            "read-only adapter."
+        ),
+    )
     local_source_rebaseline.add_argument("--expected-checkpoint-digest", required=True)
     local_source_rebaseline.add_argument("--expected-sequence", type=int, required=True)
     local_source_rebaseline.add_argument(

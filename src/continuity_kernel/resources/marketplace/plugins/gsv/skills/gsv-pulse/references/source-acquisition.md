@@ -11,6 +11,14 @@ Discord, use its source status, poll, record, and acknowledge handshake only
 after the sanctioned bot/source binding exists; never accept a user token or
 self-bot route.
 
+WhatsApp is the always-on local sense. When selected, check it on every Pulse
+wake even when its stored proof remains fresh. Treat each returned batch as one
+ordered crash-safe replay unit. After its meaning is durably readable,
+acknowledge it and poll again when it is partial. Drain in that order until the
+adapter reports complete coverage or the existing seven-minute acquisition
+boundary stops new work. Do not add an item-count or batch-count stopping rule.
+Never poll batch N+1 before batch N is acknowledged.
+
 For a selected portable Slack connection, use its bounded Seld read whenever
 the six-hour Slack proof expires. Slack rotates public-client credentials every
 12 hours, so substituting a host-owned Slack app would refresh source coverage

@@ -24,6 +24,7 @@ from continuity_kernel import apple_messages, config, whatsapp
 from continuity_kernel.atomic import PinnedPathRoot, open_regular_file, sha256_bytes
 from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
 from continuity_kernel.records import format_time, parse_time
+from continuity_kernel.source_recipes import get_recipe
 from continuity_kernel.source_state import (
     SourceSnapshot,
     source_fingerprint,
@@ -40,7 +41,8 @@ LOCAL_SOURCE_TOOL_BINDINGS: Final = {
 }
 
 STATE_VERSION: Final = 3
-TOKEN_VERSION: Final = 1
+LEGACY_TOKEN_VERSION: Final = 1
+TOKEN_VERSION: Final = 2
 MAX_STATE_BYTES: Final = 96 * 1024
 MAX_TOKEN_BYTES: Final = 48 * 1024
 MAX_CURSOR_CHARS: Final = 8_192
@@ -101,6 +103,7 @@ class _DeliveryToken:
     limit: int
     delivery_digest: str
     adapter_token: str | None
+    account_digest: str | None
 
 
 @dataclass(frozen=True)
@@ -221,7 +224,7 @@ class LocalSourceDelivery:
                     "last_reset": None,
                     "adoption": None,
                 }
-            self._adapter_root(store, binding)
+            store_root, _pending_binding = self._adapter_root(store, binding)
             state, _encoded = self._read_state(store, binding, required=False)
         if state is None:
             return {
@@ -236,7 +239,17 @@ class LocalSourceDelivery:
                 "last_reset": None,
                 "adoption": None,
             }
-        return self._status_dict(state)
+        result = self._status_dict(state)
+        if source == "whatsapp":
+            error_code = self._whatsapp_checkpoint_error(
+                state,
+                binding=binding,
+                store_root=store_root,
+            )
+            if error_code is not None:
+                result["source_health"] = "blocked"
+                result["error_code"] = error_code
+        return result
 
     def baseline(self, source: str) -> dict[str, Any]:
         """Store the current aggregate cursor as a forward-only baseline."""
@@ -424,10 +437,11 @@ class LocalSourceDelivery:
                 token = state.pending_token
             else:
                 snapshot = self._selected_snapshot(source)
+                effective_limit = min(limit, get_recipe(source).read_limit)
                 delta = self._read_delta(
                     source,
                     cursor=state.cursor,
-                    limit=limit,
+                    limit=effective_limit,
                     store_root=store_root,
                 )
                 prepared = self._prepare_token(
@@ -435,7 +449,7 @@ class LocalSourceDelivery:
                     state=state,
                     source_revision=snapshot.revision,
                     delta=delta,
-                    limit=limit,
+                    limit=effective_limit,
                 )
                 token = _encode_token(prepared)
                 state = _Checkpoint(
@@ -612,7 +626,7 @@ class LocalSourceDelivery:
         disposition: str,
         result_refs: tuple[str, ...],
         actor_ref: str,
-        account_binding: str,
+        account_binding: str | None = None,
     ) -> dict[str, Any]:
         """Record the semantic receipt before advancing the host checkpoint."""
 
@@ -620,7 +634,6 @@ class LocalSourceDelivery:
         clean_disposition = _disposition(disposition)
         clean_refs = _result_refs(result_refs)
         actor_digest = _required_fingerprint(actor_ref, "actor reference")
-        account_digest = _required_fingerprint(account_binding, "account binding")
         binding = self._required_binding(source)
         prepared = _decode_token(token, binding)
         if expected_source_revision != prepared.source_revision:
@@ -634,6 +647,21 @@ class LocalSourceDelivery:
                 self._persist_adapter_binding(store, binding, pending_binding)
             token_digest = _digest(token)
             if state.pending_token is None:
+                if source == "whatsapp":
+                    receipt = state.last_receipt
+                    if receipt is None:
+                        raise ConflictError("local source delivery is no longer pending")
+                    account_digest = (
+                        receipt.account_digest
+                        if account_binding is None
+                        else whatsapp.account_fingerprint(account_binding)
+                    )
+                else:
+                    account_digest = self._account_digest(
+                        source,
+                        account_binding=account_binding,
+                        store_root=store_root,
+                    )
                 return self._already_acknowledged(
                     state,
                     token_digest=token_digest,
@@ -645,6 +673,21 @@ class LocalSourceDelivery:
             if state.pending_token != token:
                 raise ConflictError("another local-source delivery is pending")
             self._validate_prepared_state(state, prepared)
+            account_digest = self._account_digest(
+                source,
+                account_binding=account_binding,
+                store_root=store_root,
+            )
+            if source == "whatsapp":
+                if prepared.account_digest is None:
+                    prior = self.vault.get_source_snapshot().observation(source)
+                    if prior is None or prior.account_fingerprint != account_digest:
+                        raise ConflictError(
+                            "legacy WhatsApp delivery lacks a verified account identity; "
+                            "deselect and explicitly select it again"
+                        )
+                elif prepared.account_digest != account_digest:
+                    raise ConflictError("local source account binding changed after polling")
             self._verify_prepared_delivery(
                 prepared,
                 state.cursor,
@@ -754,11 +797,11 @@ class LocalSourceDelivery:
                 result=("explicit_empty" if prepared.items_observed == 0 else "success"),
                 covered_through=prepared.covered_through,
                 completeness=prepared.completeness,
-                account_binding=account_binding,
                 tool_binding=LOCAL_SOURCE_TOOL_BINDINGS[source],
                 cursor=prepared.target_cursor,
                 evidence_refs=evidence_refs,
                 canonical_result_refs=clean_refs,
+                _account_fingerprint=account_digest,
                 _before_commit=prepare_source_commit,
                 _after_commit=finish_source_commit,
             )
@@ -952,6 +995,56 @@ class LocalSourceDelivery:
             runner=self.whatsapp_runner,
         )
 
+    def _account_digest(
+        self,
+        source: str,
+        *,
+        account_binding: str | None,
+        store_root: Path | None,
+    ) -> str:
+        if source == "whatsapp":
+            status = self._inspect(source, store_root=store_root)
+            assert isinstance(status, whatsapp.WhatsAppStatus)
+            if not status.available or status.account_fingerprint is None:
+                raise ContinuityError(
+                    status.error or "standalone WhatsApp account identity is unavailable"
+                )
+            if account_binding is not None:
+                supplied = whatsapp.account_fingerprint(account_binding)
+                if supplied != status.account_fingerprint:
+                    raise ConflictError(
+                        "local source account binding does not match the verified adapter identity"
+                    )
+            return status.account_fingerprint
+        if account_binding is None:
+            raise ValidationError("Apple Messages acknowledgement requires an account binding")
+        return _required_fingerprint(account_binding, "account binding")
+
+    def _whatsapp_checkpoint_error(
+        self,
+        state: _Checkpoint,
+        *,
+        binding: _Binding,
+        store_root: Path | None,
+    ) -> str | None:
+        status = self._inspect("whatsapp", store_root=store_root)
+        assert isinstance(status, whatsapp.WhatsAppStatus)
+        if not status.available or status.account_fingerprint is None:
+            return "adapter_unavailable"
+        expected = state.last_receipt.account_digest if state.last_receipt is not None else None
+        if state.pending_token is not None:
+            prepared = _decode_token(
+                state.pending_token,
+                binding,
+            )
+            if prepared.account_digest is not None:
+                expected = prepared.account_digest
+            elif expected is None:
+                return "identity_unverified"
+        if expected is not None and expected != status.account_fingerprint:
+            return "identity_mismatch"
+        return None
+
     def _verify_prior_checkpoint(
         self,
         source: str,
@@ -1067,6 +1160,9 @@ class LocalSourceDelivery:
             limit=limit,
             delivery_digest=_delta_digest(delta),
             adapter_token=adapter_token,
+            account_digest=(
+                delta.account_fingerprint if isinstance(delta, whatsapp.WhatsAppDelta) else None
+            ),
         )
 
     def _validate_prepared_state(self, state: _Checkpoint, prepared: _DeliveryToken) -> None:
@@ -1082,6 +1178,12 @@ class LocalSourceDelivery:
         prepared: _DeliveryToken,
         delta: apple_messages.AppleMessagesDelta | whatsapp.WhatsAppDelta,
     ) -> None:
+        if (
+            isinstance(delta, whatsapp.WhatsAppDelta)
+            and prepared.account_digest is not None
+            and delta.account_fingerprint != prepared.account_digest
+        ):
+            raise ConflictError("local source account binding changed after polling")
         if delta.cursor != prepared.target_cursor or len(delta.messages) != prepared.items_observed:
             raise ContinuityError("local source content changed after polling")
         if prepared.adapter_token is None and _delta_digest(delta) != prepared.delivery_digest:
@@ -1638,6 +1740,9 @@ def _decode_token(token: str, binding: _Binding) -> _DeliveryToken:
         "delivery_digest",
         "adapter_token",
     }
+    version = payload.get("version") if isinstance(payload, dict) else None
+    if version == TOKEN_VERSION:
+        expected.add("account_digest")
     if not isinstance(payload, dict) or set(payload) != expected:
         raise ValidationError("local source delivery token is invalid")
     canonical = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
@@ -1653,7 +1758,8 @@ def _decode_token(token: str, binding: _Binding) -> _DeliveryToken:
 
 
 def _token_payload(payload: dict[str, Any]) -> _DeliveryToken:
-    if payload.get("version") != TOKEN_VERSION:
+    version = payload.get("version")
+    if version not in {LEGACY_TOKEN_VERSION, TOKEN_VERSION}:
         raise ValidationError("local source delivery token is invalid")
     strings = (
         "source",
@@ -1674,6 +1780,7 @@ def _token_payload(payload: dict[str, Any]) -> _DeliveryToken:
     items = payload.get("items_observed")
     limit = payload.get("limit")
     adapter_token = payload.get("adapter_token")
+    account_digest = payload.get("account_digest") if version == TOKEN_VERSION else None
     target_cursor = cast(str, payload["target_cursor"])
     if (
         type(sequence) is not int
@@ -1684,6 +1791,7 @@ def _token_payload(payload: dict[str, Any]) -> _DeliveryToken:
         or not 1 <= limit <= 100
         or len(target_cursor) > MAX_CURSOR_CHARS
         or (adapter_token is not None and not isinstance(adapter_token, str))
+        or (account_digest is not None and _SHA256.fullmatch(account_digest) is None)
         or (items > 0) != (adapter_token is not None)
         or cast(str, payload["completeness"]) not in {"complete", "partial"}
         or _REVISION.fullmatch(cast(str, payload["source_revision"])) is None
@@ -1692,6 +1800,8 @@ def _token_payload(payload: dict[str, Any]) -> _DeliveryToken:
             for name in ("checkpoint_digest", "target_cursor_digest", "delivery_digest")
         )
     ):
+        raise ValidationError("local source delivery token is invalid")
+    if version == TOKEN_VERSION and (source == "whatsapp") != (account_digest is not None):
         raise ValidationError("local source delivery token is invalid")
     parse_time(cast(str, payload["observed_at"]))
     parse_time(cast(str, payload["covered_through"]))
@@ -1710,6 +1820,7 @@ def _token_payload(payload: dict[str, Any]) -> _DeliveryToken:
         limit=limit,
         delivery_digest=cast(str, payload["delivery_digest"]),
         adapter_token=adapter_token,
+        account_digest=cast(str | None, account_digest),
     )
 
 

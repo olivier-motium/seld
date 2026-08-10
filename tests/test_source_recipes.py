@@ -39,10 +39,11 @@ def test_supported_source_set_is_explicit_and_versioned() -> None:
     }
     assert RECIPES["discord"].recipe_version == "2"
     assert RECIPES["slack"].recipe_version == "2"
+    assert RECIPES["whatsapp"].recipe_version == "2"
     assert {
         recipe.recipe_version
         for source, recipe in RECIPES.items()
-        if source not in {"discord", "slack"}
+        if source not in {"discord", "slack", "whatsapp"}
     } == {"1"}
     assert all(recipe.read_limit > 0 for recipe in RECIPES.values())
     assert all(recipe.proof_ttl.total_seconds() > 0 for recipe in RECIPES.values())
