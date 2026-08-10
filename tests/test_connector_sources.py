@@ -890,7 +890,7 @@ def test_provider_auth_rejection_requires_reauthorization_before_retry(
     assert provider_calls == 1
 
 
-def test_slack_reads_one_exact_channel_with_portable_user_oauth(
+def test_slack_reads_recent_messages_across_visible_conversations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -901,11 +901,13 @@ def test_slack_reads_one_exact_channel_with_portable_user_oauth(
         marker="m",
     )
     channel_id = "C123456789"
+    dm_id = "D123456789"
+    unavailable_dm_id = "D987654321"
     team_id = "T123456789"
     user_id = "U123456789"
-    slack_timestamp = f"{int(BASE_TIME.timestamp())}.000001"
+    channel_timestamp = f"{int(BASE_TIME.timestamp())}.000001"
+    dm_timestamp = f"{int(BASE_TIME.timestamp()) + 1}.000001"
     calls: list[str] = []
-    monkeypatch.setenv("SLACK_CHANNEL_ID", channel_id)
     monkeypatch.setenv("SLACK_TOKEN", "ambient-token-must-not-be-used")
 
     def get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
@@ -915,11 +917,27 @@ def test_slack_reads_one_exact_channel_with_portable_user_oauth(
         parsed = urlsplit(url)
         if parsed.path == "/api/auth.test":
             return {"ok": True, "team_id": team_id, "user_id": user_id}
-        if parsed.path == "/api/conversations.history":
+        if parsed.path == "/api/conversations.list":
             assert parse_qs(parsed.query) == {
-                "channel": [channel_id],
-                "limit": ["15"],
+                "exclude_archived": ["true"],
+                "limit": ["50"],
+                "types": ["public_channel,private_channel,mpim,im"],
             }
+            return {
+                "ok": True,
+                "channels": [
+                    {"id": channel_id},
+                    {"id": dm_id},
+                    {"id": unavailable_dm_id},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+        if parsed.path == "/api/conversations.history":
+            query = parse_qs(parsed.query)
+            assert query["limit"] == ["1"]
+            if query["channel"] == [unavailable_dm_id]:
+                return {"ok": False, "error": "channel_not_found"}
+            timestamp = dm_timestamp if query["channel"] == [dm_id] else channel_timestamp
             return {
                 "ok": True,
                 "messages": [
@@ -927,11 +945,11 @@ def test_slack_reads_one_exact_channel_with_portable_user_oauth(
                         "type": "message",
                         "user": user_id,
                         "text": "x" * 600,
-                        "ts": slack_timestamp,
+                        "ts": timestamp,
                     }
                 ],
-                "has_more": True,
-                "response_metadata": {"next_cursor": "private-cursor"},
+                "has_more": False,
+                "response_metadata": {"next_cursor": ""},
             }
         pytest.fail("unexpected fixed Slack endpoint")
 
@@ -946,23 +964,25 @@ def test_slack_reads_one_exact_channel_with_portable_user_oauth(
 
     assert delivery["result"] == "success"
     items = cast(list[dict[str, object]], delivery["items"])
-    assert len(items) == 1
+    assert len(items) == 2
     assert items[0]["text"] == "x" * 500
-    assert items[0]["timestamp"] == "2026-07-30T09:00:00.000001Z"
+    assert items[0]["timestamp"] == "2026-07-30T09:00:01.000001Z"
     assert str(items[0]["channelRef"]).startswith("sha256:")
     assert str(items[0]["authorRef"]).startswith("sha256:")
     record = cast(dict[str, object], delivery["record"])
     assert record["completeness"] == "partial"
-    assert len(calls) == 2
+    assert len(calls) == 5
     serialized_delivery = json.dumps(delivery, sort_keys=True)
     for private_value in (
         TOKEN,
         "ambient-token-must-not-be-used",
         channel_id,
+        dm_id,
+        unavailable_dm_id,
         team_id,
         user_id,
-        slack_timestamp,
-        "private-cursor",
+        channel_timestamp,
+        dm_timestamp,
     ):
         assert private_value not in serialized_delivery
     _record_delivery(vault, delivery)
@@ -1034,6 +1054,12 @@ def test_slack_history_error_and_credential_rotation_fail_closed(
         del headers, timeout
         if url.endswith("/auth.test"):
             return {"ok": True, "team_id": "T123456789", "user_id": "U123456789"}
+        if "/conversations.list?" in url:
+            return {
+                "ok": True,
+                "channels": [{"id": "C123456789"}],
+                "response_metadata": {"next_cursor": ""},
+            }
         history_calls += 1
         return {"ok": False, "error": "missing_scope"}
 
@@ -1127,18 +1153,27 @@ class _SuccessOpener:
         return self.response
 
 
-def test_http_boundary_allows_the_exact_slack_history_read(
+def test_http_boundary_allows_exact_slack_conversation_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opener = _SuccessOpener(_JSONResponse(b'{"ok":true,"messages":[]}'))
     monkeypatch.setattr(connector_http, "build_opener", lambda *handlers: opener)
 
+    listing = connector_http.get_json(
+        (
+            "https://slack.com/api/conversations.list?"
+            "exclude_archived=true&limit=50&types=public_channel,private_channel,mpim,im"
+        ),
+        {"Accept": "application/json", "Authorization": "Bearer synthetic"},
+        3.0,
+    )
     result = connector_http.get_json(
         "https://slack.com/api/conversations.history?channel=C123456789&limit=15",
         {"Accept": "application/json", "Authorization": "Bearer synthetic"},
         3.0,
     )
 
+    assert listing == {"ok": True, "messages": []}
     assert result == {"ok": True, "messages": []}
     assert opener.request is not None
     assert opener.request.get_method() == "GET"

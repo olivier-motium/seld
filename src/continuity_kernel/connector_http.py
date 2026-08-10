@@ -27,6 +27,7 @@ _GRAPH_ME: Final = "/v1.0/me"
 _GRAPH_MESSAGES: Final = "/v1.0/me/messages"
 _GRAPH_CALENDAR_VIEW: Final = "/v1.0/me/calendar/calendarView"
 _SLACK_AUTH_TEST: Final = "/api/auth.test"
+_SLACK_CONVERSATIONS_LIST: Final = "/api/conversations.list"
 _SLACK_CONVERSATIONS_HISTORY: Final = "/api/conversations.history"
 
 JsonGetter = Callable[[str, Mapping[str, str], float], object]
@@ -202,6 +203,8 @@ def _allowed_query_keys(host: str, path: str) -> frozenset[str] | None:
     if host == "slack.com":
         if path == _SLACK_AUTH_TEST:
             return frozenset()
+        if path == _SLACK_CONVERSATIONS_LIST:
+            return frozenset({"exclude_archived", "limit", "types"})
         if path == _SLACK_CONVERSATIONS_HISTORY:
             return frozenset({"channel", "limit"})
     return None

@@ -126,9 +126,10 @@ RECIPES: Final = {
         _recipe(
             "slack",
             "Slack",
-            version="1",
+            version="2",
             identity="slack.workspace.identity",
             read="slack.messages.recent_read",
+            ttl_hours=6,
         ),
         _recipe(
             "teams",

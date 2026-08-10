@@ -27,10 +27,19 @@ a public Slack client registration, sign-in stops and saves nothing.
 ## Verify the source
 
 Use `gsv connectors status slack`, confirm the expected workspace and member,
-then use the narrow `gsv_connector_source_read` Pulse path for one bounded
-recent conversation window under the exact host-private source policy. A
+then use the narrow `gsv_connector_source_read` Pulse path. It lists the
+authorized public channels, private channels, group messages, and direct
+messages and returns the newest bounded cross-conversation slice under the
+exact host-private source policy. It never depends on an ambient channel ID. A
 successful empty result counts. This bound proves coverage and does not limit
 the separate interactive connector.
+
+Slack's public-client grant rotates every 12 hours. Seld therefore expires a
+Slack source proof after six hours. When a portable Seld Slack connection is
+configured, reprove through that connection rather than substituting a
+host-owned app: the bounded read is also the content-safe access-token refresh
+that preserves the next rotating refresh token. A missed six-hour reproof is
+an authentication incident, not an empty source.
 
 The isolated `gsv_connectors` server exposes `gsv_slack_read` and
 `gsv_slack_write`. It translates only cataloged operations to fixed Slack API
