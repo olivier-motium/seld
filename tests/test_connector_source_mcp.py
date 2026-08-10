@@ -34,12 +34,14 @@ def test_connector_reader_mcp_is_finite_and_not_a_credentialed_proxy(
         connection_id: str,
         source_id: str,
         limit: int,
+        timeout_seconds: float,
     ) -> dict[str, object]:
         observed.update(
             {
                 "connection_id": connection_id,
                 "limit": limit,
                 "source": source_id,
+                "timeout": timeout_seconds,
                 "vault": observed_vault,
             }
         )
@@ -60,8 +62,20 @@ def test_connector_reader_mcp_is_finite_and_not_a_credentialed_proxy(
         "connection_id": "con-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "limit": 3,
         "source": "gmail",
+        "timeout": 15.0,
         "vault": vault,
     }
+
+    mcp_server._call(
+        "gsv_connector_source_read",
+        {
+            "connection_id": "con-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source": "slack",
+            "limit": 25,
+        },
+        vault=vault,
+    )
+    assert observed["timeout"] == 45.0
 
     with pytest.raises(ValidationError, match="unknown field url"):
         mcp_server._call(

@@ -323,11 +323,13 @@ def _call(
     if name == "gsv_connection_list":
         return ConnectorAuthManager(vault).status()
     if name == "gsv_connector_source_read":
+        source_id = _string(values, "source")
         return read_connector_source(
             vault,
             connection_id=_string(values, "connection_id"),
-            source_id=_string(values, "source"),
+            source_id=source_id,
             limit=_integer(values, "limit", 5),
+            timeout_seconds=45.0 if source_id == "slack" else 15.0,
         )
     if name == "gsv_source_select":
         return vault.select_sources(
