@@ -63,7 +63,11 @@ Use one setup wave:
    zero and keep it selected whenever the person is onboarding this vault. If
    the Seld MCP tools are missing in the current task, use the installed local
    `gsv --vault <exact-root>` CLI against the same vault; absence from one task
-   is not evidence that the Mind was uninstalled or lost. Then show one
+   is not evidence that the Mind was uninstalled or lost. Check `gsv codex
+   status` before diagnosing a provider or OAuth failure. A false `ready`
+   value is a Codex registration failure: repair it only through `gsv codex
+   install`, verify `ready: true`, and never register the repository template
+   marketplace directly. Then show one
    combined checklist for the selected ChatGPT apps, custom MCP apps, local
    read tools, and required host-OS permissions.
 2. Let the person complete OAuth, credentials, 2FA, legal terms, administrator
@@ -126,15 +130,17 @@ use `gsv_local_source_poll` for the canary. The poll does not advance its
 checkpoint. After the model has written and read back its explicit semantic
 disposition, call `gsv_local_source_acknowledge` with the exact token,
 source-state revision, result references, and actor. WhatsApp derives its
-account identity from the read-only adapter; never invent or submit that
-binding. Apple Messages still requires its confirmed local account binding.
+account identity from the read-only adapter. Apple Messages derives an opaque
+identity from its read-only local store. Never invent or submit an account
+binding for either source.
 Never import existing message history merely to establish a baseline.
 
-After an upgrade from the legacy WhatsApp binding, the first replay may report
-that its account identity is unverified. Preserve the pending token and host
-checkpoint. CAS-deselect only WhatsApp, then CAS-reselect the same approved
-source set and replay the pending batch. Do not baseline, rebaseline, reset, or
-discard the delivery for this recipe migration.
+After an upgrade from a legacy Apple Messages or WhatsApp binding, the first
+replay may report that its account identity is unverified or changed. Preserve
+the pending token and host checkpoint. CAS-deselect only that local source,
+then CAS-reselect the same approved source set and replay the pending batch.
+Do not baseline, rebaseline, reset, or discard the delivery for this recipe
+migration.
 
 For selected Discord, read [Discord setup](references/providers/discord.md)
 before asking the person to enable anything. Discord is bot-only: never accept,

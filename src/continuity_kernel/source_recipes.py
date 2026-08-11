@@ -199,7 +199,7 @@ RECIPES: Final = {
         _recipe(
             "apple_messages",
             "Apple Messages",
-            version="1",
+            version="2",
             identity="apple.messages.identity",
             read="apple.messages.recent_read",
             ttl_hours=6,

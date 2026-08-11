@@ -155,6 +155,7 @@ document CAS.
 
 ```bash
 gsv doctor
+gsv codex status
 gsv demo
 gsv bridge status
 ```
@@ -162,6 +163,11 @@ gsv bridge status
 `gsv demo` creates and removes an isolated temporary synthetic vault. It does
 not read the configured vault. `gsv` with no arguments opens the Bridge for the
 configured vault.
+
+`gsv codex status` must report `ready: true`. Install or repair the Codex
+integration only with `gsv codex install`; never register the repository's
+template marketplace directly because its runtime placeholders are resolved
+only in the installer-owned generated marketplace.
 
 Restart the ChatGPT desktop app after first setup so the new marketplace, plugin, and managed
 instructions are loaded.
