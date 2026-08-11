@@ -547,7 +547,6 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 disposition=args.disposition,
                 result_refs=tuple(args.result_ref),
                 actor_ref=args.actor_ref,
-                account_binding=args.account_binding,
             )
         raise AssertionError("unreachable local source command")
     if args.command == "signal":
@@ -1975,13 +1974,6 @@ def _parser() -> argparse.ArgumentParser:
     local_source_ack.add_argument("--disposition", choices=("accepted", "rejected"), required=True)
     local_source_ack.add_argument("--result-ref", action="append", required=True)
     local_source_ack.add_argument("--actor-ref", required=True)
-    local_source_ack.add_argument(
-        "--account-binding",
-        help=(
-            "Required for Apple Messages. WhatsApp derives its account identity from the "
-            "read-only adapter."
-        ),
-    )
     local_source_rebaseline.add_argument("--expected-checkpoint-digest", required=True)
     local_source_rebaseline.add_argument("--expected-sequence", type=int, required=True)
     local_source_rebaseline.add_argument(

@@ -473,7 +473,6 @@ def test_fresh_mcp_process_rejects_fields_outside_new_read_surface_schemas(
         (
             "gsv_local_source_acknowledge",
             {
-                "account_binding": "synthetic-account",
                 "actor_ref": "codex:synthetic",
                 "disposition": "accepted",
                 "expected_source_revision": "absent",

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
+import plistlib
 import sqlite3
 import stat
 import subprocess
 import sys
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -26,14 +29,14 @@ from continuity_kernel import (
 from continuity_kernel import (
     whatsapp as whatsapp_adapter,
 )
-from continuity_kernel.atomic import PinnedPathRoot
+from continuity_kernel.atomic import PinnedPathRoot, sha256_bytes
 from continuity_kernel.errors import ConflictError, ContinuityError, NotFoundError, ValidationError
 from continuity_kernel.local_source_delivery import (
     LocalSourceDelivery,
     _Binding,
     _Checkpoint,
 )
-from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
+from continuity_kernel.source_state import ABSENT_SOURCE_REVISION, source_fingerprint
 from continuity_kernel.vault import Vault
 
 _POSIX_STORAGE = pytest.mark.skipif(
@@ -41,6 +44,17 @@ _POSIX_STORAGE = pytest.mark.skipif(
 )
 
 APPLE_TEST_TIMESTAMP = 800_000_000
+
+
+@pytest.fixture(autouse=True)
+def apple_account_preferences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    preferences = tmp_path / "com.apple.imservice.ids.iMessage.plist"
+    preferences.write_bytes(plistlib.dumps({"ActiveAccounts": ["test-active-account"]}))
+    monkeypatch.setattr(apple_adapter, "default_account_preferences", lambda: preferences)
+    return preferences
 
 
 def _apple_store(root: Path, *, old_body: str = "already covered") -> Path:
@@ -181,6 +195,22 @@ def _state_path() -> Path:
     return paths[0]
 
 
+def _legacy_delivery_token(token: str) -> str:
+    encoded = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+    envelope = json.loads(encoded.decode("ascii"))
+    payload = cast(dict[str, Any], envelope["payload"])
+    payload["version"] = local_source_delivery.LEGACY_TOKEN_VERSION
+    payload.pop("account_digest")
+    canonical = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    envelope["digest"] = sha256_bytes(("seld-local-source-delivery-v1\0" + canonical).encode())
+    result = base64.urlsafe_b64encode(
+        json.dumps(envelope, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
+            "ascii"
+        )
+    ).decode("ascii")
+    return result.rstrip("=")
+
+
 def _result_ref(vault: Vault, identifier: str) -> str:
     try:
         task = vault.get_task(identifier)
@@ -206,9 +236,6 @@ def _ack(
 ) -> dict[str, Any]:
     delivery_info = cast(dict[str, Any], poll["delivery"])
     exact_refs = result_refs or (_result_ref(delivery.vault, "local-proof"),)
-    arguments: dict[str, Any] = {}
-    if poll["source"] == "apple_messages":
-        arguments["account_binding"] = "local-account:confirmed"
     return delivery.acknowledge(
         cast(str, poll["source"]),
         token=cast(str, delivery_info["token"]),
@@ -216,7 +243,6 @@ def _ack(
         disposition=disposition,
         result_refs=exact_refs,
         actor_ref="codex-task:local-source-proof",
-        **arguments,
     )
 
 
@@ -311,6 +337,118 @@ def test_forward_baseline_discard_replay_and_semantic_ack_are_content_free(
 
 
 @_POSIX_STORAGE
+def test_apple_identity_is_code_owned_opaque_and_blocks_account_drift(
+    tmp_path: Path,
+    apple_account_preferences: Path,
+) -> None:
+    private_account = "private-apple-account@example.test"
+    apple_account_preferences.write_bytes(plistlib.dumps({"ActiveAccounts": [private_account]}))
+    vault, _selected = _selected_vault(tmp_path, "apple_messages")
+    store = tmp_path / "Messages"
+    database = _apple_store(store)
+    delivery = LocalSourceDelivery(vault, store_root=store)
+    delivery.baseline("apple_messages")
+    _append_apple(database, "prepared body")
+
+    prepared = delivery.poll("apple_messages")
+    serialized = json.dumps(prepared, ensure_ascii=True)
+    assert private_account not in serialized
+    assert private_account.encode() not in _state_path().read_bytes()
+
+    apple_account_preferences.write_bytes(
+        plistlib.dumps({"ActiveAccounts": ["different-private-apple-account@example.test"]})
+    )
+    with pytest.raises(ConflictError, match="changed after polling"):
+        _ack(delivery, prepared)
+
+    blocked = delivery.status("apple_messages")
+    assert blocked["pending"] is True
+    assert blocked["sequence"] == 0
+    assert blocked["source_health"] == "blocked"
+    assert blocked["error_code"] == "identity_mismatch"
+    assert vault.get_source_snapshot().observation("apple_messages") is None
+
+
+@_POSIX_STORAGE
+def test_apple_completed_ack_retry_does_not_reopen_the_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, _selected = _selected_vault(tmp_path, "apple_messages")
+    store = tmp_path / "Messages"
+    database = _apple_store(store)
+    delivery = LocalSourceDelivery(vault, store_root=store)
+    delivery.baseline("apple_messages")
+    _append_apple(database, "bounded body")
+    prepared = delivery.poll("apple_messages")
+    _ack(delivery, prepared)
+
+    def unexpected_adapter_call(**_kwargs: object) -> object:
+        raise AssertionError("completed acknowledgement retried the adapter")
+
+    monkeypatch.setattr(apple_adapter, "inspect_apple_messages", unexpected_adapter_call)
+    assert _ack(delivery, prepared)["already_acknowledged"] is True
+
+
+@_POSIX_STORAGE
+def test_legacy_apple_delivery_survives_exact_reselection_migration(tmp_path: Path) -> None:
+    vault, selected = _selected_vault(tmp_path, "apple_messages")
+    store = tmp_path / "Messages"
+    database = _apple_store(store)
+    delivery = LocalSourceDelivery(vault, store_root=store)
+    legacy_observation = vault.record_source_observation(
+        expected_revision=cast(str, selected["revision"]),
+        source_id="apple_messages",
+        actor_ref="legacy-pulse",
+        result="explicit_empty",
+        covered_through=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        completeness="complete",
+        account_binding="apple-messages:local-profile:test",
+        tool_binding="legacy.apple-messages.read.v1",
+    )
+    delivery.baseline("apple_messages")
+    _append_apple(database, "legacy pending body")
+    prepared = delivery.poll("apple_messages")
+    delivery_info = cast(dict[str, Any], prepared["delivery"])
+    legacy_token = _legacy_delivery_token(cast(str, delivery_info["token"]))
+    binding = delivery._required_binding("apple_messages")
+    with delivery._locked_storage(binding, create=True) as checkpoint_store:
+        assert checkpoint_store is not None
+        state, state_bytes = delivery._read_state(checkpoint_store, binding, required=True)
+        assert state is not None and state_bytes is not None
+        delivery._write_state(
+            checkpoint_store,
+            binding,
+            replace(state, pending_token=legacy_token),
+            expected=state_bytes,
+        )
+    delivery_info["token"] = legacy_token
+
+    with pytest.raises(ConflictError, match="legacy Apple Messages delivery"):
+        _ack(delivery, prepared)
+    assert delivery.status("apple_messages")["pending"] is True
+
+    deselected = vault.select_sources(
+        expected_revision=cast(str, legacy_observation["revision"]),
+        sources=(),
+    )
+    vault.select_sources(
+        expected_revision=cast(str, deselected["revision"]),
+        sources=("apple_messages",),
+    )
+    acknowledged = _ack(delivery, prepared)
+
+    assert acknowledged["sequence"] == 1
+    assert delivery.status("apple_messages")["pending"] is False
+    observation = vault.get_source_snapshot().observation("apple_messages")
+    assert observation is not None
+    assert observation.account_fingerprint != source_fingerprint(
+        "apple-messages:local-profile:test",
+        "account binding",
+    )
+
+
+@_POSIX_STORAGE
 def test_ack_rejects_noncanonical_result_reference_before_any_persistence(
     tmp_path: Path,
 ) -> None:
@@ -332,7 +470,6 @@ def test_ack_rejects_noncanonical_result_reference_before_any_persistence(
             disposition="accepted",
             result_refs=(marker,),
             actor_ref="codex-task:local-source-proof",
-            account_binding="local-account:confirmed",
         )
 
     assert _state_path().read_bytes() == before
@@ -515,7 +652,6 @@ def test_receipt_recovery_requires_exact_semantics_even_after_result_record_adva
             disposition="accepted",
             result_refs=(result_ref,),
             actor_ref="codex-task:original-receipt",
-            account_binding="local-account:original",
         )
 
     advanced = vault.update_task(
@@ -527,12 +663,11 @@ def test_receipt_recovery_requires_exact_semantics_even_after_result_record_adva
     assert advanced.revision != result_task.revision
 
     changed_attempts = (
-        ("rejected", (result_ref,), "codex-task:original-receipt", "local-account:original"),
-        ("accepted", (alternate_ref,), "codex-task:original-receipt", "local-account:original"),
-        ("accepted", (result_ref,), "codex-task:changed-receipt", "local-account:original"),
-        ("accepted", (result_ref,), "codex-task:original-receipt", "local-account:changed"),
+        ("rejected", (result_ref,), "codex-task:original-receipt"),
+        ("accepted", (alternate_ref,), "codex-task:original-receipt"),
+        ("accepted", (result_ref,), "codex-task:changed-receipt"),
     )
-    for disposition, refs, actor_ref, account_binding in changed_attempts:
+    for disposition, refs, actor_ref in changed_attempts:
         with pytest.raises(ConflictError, match="exact prepared receipt"):
             LocalSourceDelivery(vault, store_root=store).acknowledge(
                 "apple_messages",
@@ -541,7 +676,6 @@ def test_receipt_recovery_requires_exact_semantics_even_after_result_record_adva
                 disposition=disposition,
                 result_refs=refs,
                 actor_ref=actor_ref,
-                account_binding=account_binding,
             )
         assert LocalSourceDelivery(vault, store_root=store).status("apple_messages")["pending"]
 
@@ -552,7 +686,6 @@ def test_receipt_recovery_requires_exact_semantics_even_after_result_record_adva
         disposition="accepted",
         result_refs=(result_ref,),
         actor_ref="codex-task:original-receipt",
-        account_binding="local-account:original",
     )
 
     assert recovered["already_acknowledged"] is False
@@ -1141,7 +1274,6 @@ def test_token_is_bound_to_exact_vault_root_host_and_checkpoint(
             disposition="accepted",
             result_refs=("task:root-proof@revision",),
             actor_ref="actor",
-            account_binding="account",
         )
 
     monkeypatch.setattr(
@@ -1161,7 +1293,6 @@ def test_token_is_bound_to_exact_vault_root_host_and_checkpoint(
             disposition="accepted",
             result_refs=("task:token-proof@revision",),
             actor_ref="actor",
-            account_binding="account",
         )
 
 
@@ -1245,18 +1376,6 @@ def test_whatsapp_acknowledgement_uses_the_verified_adapter_identity(tmp_path: P
     assert blocked["source_health"] == "blocked"
     assert blocked["error_code"] == "identity_mismatch"
 
-    with pytest.raises(ConflictError, match="verified adapter identity"):
-        delivery.acknowledge(
-            "whatsapp",
-            token=cast(str, delivery_info["token"]),
-            expected_source_revision=cast(str, delivery_info["source_revision"]),
-            disposition="accepted",
-            result_refs=(result_ref,),
-            actor_ref="codex-task:local-source-proof",
-            account_binding="19995550123@s.whatsapp.net",
-        )
-    assert delivery.status("whatsapp")["pending"] is True
-
     accepted = delivery.acknowledge(
         "whatsapp",
         token=cast(str, delivery_info["token"]),
@@ -1264,7 +1383,6 @@ def test_whatsapp_acknowledgement_uses_the_verified_adapter_identity(tmp_path: P
         disposition="accepted",
         result_refs=(result_ref,),
         actor_ref="codex-task:local-source-proof",
-        account_binding="15551234567:9@s.whatsapp.net",
     )
     assert accepted["sequence"] == 2
 
@@ -1402,6 +1520,9 @@ def test_fresh_cli_custom_store_is_visible_to_generated_manifest_mcp_process(
     database = _apple_store(store)
     isolated_home = tmp_path / "home"
     _apple_store(isolated_home / "Library/Messages", old_body="wrong synthetic store")
+    preferences = isolated_home / "Library/Preferences/com.apple.imservice.ids.iMessage.plist"
+    preferences.parent.mkdir(parents=True)
+    preferences.write_bytes(plistlib.dumps({"ActiveAccounts": ["test-active-account"]}))
     monkeypatch.setenv("HOME", str(isolated_home))
     environment = os.environ.copy()
     command = [
@@ -1667,7 +1788,9 @@ def test_mcp_local_source_contract_marks_poll_and_ack_as_mutating() -> None:
     assert tools["gsv_local_source_adopt_staged"]["annotations"]["readOnlyHint"] is False
     assert tools["gsv_local_source_rebaseline"]["annotations"]["readOnlyHint"] is False
     assert tools["gsv_local_source_acknowledge"]["annotations"]["readOnlyHint"] is False
-    assert "account_binding" not in tools["gsv_local_source_acknowledge"]["inputSchema"]["required"]
+    assert (
+        "account_binding" not in tools["gsv_local_source_acknowledge"]["inputSchema"]["properties"]
+    )
     assert "untrusted evidence" in tools["gsv_local_source_poll"]["description"]
     assert "host-local pending token" in tools["gsv_local_source_poll"]["description"]
     assert "sends" in tools["gsv_local_source_poll"]["description"]

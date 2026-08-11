@@ -162,12 +162,18 @@ coverage or the seven-minute no-new-acquisition boundary arrives. Each next
 poll is permitted only after the prior acknowledgement succeeds. If time runs
 out, leave the exact remaining delivery pending for the next wake.
 
-WhatsApp derives account identity from the read-only local adapter. Never
-invent or submit an account binding for it. A binding, adapter, replay, or
-acknowledgement failure is a critical source incident. On its first occurrence,
-send one content-free alert to the exact Chief of Staff task in the same wake.
-Carry a compact incident marker in `NOW.md`, and alert again only when the
-failure materially changes or clears.
+Apple Messages and WhatsApp derive account identity inside their read-only
+local adapters. Never invent or submit an account binding for either source. A
+binding, adapter, replay, or acknowledgement failure is a critical source
+incident. On its first occurrence, send one content-free alert to the exact
+Chief of Staff task in the same wake. Carry a compact incident marker in
+`NOW.md`, and alert again only when the failure materially changes or clears.
+
+When a due Google or Outlook calendar read has no connector tool, check the
+content-free `gsv codex status` through the installed CLI before calling it an
+OAuth failure. If integration `ready` is false, report a critical Codex
+registration incident immediately. Preserve prior coverage and make no account
+or authentication change.
 
 ## Keep NOW useful
 

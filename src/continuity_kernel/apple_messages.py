@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
+import plistlib
 import secrets
 import sqlite3
 import stat
@@ -15,6 +17,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from continuity_kernel.atomic import read_regular_file
 from continuity_kernel.errors import ContinuityError, ValidationError
 from continuity_kernel.sqlite_snapshot import (
     SQLiteFileIdentity as FileIdentity,
@@ -47,6 +50,9 @@ MAX_CURSOR_CHARS = 8_192
 FINGERPRINT_CHARS = 20
 MAX_TIMESTAMP_CHARS = 40
 MAX_CLOCK_SKEW_SECONDS = 300
+MAX_ACTIVE_ACCOUNTS = 64
+MAX_ACTIVE_ACCOUNT_BYTES = 1_024
+MAX_ACCOUNT_PREFERENCES_BYTES = 64 * 1_024
 CURSOR_VERSION = 2
 ACK_TOKEN_VERSION = 1
 MAX_ACK_TOKEN_CHARS = 16_384
@@ -69,9 +75,11 @@ class AppleMessagesStatus:
     newest_message_at: str | None
     available: bool
     error: str | None
+    account_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
+        del payload["account_fingerprint"]
         payload["cursor"] = self.cursor()
         return payload
 
@@ -118,11 +126,14 @@ class AppleMessagesDelta:
     complete: bool
     cursor: str
     messages: tuple[AppleMessage, ...]
+    account_fingerprint: str | None = None
     store_reconciled: bool = False
     drift: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
-        return {**asdict(self), "messages": [asdict(message) for message in self.messages]}
+        payload = {**asdict(self), "messages": [asdict(message) for message in self.messages]}
+        del payload["account_fingerprint"]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -156,10 +167,15 @@ def default_store_root() -> Path:
     return Path.home() / "Library/Messages"
 
 
+def default_account_preferences() -> Path:
+    return Path.home() / "Library/Preferences/com.apple.imservice.ids.iMessage.plist"
+
+
 def inspect_apple_messages(
     *,
     store_root: Path | None = None,
     observed_at: datetime | None = None,
+    account_key: bytes | None = None,
 ) -> AppleMessagesStatus:
     """Inspect scalar store health without selecting message content."""
 
@@ -173,12 +189,15 @@ def inspect_apple_messages(
     messages: int | None = None
     max_rowid: int | None = None
     newest: str | None = None
+    account_fingerprint: str | None = None
     query_error: str | None = None
 
     if database_present:
         read_mode = "ro"
         try:
             schema, generation, messages, _chats, max_rowid, newest = _aggregates(database)
+            if account_key is not None:
+                account_fingerprint = _active_account_fingerprint(account_key)
         except ContinuityError as exc:
             query_error = str(exc)
     error = "Apple Messages store is unavailable" if not database_present else query_error
@@ -194,6 +213,7 @@ def inspect_apple_messages(
         newest_message_at=newest,
         available=error is None,
         error=error,
+        account_fingerprint=account_fingerprint,
     )
 
 
@@ -240,6 +260,7 @@ def read_apple_messages_delta(
     limit: int = MAX_DELTA,
     observed_at: datetime | None = None,
     reconcile_store_replacement: bool = False,
+    account_key: bytes | None = None,
 ) -> AppleMessagesDelta:
     """Read a bounded delta while structurally excluding JIDs, IDs, keys, and paths."""
 
@@ -249,6 +270,7 @@ def read_apple_messages_delta(
     status = inspect_apple_messages(
         store_root=store_root,
         observed_at=observed_at,
+        account_key=account_key,
     )
     if not status.available:
         raise ContinuityError(status.error or "Apple Messages source is unavailable")
@@ -269,6 +291,7 @@ def read_apple_messages_delta(
             complete=True,
             cursor=next_cursor,
             messages=(),
+            account_fingerprint=status.account_fingerprint,
             store_reconciled=store_reconciled,
             drift=drift,
         )
@@ -290,6 +313,7 @@ def read_apple_messages_delta(
         complete=complete,
         cursor=next_cursor,
         messages=messages,
+        account_fingerprint=status.account_fingerprint,
         store_reconciled=store_reconciled,
         drift=drift,
     )
@@ -303,6 +327,7 @@ def replay_apple_messages_delta(
     store_root: Path | None = None,
     limit: int = MAX_DELTA,
     observed_at: datetime | None = None,
+    account_key: bytes | None = None,
 ) -> AppleMessagesDelta:
     """Re-read one prepared historical prefix while leaving later rows for the next poll."""
 
@@ -310,7 +335,11 @@ def replay_apple_messages_delta(
         raise ValidationError(f"Apple Messages delta limit must be between 1 and {MAX_DELTA}")
     previous = _decode_cursor(cursor)
     target = _decode_cursor(target_cursor)
-    status = inspect_apple_messages(store_root=store_root, observed_at=observed_at)
+    status = inspect_apple_messages(
+        store_root=store_root,
+        observed_at=observed_at,
+        account_key=account_key,
+    )
     if not status.available:
         raise ContinuityError(status.error or "Apple Messages source is unavailable")
     _validate_cursor(previous, status)
@@ -356,6 +385,7 @@ def replay_apple_messages_delta(
         complete=complete,
         cursor=target_cursor,
         messages=messages,
+        account_fingerprint=status.account_fingerprint,
         drift=_cursor_drift(previous, status),
     )
 
@@ -519,6 +549,43 @@ def _aggregates(database: Path) -> tuple[str, str, int, int, int, str | None]:
     newest = _epoch_iso(message_row[2])
     generation = _generation(before, schema)
     return schema, generation, messages, chats, max_rowid, newest
+
+
+def _active_account_fingerprint(account_key: bytes) -> str:
+    """Return a keyed opaque identity for the active local iMessage account set."""
+
+    if len(account_key) != hashlib.sha256().digest_size:
+        raise ValidationError("Apple Messages account identity key is invalid")
+    try:
+        encoded_preferences = read_regular_file(
+            default_account_preferences(),
+            label="Apple Messages account preferences",
+            max_bytes=MAX_ACCOUNT_PREFERENCES_BYTES,
+        )
+        preferences = plistlib.loads(encoded_preferences)
+    except (OSError, plistlib.InvalidFileException, ValidationError, ValueError) as exc:
+        raise ContinuityError("Apple Messages account identity is unavailable") from exc
+    if not isinstance(preferences, dict):
+        raise ContinuityError("Apple Messages account identity is unavailable")
+    raw_accounts = preferences.get("ActiveAccounts")
+    if not isinstance(raw_accounts, list) or not 1 <= len(raw_accounts) <= MAX_ACTIVE_ACCOUNTS:
+        raise ContinuityError("Apple Messages account identity is unavailable")
+    accounts: set[str] = set()
+    for value in raw_accounts:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value.encode("utf-8")) > MAX_ACTIVE_ACCOUNT_BYTES
+        ):
+            raise ContinuityError("Apple Messages account identity is invalid")
+        accounts.add(value)
+    encoded = json.dumps(sorted(accounts), ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    digest = hmac.new(
+        account_key,
+        b"seld-apple-messages-account-v1\0" + encoded,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _delta_rows(

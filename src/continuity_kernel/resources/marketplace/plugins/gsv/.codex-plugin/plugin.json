@@ -1,6 +1,6 @@
 {
   "name": "gsv",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "A resident AI chief of staff for ChatGPT that maintains local context and prepares decisions for review.",
   "author": {
     "name": "Seld contributors"

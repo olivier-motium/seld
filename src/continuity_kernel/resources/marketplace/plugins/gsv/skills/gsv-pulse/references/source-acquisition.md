@@ -19,6 +19,16 @@ adapter reports complete coverage or the existing seven-minute acquisition
 boundary stops new work. Do not add an item-count or batch-count stopping rule.
 Never poll batch N+1 before batch N is acknowledged.
 
+Apple Messages and WhatsApp derive their opaque account identities inside the
+read-only local adapters. Never ask the model to create or reproduce an account
+binding. Treat an unavailable identity or identity mismatch as a blocked
+checkpoint and escalate it without advancing coverage.
+
+If a due Google or Outlook calendar source has no connector tool, inspect the
+content-free `gsv codex status` before diagnosing OAuth. A false integration
+`ready` value is a Codex plugin-registration incident, not provider evidence.
+Preserve prior coverage and alert the Chief of Staff task.
+
 For a selected portable Slack connection, use its bounded Seld read whenever
 the six-hour Slack proof expires. Slack rotates public-client credentials every
 12 hours, so substituting a host-owned Slack app would refresh source coverage

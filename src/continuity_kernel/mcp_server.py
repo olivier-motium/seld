@@ -396,7 +396,6 @@ def _call(
             disposition=_string(values, "disposition"),
             result_refs=_strings(values, "result_refs"),
             actor_ref=_string(values, "actor_ref"),
-            account_binding=_optional_string(values, "account_binding"),
         )
     if name == "gsv_signal_status":
         return vault.resident_signal_status()
@@ -1400,13 +1399,6 @@ TOOLS: Final = [
             "then advance the host checkpoint."
         ),
         {
-            "account_binding": {
-                "description": (
-                    "Apple Messages only: transient confirmed local account binding. "
-                    "WhatsApp derives identity from its read-only adapter; omit this field."
-                ),
-                "type": "string",
-            },
             "actor_ref": TEXT,
             "disposition": {"enum": ["accepted", "rejected"], "type": "string"},
             "expected_source_revision": TEXT,
