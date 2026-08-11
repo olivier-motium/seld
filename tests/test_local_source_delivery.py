@@ -29,14 +29,14 @@ from continuity_kernel import (
 from continuity_kernel import (
     whatsapp as whatsapp_adapter,
 )
-from continuity_kernel.atomic import PinnedPathRoot
+from continuity_kernel.atomic import PinnedPathRoot, sha256_bytes
 from continuity_kernel.errors import ConflictError, ContinuityError, NotFoundError, ValidationError
 from continuity_kernel.local_source_delivery import (
     LocalSourceDelivery,
     _Binding,
     _Checkpoint,
 )
-from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
+from continuity_kernel.source_state import ABSENT_SOURCE_REVISION, source_fingerprint
 from continuity_kernel.vault import Vault
 
 _POSIX_STORAGE = pytest.mark.skipif(
@@ -202,9 +202,7 @@ def _legacy_delivery_token(token: str) -> str:
     payload["version"] = local_source_delivery.LEGACY_TOKEN_VERSION
     payload.pop("account_digest")
     canonical = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-    envelope["digest"] = local_source_delivery.sha256_bytes(
-        ("seld-local-source-delivery-v1\0" + canonical).encode()
-    )
+    envelope["digest"] = sha256_bytes(("seld-local-source-delivery-v1\0" + canonical).encode())
     result = base64.urlsafe_b64encode(
         json.dumps(envelope, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
             "ascii"
@@ -444,7 +442,7 @@ def test_legacy_apple_delivery_survives_exact_reselection_migration(tmp_path: Pa
     assert delivery.status("apple_messages")["pending"] is False
     observation = vault.get_source_snapshot().observation("apple_messages")
     assert observation is not None
-    assert observation.account_fingerprint != local_source_delivery.source_fingerprint(
+    assert observation.account_fingerprint != source_fingerprint(
         "apple-messages:local-profile:test",
         "account binding",
     )
