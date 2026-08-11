@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import plistlib
 import sqlite3
 import subprocess
 import sys
@@ -12,9 +13,11 @@ from typing import Any
 
 import pytest
 
+import continuity_kernel.apple_messages as apple_messages
 import continuity_kernel.atomic as atomic_module
+import continuity_kernel.cli as cli
+import continuity_kernel.resident_import as resident_import
 import continuity_kernel.update as self_update
-from continuity_kernel import apple_messages, cli, resident_import
 from continuity_kernel.atomic import sha256_bytes
 from continuity_kernel.direction import direction_aim, direction_dict, new_direction
 from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
@@ -607,6 +610,9 @@ def _import_v2_local_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Vault, Path, Path]:
     monkeypatch.setattr(self_update, "status", _available_update)
+    preferences = tmp_path / "com.apple.imservice.ids.iMessage.plist"
+    preferences.write_bytes(plistlib.dumps({"ActiveAccounts": ["test-active-account"]}))
+    monkeypatch.setattr(apple_messages, "default_account_preferences", lambda: preferences)
     store = tmp_path / "Messages"
     store.mkdir()
     database = store / "chat.db"

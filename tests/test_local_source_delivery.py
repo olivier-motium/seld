@@ -17,18 +17,12 @@ from typing import Any, cast
 
 import pytest
 
-from continuity_kernel import (
-    apple_messages as apple_adapter,
-)
-from continuity_kernel import (
-    codex_integration,
-    config,
-    local_source_delivery,
-    mcp_server,
-)
-from continuity_kernel import (
-    whatsapp as whatsapp_adapter,
-)
+import continuity_kernel.apple_messages as apple_adapter
+import continuity_kernel.codex_integration as codex_integration
+import continuity_kernel.config as config
+import continuity_kernel.local_source_delivery as local_source_delivery
+import continuity_kernel.mcp_server as mcp_server
+import continuity_kernel.whatsapp as whatsapp_adapter
 from continuity_kernel.atomic import PinnedPathRoot, sha256_bytes
 from continuity_kernel.errors import ConflictError, ContinuityError, NotFoundError, ValidationError
 from continuity_kernel.local_source_delivery import (
@@ -46,13 +40,19 @@ _POSIX_STORAGE = pytest.mark.skipif(
 APPLE_TEST_TIMESTAMP = 800_000_000
 
 
+def _write_apple_account_preferences(home: Path) -> Path:
+    preferences = home / "Library/Preferences/com.apple.imservice.ids.iMessage.plist"
+    preferences.parent.mkdir(parents=True, exist_ok=True)
+    preferences.write_bytes(plistlib.dumps({"ActiveAccounts": ["test-active-account"]}))
+    return preferences
+
+
 @pytest.fixture(autouse=True)
 def apple_account_preferences(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Path:
-    preferences = tmp_path / "com.apple.imservice.ids.iMessage.plist"
-    preferences.write_bytes(plistlib.dumps({"ActiveAccounts": ["test-active-account"]}))
+    preferences = _write_apple_account_preferences(tmp_path / "test-home")
     monkeypatch.setattr(apple_adapter, "default_account_preferences", lambda: preferences)
     return preferences
 
@@ -1675,7 +1675,9 @@ def test_raw_cursor_adoption_is_internal_and_fresh_cli_delivers_only_the_gap(
     prior_cursor = apple_adapter.inspect_apple_messages(store_root=store).cursor()
     assert prior_cursor is not None
     _append_apple(database, "gap after CLI cutover")
-    environment = os.environ.copy()
+    cli_home = tmp_path / "cli-home"
+    _write_apple_account_preferences(cli_home)
+    environment = {**os.environ, "HOME": str(cli_home)}
     base = [
         sys.executable,
         "-m",
@@ -1745,6 +1747,8 @@ def test_fresh_cli_rebaseline_requires_exact_replacement_disposition(tmp_path: P
     delivery.baseline("apple_messages")
     before = delivery.status("apple_messages")
     _replace_apple(database, new_body="replacement through CLI")
+    cli_home = tmp_path / "cli-home"
+    _write_apple_account_preferences(cli_home)
 
     completed = subprocess.run(
         [
@@ -1770,7 +1774,7 @@ def test_fresh_cli_rebaseline_requires_exact_replacement_disposition(tmp_path: P
         check=True,
         capture_output=True,
         text=True,
-        env=os.environ.copy(),
+        env={**os.environ, "HOME": str(cli_home)},
         timeout=10,
     )
 
