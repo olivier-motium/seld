@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import threading
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ import pytest
 
 from continuity_kernel.atomic import sha256_bytes
 from continuity_kernel.errors import ConflictError, NotFoundError, ValidationError
-from continuity_kernel.records import new_task, render_task
+from continuity_kernel.records import Task, new_task, render_task
 from continuity_kernel.vault import MAX_DOCUMENT_BYTES, Vault
 from continuity_kernel.vault_identity import REQUIRED_VAULT_DIRECTORIES
 
@@ -93,6 +94,56 @@ def test_stale_update_is_rejected_and_terminal_update_clears_future(vault: Vault
             expected_revision=task.revision,
             outcome="A stale mutation.",
         )
+
+
+def test_history_compaction_archives_the_oldest_entries_and_changes_nothing_else(
+    vault: Vault,
+) -> None:
+    history = tuple(
+        f"2026-07-{day:02d}T09:00:00.000000Z — Recorded change {day}." for day in range(1, 9)
+    )
+    task = vault.create_task(
+        identifier="compact-history",
+        title="Compact history",
+        outcome="Keep the record bounded without losing an entry.",
+        status="doing",
+        next_actor="agent",
+        history=history,
+    )
+
+    with pytest.raises(ConflictError, match="record changed"):
+        Vault(vault.root).compact_task_history(
+            task.identifier,
+            expected_revision=f"sha256:{'0' * 64}",
+            keep=3,
+        )
+    assert Vault(vault.root).get_task(task.identifier).history == history
+
+    result = Vault(vault.root).compact_task_history(
+        task.identifier,
+        expected_revision=task.revision,
+        keep=3,
+    )
+    assert result.archive_file is not None
+    archive = vault.root / ".gsv/archive" / result.archive_file
+    archived = json.loads(archive.read_text(encoding="utf-8"))
+
+    assert (result.archived, result.kept) == (5, 3)
+    assert archived["task_id"] == task.identifier
+    assert archived["entries"] == list(history[:5])
+    assert result.task.history[:3] == history[5:]
+    assert len(result.task.history) == 4
+    assert f"archived 5 history entries to {result.archive_file}" in result.task.history[3]
+    assert result.task.revision != task.revision
+    assert Vault(vault.root).get_task(task.identifier) == result.task
+    carried = [
+        field.name
+        for field in fields(Task)
+        if field.name not in {"history", "revision", "updated_at"}
+    ]
+    assert [getattr(result.task, name) for name in carried] == [
+        getattr(task, name) for name in carried
+    ]
 
 
 def test_terminal_update_rejects_explicit_future_work(vault: Vault) -> None:

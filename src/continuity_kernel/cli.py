@@ -93,7 +93,12 @@ from continuity_kernel.sense_sweep import heartbeat_status, sense_sweep
 from continuity_kernel.slack_tasks import SlackTaskReader
 from continuity_kernel.source_recipes import list_recipes
 from continuity_kernel.source_state import SOURCE_ERROR_CODES
-from continuity_kernel.vault import Vault, doctor_dict
+from continuity_kernel.vault import (
+    DEFAULT_TASK_HISTORY_KEEP,
+    Vault,
+    doctor_dict,
+    task_history_compaction_dict,
+)
 
 ROLLBACK_PROBE_TIMEOUT_SECONDS = 5
 ROLLBACK_PROBE_MAX_OUTPUT_BYTES = 64 * 1024
@@ -1171,6 +1176,14 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
                 refs=tuple(args.ref),
             )
         )
+    if args.task_command == "compact-history":
+        return task_history_compaction_dict(
+            vault.compact_task_history(
+                args.id,
+                expected_revision=args.expected_revision,
+                keep=args.keep,
+            )
+        )
     return record_dict(
         vault.update_task(
             args.id,
@@ -2167,6 +2180,18 @@ def _parser() -> argparse.ArgumentParser:
     task_update.add_argument("--add-ref", action="append", default=[])
     task_update.add_argument("--remove-ref", action="append", default=[])
     task_update.add_argument("--note")
+    task_compact_history = task_commands.add_parser(
+        "compact-history",
+        help="Archive the oldest task history and keep only the newest entries in the record.",
+    )
+    task_compact_history.add_argument("id")
+    task_compact_history.add_argument("--expected-revision", required=True)
+    task_compact_history.add_argument(
+        "--keep",
+        type=int,
+        default=DEFAULT_TASK_HISTORY_KEEP,
+        help="Number of newest history entries the record keeps.",
+    )
 
     portfolio = commands.add_parser(
         "portfolio", help="Show or author the complete open Portfolio judgment."

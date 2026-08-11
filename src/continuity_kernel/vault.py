@@ -87,6 +87,7 @@ from continuity_kernel.portfolio import (
     render_portfolio,
 )
 from continuity_kernel.records import (
+    MAX_HISTORY_ENTRIES,
     REVIEW_WORK_THREAD_ID,
     SHA256_REVISION,
     TERMINAL_TASK_STATUSES,
@@ -127,6 +128,7 @@ from continuity_kernel.records import (
     parse_task,
     parse_thread,
     parse_time,
+    record_dict,
     references,
     relationship_status,
     render_entity,
@@ -194,6 +196,7 @@ from continuity_kernel.vault_identity import (
 
 MAX_DOCUMENT_BYTES: Final = 512 * 1024
 MAX_JOURNAL_LINE_BYTES: Final = 64 * 1024
+DEFAULT_TASK_HISTORY_KEEP: Final = 50
 RecordKind = Literal["task", "entity", "thread"]
 RecordValue = TypeVar("RecordValue", Task, Entity, WorkThread)
 
@@ -283,6 +286,16 @@ class WorkThreadMergeResult:
     source: WorkThread
     target: WorkThread
     changed: bool
+
+
+@dataclass(frozen=True)
+class TaskHistoryCompaction:
+    """One bounded task-history compaction and the archive it published."""
+
+    task: Task
+    archived: int
+    kept: int
+    archive_file: str | None
 
 
 class Vault:
@@ -690,6 +703,70 @@ class Vault:
             else:
                 self._replace_record(path, "task", before, after, render_task(after))
             return after
+
+    def compact_task_history(
+        self,
+        identifier: str,
+        *,
+        expected_revision: str,
+        keep: int = DEFAULT_TASK_HISTORY_KEEP,
+        observed_at: datetime | None = None,
+    ) -> TaskHistoryCompaction:
+        """Move the oldest task history into a durable archive without losing an entry."""
+
+        clean_id = task_id(identifier)
+        retained = _history_keep_count(keep)
+        path = self._path("task", clean_id)
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("task", clean_id)),
+        ):
+            before = self._read_task(clean_id)
+            self._expect(before.revision, expected_revision)
+            if len(before.history) <= retained:
+                return TaskHistoryCompaction(
+                    task=before,
+                    archived=0,
+                    kept=len(before.history),
+                    archive_file=None,
+                )
+
+            boundary = len(before.history) - retained
+            archived = before.history[:boundary]
+            timestamp = _next_record_timestamp((before,), observed_at)
+            archive = self._task_history_archive_path(clean_id, timestamp)
+            if os.path.lexists(archive):
+                raise ConflictError(f"task history archive already exists: {archive.name}")
+            atomic_write(
+                archive,
+                _json_bytes(
+                    {
+                        "archived_at": timestamp,
+                        "entries": list(archived),
+                        "task_id": clean_id,
+                    }
+                ),
+            )
+            history = _append_record_history(
+                before.history[boundary:],
+                timestamp,
+                (f"archived {len(archived)} history entries to {archive.name}",),
+                None,
+            )
+            candidate = replace(
+                before,
+                history=history,
+                updated_at=timestamp,
+                revision="",
+            )
+            after = parse_task(render_task(candidate))
+            self._replace_record(path, "task", before, after, render_task(after))
+            return TaskHistoryCompaction(
+                task=after,
+                archived=len(archived),
+                kept=retained,
+                archive_file=archive.name,
+            )
 
     def create_entity(self, **values: Any) -> Entity:
         with exclusive_lock(self.state / "locks/global.lock"):
@@ -3183,6 +3260,13 @@ class Vault:
         safe = identifier.replace(":", "--")
         return self.state / "locks" / f"{kind}-{safe}.lock"
 
+    def _task_history_archive_path(self, identifier: str, timestamp: str) -> Path:
+        safe = identifier.replace(":", "--")
+        stamp = parse_time(timestamp).strftime("%Y%m%dT%H%M%S%fZ")
+        path = self.state / "archive" / f"task-{safe}-history-{stamp}.json"
+        self._assert_inside(path)
+        return path
+
     def _record_files(self, directory: str) -> list[Path]:
         root = self.root / directory
         if not root.exists():
@@ -4071,6 +4155,25 @@ def doctor_dict(result: DoctorResult) -> dict[str, Any]:
         "vault": result.vault,
         "vault_id": result.vault_id,
     }
+
+
+def task_history_compaction_dict(result: TaskHistoryCompaction) -> dict[str, Any]:
+    return {
+        "archive_file": result.archive_file,
+        "archived": result.archived,
+        "kept": result.kept,
+        "task": record_dict(result.task),
+    }
+
+
+def _history_keep_count(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError("history keep count must be a whole number")
+    if value < 0 or value > MAX_HISTORY_ENTRIES:
+        raise ValidationError(
+            f"history keep count must be between 0 and {MAX_HISTORY_ENTRIES} entries"
+        )
+    return value
 
 
 def _exclusive_choice(value: object | None, clear: bool, label: str) -> None:
