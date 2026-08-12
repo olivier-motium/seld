@@ -93,7 +93,59 @@ class _Runtime:
         self.closed = True
 
 
-def _reader(tmp_path: Path) -> tuple[Vault, SlackTaskReader]:
+class _PagedRuntime:
+    """Serve Slack search pages with the provider's page and count offset semantics."""
+
+    def __init__(self, total: int) -> None:
+        self.total = total
+        self.requests: list[dict[str, object]] = []
+
+    def call_tool(self, name: str, values: dict[str, object]) -> dict[str, object]:
+        assert name == "gsv_slack_read"
+        assert values["operation"] == "search.messages"
+        request = cast(dict[str, object], values["input"])
+        self.requests.append(dict(request))
+        count = cast(int, request["count"])
+        page = cast(int, request["page"])
+        start = (page - 1) * count
+        matches = [
+            {
+                "channel": {"id": CHANNEL_ID, "name": "project"},
+                "text": f"synthetic message {index}",
+                "ts": f"{1786356000 + index}.000001",
+                "user": USER_ID,
+                "username": "Teammate",
+            }
+            for index in range(start, min(start + count, self.total))
+        ]
+        return {
+            "connection_id": str(CONNECTION_ID),
+            "effect": "read",
+            "operation": "search.messages",
+            "provider": "slack",
+            "result": {
+                "ok": True,
+                "messages": {
+                    "matches": matches,
+                    "pagination": {
+                        "page": page,
+                        "page_count": -(-self.total // count),
+                        "total_count": self.total,
+                    },
+                },
+            },
+            "status": "ok",
+        }
+
+    def close(self) -> None:
+        return None
+
+
+def _reader(
+    tmp_path: Path,
+    *,
+    runtime: object | None = None,
+) -> tuple[Vault, SlackTaskReader]:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Slack task reader")
     profile = get_profile("slack")
@@ -131,10 +183,11 @@ def _reader(tmp_path: Path) -> tuple[Vault, SlackTaskReader]:
         secret_store=InMemorySecretStore(),
         state_root=tmp_path / "connector-state",
     )
+    selected = runtime if runtime is not None else _Runtime()
     reader = SlackTaskReader(
         vault,
         auth_manager=manager,
-        runtime_factory=lambda: cast(ConnectorRuntime, _Runtime()),
+        runtime_factory=lambda: cast(ConnectorRuntime, selected),
         now=lambda: NOW,
     )
     return vault, reader
@@ -167,6 +220,35 @@ def test_task_shaped_slack_reads_use_portable_connection_and_opaque_context(
     rendered = repr((inbox, context))
     assert CHANNEL_ID not in rendered
     assert USER_ID not in rendered
+
+
+def test_slack_search_reads_each_page_once_and_skips_no_match(tmp_path: Path) -> None:
+    runtime = _PagedRuntime(total=250)
+    _vault, reader = _reader(tmp_path, runtime=runtime)
+
+    searched = reader.search("after:2026-08-01", max_pages=2, max_results=150)
+
+    messages = cast(list[dict[str, object]], searched["messages"])
+    texts = [cast(str, message["text"]) for message in messages]
+    assert [request["count"] for request in runtime.requests] == [100, 100]
+    assert [request["page"] for request in runtime.requests] == [1, 2]
+    assert len(messages) == 150
+    assert len(set(texts)) == 150
+    assert texts == [f"synthetic message {index}" for index in range(150)]
+
+
+def test_every_slack_search_reference_resolves_after_the_same_read(tmp_path: Path) -> None:
+    runtime = _PagedRuntime(total=250)
+    _vault, reader = _reader(tmp_path, runtime=runtime)
+
+    searched = reader.search("after:2026-08-01", max_pages=2, max_results=150)
+
+    messages = cast(list[dict[str, object]], searched["messages"])
+    references = [cast(str, message["ref"]) for message in messages]
+    assert len(set(references)) == 150
+    for reference in references:
+        expanded = reader.context(reference, before=0, after=0, include_thread=False)
+        assert expanded["focus_ref"] == reference
 
 
 def test_slack_poll_records_the_canonical_source_checkpoint(

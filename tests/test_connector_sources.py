@@ -990,6 +990,151 @@ def test_slack_reads_recent_messages_across_visible_conversations(
     assert "x" * 100 not in stored
 
 
+def _slack_conversation_reader(
+    readable: dict[str, tuple[str, str]],
+    *,
+    unreadable: dict[str, str] | None = None,
+) -> Callable[[str, Mapping[str, str], float], object]:
+    """Serve one bounded message for each readable conversation of a fixed workspace."""
+
+    rejected = unreadable or {}
+
+    def get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
+        del headers, timeout
+        parsed = urlsplit(url)
+        if parsed.path == "/api/auth.test":
+            return {"ok": True, "team_id": "T123456789", "user_id": "U123456789"}
+        if parsed.path == "/api/conversations.list":
+            return {
+                "ok": True,
+                "channels": [{"id": channel} for channel in (*readable, *rejected)],
+                "response_metadata": {"next_cursor": ""},
+            }
+        if parsed.path == "/api/conversations.history":
+            channel = parse_qs(parsed.query)["channel"][0]
+            if channel in rejected:
+                return {"ok": False, "error": rejected[channel]}
+            timestamp, text = readable[channel]
+            return {
+                "ok": True,
+                "messages": [
+                    {
+                        "type": "message",
+                        "user": "U123456789",
+                        "text": text,
+                        "ts": timestamp,
+                    }
+                ],
+                "has_more": False,
+                "response_metadata": {"next_cursor": ""},
+            }
+        pytest.fail("unexpected fixed Slack endpoint")
+
+    return get_json
+
+
+def test_slack_evidence_refs_stay_bound_to_their_message_after_sort_and_truncation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, manager, connection_id = _prepared(
+        tmp_path,
+        source_id="slack",
+        provider="slack",
+        marker="w",
+    )
+    seconds = int(BASE_TIME.timestamp())
+    conversations = {
+        "C111111111": (f"{seconds + 1}.000001", "oldest"),
+        "C222222222": (f"{seconds + 3}.000001", "newest"),
+        "C333333333": (f"{seconds + 2}.000001", "middle"),
+    }
+
+    def read(
+        channels: dict[str, tuple[str, str]], *, limit: int
+    ) -> tuple[list[dict[str, object]], list[str]]:
+        _install_reader(
+            monkeypatch,
+            vault=vault,
+            manager=manager,
+            get_json=_slack_conversation_reader(channels),
+        )
+        delivery = read_connector_source(
+            vault,
+            connection_id=str(connection_id),
+            source_id="slack",
+            limit=limit,
+            observed_at=BASE_TIME,
+        )
+        record = cast(dict[str, object], delivery["record"])
+        return (
+            cast(list[dict[str, object]], delivery["items"]),
+            cast(list[str], record["evidenceRefs"]),
+        )
+
+    alone: dict[str, tuple[dict[str, object], str]] = {}
+    for channel, (timestamp, text) in conversations.items():
+        items, refs = read({channel: (timestamp, text)}, limit=25)
+        alone[text] = (items[0], refs[0])
+
+    items, refs = read(conversations, limit=2)
+
+    assert [item["text"] for item in items] == ["newest", "middle"]
+    assert items == [alone["newest"][0], alone["middle"][0]]
+    assert refs == [alone["newest"][1], alone["middle"][1]]
+
+
+def test_slack_omits_one_unreadable_conversation_but_fails_a_wholly_unreadable_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, manager, connection_id = _prepared(
+        tmp_path,
+        source_id="slack",
+        provider="slack",
+        marker="x",
+    )
+    timestamp = f"{int(BASE_TIME.timestamp())}.000001"
+    _install_reader(
+        monkeypatch,
+        vault=vault,
+        manager=manager,
+        get_json=_slack_conversation_reader(
+            {"C111111111": (timestamp, "readable")},
+            unreadable={"C222222222": "not_in_channel"},
+        ),
+    )
+    delivery = read_connector_source(
+        vault,
+        connection_id=str(connection_id),
+        source_id="slack",
+        limit=25,
+        observed_at=BASE_TIME,
+    )
+    items = cast(list[dict[str, object]], delivery["items"])
+    record = cast(dict[str, object], delivery["record"])
+
+    assert delivery["result"] == "success"
+    assert [item["text"] for item in items] == ["readable"]
+    assert record["completeness"] == "partial"
+
+    _install_reader(
+        monkeypatch,
+        vault=vault,
+        manager=manager,
+        get_json=_slack_conversation_reader({}, unreadable={"C222222222": "not_in_channel"}),
+    )
+    blocked = read_connector_source(
+        vault,
+        connection_id=str(connection_id),
+        source_id="slack",
+        limit=25,
+        observed_at=BASE_TIME,
+    )
+
+    assert blocked["errorCode"] == "permission_denied"
+
+
 def test_slack_requires_ok_and_rejects_bot_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

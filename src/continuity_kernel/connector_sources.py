@@ -133,6 +133,14 @@ _SLACK_TIMESTAMP = re.compile(r"^(?P<seconds>[0-9]{10,12})\.(?P<microseconds>[0-
 _SLACK_CONVERSATION_TYPES: Final = "public_channel,private_channel,mpim,im"
 _SLACK_MAX_CONVERSATIONS: Final = 50
 _SLACK_PREVIEW_CHARS: Final = 500
+_SLACK_LOCALIZED_OMISSION_CODES: Final = frozenset(
+    {
+        "channel_not_found",
+        "missing_scope",
+        "no_permission",
+        "not_in_channel",
+    }
+)
 _MAX_LIMIT: Final = 25
 _MAX_PROVIDER_ID_BYTES: Final = 2_048
 _MAX_TRANSIENT_BYTES: Final = 8_192
@@ -738,10 +746,9 @@ def _read_slack(
         optional=True,
     )
     incomplete = _slack_next_cursor(conversations_payload.get("response_metadata")) is not None
-    items: list[dict[str, object]] = []
-    evidence_refs: list[str] = []
+    entries: list[tuple[dict[str, object], str]] = []
     readable_conversations = 0
-    localized_omissions = 0
+    omitted_error: str | None = None
     for conversation in conversations:
         channel_id = _provider_id(conversation.get("id"), "Slack conversation ID")
         try:
@@ -755,9 +762,10 @@ def _read_slack(
                 timeout_seconds=timeout_seconds,
             )
         except _SlackAPIError as exc:
-            if exc.error != "channel_not_found":
+            if exc.error not in _SLACK_LOCALIZED_OMISSION_CODES:
                 raise
-            localized_omissions += 1
+            if omitted_error is None:
+                omitted_error = exc.error
             incomplete = True
             continue
         readable_conversations += 1
@@ -789,24 +797,24 @@ def _read_slack(
                 "Slack message text",
                 _MAX_SNIPPET_BYTES,
             )
-            evidence_refs.append(
-                _digest(_EVIDENCE_NAMESPACE, f"slack:message:{channel_id}:{timestamp_value}")
+            entries.append(
+                (
+                    {
+                        "channelRef": channel_ref,
+                        "authorRef": author_ref,
+                        "timestamp": _slack_timestamp(timestamp_value),
+                        "text": text[:_SLACK_PREVIEW_CHARS],
+                    },
+                    _digest(_EVIDENCE_NAMESPACE, f"slack:message:{channel_id}:{timestamp_value}"),
+                )
             )
-            items.append(
-                {
-                    "channelRef": channel_ref,
-                    "authorRef": author_ref,
-                    "timestamp": _slack_timestamp(timestamp_value),
-                    "text": text[:_SLACK_PREVIEW_CHARS],
-                }
-            )
-    if conversations and readable_conversations == 0 and localized_omissions:
-        raise _SlackAPIError("channel_not_found")
-    items.sort(key=lambda item: cast(str, item["timestamp"]), reverse=True)
-    items = items[:limit]
-    evidence_refs = evidence_refs[:limit]
+    if conversations and readable_conversations == 0 and omitted_error is not None:
+        raise _SlackAPIError(omitted_error)
+    entries.sort(key=lambda entry: cast(str, entry[0]["timestamp"]), reverse=True)
+    entries = entries[:limit]
+    evidence_refs = [reference for _, reference in entries]
     return _ReadResult(
-        items=items,
+        items=[item for item, _ in entries],
         account_binding=account_binding,
         completeness=_page_completeness(None, incomplete=incomplete),
         covered_through=format_time(observed_at),
@@ -1177,12 +1185,7 @@ def _token_error_code(error: OAuthTokenEndpointError, *, provider: str) -> str:
 def _slack_error_code(error: str) -> str:
     if error in SLACK_AUTH_FAILURE_CODES:
         return "auth_expired"
-    if error in {
-        "channel_not_found",
-        "missing_scope",
-        "no_permission",
-        "not_in_channel",
-    }:
+    if error in _SLACK_LOCALIZED_OMISSION_CODES:
         return "permission_denied"
     if error == "ratelimited":
         return "rate_limited"

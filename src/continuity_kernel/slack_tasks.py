@@ -21,7 +21,9 @@ MAX_SEARCH_PAGES: Final = 10
 MAX_SEARCH_RESULTS: Final = 200
 MAX_CONTEXT_SIDE: Final = 50
 MAX_SNIPPET_CHARS: Final = 4_000
-MAX_REFERENCE_ENTRIES: Final = 128
+MAX_SEARCH_PAGE_SIZE: Final = 100
+# Keep the store larger than one bounded read so a read never evicts its own references.
+MAX_REFERENCE_ENTRIES: Final = 256
 REFERENCE_TTL: Final = timedelta(hours=6)
 _REFERENCE_NAME: Final = SecretName("slack-reference-map")
 _REFERENCE = re.compile(r"^slack:v1:(?P<token>[A-Za-z0-9_-]{16,64})$")
@@ -161,6 +163,7 @@ class SlackTaskReader:
         total_known: int | None = None
         page_count: int | None = None
         pages_read = 0
+        page_size = min(MAX_SEARCH_PAGE_SIZE, max_results)
         for page in range(1, max_pages + 1):
             remaining = max_results - len(messages)
             if remaining <= 0:
@@ -168,7 +171,7 @@ class SlackTaskReader:
             response = self._call(
                 "search.messages",
                 {
-                    "count": min(100, remaining),
+                    "count": page_size,
                     "page": page,
                     "query": clean_query,
                     "sort": "timestamp",
@@ -185,7 +188,7 @@ class SlackTaskReader:
                 total_known = _optional_int(pagination.get("total_count"))
                 page_count = _optional_int(pagination.get("page_count"))
             pages_read += 1
-            messages.extend(self._render_matches(matches, snippet_chars=snippet_chars)[:remaining])
+            messages.extend(self._render_matches(matches[:remaining], snippet_chars=snippet_chars))
             if page_count is not None and page >= page_count:
                 break
             if not matches:
@@ -441,14 +444,17 @@ class _SlackReferenceStore:
         self.now = now
 
     def issue(self, bindings: list[dict[str, str | None]]) -> list[str]:
-        state = self._load()
-        entries = self._current_entries(state)
+        retained = self._current_entries(self._load())
         issued_at = self.now().astimezone(UTC).isoformat()
+        entries: dict[str, dict[str, object]] = {}
         references: list[str] = []
         for binding in bindings:
             token = secrets.token_urlsafe(18)
             entries[token] = {**binding, "issued_at": issued_at}
             references.append(f"slack:v1:{token}")
+        for token, retained_entry in retained.items():
+            entries.setdefault(token, retained_entry)
+        # A stable sort keeps just-issued references ahead of older ones from the same instant.
         ordered = sorted(
             entries.items(),
             key=lambda item: _required_text(item[1].get("issued_at"), "Slack reference time"),
