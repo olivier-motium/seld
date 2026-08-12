@@ -737,16 +737,6 @@ class Vault:
             archive = self._task_history_archive_path(clean_id, timestamp)
             if os.path.lexists(archive):
                 raise ConflictError(f"task history archive already exists: {archive.name}")
-            atomic_write(
-                archive,
-                _json_bytes(
-                    {
-                        "archived_at": timestamp,
-                        "entries": list(archived),
-                        "task_id": clean_id,
-                    }
-                ),
-            )
             history = _append_record_history(
                 before.history[boundary:],
                 timestamp,
@@ -760,6 +750,16 @@ class Vault:
                 revision="",
             )
             after = parse_task(render_task(candidate))
+            atomic_write(
+                archive,
+                _json_bytes(
+                    {
+                        "archived_at": timestamp,
+                        "entries": list(archived),
+                        "task_id": clean_id,
+                    }
+                ),
+            )
             self._replace_record(path, "task", before, after, render_task(after))
             return TaskHistoryCompaction(
                 task=after,

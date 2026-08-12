@@ -118,6 +118,28 @@ def test_history_compaction_archives_the_oldest_entries_and_changes_nothing_else
             keep=3,
         )
     assert Vault(vault.root).get_task(task.identifier).history == history
+    assert not list((vault.root / ".gsv/archive").glob("*"))
+
+    untouched = Vault(vault.root).compact_task_history(
+        task.identifier,
+        expected_revision=task.revision,
+        keep=len(history),
+    )
+    assert (untouched.archived, untouched.kept, untouched.archive_file) == (
+        0,
+        len(history),
+        None,
+    )
+    assert untouched.task == task
+    assert not list((vault.root / ".gsv/archive").glob("*"))
+
+    with pytest.raises(ValidationError):
+        Vault(vault.root).compact_task_history(
+            task.identifier,
+            expected_revision=task.revision,
+            keep=-1,
+        )
+    assert not list((vault.root / ".gsv/archive").glob("*"))
 
     result = Vault(vault.root).compact_task_history(
         task.identifier,
