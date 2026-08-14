@@ -16,10 +16,16 @@ from continuity_kernel.errors import ValidationError
 FORMAT_VERSION: Final = 1
 TASK_FORMAT_VERSION: Final = 2
 TASK_RESIDENT_FORMAT_VERSION: Final = 3
+TASK_DISPATCH_FORMAT_VERSION: Final = 4
 ENTITY_RESIDENT_FORMAT_VERSION: Final = 2
 THREAD_RESIDENT_FORMAT_VERSION: Final = 2
 TASK_FORMAT_VERSIONS: Final = frozenset(
-    {FORMAT_VERSION, TASK_FORMAT_VERSION, TASK_RESIDENT_FORMAT_VERSION}
+    {
+        FORMAT_VERSION,
+        TASK_FORMAT_VERSION,
+        TASK_RESIDENT_FORMAT_VERSION,
+        TASK_DISPATCH_FORMAT_VERSION,
+    }
 )
 ENTITY_FORMAT_VERSIONS: Final = frozenset({FORMAT_VERSION, ENTITY_RESIDENT_FORMAT_VERSION})
 THREAD_FORMAT_VERSIONS: Final = frozenset({FORMAT_VERSION, THREAD_RESIDENT_FORMAT_VERSION})
@@ -36,9 +42,14 @@ MAX_CODEX_EPISODES: Final = 50
 MAX_HISTORY_ENTRIES: Final = 2_000
 MAX_HISTORY_LINE_LENGTH: Final = 2_000
 MAX_TASK_RANK: Final = 2_147_483_647
+DEFAULT_CLAIM_WINDOW: Final = timedelta(minutes=5)
+SLA_CLOCK_HEALTH: Final = ("healthy", "unknown")
 SAFE_ID = re.compile(r"^[a-z][a-z0-9]*(?::[a-z0-9][a-z0-9-]{0,95})$")
 SAFE_TASK_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
 SAFE_HAND_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+TARGET_SEAT = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+DISPATCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+TASK_REVISION = re.compile(r"^[0-9a-f]{64}$")
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 CALENDAR_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 META = re.compile(r"^<!-- gsv:(\{.*\}) -->$")
@@ -126,6 +137,15 @@ _TASK_RESIDENT_KEYS: Final = _TASK_LEGACY_KEYS | {
     "state_changed_at",
     "superseded_by",
     "workspace",
+}
+_TASK_DISPATCH_KEYS: Final = _TASK_RESIDENT_KEYS | {
+    "blocker_condition",
+    "blocker_owner",
+    "claim_by",
+    "dispatch_id",
+    "dispatch_revision",
+    "progress_check_by",
+    "target_seat",
 }
 _ENTITY_LEGACY_KEYS: Final = frozenset(
     {"aliases", "created_at", "entity_type", "id", "kind", "refs", "updated_at", "version"}
@@ -250,6 +270,13 @@ class Task:
     codex_episode_ids: tuple[str, ...] = ()
     state_changed_at: str | None = None
     history: tuple[str, ...] = ()
+    target_seat: str | None = None
+    claim_by: str | None = None
+    progress_check_by: str | None = None
+    dispatch_id: str | None = None
+    dispatch_revision: str | None = None
+    blocker_owner: str | None = None
+    blocker_condition: str | None = None
 
 
 @dataclass(frozen=True)
@@ -366,6 +393,13 @@ def new_task(
     next_action: str | None = None,
     waiting_on: str | None = None,
     rank: int | None = None,
+    target_seat: str | None = None,
+    claim_by: str | None = None,
+    progress_check_by: str | None = None,
+    dispatch_id: str | None = None,
+    dispatch_revision: str | None = None,
+    blocker_owner: str | None = None,
+    blocker_condition: str | None = None,
     active_thread_id: str | None = None,
     refs: tuple[str, ...] = (),
     superseded_by: str | None = None,
@@ -385,6 +419,27 @@ def new_task(
             "task ID is reserved by Windows; choose a portable identifier before creating it"
         )
     clean_active = hand_id(active_thread_id)
+    clean_target_seat = target_seat_value(target_seat)
+    clean_claim_by = optional_stored_time(claim_by, "claim_by")
+    clean_progress_check_by = optional_stored_time(progress_check_by, "progress_check_by")
+    clean_dispatch_id = dispatch_id_value(dispatch_id)
+    clean_dispatch_revision = dispatch_revision_value(dispatch_revision)
+    clean_status = task_status(status)
+    clean_waiting = optional_body(waiting_on, "waiting on")
+    clean_blocker_owner = optional_line(blocker_owner, "blocker owner", 120)
+    clean_blocker_condition = optional_line(blocker_condition, "blocker condition", 500)
+    if clean_blocker_condition is not None and clean_waiting is None:
+        clean_waiting = clean_blocker_condition
+    _validate_dispatch_fields(
+        clean_dispatch_id,
+        clean_dispatch_revision,
+        clean_status,
+        clean_waiting,
+        clean_blocker_owner,
+        clean_blocker_condition,
+    )
+    if clean_claim_by is None and claim_by_eligible(clean_status, clean_target_seat, clean_waiting):
+        clean_claim_by = format_time(parse_time(now) + DEFAULT_CLAIM_WINDOW)
     clean_episodes = codex_episodes(
         (*codex_episode_ids, *((clean_active,) if clean_active is not None else ()))
     )
@@ -398,16 +453,23 @@ def new_task(
             due is not None,
             bool(clean_episodes),
             bool(history),
+            clean_target_seat is not None,
+            clean_claim_by is not None,
+            clean_progress_check_by is not None,
+            clean_dispatch_id is not None,
+            clean_dispatch_revision is not None,
+            clean_blocker_owner is not None,
+            clean_blocker_condition is not None,
         )
     )
     task = Task(
         identifier=identifier,
         title=title_text(title),
-        status=task_status(status),
+        status=clean_status,
         next_actor=actor(next_actor),
         outcome=body_text(outcome, "outcome", required=True),
         next_action=optional_body(next_action, "next action"),
-        waiting_on=optional_body(waiting_on, "waiting on"),
+        waiting_on=clean_waiting,
         rank=task_rank(rank),
         active_thread_id=clean_active,
         refs=references(refs),
@@ -429,6 +491,13 @@ def new_task(
             if rich
             else ()
         ),
+        target_seat=clean_target_seat,
+        claim_by=clean_claim_by,
+        progress_check_by=clean_progress_check_by,
+        dispatch_id=clean_dispatch_id,
+        dispatch_revision=clean_dispatch_revision,
+        blocker_owner=clean_blocker_owner,
+        blocker_condition=clean_blocker_condition,
     )
     _validate_task_state(task)
     return parse_task(render_task(task))
@@ -598,7 +667,19 @@ def render_task(task: Task) -> str:
     review = validate_review_references(task.refs, terminal=task.status in TERMINAL_TASK_STATUSES)
     rich = _task_is_rich(task)
     stored_version = (
-        TASK_RESIDENT_FORMAT_VERSION
+        TASK_DISPATCH_FORMAT_VERSION
+        if any(
+            (
+                task.target_seat is not None,
+                task.claim_by is not None,
+                task.progress_check_by is not None,
+                task.dispatch_id is not None,
+                task.dispatch_revision is not None,
+                task.blocker_owner is not None,
+                task.blocker_condition is not None,
+            )
+        )
+        else TASK_RESIDENT_FORMAT_VERSION
         if rich
         else TASK_FORMAT_VERSION
         if len(review.subject_task_ids) > 1
@@ -641,6 +722,22 @@ def render_task(task: Task) -> str:
                 "workspace": optional_line(task.workspace, "workspace", 2_048),
             }
         )
+        if stored_version == TASK_DISPATCH_FORMAT_VERSION:
+            metadata.update(
+                {
+                    "blocker_condition": optional_line(
+                        task.blocker_condition, "blocker condition", 500
+                    ),
+                    "blocker_owner": optional_line(task.blocker_owner, "blocker owner", 120),
+                    "claim_by": optional_stored_time(task.claim_by, "claim_by"),
+                    "dispatch_id": dispatch_id_value(task.dispatch_id),
+                    "dispatch_revision": dispatch_revision_value(task.dispatch_revision),
+                    "progress_check_by": optional_stored_time(
+                        task.progress_check_by, "progress_check_by"
+                    ),
+                    "target_seat": target_seat_value(task.target_seat),
+                }
+            )
         sections = (*sections, ("History", render_history(task.history)))
     return _render(
         metadata,
@@ -768,19 +865,22 @@ def parse_task(markdown: str) -> Task:
             FORMAT_VERSION: ("Outcome", "Next action", "Waiting on"),
             TASK_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on"),
             TASK_RESIDENT_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on", "History"),
+            TASK_DISPATCH_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on", "History"),
         },
     )
     stored_version = meta["version"]
     _expect_metadata_keys(
         meta,
         (
-            _TASK_RESIDENT_KEYS
+            _TASK_DISPATCH_KEYS
+            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            else _TASK_RESIDENT_KEYS
             if stored_version == TASK_RESIDENT_FORMAT_VERSION
             else _TASK_LEGACY_KEYS
         ),
         "task",
     )
-    rich = stored_version == TASK_RESIDENT_FORMAT_VERSION
+    rich = stored_version in {TASK_RESIDENT_FORMAT_VERSION, TASK_DISPATCH_FORMAT_VERSION}
     task = Task(
         identifier=task_id(_string(meta, "id")),
         title=title_text(title),
@@ -818,6 +918,41 @@ def parse_task(markdown: str) -> Task:
             stored_time(_string(meta, "state_changed_at"), "state_changed_at") if rich else None
         ),
         history=(parse_history(sections["History"]) if rich else ()),
+        target_seat=(
+            target_seat_value(_optional_string(meta, "target_seat"))
+            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            else None
+        ),
+        claim_by=(
+            optional_stored_time(_optional_string(meta, "claim_by"), "claim_by")
+            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            else None
+        ),
+        progress_check_by=(
+            optional_stored_time(_optional_string(meta, "progress_check_by"), "progress_check_by")
+            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            else None
+        ),
+        dispatch_id=(
+            dispatch_id_value(_optional_string(meta, "dispatch_id"))
+            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            else None
+        ),
+        dispatch_revision=(
+            dispatch_revision_value(_optional_string(meta, "dispatch_revision"))
+            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            else None
+        ),
+        blocker_owner=(
+            optional_line(_optional_string(meta, "blocker_owner"), "blocker owner", 120)
+            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            else None
+        ),
+        blocker_condition=(
+            optional_line(_optional_string(meta, "blocker_condition"), "blocker condition", 500)
+            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            else None
+        ),
     )
     _validate_task_state(task)
     review = validate_review_references(task.refs, terminal=task.status in TERMINAL_TASK_STATUSES)
@@ -827,6 +962,8 @@ def parse_task(markdown: str) -> Task:
         raise ValidationError("task record version 2 requires multiple current review subjects")
     if stored_version == TASK_RESIDENT_FORMAT_VERSION and not _task_is_rich(task):
         raise ValidationError("task record version 3 requires resident continuity fields")
+    if stored_version == TASK_DISPATCH_FORMAT_VERSION and not _task_is_rich(task):
+        raise ValidationError("task record version 4 requires dispatch continuity fields")
     return task
 
 
@@ -1088,6 +1225,62 @@ def hand_id(value: str | None) -> str | None:
     if not SAFE_HAND_ID.fullmatch(clean):
         raise ValidationError("active thread ID must be one bounded opaque identifier")
     return clean
+
+
+def target_seat_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    clean = optional_line(value, "target seat", 64)
+    if clean is None:
+        return None
+    if TARGET_SEAT.fullmatch(clean) is None:
+        raise ValidationError("target seat must be a lowercase kebab-case seat ID")
+    return clean
+
+
+def dispatch_id_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    clean = optional_line(value, "dispatch ID", 128)
+    if clean is None:
+        return None
+    if DISPATCH_ID.fullmatch(clean) is None:
+        raise ValidationError("dispatch ID is invalid")
+    return clean
+
+
+def dispatch_revision_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    clean = optional_line(value, "dispatch revision", 64)
+    if clean is None:
+        return None
+    clean = clean.casefold()
+    if TASK_REVISION.fullmatch(clean) is None:
+        raise ValidationError("dispatch revision must be a task SHA-256 revision")
+    return clean
+
+
+def claim_by_eligible(status: str, target_seat: str | None, waiting_on: str | None) -> bool:
+    return status == "ready" and target_seat is not None and waiting_on is None
+
+
+def _validate_dispatch_fields(
+    dispatch_id: str | None,
+    dispatch_revision: str | None,
+    status: str,
+    waiting_on: str | None,
+    blocker_owner: str | None,
+    blocker_condition: str | None,
+) -> None:
+    if (dispatch_id is None) != (dispatch_revision is None):
+        raise ValidationError("dispatch ID and dispatch revision must be supplied together")
+    if (blocker_owner is None) != (blocker_condition is None):
+        raise ValidationError("blocker requires both owner and condition")
+    if blocker_owner is not None and status != "waiting":
+        raise ValidationError("blocker fields require waiting task status")
+    if blocker_condition is not None and waiting_on != blocker_condition:
+        raise ValidationError("blocker condition must match waiting_on")
 
 
 def review_coverage_ref(
@@ -1713,6 +1906,13 @@ def _task_is_rich(task: Task) -> bool:
             bool(task.codex_episode_ids),
             task.state_changed_at is not None,
             bool(task.history),
+            task.target_seat is not None,
+            task.claim_by is not None,
+            task.progress_check_by is not None,
+            task.dispatch_id is not None,
+            task.dispatch_revision is not None,
+            task.blocker_owner is not None,
+            task.blocker_condition is not None,
         )
     )
 
@@ -1772,6 +1972,14 @@ def _validate_timeline(
 
 def _validate_task_state(task: Task) -> None:
     rich = _task_is_rich(task)
+    _validate_dispatch_fields(
+        dispatch_id_value(task.dispatch_id),
+        dispatch_revision_value(task.dispatch_revision),
+        task.status,
+        task.waiting_on,
+        optional_line(task.blocker_owner, "blocker owner", 120),
+        optional_line(task.blocker_condition, "blocker condition", 500),
+    )
     if task.status in TERMINAL_TASK_STATUSES and any(
         (task.next_actor, task.next_action, task.waiting_on)
     ):

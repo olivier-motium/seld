@@ -218,7 +218,7 @@ def test_candidate_version_is_consistent_across_runtime_installers_and_lock() ->
     lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     locked_gsv = next(package for package in lock["package"] if package["name"] == "gsv")
 
-    assert project["project"]["version"] == __version__ == "0.3.0"
+    assert project["project"]["version"] == __version__ == "0.4.0"
     assert locked_gsv["version"] == __version__
     assert f"GSV_VERSION:-{__version__}" in (ROOT / "scripts/install.sh").read_text(
         encoding="utf-8"

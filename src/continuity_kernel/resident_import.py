@@ -147,6 +147,15 @@ _TASK_KEYS: Final = frozenset(
         "workspace",
     }
 )
+_TASK_DISPATCH_KEYS: Final = _TASK_KEYS | {
+    "blocker_condition",
+    "blocker_owner",
+    "claim_by",
+    "dispatch_id",
+    "dispatch_revision",
+    "progress_check_by",
+    "target_seat",
+}
 _ENTITY_KEYS: Final = frozenset(
     {
         "aliases",
@@ -967,7 +976,9 @@ def _semantic_payload(
 
 
 def _task_from_private(value: object) -> Task:
-    raw = _object(value, "private task", _TASK_KEYS)
+    if not isinstance(value, dict) or set(value) not in {_TASK_KEYS, _TASK_DISPATCH_KEYS}:
+        raise ValidationError("private task has an unsupported shape")
+    raw = value
     candidate = Task(
         identifier=raw["identifier"],
         title=raw["title"],
@@ -977,6 +988,13 @@ def _task_from_private(value: object) -> Task:
         next_action=raw["next_action"],
         waiting_on=raw["waiting_on"],
         rank=raw["rank"],
+        target_seat=raw.get("target_seat"),
+        claim_by=raw.get("claim_by"),
+        progress_check_by=raw.get("progress_check_by"),
+        dispatch_id=raw.get("dispatch_id"),
+        dispatch_revision=raw.get("dispatch_revision"),
+        blocker_owner=raw.get("blocker_owner"),
+        blocker_condition=raw.get("blocker_condition"),
         active_thread_id=raw["active_thread_id"],
         refs=_string_tuple(raw["refs"], "task refs"),
         created_at=raw["created_at"],

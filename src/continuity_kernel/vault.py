@@ -87,6 +87,7 @@ from continuity_kernel.portfolio import (
     render_portfolio,
 )
 from continuity_kernel.records import (
+    DEFAULT_CLAIM_WINDOW,
     MAX_HISTORY_ENTRIES,
     REVIEW_WORK_THREAD_ID,
     SHA256_REVISION,
@@ -105,7 +106,10 @@ from continuity_kernel.records import (
     body_text,
     calendar_date,
     canonical_id,
+    claim_by_eligible,
     codex_episodes,
+    dispatch_id_value,
+    dispatch_revision_value,
     entity_ids_value,
     entity_merge_absorptions,
     entity_relationships,
@@ -136,6 +140,7 @@ from continuity_kernel.records import (
     render_thread,
     safe_token,
     stored_time,
+    target_seat_value,
     task_entity_links,
     task_id,
     task_ids_value,
@@ -414,6 +419,13 @@ class Vault:
         next_action: str | None = None,
         waiting_on: str | None = None,
         rank: int | None = None,
+        target_seat: str | None = None,
+        claim_by: str | None = None,
+        progress_check_by: str | None = None,
+        dispatch_id: str | None = None,
+        dispatch_revision: str | None = None,
+        blocker_owner: str | None = None,
+        blocker_condition: str | None = None,
         active_thread_id: str | None = None,
         superseded_by: str | None = None,
         project: str | None = None,
@@ -424,6 +436,13 @@ class Vault:
         clear_next_action: bool = False,
         clear_waiting_on: bool = False,
         clear_rank: bool = False,
+        clear_target_seat: bool = False,
+        clear_claim_by: bool = False,
+        clear_progress_check_by: bool = False,
+        clear_dispatch_id: bool = False,
+        clear_dispatch_revision: bool = False,
+        clear_blocker_owner: bool = False,
+        clear_blocker_condition: bool = False,
         clear_active_thread_id: bool = False,
         clear_superseded_by: bool = False,
         clear_project: bool = False,
@@ -457,6 +476,25 @@ class Vault:
             _exclusive_choice(next_action, clear_next_action, "next action")
             _exclusive_choice(waiting_on, clear_waiting_on, "waiting on")
             _exclusive_choice(rank, clear_rank, "rank")
+            _exclusive_choice(target_seat, clear_target_seat, "target seat")
+            _exclusive_choice(claim_by, clear_claim_by, "claim deadline")
+            _exclusive_choice(
+                progress_check_by,
+                clear_progress_check_by,
+                "progress deadline",
+            )
+            _exclusive_choice(dispatch_id, clear_dispatch_id, "dispatch ID")
+            _exclusive_choice(
+                dispatch_revision,
+                clear_dispatch_revision,
+                "dispatch revision",
+            )
+            _exclusive_choice(blocker_owner, clear_blocker_owner, "blocker owner")
+            _exclusive_choice(
+                blocker_condition,
+                clear_blocker_condition,
+                "blocker condition",
+            )
 
             target_status = task_status(status) if status is not None else before.status
             target_actor = (
@@ -482,6 +520,71 @@ class Vault:
             )
             target_rank = (
                 task_rank(rank) if rank is not None else None if clear_rank else before.rank
+            )
+            target_target_seat = (
+                target_seat_value(target_seat)
+                if target_seat is not None
+                else None
+                if clear_target_seat
+                else before.target_seat
+            )
+            target_claim_by = (
+                optional_stored_time(claim_by, "claim_by")
+                if claim_by is not None
+                else None
+                if clear_claim_by
+                else before.claim_by
+            )
+            target_progress_check_by = (
+                optional_stored_time(progress_check_by, "progress_check_by")
+                if progress_check_by is not None
+                else None
+                if clear_progress_check_by
+                else before.progress_check_by
+            )
+            target_dispatch_id = (
+                dispatch_id_value(dispatch_id)
+                if dispatch_id is not None
+                else None
+                if clear_dispatch_id
+                else before.dispatch_id
+            )
+            target_dispatch_revision = (
+                dispatch_revision_value(dispatch_revision)
+                if dispatch_revision is not None
+                else None
+                if clear_dispatch_revision
+                else before.dispatch_revision
+            )
+            target_blocker_owner = (
+                optional_line(blocker_owner, "blocker owner", 120)
+                if blocker_owner is not None
+                else None
+                if clear_blocker_owner
+                else before.blocker_owner
+            )
+            target_blocker_condition = (
+                optional_line(blocker_condition, "blocker condition", 500)
+                if blocker_condition is not None
+                else None
+                if clear_blocker_condition
+                else before.blocker_condition
+            )
+            if target_blocker_condition is not None and target_waiting is None:
+                target_waiting = target_blocker_condition
+            if target_status in TERMINAL_TASK_STATUSES:
+                target_blocker_owner = None
+                target_blocker_condition = None
+            _validate_task_dispatch_update(
+                target_status,
+                target_waiting,
+                target_target_seat,
+                target_claim_by,
+                target_progress_check_by,
+                target_dispatch_id,
+                target_dispatch_revision,
+                target_blocker_owner,
+                target_blocker_condition,
             )
             target_active_thread_id = (
                 hand_id(active_thread_id)
@@ -593,6 +696,18 @@ class Vault:
                 (before, *((transfer_owner,) if transfer_owner is not None else ())),
                 observed_at,
             )
+            if (
+                before.claim_by is None
+                and target_claim_by is None
+                and claim_by_eligible(target_status, target_target_seat, target_waiting)
+                and not clear_claim_by
+                and (
+                    target_status != before.status
+                    or target_target_seat != before.target_seat
+                    or target_waiting != before.waiting_on
+                )
+            ):
+                target_claim_by = format_time(parse_time(timestamp) + DEFAULT_CLAIM_WINDOW)
             changes = _changed_fields(
                 (
                     (
@@ -612,6 +727,25 @@ class Vault:
                     ("next action", before.next_action, target_next),
                     ("waiting on", before.waiting_on, target_waiting),
                     ("rank", before.rank, target_rank),
+                    ("target seat", before.target_seat, target_target_seat),
+                    ("claim deadline", before.claim_by, target_claim_by),
+                    (
+                        "progress deadline",
+                        before.progress_check_by,
+                        target_progress_check_by,
+                    ),
+                    ("dispatch ID", before.dispatch_id, target_dispatch_id),
+                    (
+                        "dispatch revision",
+                        before.dispatch_revision,
+                        target_dispatch_revision,
+                    ),
+                    ("blocker owner", before.blocker_owner, target_blocker_owner),
+                    (
+                        "blocker condition",
+                        before.blocker_condition,
+                        target_blocker_condition,
+                    ),
                     ("active Codex hand", before.active_thread_id, target_active_thread_id),
                     ("superseding task", before.superseded_by, target_superseded_by),
                     ("project", before.project, target_project),
@@ -636,6 +770,13 @@ class Vault:
                     target_attention is not None,
                     target_due is not None,
                     bool(target_episodes),
+                    target_target_seat is not None,
+                    target_claim_by is not None,
+                    target_progress_check_by is not None,
+                    target_dispatch_id is not None,
+                    target_dispatch_revision is not None,
+                    target_blocker_owner is not None,
+                    target_blocker_condition is not None,
                     clean_note is not None,
                 )
             )
@@ -657,6 +798,13 @@ class Vault:
                 next_action=target_next,
                 waiting_on=target_waiting,
                 rank=target_rank,
+                target_seat=target_target_seat,
+                claim_by=target_claim_by,
+                progress_check_by=target_progress_check_by,
+                dispatch_id=target_dispatch_id,
+                dispatch_revision=target_dispatch_revision,
+                blocker_owner=target_blocker_owner,
+                blocker_condition=target_blocker_condition,
                 active_thread_id=target_active_thread_id,
                 refs=refs,
                 superseded_by=target_superseded_by,
@@ -4174,6 +4322,28 @@ def _history_keep_count(value: int) -> int:
             f"history keep count must be between 0 and {MAX_HISTORY_ENTRIES} entries"
         )
     return value
+
+
+def _validate_task_dispatch_update(
+    status: str,
+    waiting_on: str | None,
+    target_seat: str | None,
+    claim_by: str | None,
+    progress_check_by: str | None,
+    dispatch_id: str | None,
+    dispatch_revision: str | None,
+    blocker_owner: str | None,
+    blocker_condition: str | None,
+) -> None:
+    del target_seat, claim_by, progress_check_by
+    if (dispatch_id is None) != (dispatch_revision is None):
+        raise ValidationError("dispatch ID and dispatch revision must be supplied together")
+    if (blocker_owner is None) != (blocker_condition is None):
+        raise ValidationError("blocker requires both owner and condition")
+    if blocker_owner is not None and status != "waiting":
+        raise ValidationError("blocker fields require waiting task status")
+    if blocker_condition is not None and waiting_on != blocker_condition:
+        raise ValidationError("blocker condition must match waiting_on")
 
 
 def _exclusive_choice(value: object | None, clear: bool, label: str) -> None:

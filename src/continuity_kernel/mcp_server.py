@@ -9,6 +9,7 @@ import sys
 import uuid
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import IO, Any, Final, cast
 
 import continuity_kernel.update as self_update
@@ -26,6 +27,14 @@ from continuity_kernel.connector_sources import SUPPORTED_SOURCE_IDS, read_conne
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.direction import direction_aim, direction_dict
 from continuity_kernel.discord_source import DiscordSourceBridge
+from continuity_kernel.dispatch import (
+    bind_task_hand,
+    claim_task,
+    clear_task_blocker,
+    dispatch_eligible,
+    evaluate_task_deadline,
+    write_task_blocker,
+)
 from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
 from continuity_kernel.local_source_delivery import (
     FORWARD_ONLY_RESET,
@@ -49,6 +58,7 @@ from continuity_kernel.records import (
     TaskEntityLink,
     WorkThreadEntityLink,
     WorkThreadTaskLink,
+    parse_time,
     record_dict,
 )
 from continuity_kernel.resident_context import (
@@ -59,6 +69,7 @@ from continuity_kernel.resident_context import (
 from continuity_kernel.sense_sweep import heartbeat_status, sense_sweep
 from continuity_kernel.source_recipes import list_recipes
 from continuity_kernel.source_state import SOURCE_ERROR_CODES
+from continuity_kernel.task_pointer import create_or_update_task_and_place_pointer_mail
 from continuity_kernel.vault import Vault, doctor_dict
 
 PROTOCOL_VERSION: Final = "2025-06-18"
@@ -91,6 +102,13 @@ GUIDED_REVIEW_TOOL_NAMES: Final = frozenset(
         "gsv_task_show",
         "gsv_task_create",
         "gsv_task_update",
+        "gsv_task_create_and_place_pointer",
+        "gsv_dispatch_eligible",
+        "gsv_dispatch_claim",
+        "gsv_dispatch_bind",
+        "gsv_dispatch_blocker",
+        "gsv_dispatch_blocker_clear",
+        "gsv_dispatch_deadline_eval",
         "gsv_direction_show",
         "gsv_portfolio_show",
         "gsv_portfolio_inspect",
@@ -464,6 +482,13 @@ def _call(
                 next_action=_optional_string(values, "next_action"),
                 waiting_on=_optional_string(values, "waiting_on"),
                 rank=_optional_integer(values, "rank"),
+                target_seat=_optional_string(values, "target_seat"),
+                claim_by=_optional_string(values, "claim_by"),
+                progress_check_by=_optional_string(values, "progress_check_by"),
+                dispatch_id=_optional_string(values, "dispatch_id"),
+                dispatch_revision=_optional_string(values, "dispatch_revision"),
+                blocker_owner=_optional_string(values, "blocker_owner"),
+                blocker_condition=_optional_string(values, "blocker_condition"),
                 active_thread_id=_optional_string(values, "active_thread_id"),
                 superseded_by=_optional_string(values, "superseded_by"),
                 project=_optional_string(values, "project"),
@@ -487,6 +512,13 @@ def _call(
                 next_action=_optional_string(values, "next_action"),
                 waiting_on=_optional_string(values, "waiting_on"),
                 rank=_optional_integer(values, "rank"),
+                target_seat=_optional_string(values, "target_seat"),
+                claim_by=_optional_string(values, "claim_by"),
+                progress_check_by=_optional_string(values, "progress_check_by"),
+                dispatch_id=_optional_string(values, "dispatch_id"),
+                dispatch_revision=_optional_string(values, "dispatch_revision"),
+                blocker_owner=_optional_string(values, "blocker_owner"),
+                blocker_condition=_optional_string(values, "blocker_condition"),
                 active_thread_id=_optional_string(values, "active_thread_id"),
                 superseded_by=_optional_string(values, "superseded_by"),
                 project=_optional_string(values, "project"),
@@ -497,6 +529,13 @@ def _call(
                 clear_next_action=_boolean(values, "clear_next_action"),
                 clear_waiting_on=_boolean(values, "clear_waiting_on"),
                 clear_rank=_boolean(values, "clear_rank"),
+                clear_target_seat=_boolean(values, "clear_target_seat"),
+                clear_claim_by=_boolean(values, "clear_claim_by"),
+                clear_progress_check_by=_boolean(values, "clear_progress_check_by"),
+                clear_dispatch_id=_boolean(values, "clear_dispatch_id"),
+                clear_dispatch_revision=_boolean(values, "clear_dispatch_revision"),
+                clear_blocker_owner=_boolean(values, "clear_blocker_owner"),
+                clear_blocker_condition=_boolean(values, "clear_blocker_condition"),
                 clear_active_thread_id=_boolean(values, "clear_active_thread_id"),
                 clear_superseded_by=_boolean(values, "clear_superseded_by"),
                 clear_project=_boolean(values, "clear_project"),
@@ -512,6 +551,92 @@ def _call(
                 note=_optional_string(values, "note"),
             )
         )
+    if name == "gsv_task_create_and_place_pointer":
+        result = create_or_update_task_and_place_pointer_mail(
+            vault.root,
+            identifier=_string(values, "id"),
+            title=_string(values, "title"),
+            outcome=_string(values, "outcome"),
+            target_seat=_optional_string(values, "target_seat"),
+            authoring_seat=_optional_string(values, "authoring_seat"),
+            expected_revision=_optional_string(values, "expected_revision"),
+            status=_optional_string(values, "status"),
+            rank=_optional_integer(values, "rank"),
+            next_actor=_optional_string(values, "next_actor"),
+            next_action=_optional_string(values, "next_action"),
+            waiting_on=_optional_string(values, "waiting_on"),
+            claim_by=_optional_string(values, "claim_by"),
+            progress_check_by=_optional_string(values, "progress_check_by"),
+            blocker_owner=_optional_string(values, "blocker_owner"),
+            blocker_condition=_optional_string(values, "blocker_condition"),
+            project=_optional_string(values, "project"),
+            workspace=_optional_string(values, "workspace"),
+            observed_at=_optional_time(values, "observed_at"),
+        )
+        return {
+            "created": result.created,
+            "event_key": result.event_key,
+            "task": record_dict(result.task),
+        }
+    if name == "gsv_dispatch_eligible":
+        return {"tasks": [record_dict(task) for task in dispatch_eligible(vault.root)]}
+    if name == "gsv_dispatch_claim":
+        return record_dict(
+            claim_task(
+                vault.root,
+                _string(values, "id"),
+                expected_revision=_string(values, "expected_revision"),
+                dispatch_id=_string(values, "dispatch_id"),
+                observed_at=_optional_time(values, "observed_at"),
+            )
+        )
+    if name == "gsv_dispatch_bind":
+        return record_dict(
+            bind_task_hand(
+                vault.root,
+                _string(values, "id"),
+                expected_revision=_string(values, "expected_revision"),
+                dispatch_id=_string(values, "dispatch_id"),
+                active_thread_id=_string(values, "active_thread_id"),
+                observed_at=_optional_time(values, "observed_at"),
+            )
+        )
+    if name == "gsv_dispatch_blocker":
+        return record_dict(
+            write_task_blocker(
+                vault.root,
+                _string(values, "id"),
+                expected_revision=_string(values, "expected_revision"),
+                dispatch_id=_string(values, "dispatch_id"),
+                owner=_string(values, "owner"),
+                condition=_string(values, "condition"),
+                observed_at=_optional_time(values, "observed_at"),
+            )
+        )
+    if name == "gsv_dispatch_blocker_clear":
+        return record_dict(
+            clear_task_blocker(
+                vault.root,
+                _string(values, "id"),
+                expected_revision=_string(values, "expected_revision"),
+                dispatch_id=_string(values, "dispatch_id"),
+                owner=_string(values, "owner"),
+                condition=_string(values, "condition"),
+                observed_at=_optional_time(values, "observed_at"),
+            )
+        )
+    if name == "gsv_dispatch_deadline_eval":
+        return {
+            "findings": [
+                asdict(finding)
+                for finding in evaluate_task_deadline(
+                    vault.root,
+                    _string(values, "id"),
+                    now=_optional_time(values, "now"),
+                    clock_health=_optional_string(values, "clock_health") or "healthy",
+                )
+            ]
+        }
     if name == "gsv_direction_show":
         return direction_dict(vault.get_direction())
     if name == "gsv_direction_set":
@@ -890,9 +1015,14 @@ def _compact_task(task: Task) -> dict[str, Any]:
     return {
         "active_thread_id": task.active_thread_id,
         "attention_at": task.attention_at,
+        "blocker_condition": task.blocker_condition,
+        "blocker_owner": task.blocker_owner,
+        "claim_by": task.claim_by,
         "codex_episode_count": len(task.codex_episode_ids),
         "created_at": task.created_at,
         "due": task.due,
+        "dispatch_id": task.dispatch_id,
+        "dispatch_revision": task.dispatch_revision,
         "entity_link_count": len(task.entity_links),
         "history_count": len(task.history),
         "identifier": task.identifier,
@@ -900,12 +1030,14 @@ def _compact_task(task: Task) -> dict[str, Any]:
         "next_actor": task.next_actor,
         "outcome_excerpt": outcome,
         "project": task.project,
+        "progress_check_by": task.progress_check_by,
         "rank": task.rank,
         "reference_count": len(task.refs),
         "revision": task.revision,
         "state_changed_at": task.state_changed_at,
         "status": task.status,
         "superseded_by": task.superseded_by,
+        "target_seat": task.target_seat,
         "title": task.title,
         "truncated_fields": truncated_fields,
         "updated_at": task.updated_at,
@@ -1561,18 +1693,25 @@ TOOLS: Final = [
             "id": TEXT,
             "active_thread_id": TASK_ACTIVE_THREAD_ID,
             "attention_at": TEXT,
+            "blocker_condition": TEXT,
+            "blocker_owner": TEXT,
+            "claim_by": TEXT,
             "codex_episode_ids": TEXTS,
+            "dispatch_id": TEXT,
+            "dispatch_revision": TEXT,
             "due": TEXT,
             "entity_links": TASK_ENTITY_LINKS,
             "next_action": TEXT,
             "next_actor": {"enum": ["agent", "human", "external"], "type": "string"},
             "outcome": TEXT,
+            "progress_check_by": TEXT,
             "project": TEXT,
             "refs": TASK_REFS,
             "rank": {"minimum": 0, "type": "integer"},
             "status": TEXT,
             "superseded_by": TEXT,
             "title": TEXT,
+            "target_seat": TEXT,
             "waiting_on": TEXT,
             "workspace": TEXT,
         },
@@ -1588,17 +1727,29 @@ TOOLS: Final = [
             "add_refs": TASK_REFS,
             "active_thread_id": TASK_ACTIVE_THREAD_ID,
             "attention_at": TEXT,
+            "blocker_condition": TEXT,
+            "blocker_owner": TEXT,
+            "claim_by": TEXT,
             "clear_active_thread_id": BOOLEAN,
             "clear_attention_at": BOOLEAN,
+            "clear_blocker_condition": BOOLEAN,
+            "clear_blocker_owner": BOOLEAN,
+            "clear_claim_by": BOOLEAN,
             "clear_due": BOOLEAN,
+            "clear_dispatch_id": BOOLEAN,
+            "clear_dispatch_revision": BOOLEAN,
             "clear_next_action": BOOLEAN,
             "clear_next_actor": BOOLEAN,
+            "clear_progress_check_by": BOOLEAN,
             "clear_project": BOOLEAN,
             "clear_superseded_by": BOOLEAN,
+            "clear_target_seat": BOOLEAN,
             "clear_waiting_on": BOOLEAN,
             "clear_rank": BOOLEAN,
             "clear_workspace": BOOLEAN,
             "due": TEXT,
+            "dispatch_id": TEXT,
+            "dispatch_revision": TEXT,
             "expected_revision": TEXT,
             "id": TEXT,
             "next_action": TEXT,
@@ -1606,18 +1757,123 @@ TOOLS: Final = [
             "note": TEXT,
             "outcome": TEXT,
             "project": TEXT,
+            "progress_check_by": TEXT,
             "remove_codex_episode_ids": TEXTS,
             "remove_entity_links": TASK_ENTITY_LINKS,
             "remove_refs": TASK_REMOVE_REFS,
             "rank": {"minimum": 0, "type": "integer"},
             "status": TEXT,
             "superseded_by": TEXT,
+            "target_seat": TEXT,
             "title": TEXT,
             "waiting_on": TEXT,
             "workspace": TEXT,
         },
         ("id", "expected_revision"),
         read_only=False,
+    ),
+    _tool(
+        "gsv_task_create_and_place_pointer",
+        (
+            "Author one task and place one exact typed pointer through Workbench mail. "
+            "The authoring seat is mandatory and is copied to the sender field; no sender "
+            "identity is inferred."
+        ),
+        {
+            "authoring_seat": TEXT,
+            "blocker_condition": TEXT,
+            "blocker_owner": TEXT,
+            "claim_by": TEXT,
+            "expected_revision": TEXT,
+            "id": TEXT,
+            "next_action": TEXT,
+            "next_actor": {"enum": ["agent", "human", "external"], "type": "string"},
+            "observed_at": TEXT,
+            "outcome": TEXT,
+            "progress_check_by": TEXT,
+            "project": TEXT,
+            "rank": {"minimum": 0, "type": "integer"},
+            "status": TEXT,
+            "target_seat": TEXT,
+            "title": TEXT,
+            "waiting_on": TEXT,
+            "workspace": TEXT,
+        },
+        ("id", "title", "outcome", "target_seat", "authoring_seat"),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_dispatch_eligible",
+        (
+            "List every ready task with an explicit typed target that is unblocked and unclaimed. "
+            "The result is ordered by authored rank, then creation time."
+        ),
+        {},
+        read_only=True,
+    ),
+    _tool(
+        "gsv_dispatch_claim",
+        "Claim one eligible task with its exact current revision and one dispatch ID.",
+        {
+            "dispatch_id": TEXT,
+            "expected_revision": TEXT,
+            "id": TEXT,
+            "observed_at": TEXT,
+        },
+        ("id", "expected_revision", "dispatch_id"),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_dispatch_bind",
+        "Bind one claimed task to one exact active execution hand.",
+        {
+            "active_thread_id": TASK_ACTIVE_THREAD_ID,
+            "dispatch_id": TEXT,
+            "expected_revision": TEXT,
+            "id": TEXT,
+            "observed_at": TEXT,
+        },
+        ("id", "expected_revision", "dispatch_id", "active_thread_id"),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_dispatch_blocker",
+        "Write one named recoverable blocker for a claimed task.",
+        {
+            "condition": TEXT,
+            "dispatch_id": TEXT,
+            "expected_revision": TEXT,
+            "id": TEXT,
+            "observed_at": TEXT,
+            "owner": TEXT,
+        },
+        ("id", "expected_revision", "dispatch_id", "owner", "condition"),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_dispatch_blocker_clear",
+        "Clear one exact blocker and return the task to the ready queue.",
+        {
+            "condition": TEXT,
+            "dispatch_id": TEXT,
+            "expected_revision": TEXT,
+            "id": TEXT,
+            "observed_at": TEXT,
+            "owner": TEXT,
+        },
+        ("id", "expected_revision", "dispatch_id", "owner", "condition"),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_dispatch_deadline_eval",
+        "Project task deadlines as attention without mutating task truth.",
+        {
+            "clock_health": {"enum": ["healthy", "unknown"], "type": "string"},
+            "id": TEXT,
+            "now": TEXT,
+        },
+        ("id",),
+        read_only=True,
     ),
     _tool(
         "gsv_direction_show",
@@ -2144,6 +2400,11 @@ def _optional_string(values: dict[str, Any], name: str) -> str | None:
     if not isinstance(value, str):
         raise ValidationError(f"{name} must be a string")
     return value
+
+
+def _optional_time(values: dict[str, Any], name: str) -> datetime | None:
+    value = _optional_string(values, name)
+    return parse_time(value) if value is not None else None
 
 
 def _strings(values: dict[str, Any], name: str) -> tuple[str, ...]:
