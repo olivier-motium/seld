@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gsv"
-version = "0.3.0"
+version = "0.4.0"
 description = "An ambient AI chief of staff that stays caught up across the sources you choose"
 readme = "README.md"
 requires-python = ">=3.11"

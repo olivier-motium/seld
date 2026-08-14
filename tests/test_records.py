@@ -79,6 +79,33 @@ def test_task_round_trips_authored_rank_and_exact_active_hand() -> None:
     assert task.active_thread_id == "019f95fd-009e-7603-ab87-f9927cf31c4d"
 
 
+def test_typed_dispatch_fields_are_additive_and_nullable() -> None:
+    legacy = new_task(
+        identifier="legacy-task",
+        title="Legacy task",
+        outcome="Keep the existing task row unchanged.",
+        observed_at=NOW,
+    )
+    legacy_stored = render_task(legacy)
+    typed = new_task(
+        identifier="typed-task",
+        title="Typed task",
+        outcome="Carry one explicit dispatch target.",
+        status="ready",
+        next_actor="agent",
+        target_seat="worker-one",
+        observed_at=NOW,
+    )
+
+    assert '"version":1' in legacy_stored.splitlines()[0]
+    assert parse_task(legacy_stored) == legacy
+    assert '"version":4' in render_task(typed).splitlines()[0]
+    assert typed.claim_by == "2026-07-22T12:05:00.000000Z"
+    assert typed.dispatch_id is None
+    assert typed.blocker_condition is None
+    assert parse_task(render_task(typed)) == typed
+
+
 def test_task_versions_only_the_multi_subject_review_shape() -> None:
     single = new_task(
         identifier="single-subject-review",
