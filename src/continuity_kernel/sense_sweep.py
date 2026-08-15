@@ -87,11 +87,17 @@ def sense_sweep(
     vault: Vault | Path | str,
     *,
     signal_store: ResidentSignalStore | None = None,
+    recall_refresh: Callable[[], SweepRecallStatus] | None = None,
     observed_at: datetime | None = None,
     budget_seconds: float = MAX_SWEEP_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> SenseSweepResult:
-    """Run one current sweep; missed intervals are never enumerated or replayed."""
+    """Run one current sweep; missed intervals are never enumerated or replayed.
+
+    The mechanical scan stays within its five-second budget. A scheduled caller
+    may add one host-admitted recall refresh after that scan while the sweep lock
+    still prevents overlap.
+    """
 
     if (
         isinstance(budget_seconds, bool)
@@ -189,6 +195,9 @@ def sense_sweep(
                 results = store.append_many_results(pending)
                 counts["signals"] = sum(int(created) for _signal, created in results)
                 _within_budget(monotonic, deadline)
+
+                if recall_refresh is not None:
+                    recall_status = recall_refresh()
 
             except _BudgetExceeded:
                 status = "timed_out"

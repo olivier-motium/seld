@@ -15,7 +15,7 @@ from continuity_kernel.resident_signals import (
     ResidentSignalStore,
     SignalAppendRequest,
 )
-from continuity_kernel.sense_sweep import heartbeat_status, sense_sweep
+from continuity_kernel.sense_sweep import SweepRecallStatus, heartbeat_status, sense_sweep
 from continuity_kernel.source_state import (
     record_source_observation,
     render_source_snapshot,
@@ -72,6 +72,22 @@ def test_empty_sweep_records_only_host_local_heartbeat(vault: Vault) -> None:
     assert heartbeat["sequence"] == 1
     assert heartbeat["status"] == "complete"
     assert vault.logical_digest() == before
+
+
+def test_scheduled_recall_result_is_published_in_same_heartbeat(vault: Vault) -> None:
+    result = sense_sweep(
+        vault,
+        observed_at=datetime(2026, 7, 29, 8, tzinfo=UTC),
+        recall_refresh=lambda: SweepRecallStatus(True, True, True, None),
+    )
+
+    assert result.recall == SweepRecallStatus(True, True, True, None)
+    assert heartbeat_status(vault.root)["recall"] == {
+        "attempted": True,
+        "changed": True,
+        "failure": None,
+        "updated": True,
+    }
 
 
 def test_fresh_source_is_not_due_and_never_read_source_is_due(vault: Vault) -> None:

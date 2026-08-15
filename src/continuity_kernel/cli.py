@@ -99,7 +99,7 @@ from continuity_kernel.resident_context import (
     resident_context_status,
 )
 from continuity_kernel.scheduler import MacOSScheduler, scheduler_dict
-from continuity_kernel.sense_sweep import heartbeat_status, sense_sweep
+from continuity_kernel.sense_sweep import SweepRecallStatus, heartbeat_status, sense_sweep
 from continuity_kernel.slack_tasks import SlackTaskReader
 from continuity_kernel.source_recipes import list_recipes
 from continuity_kernel.source_state import SOURCE_ERROR_CODES
@@ -115,6 +115,7 @@ from continuity_kernel.vault import (
 
 ROLLBACK_PROBE_TIMEOUT_SECONDS = 5
 ROLLBACK_PROBE_MAX_OUTPUT_BYTES = 64 * 1024
+RECALL_REFRESH_LOAD_CEILING = 40.0
 DISPATCH_ELIGIBLE_ALIAS = "task-" + "dispatch-eligible"
 DISPATCH_CLAIM_ALIAS = "task-" + "dispatch-claim"
 DISPATCH_BIND_ALIAS = "task-" + "dispatch-bind"
@@ -628,7 +629,10 @@ def _dispatch(args: argparse.Namespace) -> Any:
         if args.pulse_command == "status":
             return _pulse_status(vault)
         if args.pulse_command == "sweep":
-            return sense_sweep(vault).to_dict()
+            return sense_sweep(
+                vault,
+                recall_refresh=lambda: _scheduled_recall_refresh(vault),
+            ).to_dict()
         raise AssertionError("unreachable pulse command")
     if args.command == "scheduler":
         scheduler = _scheduler_for(vault, interval_seconds=args.interval_seconds)
@@ -1143,6 +1147,27 @@ def _pulse_status(vault: Vault) -> dict[str, object]:
         "heartbeat": heartbeat_status(vault.root),
         "signals": vault.resident_signal_status(),
     }
+
+
+def _scheduled_recall_refresh(vault: Vault) -> SweepRecallStatus:
+    """Refresh recall once when the host has enough spare capacity."""
+
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        return SweepRecallStatus(False, None, False, "deferred_budget")
+    if load >= RECALL_REFRESH_LOAD_CEILING:
+        return SweepRecallStatus(False, None, False, "deferred_budget")
+    try:
+        result = RecallCompanion(vault.root).refresh(timeout_seconds=600)
+    except (ContinuityError, OSError):
+        return SweepRecallStatus(True, None, False, "refresh_failed")
+    return SweepRecallStatus(
+        True,
+        result.changed,
+        result.updated,
+        "refresh_failed" if result.reason is not None else None,
+    )
 
 
 def _scheduler_for(vault: Vault, *, interval_seconds: int) -> MacOSScheduler:
