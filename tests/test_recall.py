@@ -474,12 +474,13 @@ def test_qmd_search_is_bounded_to_known_documents(
             "--index",
             "seld",
             "query",
-            "launch review",
+            "lex: launch review\nvec: launch review",
             "-n",
             "2",
             "--json",
             "-c",
             companion.collection,
+            "--no-rerank",
         )
     ]
 
@@ -538,7 +539,10 @@ def test_qmd_failure_is_sanitized_before_markdown_fallback(
         return recall_module._CommandResult(
             17,
             b"",
-            b"/private/path secret-provider-token",
+            (
+                b"Error: EPERM: operation not permitted, scandir '/private/var/OOPJit'\n"
+                b"secret-provider-token"
+            ),
         )
 
     monkeypatch.setattr(recall_module, "_run_command", fail)
@@ -548,7 +552,10 @@ def test_qmd_failure_is_sanitized_before_markdown_fallback(
     assert result.hits
     assert result.reason is not None
     assert "exit code 17" in result.reason
+    assert "EPERM" in result.reason
+    assert "scandir" in result.reason
     assert "private" not in result.reason
+    assert "OOPJit" not in result.reason
     assert "token" not in result.reason
 
 

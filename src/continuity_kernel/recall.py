@@ -43,7 +43,17 @@ MAX_REFRESH_TIMEOUT_SECONDS: Final = 600
 MAX_SEARCH_TIMEOUT_SECONDS: Final = 60
 _INDEX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _QUERY_TERM = re.compile(r"[^\W_]+", re.UNICODE)
+_ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+_ABSOLUTE_PATH = re.compile(
+    r"(?<![A-Za-z0-9_])(?:/[^\s'\"`,;:()\[\]{}]+|[A-Za-z]:\\[^\s'\"`,;:()\[\]{}]+)"
+)
+_SENSITIVE_WORD = re.compile(
+    r"\S*(?:authorization|bearer|cookie|credential|password|secret|token)\S*",
+    re.IGNORECASE,
+)
+_LONG_OPAQUE_VALUE = re.compile(r"\b[A-Za-z0-9._~-]{32,}\b")
 _DEFAULT_QMD_EXECUTABLES: Final = (
+    data_dir() / "qmd/bin/qmd",
     Path("/opt/homebrew/bin/qmd"),
     Path("/usr/local/bin/qmd"),
 )
@@ -554,12 +564,13 @@ class RecallCompanion:
                 result = _run_command(
                     self._command(
                         "query",
-                        clean_query,
+                        f"lex: {clean_query}\nvec: {clean_query}",
                         "-n",
                         str(limit),
                         "--json",
                         "-c",
                         self.collection,
+                        "--no-rerank",
                     ),
                     cwd=self.index_root,
                     env=self._environment(),
@@ -1533,11 +1544,29 @@ def _command_problem(result: _CommandResult, *, operation: str) -> str | None:
     if result.problem is not None:
         return f"QMD {operation} is unavailable; exact Markdown recall remains available"
     if result.returncode:
+        detail = _command_failure_detail(result)
+        explanation = f": {detail}" if detail else ""
         return (
-            f"QMD {operation} failed with exit code {result.returncode}; "
+            f"QMD {operation} failed with exit code {result.returncode}{explanation}; "
             "exact Markdown recall remains available"
         )
     return None
+
+
+def _command_failure_detail(result: _CommandResult) -> str | None:
+    """Return a bounded diagnostic without exposing local paths or secret material."""
+
+    encoded = result.stderr.strip() or result.stdout.strip()
+    if not encoded:
+        return None
+    text = _ANSI_ESCAPE.sub(b"", encoded[:16_384]).decode("utf-8", errors="replace")
+    text = _ABSOLUTE_PATH.sub("<path>", text)
+    text = _SENSITIVE_WORD.sub("<redacted>", text)
+    text = _LONG_OPAQUE_VALUE.sub("<redacted>", text)
+    clean = " ".join(text.split())
+    if not clean:
+        return None
+    return clean if len(clean) <= 240 else clean[:239].rstrip() + "…"
 
 
 def _run_command(
