@@ -347,7 +347,7 @@ def test_import_rejects_an_overbroad_oauth_grant_before_mutating_custody(
         access_token="overbroad-slack-token",
         refresh_token=None,
         token_type=OAuthTokenType.BEARER,
-        scopes=(*profile.read_scopes, "chat:write"),
+        scopes=(*profile.read_scopes, "admin"),
         issued_at=now,
         expires_at=None,
     ).to_bytes()

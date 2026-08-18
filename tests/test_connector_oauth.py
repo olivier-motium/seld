@@ -6,11 +6,13 @@ import socket
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from continuity_kernel.connector_credentials import OAuthCredential, credential_from_token_set
+from continuity_kernel.connector_local_tls import ensure_local_tls
 from continuity_kernel.connector_oauth import (
     OAuthAuthorizationRejectedError,
     OAuthCallbackError,
@@ -130,9 +132,31 @@ def test_authorization_url_rejects_a_mismatched_pkce_challenge(
     "redirect_uri",
     [
         "https://127.0.0.1:49152/oauth/callback",
+        "https://localhost:8767/oauth/callback",
+        "https://[::1]:49152/oauth/callback",
+        "https://127.0.0.1:49152",
+    ],
+)
+def test_configuration_accepts_https_loopback_redirect(redirect_uri: str) -> None:
+    config = OAuthClientConfig(
+        authorization_endpoint="https://accounts.example/authorize",
+        token_endpoint="https://accounts.example/token",
+        client_id="client",
+        redirect_uri=redirect_uri,
+    )
+    assert config.redirect_uri == redirect_uri
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "https://example.test:49152/oauth/callback",
         "http://example.test:49152/oauth/callback",
         "http://127.0.0.1/oauth/callback",
+        "https://127.0.0.1/oauth/callback",
         "http://127.0.0.1:49152/oauth/callback?fixed=query",
+        "https://127.0.0.1:49152/oauth/callback?fixed=query",
+        "https://127.0.0.1:49152/oauth/callback#frag",
     ],
 )
 def test_configuration_requires_an_exact_loopback_redirect(redirect_uri: str) -> None:
@@ -218,6 +242,118 @@ def test_localhost_redirect_listens_on_both_loopback_families(callback_host: str
     thread.start()
     try:
         assert listener.wait_for_code(timeout_seconds=5) == "localhost-code"
+    finally:
+        listener.close()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_tls_loopback_callback_binds_https_and_completes(tmp_path: Path) -> None:
+    state_dir = tmp_path / "connector-tls"
+    material = ensure_local_tls(state_dir=state_dir, install_trust=False)
+    server_ssl_ctx = material.create_ssl_context()
+    client_ssl_ctx = material.create_client_ssl_context()
+
+    listener = BoundLoopbackCallback.bind(
+        host="127.0.0.1",
+        port=0,
+        path="/oauth/callback",
+        tls_context=server_ssl_ctx,
+    )
+    assert listener.redirect_uri.startswith("https://127.0.0.1:")
+    assert listener.redirect_uri.endswith("/oauth/callback")
+
+    config = OAuthClientConfig(
+        authorization_endpoint="https://accounts.example/authorize",
+        token_endpoint="https://accounts.example/token",
+        client_id="seld-public-client",
+        redirect_uri=listener.redirect_uri,
+    )
+    attempt = begin_authorization(config)
+    listener.configure(config, attempt)
+    redirect = urlsplit(listener.redirect_uri)
+    assert redirect.port is not None
+
+    def callback() -> None:
+        connection = http.client.HTTPSConnection(
+            "127.0.0.1",
+            redirect.port,
+            timeout=5,
+            context=client_ssl_ctx,
+        )
+        connection.request(
+            "GET",
+            f"{redirect.path}?code=tls-code&state={attempt.state}",
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        response.read()
+        connection.close()
+
+    thread = threading.Thread(target=callback)
+    thread.start()
+    try:
+        assert listener.wait_for_code(timeout_seconds=5) == "tls-code"
+    finally:
+        listener.close()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("callback_host", ["127.0.0.1", "::1"])
+def test_tls_localhost_redirect_listens_on_both_loopback_families_with_https(
+    tmp_path: Path,
+    callback_host: str,
+) -> None:
+    if callback_host == "::1" and not socket.has_ipv6:
+        pytest.skip("IPv6 is unavailable on this host")
+    state_dir = tmp_path / "connector-tls"
+    material = ensure_local_tls(state_dir=state_dir, install_trust=False)
+    server_ssl_ctx = material.create_ssl_context()
+    client_ssl_ctx = material.create_client_ssl_context()
+
+    listener = BoundLoopbackCallback.bind(
+        host="localhost",
+        port=0,
+        path="/oauth/callback",
+        tls_context=server_ssl_ctx,
+    )
+    assert listener.redirect_uri.startswith("https://localhost:")
+    assert listener.redirect_uri.endswith("/oauth/callback")
+    config = OAuthClientConfig(
+        authorization_endpoint="https://slack.com/oauth/v2_user/authorize",
+        token_endpoint="https://slack.com/api/oauth.v2.user.access",
+        client_id="seld-public-client",
+        redirect_uri=listener.redirect_uri,
+        dialect=OAuthDialect.SLACK_USER,
+    )
+    attempt = begin_authorization(config)
+    listener.configure(config, attempt)
+    redirect = urlsplit(listener.redirect_uri)
+    assert redirect.hostname == "localhost"
+    assert redirect.port is not None
+
+    def callback() -> None:
+        target_host = f"[{callback_host}]" if callback_host == "::1" else callback_host
+        connection = http.client.HTTPSConnection(
+            target_host,
+            redirect.port,
+            timeout=5,
+            context=client_ssl_ctx,
+        )
+        connection.request(
+            "GET",
+            f"{redirect.path}?code=tls-localhost-code&state={attempt.state}",
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        response.read()
+        connection.close()
+
+    thread = threading.Thread(target=callback)
+    thread.start()
+    try:
+        assert listener.wait_for_code(timeout_seconds=5) == "tls-localhost-code"
     finally:
         listener.close()
         thread.join(timeout=5)
