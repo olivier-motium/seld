@@ -82,7 +82,9 @@ def test_scheduled_recall_result_is_published_in_same_heartbeat(vault: Vault) ->
     )
 
     assert result.recall == SweepRecallStatus(True, True, True, None)
-    assert heartbeat_status(vault.root)["recall"] == {
+    status = heartbeat_status(vault.root)
+    assert status is not None
+    assert status["recall"] == {
         "attempted": True,
         "changed": True,
         "failure": None,
