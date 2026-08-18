@@ -758,8 +758,10 @@ def test_canary_does_not_accept_an_uncorrelated_main_job_heartbeat(tmp_path: Pat
 
     assert not canary.proved
     assert canary.failure == "canary_missing"
-    assert heartbeat_status(scheduler.vault_root) is not None
+    # The main job records its heartbeat AFTER the recall refresh attempt,
+    # which can outlive the canary timeout. Wait for the job before reading.
     assert all(child.wait(timeout=5) == 0 for child in runner.children)
+    assert heartbeat_status(scheduler.vault_root) is not None
 
 
 @WINDOWS_REQUIRES_DARWIN_SCHEDULER
