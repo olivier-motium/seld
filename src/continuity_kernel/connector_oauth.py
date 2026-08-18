@@ -509,7 +509,7 @@ def _validate_loopback_redirect(redirect_uri: str) -> None:
     except ValueError as exc:
         raise OAuthConfigurationError("OAuth redirect URI has an invalid port") from exc
     if (
-        parsed.scheme != "http"
+        parsed.scheme not in {"http", "https"}
         or parsed.hostname not in _LOOPBACK_HOSTS
         or port is None
         or parsed.username is not None
@@ -518,7 +518,7 @@ def _validate_loopback_redirect(redirect_uri: str) -> None:
         or parsed.fragment
     ):
         raise OAuthConfigurationError(
-            "OAuth redirect URI must be an exact HTTP loopback URI with an explicit port"
+            "OAuth redirect URI must be an exact HTTP or HTTPS loopback URI with an explicit port"
         )
 
 

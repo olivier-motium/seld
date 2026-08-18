@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -245,6 +247,51 @@ def _discord_manager(
         ),
         scopes=profile.full_scopes if scopes is None else scopes,
         client=ClientMetadata(kind=ClientKind.EXTERNAL),
+        health=health,
+        created_at=BASE_TIME,
+        updated_at=BASE_TIME,
+        version=1,
+        last_verified_at=BASE_TIME if fingerprint is not None else None,
+    )
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=metadata,
+        observed_at=BASE_TIME,
+    )
+    return ConnectorAuthManager(
+        vault,
+        secret_store=InMemorySecretStore(),
+        state_root=tmp_path / "host-state",
+    )
+
+
+def _slack_manager(
+    tmp_path: Path,
+    *,
+    health: ConnectionHealth = ConnectionHealth.READY,
+    fingerprint: str | None = GOOGLE_ACCOUNT_FINGERPRINT,
+    scopes: tuple[str, ...] | None = None,
+) -> ConnectorAuthManager:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Portable Slack auth")
+    profile = get_profile("slack")
+    metadata = ConnectionMetadata(
+        connection_id=CONNECTION_ID,
+        provider=profile.provider,
+        source_ids=profile.source_ids,
+        credential_kind=profile.credential_kind,
+        account=AccountMetadata(
+            fingerprint=fingerprint,
+            label="Synthetic Slack workspace",
+        ),
+        scopes=profile.read_scopes if scopes is None else scopes,
+        client=ClientMetadata(
+            kind=ClientKind.PUBLIC,
+            identifier="public-slack-client",
+            redirect_uris=("https://localhost:8767/oauth/callback",),
+            authorization_endpoint=profile.authorization_endpoint,
+            token_endpoint=profile.token_endpoint,
+        ),
         health=health,
         created_at=BASE_TIME,
         updated_at=BASE_TIME,
@@ -1787,6 +1834,88 @@ def test_microsoft_logical_connector_accepts_known_sibling_grants(tmp_path: Path
     )
 
 
+def test_slack_read_tier_accepts_union_grant_within_profile_surface(tmp_path: Path) -> None:
+    profile = get_profile("slack")
+    manager = _slack_manager(tmp_path, scopes=profile.read_scopes)
+    credential = OAuthCredential(
+        access_token="slack-union-access",
+        refresh_token="slack-union-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=profile.full_scopes,
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    stored = _import_oauth_credential(manager, credential)
+
+    assert stored.version == 1
+    assert (
+        OAuthCredential.from_bytes(manager.tokens.read(CONNECTION_ID).value).scopes
+        == profile.full_scopes
+    )
+
+
+def test_slack_read_tier_refuses_grant_containing_scopes_outside_profile_surface(
+    tmp_path: Path,
+) -> None:
+    profile = get_profile("slack")
+    manager = _slack_manager(tmp_path, scopes=profile.read_scopes)
+    overbroad = OAuthCredential(
+        access_token="slack-overbroad-access",
+        refresh_token="slack-overbroad-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=(*profile.full_scopes, "admin"),
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    with pytest.raises(OAuthPermissionGrantError) as failure:
+        _import_oauth_credential(manager, overbroad)
+
+    assert failure.value.reason == "outside_selected_tier"
+    assert manager.tokens.state(CONNECTION_ID) is None
+
+
+def test_slack_read_tier_refuses_grant_with_unrequested_write_scope_outside_profile(
+    tmp_path: Path,
+) -> None:
+    profile = get_profile("slack")
+    manager = _slack_manager(tmp_path, scopes=profile.read_scopes)
+    overbroad = OAuthCredential(
+        access_token="slack-overbroad-write-access",
+        refresh_token="slack-overbroad-write-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=(*profile.read_scopes, "app_configurations:write"),
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    with pytest.raises(OAuthPermissionGrantError) as failure:
+        _import_oauth_credential(manager, overbroad)
+
+    assert failure.value.reason == "outside_selected_tier"
+    assert manager.tokens.state(CONNECTION_ID) is None
+
+
+def test_slack_read_tier_refuses_grant_missing_selected_permissions(tmp_path: Path) -> None:
+    profile = get_profile("slack")
+    manager = _slack_manager(tmp_path, scopes=profile.read_scopes)
+    partial = OAuthCredential(
+        access_token="slack-partial-access",
+        refresh_token="slack-partial-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=("users:read", "channels:read"),
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    with pytest.raises(OAuthPermissionGrantError) as failure:
+        _import_oauth_credential(manager, partial)
+
+    assert failure.value.reason == "missing_selected_permissions"
+    assert manager.tokens.state(CONNECTION_ID) is None
+
+
 def test_microsoft_publish_canonicalizes_access_scopes_and_omits_non_resource_scopes(
     tmp_path: Path,
 ) -> None:
@@ -2205,3 +2334,151 @@ def test_interrupted_removal_leaves_a_terminal_retryable_revocation(
     removed = manager.remove(CONNECTION_ID, expected_revision=interrupted.revision)
     assert removed["connections"] == []
     assert manager.tokens.state(CONNECTION_ID) is None
+
+
+def test_authorize_oauth_with_https_template_wraps_and_uses_https_redirect_uri(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _slack_manager(tmp_path)
+    tls_called = False
+    fake_material = MagicMock()
+    fake_context = MagicMock()
+    fake_material.create_ssl_context.return_value = fake_context
+
+    def fake_ensure_local_tls() -> MagicMock:
+        nonlocal tls_called
+        tls_called = True
+        return fake_material
+
+    bound_kwargs: dict[str, Any] = {}
+
+    class FakeListener:
+        redirect_uri = "https://localhost:8767/oauth/callback"
+
+        def configure(self, config: object, attempt: object) -> None:
+            del config, attempt
+
+        def wait_for_code(self, *, timeout_seconds: float) -> str:
+            del timeout_seconds
+            return "slack-auth-code"
+
+        def close(self) -> None:
+            pass
+
+    def fake_bind(*args: Any, **kwargs: Any) -> FakeListener:
+        del args
+        bound_kwargs.update(kwargs)
+        return FakeListener()
+
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.ensure_local_tls",
+        fake_ensure_local_tls,
+    )
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.BoundLoopbackCallback.bind",
+        fake_bind,
+    )
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.exchange_authorization_code",
+        lambda *args, **kwargs: OAuthTokenSet(
+            access_token="slack-token",
+            token_type=OAuthTokenType.BEARER,
+            refresh_token=None,
+            scopes=get_profile("slack").read_scopes,
+            expires_in_seconds=None,
+        ),
+    )
+
+    manager.authorize_oauth(
+        CONNECTION_ID,
+        present_authorization_url=lambda url, opened: None,
+    )
+
+    assert tls_called is True
+    assert bound_kwargs.get("tls_context") is fake_context
+    stored = OAuthCredential.from_bytes(manager.tokens.read(CONNECTION_ID).value)
+    assert stored.access_token == "slack-token"
+
+
+def test_authorize_oauth_with_http_template_stays_http_even_with_tls_material_on_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    tls_called = False
+
+    def fake_ensure_local_tls() -> MagicMock:
+        nonlocal tls_called
+        tls_called = True
+        return MagicMock()
+
+    bound_kwargs: dict[str, Any] = {}
+
+    class FakeListener:
+        redirect_uri = "http://127.0.0.1:49152"
+
+        def configure(self, config: object, attempt: object) -> None:
+            del config, attempt
+
+        def wait_for_code(self, *, timeout_seconds: float) -> str:
+            del timeout_seconds
+            return "google-auth-code"
+
+        def close(self) -> None:
+            pass
+
+    def fake_bind(*args: Any, **kwargs: Any) -> FakeListener:
+        del args
+        bound_kwargs.update(kwargs)
+        return FakeListener()
+
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.ensure_local_tls",
+        fake_ensure_local_tls,
+    )
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.BoundLoopbackCallback.bind",
+        fake_bind,
+    )
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.exchange_authorization_code",
+        lambda *args, **kwargs: OAuthTokenSet(
+            access_token="google-token",
+            token_type=OAuthTokenType.BEARER,
+            refresh_token="google-refresh",
+            scopes=GOOGLE_IDENTITY_SCOPES,
+            expires_in_seconds=3600,
+        ),
+    )
+
+    manager.authorize_oauth(
+        CONNECTION_ID,
+        present_authorization_url=lambda url, opened: None,
+    )
+
+    assert tls_called is False
+    assert bound_kwargs.get("tls_context") is None
+    stored = OAuthCredential.from_bytes(manager.tokens.read(CONNECTION_ID).value)
+    assert stored.access_token == "google-token"
+
+
+def test_authorize_oauth_with_https_template_raises_setuperror_when_tls_ensure_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _slack_manager(tmp_path)
+
+    def failing_ensure_local_tls() -> None:
+        raise SetupError("openssl executable was not found; cannot generate local TLS certificates")
+
+    monkeypatch.setattr(
+        "continuity_kernel.connector_auth_manager.ensure_local_tls",
+        failing_ensure_local_tls,
+    )
+
+    with pytest.raises(SetupError, match="openssl executable was not found"):
+        manager.authorize_oauth(
+            CONNECTION_ID,
+            present_authorization_url=lambda url, opened: None,
+        )
