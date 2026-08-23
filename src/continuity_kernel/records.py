@@ -442,8 +442,8 @@ def new_task(
         clean_waiting = clean_blocker_condition
     if clean_dispatch_id is not None or clean_dispatch_revision is not None:
         raise ValidationError("task cannot be created with a dispatch ID or revision")
-    if clean_agent_run == "yes" and clean_active is not None:
-        raise ValidationError("agent-run task cannot be created with an active thread ID")
+    if clean_active is not None:
+        raise ValidationError("task cannot be created with an active thread ID")
     _validate_dispatch_fields(
         clean_dispatch_id,
         clean_dispatch_revision,

@@ -61,7 +61,21 @@ def test_records_round_trip_unicode_and_stable_revisions() -> None:
 
 
 def test_task_round_trips_authored_rank_and_exact_active_hand() -> None:
-    task = new_task(
+    with pytest.raises(ValidationError, match="cannot be created with an active thread ID"):
+        new_task(
+            identifier="review-session",
+            title="Review every open outcome",
+            outcome="Check every outcome without equating checked with resolved.",
+            status="doing",
+            next_actor="agent",
+            next_action="Present one exact outcome.",
+            rank=17,
+            active_thread_id="019f95fd-009e-7603-ab87-f9927cf31c4d",
+            refs=("review-scope:all-open",),
+            observed_at=NOW,
+        )
+
+    base = new_task(
         identifier="review-session",
         title="Review every open outcome",
         outcome="Check every outcome without equating checked with resolved.",
@@ -69,14 +83,15 @@ def test_task_round_trips_authored_rank_and_exact_active_hand() -> None:
         next_actor="agent",
         next_action="Present one exact outcome.",
         rank=17,
-        active_thread_id="019f95fd-009e-7603-ab87-f9927cf31c4d",
         refs=("review-scope:all-open",),
         observed_at=NOW,
     )
-
-    assert parse_task(render_task(task)) == task
-    assert task.rank == 17
-    assert task.active_thread_id == "019f95fd-009e-7603-ab87-f9927cf31c4d"
+    task = replace(base, active_thread_id="019f95fd-009e-7603-ab87-f9927cf31c4d")
+    rendered = render_task(task)
+    parsed = parse_task(rendered)
+    assert parsed.rank == 17
+    assert parsed.active_thread_id == "019f95fd-009e-7603-ab87-f9927cf31c4d"
+    assert render_task(parsed) == rendered
 
 
 def test_typed_dispatch_fields_are_additive_and_nullable() -> None:
@@ -296,7 +311,7 @@ def test_terminal_task_cannot_claim_future_work() -> None:
             observed_at=NOW,
         )
 
-    with pytest.raises(ValidationError, match="terminal tasks"):
+    with pytest.raises(ValidationError, match="cannot be created with an active thread ID"):
         new_task(
             identifier="done-review",
             title="Done review",

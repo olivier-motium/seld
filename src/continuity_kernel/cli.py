@@ -1249,7 +1249,6 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
                 blocker_owner=args.blocker_owner,
                 blocker_condition=args.blocker_condition,
                 agent_run=args.agent_run,
-                active_thread_id=args.active_thread_id,
                 superseded_by=args.superseded_by,
                 project=args.project,
                 workspace=args.workspace,
@@ -1313,7 +1312,6 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
             blocker_owner=args.blocker_owner,
             blocker_condition=args.blocker_condition,
             agent_run=args.agent_run,
-            active_thread_id=args.active_thread_id,
             superseded_by=args.superseded_by,
             project=args.project,
             workspace=args.workspace,
@@ -1329,7 +1327,6 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
             clear_blocker_owner=args.clear_blocker_owner,
             clear_blocker_condition=args.clear_blocker_condition,
             clear_agent_run=args.clear_agent_run,
-            clear_active_thread_id=args.clear_active_thread_id,
             clear_superseded_by=args.clear_superseded_by,
             clear_project=args.clear_project,
             clear_workspace=args.clear_workspace,
@@ -2369,7 +2366,6 @@ def _parser() -> argparse.ArgumentParser:
     task_update.add_argument("--blocker-owner")
     task_update.add_argument("--blocker-condition")
     task_update.add_argument("--agent-run", choices=("yes", "no"))
-    task_update.add_argument("--active-thread-id")
     task_update.add_argument("--superseded-by")
     task_update.add_argument("--project")
     task_update.add_argument("--workspace")
@@ -2385,7 +2381,6 @@ def _parser() -> argparse.ArgumentParser:
     task_update.add_argument("--clear-blocker-owner", action="store_true")
     task_update.add_argument("--clear-blocker-condition", action="store_true")
     task_update.add_argument("--clear-agent-run", action="store_true")
-    task_update.add_argument("--clear-active-thread-id", action="store_true")
     task_update.add_argument("--clear-superseded-by", action="store_true")
     task_update.add_argument("--clear-project", action="store_true")
     task_update.add_argument("--clear-workspace", action="store_true")
@@ -2860,7 +2855,6 @@ def _task_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--blocker-owner")
     parser.add_argument("--blocker-condition")
     parser.add_argument("--agent-run", choices=("yes", "no"))
-    parser.add_argument("--active-thread-id")
     parser.add_argument("--superseded-by")
     parser.add_argument("--project")
     parser.add_argument("--workspace")
