@@ -67,6 +67,7 @@ from continuity_kernel.dispatch import (
     bind_task_hand,
     claim_task,
     clear_task_blocker,
+    clear_task_hand,
     dispatch_eligible,
     evaluate_task_deadline,
     write_task_blocker,
@@ -118,6 +119,7 @@ ROLLBACK_PROBE_MAX_OUTPUT_BYTES = 64 * 1024
 DISPATCH_ELIGIBLE_ALIAS = "task-" + "dispatch-eligible"
 DISPATCH_CLAIM_ALIAS = "task-" + "dispatch-claim"
 DISPATCH_BIND_ALIAS = "task-" + "dispatch-bind"
+DISPATCH_HAND_CLEAR_ALIAS = "task-" + "dispatch-hand-clear"
 DISPATCH_BLOCKER_ALIAS = "task-" + "dispatch-blocker"
 DISPATCH_BLOCKER_CLEAR_ALIAS = "task-" + "dispatch-blocker-clear"
 DISPATCH_DEADLINE_ALIAS = "task-" + "dispatch-deadline-eval"
@@ -683,6 +685,19 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 expected_revision=args.expected_revision,
                 dispatch_id=args.dispatch_id,
                 active_thread_id=args.active_thread_id,
+                observed_at=_optional_observed_at(args.observed_at),
+            )
+        )
+    if args.command in {"dispatch-hand-clear", DISPATCH_HAND_CLEAR_ALIAS}:
+        admission = json.loads(args.admission_json)
+        return record_dict(
+            clear_task_hand(
+                vault.root,
+                args.task_id,
+                expected_revision=args.expected_revision,
+                dispatch_id=args.dispatch_id,
+                active_thread_id=args.active_thread_id,
+                admission=admission,
                 observed_at=_optional_observed_at(args.observed_at),
             )
         )
@@ -2295,6 +2310,18 @@ def _parser() -> argparse.ArgumentParser:
     dispatch_bind_command.add_argument("--dispatch-id", required=True)
     dispatch_bind_command.add_argument("--active-thread-id", required=True)
     dispatch_bind_command.add_argument("--observed-at")
+
+    dispatch_hand_clear_command = commands.add_parser(
+        "dispatch-hand-clear",
+        aliases=[DISPATCH_HAND_CLEAR_ALIAS],
+        help="Clear one exact claimed Factory hand without changing task truth.",
+    )
+    dispatch_hand_clear_command.add_argument("task_id")
+    dispatch_hand_clear_command.add_argument("--expected-revision", required=True)
+    dispatch_hand_clear_command.add_argument("--dispatch-id", required=True)
+    dispatch_hand_clear_command.add_argument("--active-thread-id", required=True)
+    dispatch_hand_clear_command.add_argument("--admission-json", required=True)
+    dispatch_hand_clear_command.add_argument("--observed-at")
 
     dispatch_blocker_command = commands.add_parser(
         "dispatch-blocker",

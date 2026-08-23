@@ -22,6 +22,7 @@ from continuity_kernel.dispatch import (
     bind_task_hand,
     claim_task,
     clear_task_blocker,
+    clear_task_hand,
     dispatch_eligible,
     evaluate_task_deadline,
     write_task_blocker,
@@ -251,6 +252,7 @@ def test_cli_and_mcp_expose_typed_dispatch_operations(
         "gsv_dispatch_eligible",
         "gsv_dispatch_claim",
         "gsv_dispatch_bind",
+        "gsv_dispatch_hand_clear",
         "gsv_dispatch_blocker",
         "gsv_dispatch_blocker_clear",
         "gsv_dispatch_deadline_eval",
@@ -293,6 +295,20 @@ def test_cli_and_mcp_expose_typed_dispatch_operations(
         "surface-hand",
     )
     assert bound["status"] == "doing"
+    hand_cleared = run_cli(
+        "dispatch-hand-clear",
+        task.identifier,
+        "--expected-revision",
+        task.revision,
+        "--dispatch-id",
+        "surface-dispatch",
+        "--active-thread-id",
+        "surface-hand",
+        "--admission-json",
+        json.dumps(admission),
+    )
+    assert hand_cleared["status"] == "doing"
+    assert hand_cleared["active_thread_id"] is None
     blocked = run_cli(
         "dispatch-blocker",
         task.identifier,
@@ -329,6 +345,129 @@ def test_cli_and_mcp_expose_typed_dispatch_operations(
     )
     assert cleared["status"] == "ready"
     assert cleared["dispatch_id"] is None
+
+
+def test_dispatch_hand_clear_requires_exact_admitted_hand_and_preserves_task_truth(
+    vault: Vault,
+) -> None:
+    task = vault.create_task(
+        identifier="exact-factory-hand-clear",
+        title="Exact Factory hand clear",
+        outcome="Clear only the operational hand and preserve authored truth.",
+        status="ready",
+        next_actor="agent",
+        next_action="Run the allocated hand.",
+        agent_run="yes",
+        target_seat="worker-one",
+        claim_by="2026-07-22T13:00:00.000000Z",
+        project="Factory",
+        workspace="/factory/worktree",
+        attention_at="2026-07-23",
+        due="2026-07-24",
+        observed_at=NOW,
+    )
+    admission = create_factory_admission_token(
+        ADMISSION_KEY,
+        vault.root,
+        task.identifier,
+        task.revision,
+        "dispatch-hand-clear",
+    )
+    claim_task(
+        vault.root,
+        task.identifier,
+        expected_revision=task.revision,
+        dispatch_id="dispatch-hand-clear",
+        admission=admission,
+        observed_at=NOW,
+    )
+    bound = bind_task_hand(
+        vault.root,
+        task.identifier,
+        expected_revision=task.revision,
+        dispatch_id="dispatch-hand-clear",
+        active_thread_id="factory-hand",
+        observed_at=NOW,
+    )
+    authored = vault.update_task(
+        task.identifier,
+        expected_revision=bound.revision,
+        title="Authored title after launch",
+        outcome="Preserve the current authored outcome after launch.",
+        status="waiting",
+        next_actor="human",
+        next_action="Olivier decides.",
+        waiting_on="Olivier must decide.",
+        agent_run="no",
+        observed_at=NOW,
+    )
+
+    self_asserted = {**admission, "signature": "0" * 64}
+    with pytest.raises(ValidationError, match="signature verification failed"):
+        clear_task_hand(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="dispatch-hand-clear",
+            active_thread_id="factory-hand",
+            admission=self_asserted,
+            observed_at=NOW,
+        )
+    with pytest.raises(ValidationError, match="not bound to this active Factory hand"):
+        clear_task_hand(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="dispatch-hand-clear",
+            active_thread_id="other-hand",
+            admission=admission,
+            observed_at=NOW,
+        )
+    with pytest.raises(ValidationError, match="not claimed by this dispatch revision"):
+        clear_task_hand(
+            vault.root,
+            task.identifier,
+            expected_revision="0" * 64,
+            dispatch_id="dispatch-hand-clear",
+            active_thread_id="factory-hand",
+            admission=admission,
+            observed_at=NOW,
+        )
+    with pytest.raises(ValidationError, match="dedicated dispatch operation"):
+        vault.update_task(
+            task.identifier,
+            expected_revision=authored.revision,
+            clear_active_thread_id=True,
+            observed_at=NOW,
+        )
+    assert vault.get_task(task.identifier).revision == authored.revision
+
+    cleared = clear_task_hand(
+        vault.root,
+        task.identifier,
+        expected_revision=task.revision,
+        dispatch_id="dispatch-hand-clear",
+        active_thread_id="factory-hand",
+        admission=admission,
+        observed_at=NOW,
+    )
+
+    assert cleared.active_thread_id is None
+    assert cleared.status == authored.status
+    assert cleared.agent_run == authored.agent_run
+    assert cleared.next_actor == authored.next_actor
+    assert cleared.waiting_on == authored.waiting_on
+    assert cleared.title == authored.title
+    assert cleared.outcome == authored.outcome
+    assert cleared.next_action == authored.next_action
+    assert cleared.claim_by == authored.claim_by
+    assert cleared.dispatch_id == authored.dispatch_id
+    assert cleared.dispatch_revision == authored.dispatch_revision
+    assert cleared.target_seat == authored.target_seat
+    assert cleared.project == authored.project
+    assert cleared.workspace == authored.workspace
+    assert cleared.attention_at == authored.attention_at
+    assert cleared.due == authored.due
 
 
 def test_dispatch_rejects_invalid_clock_health(vault: Vault) -> None:

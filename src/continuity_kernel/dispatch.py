@@ -8,7 +8,7 @@ import json
 import os
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
@@ -246,6 +246,55 @@ def bind_task_hand(
         raise ValidationError("active hand binding readback failed")
     if bound != read_back:
         raise ValidationError("active hand binding readback returned a different task")
+    return read_back
+
+
+def clear_task_hand(
+    project_root: Path,
+    identifier: str,
+    *,
+    expected_revision: str,
+    dispatch_id: str,
+    active_thread_id: str,
+    admission: dict[str, Any] | None = None,
+    observed_at: datetime | None = None,
+) -> Task:
+    """Clear one exact claimed Factory hand without changing task truth."""
+
+    clean_dispatch = _dispatch_id(dispatch_id)
+    clean_revision = _dispatch_revision(expected_revision)
+    clean_thread = _active_thread(active_thread_id)
+    vault = Vault(project_root)
+    current = vault.get_task(identifier)
+    _require_claim(current, clean_dispatch, clean_revision)
+    if current.active_thread_id != clean_thread:
+        raise ValidationError("task is not bound to this active Factory hand")
+    _verify_factory_admission(
+        project_root,
+        current.identifier,
+        clean_revision,
+        clean_dispatch,
+        admission,
+    )
+
+    cleared = vault._update_task_dispatch(
+        current.identifier,
+        clear_active_thread_id=True,
+        expected_revision=current.revision,
+        observed_at=observed_at,
+    )
+    read_back = vault.get_task(current.identifier)
+    expected = replace(
+        current,
+        active_thread_id=None,
+        history=read_back.history,
+        updated_at=read_back.updated_at,
+        revision=read_back.revision,
+    )
+    if read_back != expected:
+        raise ValidationError("active Factory hand clear changed task truth")
+    if cleared != read_back:
+        raise ValidationError("active Factory hand clear readback returned a different task")
     return read_back
 
 

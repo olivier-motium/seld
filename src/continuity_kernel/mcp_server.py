@@ -31,6 +31,7 @@ from continuity_kernel.dispatch import (
     bind_task_hand,
     claim_task,
     clear_task_blocker,
+    clear_task_hand,
     dispatch_eligible,
     evaluate_task_deadline,
     write_task_blocker,
@@ -106,6 +107,7 @@ GUIDED_REVIEW_TOOL_NAMES: Final = frozenset(
         "gsv_dispatch_eligible",
         "gsv_dispatch_claim",
         "gsv_dispatch_bind",
+        "gsv_dispatch_hand_clear",
         "gsv_dispatch_blocker",
         "gsv_dispatch_blocker_clear",
         "gsv_dispatch_deadline_eval",
@@ -600,6 +602,21 @@ def _call(
                 expected_revision=_string(values, "expected_revision"),
                 dispatch_id=_string(values, "dispatch_id"),
                 active_thread_id=_string(values, "active_thread_id"),
+                observed_at=_optional_time(values, "observed_at"),
+            )
+        )
+    if name == "gsv_dispatch_hand_clear":
+        admission = values.get("admission")
+        if isinstance(admission, str):
+            admission = json.loads(admission)
+        return record_dict(
+            clear_task_hand(
+                vault.root,
+                _string(values, "id"),
+                expected_revision=_string(values, "expected_revision"),
+                dispatch_id=_string(values, "dispatch_id"),
+                active_thread_id=_string(values, "active_thread_id"),
+                admission=admission,
                 observed_at=_optional_time(values, "observed_at"),
             )
         )
@@ -1841,6 +1858,25 @@ TOOLS: Final = [
             "observed_at": TEXT,
         },
         ("id", "expected_revision", "dispatch_id", "active_thread_id"),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_dispatch_hand_clear",
+        "Clear one exact claimed Factory hand without changing task truth.",
+        {
+            "active_thread_id": TASK_ACTIVE_THREAD_ID,
+            "admission": {
+                "description": (
+                    "Factory allocation admission object containing payload and signature."
+                ),
+                "type": "object",
+            },
+            "dispatch_id": TEXT,
+            "expected_revision": TEXT,
+            "id": TEXT,
+            "observed_at": TEXT,
+        },
+        ("id", "expected_revision", "dispatch_id", "active_thread_id", "admission"),
         read_only=False,
     ),
     _tool(

@@ -750,6 +750,7 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         "gsv_connector_source_read",
         "gsv_execution_bindings",
         "gsv_dispatch_bind",
+        "gsv_dispatch_hand_clear",
         "gsv_dispatch_blocker",
         "gsv_dispatch_blocker_clear",
         "gsv_dispatch_claim",
@@ -1024,7 +1025,12 @@ def test_update_mcp_surface_is_cache_only_and_cannot_apply_or_check(
 
 def test_task_schema_distinguishes_codex_hand_from_gsv_workthread_without_narrowing_type() -> None:
     tools = {tool["name"]: tool for tool in mcp_server.TOOLS}
-    for name in ("gsv_dispatch_bind", "gsv_task_create", "gsv_task_update"):
+    for name in (
+        "gsv_dispatch_bind",
+        "gsv_dispatch_hand_clear",
+        "gsv_task_create",
+        "gsv_task_update",
+    ):
         properties = tools[name]["inputSchema"]["properties"]
         active_hand = properties["active_thread_id"]
         description = active_hand["description"]
