@@ -4,7 +4,7 @@ import plistlib
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -367,30 +367,18 @@ def test_apple_messages_same_store_stale_delivery_discard_recovery(
             expected_sequence=cast(int, before["sequence"]),
             disposition=DISCARD_STALE_DELIVERY,
             expected_source_revision=vault.get_source_snapshot().revision,
+            actor_ref="task-wa",
         )
 
     # Guard: reject discard_stale_delivery when Apple pending batch is healthy
-    healthy_gap_rev = cast(
-        str,
-        vault.record_source_observation(
-            expected_revision=vault.get_source_snapshot().revision,
-            source_id="apple_messages",
-            actor_ref="task-apple-healthy",
-            result="success",
-            covered_through="2026-08-23T09:00:00Z",
-            completeness="partial",
-            evidence_refs=(f"seld-local-source-gap:{token_digest}",),
-            account_binding="test-active-account",
-            tool_binding="seld.local.apple-messages.read.v1",
-        )["revision"],
-    )
     with pytest.raises(ConflictError, match="pending delivery is healthy"):
         delivery.rebaseline(
             "apple_messages",
             expected_checkpoint_digest=cast(str, before["checkpoint_digest"]),
             expected_sequence=cast(int, before["sequence"]),
             disposition=DISCARD_STALE_DELIVERY,
-            expected_source_revision=healthy_gap_rev,
+            expected_source_revision=vault.get_source_snapshot().revision,
+            actor_ref="task-apple-healthy",
         )
 
     # Tamper with the database content so delivered content changed
@@ -420,6 +408,7 @@ def test_apple_messages_same_store_stale_delivery_discard_recovery(
             expected_sequence=99,
             disposition=DISCARD_STALE_DELIVERY,
             expected_source_revision=vault.get_source_snapshot().revision,
+            actor_ref="task-apple",
         )
     with pytest.raises(ValidationError, match="requires disposition"):
         delivery.rebaseline(
@@ -429,6 +418,16 @@ def test_apple_messages_same_store_stale_delivery_discard_recovery(
             disposition="invalid_disposition",
         )
 
+    # Fail-closed guard: missing actor_ref
+    with pytest.raises(ValidationError, match="requires actor_ref"):
+        delivery.rebaseline(
+            "apple_messages",
+            expected_checkpoint_digest=cast(str, before["checkpoint_digest"]),
+            expected_sequence=cast(int, before["sequence"]),
+            disposition=DISCARD_STALE_DELIVERY,
+            expected_source_revision=vault.get_source_snapshot().revision,
+        )
+
     # Fail-closed guard: missing expected_source_revision
     with pytest.raises(ValidationError, match="requires a valid expected_source_revision"):
         delivery.rebaseline(
@@ -436,6 +435,7 @@ def test_apple_messages_same_store_stale_delivery_discard_recovery(
             expected_checkpoint_digest=cast(str, before["checkpoint_digest"]),
             expected_sequence=cast(int, before["sequence"]),
             disposition=DISCARD_STALE_DELIVERY,
+            actor_ref="task-apple",
         )
 
     # Fail-closed guard: stale expected_source_revision
@@ -446,61 +446,69 @@ def test_apple_messages_same_store_stale_delivery_discard_recovery(
             expected_sequence=cast(int, before["sequence"]),
             disposition=DISCARD_STALE_DELIVERY,
             expected_source_revision="0" * 64,
+            actor_ref="task-apple",
         )
 
-    # Fail-closed guard: observation evidence digest does not match stale delivery
-    mismatched_obs_rev = cast(
-        str,
-        vault.record_source_observation(
-            expected_revision=healthy_gap_rev,
-            source_id="apple_messages",
-            actor_ref="task-apple-mismatched",
-            result="success",
-            covered_through="2026-08-23T09:00:00Z",
-            completeness="partial",
-            evidence_refs=("seld-local-source-gap:sha256:" + "f" * 64,),
-            account_binding="test-active-account",
-            tool_binding="seld.local.apple-messages.read.v1",
-        )["revision"],
-    )
-    with pytest.raises(ConflictError, match="does not verify the exact stale delivery"):
+    # Crash-safe failure/retry path: simulate crash during checkpoint advance after receipt commit
+    initial_rev = vault.get_source_snapshot().revision
+    original_write_state = delivery._write_state
+    state_write_called = False
+
+    def failing_write_state(*args: Any, **kwargs: Any) -> None:
+        nonlocal state_write_called
+        state_write_called = True
+        raise RuntimeError("simulated crash after observation commit")
+
+    monkeypatch.setattr(delivery, "_write_state", failing_write_state)
+    with pytest.raises(RuntimeError, match="simulated crash"):
         delivery.rebaseline(
             "apple_messages",
             expected_checkpoint_digest=cast(str, before["checkpoint_digest"]),
             expected_sequence=cast(int, before["sequence"]),
             disposition=DISCARD_STALE_DELIVERY,
-            expected_source_revision=mismatched_obs_rev,
+            expected_source_revision=initial_rev,
+            actor_ref="task-apple-rebaseline",
         )
+    assert state_write_called is True
 
-    # Persist the required content-free partial gap observation for this exact delivery
-    valid_gap_rev = cast(
-        str,
-        vault.record_source_observation(
-            expected_revision=mismatched_obs_rev,
-            source_id="apple_messages",
-            actor_ref="task-apple-gap-verified",
-            result="success",
-            covered_through="2026-08-23T09:00:00Z",
-            completeness="partial",
-            evidence_refs=(f"seld-local-source-gap:{token_digest}",),
-            account_binding="test-active-account",
-            tool_binding="seld.local.apple-messages.read.v1",
-        )["revision"],
+    # Verify that the partial gap observation was persisted in the vault
+    committed_snapshot = vault.get_source_snapshot()
+    assert committed_snapshot.revision != initial_rev
+    obs = committed_snapshot.observation("apple_messages")
+    assert obs is not None
+    from continuity_kernel.source_state import SourceCompleteness, source_fingerprint
+
+    assert obs.completeness is SourceCompleteness.PARTIAL
+    assert obs.evidence_digests == (
+        source_fingerprint(f"seld-local-source-gap:{token_digest}", "source evidence reference"),
     )
 
-    # Guarded recovery via discard_stale_delivery succeeds
+    # Guarded recovery retry with fresh revision succeeds and recognizes existing receipt
+    monkeypatch.setattr(delivery, "_write_state", original_write_state)
     repaired = delivery.rebaseline(
         "apple_messages",
         expected_checkpoint_digest=cast(str, before["checkpoint_digest"]),
         expected_sequence=cast(int, before["sequence"]),
         disposition=DISCARD_STALE_DELIVERY,
-        expected_source_revision=valid_gap_rev,
+        expected_source_revision=committed_snapshot.revision,
+        actor_ref="task-apple-rebaseline-retry",
     )
     assert repaired["already_rebaselined"] is False
     assert repaired["pending_delivery_discarded"] is True
     assert repaired["disposition"] == DISCARD_STALE_DELIVERY
     assert repaired["source_health"] == "needs_reproof"
     assert repaired["sequence"] == 1
+
+    # Idempotent repeated call returns already_rebaselined
+    repeated = delivery.rebaseline(
+        "apple_messages",
+        expected_checkpoint_digest=cast(str, before["checkpoint_digest"]),
+        expected_sequence=cast(int, before["sequence"]),
+        disposition=DISCARD_STALE_DELIVERY,
+        expected_source_revision=committed_snapshot.revision,
+        actor_ref="task-apple-rebaseline-retry",
+    )
+    assert repeated["already_rebaselined"] is True
 
     after = delivery.status("apple_messages")
     assert after["pending"] is False
@@ -548,7 +556,7 @@ def test_apple_messages_discard_recovery_rejects_complete_observation(
             covered_through="2026-08-23T09:00:00Z",
             completeness="complete",
             evidence_refs=(f"seld-local-source-gap:{token_digest}",),
-            account_binding="test-active-account",
+            _account_fingerprint=delivery._account_digest("apple_messages", store_root=store),
             tool_binding="seld.local.apple-messages.read.v1",
         )["revision"],
     )
@@ -557,11 +565,12 @@ def test_apple_messages_discard_recovery_rejects_complete_observation(
     with sqlite3.connect(database) as connection:
         connection.execute("UPDATE message SET text = 'tampered' WHERE text = 'message to discard'")
 
-    with pytest.raises(ConflictError, match="must record partial completeness"):
+    with pytest.raises(ConflictError, match=r"coverage.*regress"):
         delivery.rebaseline(
             "apple_messages",
             expected_checkpoint_digest=cast(str, before["checkpoint_digest"]),
             expected_sequence=cast(int, before["sequence"]),
             disposition=DISCARD_STALE_DELIVERY,
             expected_source_revision=complete_obs_rev,
+            actor_ref="task-apple-complete",
         )

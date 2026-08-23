@@ -497,6 +497,7 @@ class LocalSourceDelivery:
         expected_sequence: int,
         disposition: str,
         expected_source_revision: str | None = None,
+        actor_ref: str | None = None,
     ) -> dict[str, Any]:
         """Explicitly accept a replaced store or discard a stale pending delivery."""
 
@@ -520,6 +521,8 @@ class LocalSourceDelivery:
                 raise ValidationError(
                     "discard_stale_delivery requires a valid expected_source_revision"
                 )
+            if not actor_ref or not actor_ref.strip():
+                raise ValidationError("discard_stale_delivery requires actor_ref")
         self._selected_snapshot(source)
         binding = self._required_binding(source)
         with self._locked_storage(binding, create=True) as store:
@@ -613,23 +616,11 @@ class LocalSourceDelivery:
                         "local source pending delivery is healthy and does not have "
                         "delivered content changed"
                     )
-                snapshot = self.vault.get_source_snapshot()
-                if expected_source_revision != snapshot.revision:
-                    raise ConflictError(
-                        "source-state revision does not match expected recovery revision"
-                    )
-                observation = snapshot.observation(source)
-                if observation is None:
-                    raise ConflictError("source state has no recorded observation for gap recovery")
-                if observation.completeness is not SourceCompleteness.PARTIAL:
-                    raise ConflictError(
-                        "source observation must record partial completeness for gap recovery"
-                    )
+                account_digest = self._account_digest(source, store_root=store_root)
                 token_digest = _digest(state.pending_token)
+                gap_evidence_ref = f"seld-local-source-gap:{token_digest}"
                 valid_digests = {
-                    source_fingerprint(
-                        f"seld-local-source-gap:{token_digest}", "source evidence reference"
-                    ),
+                    source_fingerprint(gap_evidence_ref, "source evidence reference"),
                     source_fingerprint(
                         f"seld-local-source-token:{token_digest}", "source evidence reference"
                     ),
@@ -643,12 +634,39 @@ class LocalSourceDelivery:
                     source_fingerprint(token_digest, "source evidence reference"),
                     token_digest,
                 }
-                if not any(
-                    d in observation.evidence_digests for d in valid_digests if d is not None
-                ):
-                    raise ConflictError(
-                        "source observation does not verify the exact stale delivery "
-                        "evidence digest"
+
+                snapshot = self.vault.get_source_snapshot()
+                observation = snapshot.observation(source)
+                is_gap_receipt_recorded = (
+                    observation is not None
+                    and observation.completeness is SourceCompleteness.PARTIAL
+                    and any(
+                        d in observation.evidence_digests for d in valid_digests if d is not None
+                    )
+                )
+
+                if is_gap_receipt_recorded:
+                    if expected_source_revision != snapshot.revision:
+                        raise ConflictError(
+                            "source-state revision does not match expected recovery revision"
+                        )
+                else:
+                    if expected_source_revision != snapshot.revision:
+                        raise ConflictError(
+                            "source-state revision does not match expected recovery revision"
+                        )
+                    horizon = replacement.newest_message_at or replacement.observed_at
+                    assert actor_ref is not None
+                    self.vault.record_source_observation(
+                        expected_revision=expected_source_revision,
+                        source_id=source,
+                        actor_ref=actor_ref,
+                        result="success",
+                        covered_through=horizon,
+                        completeness="partial",
+                        tool_binding=LOCAL_SOURCE_TOOL_BINDINGS[source],
+                        evidence_refs=(gap_evidence_ref,),
+                        _account_fingerprint=account_digest,
                     )
 
             archive_relative = self._checkpoint_archive_relative(binding, state)

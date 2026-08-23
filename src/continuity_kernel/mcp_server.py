@@ -406,6 +406,7 @@ def _call(
             expected_sequence=_integer(values, "expected_sequence", -1),
             disposition=_string(values, "disposition"),
             expected_source_revision=_optional_string(values, "expected_source_revision"),
+            actor_ref=_optional_string(values, "actor_ref"),
         )
     if name == "gsv_local_source_acknowledge":
         return LocalSourceDelivery(vault).acknowledge(
@@ -1512,6 +1513,7 @@ TOOLS: Final = [
             "provider state."
         ),
         {
+            "actor_ref": TEXT,
             "disposition": {"enum": list(RESET_DISPOSITIONS), "type": "string"},
             "expected_checkpoint_digest": TEXT,
             "expected_sequence": {"minimum": 0, "type": "integer"},

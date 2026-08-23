@@ -564,6 +564,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 expected_sequence=args.expected_sequence,
                 disposition=args.disposition,
                 expected_source_revision=args.expected_source_revision,
+                actor_ref=getattr(args, "actor_ref", None),
             )
         if args.local_source_command == "acknowledge":
             return delivery.acknowledge(
@@ -2149,6 +2150,7 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
     )
     local_source_rebaseline.add_argument("--expected-source-revision")
+    local_source_rebaseline.add_argument("--actor-ref")
     local_source_adopt_staged.add_argument("--expected-migration-revision", required=True)
     local_source_adopt_staged.add_argument("--expected-source-revision", required=True)
     local_source_adopt_staged.add_argument(
