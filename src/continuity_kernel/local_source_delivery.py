@@ -54,6 +54,8 @@ MAX_ADAPTER_BINDING_BYTES: Final = 16 * 1024
 MAX_STORE_ROOT_CHARACTERS: Final = 4_096
 ADAPTER_BINDING_VERSION: Final = 1
 FORWARD_ONLY_RESET: Final = "forward_only_reset"
+DISCARD_STALE_DELIVERY: Final = "discard_stale_delivery"
+RESET_DISPOSITIONS: Final = (FORWARD_ONLY_RESET, DISCARD_STALE_DELIVERY)
 VERIFIED_PREFIX_ADOPTION: Final = "adopt_verified_prefix"
 _AUTHORITY_RELATIVE: Final = Path("local-source-delivery")
 _CHECKPOINTS_RELATIVE: Final = _AUTHORITY_RELATIVE / "checkpoints"
@@ -501,9 +503,10 @@ class LocalSourceDelivery:
             raise ValidationError("expected local source checkpoint digest is invalid")
         if type(expected_sequence) is not int or expected_sequence < 0:
             raise ValidationError("expected local source checkpoint sequence is invalid")
-        if disposition != FORWARD_ONLY_RESET:
+        if disposition not in RESET_DISPOSITIONS:
             raise ValidationError(
-                "local source replacement requires disposition forward_only_reset"
+                f"local source replacement requires disposition {FORWARD_ONLY_RESET} "
+                f"or {DISCARD_STALE_DELIVERY}"
             )
         self._selected_snapshot(source)
         binding = self._required_binding(source)
@@ -552,8 +555,13 @@ class LocalSourceDelivery:
             replacement_digest = _digest(cursor)
             previous_store_identity = _cursor_store_identity(state.cursor)
             replacement_store_identity = _cursor_store_identity(cursor)
-            if previous_store_identity == replacement_store_identity:
+            if (
+                disposition == FORWARD_ONLY_RESET
+                and previous_store_identity == replacement_store_identity
+            ):
                 raise ConflictError("local source store identity has not changed")
+            if disposition == DISCARD_STALE_DELIVERY and state.pending_token is None:
+                raise ConflictError("no local source delivery is pending to discard")
 
             archive_relative = self._checkpoint_archive_relative(binding, state)
             store.ensure_directory(_HISTORY_RELATIVE)
@@ -1973,13 +1981,16 @@ def _parse_reset_receipt(value: object) -> _ResetReceipt | None:
         or _SHA256.fullmatch(previous_store_identity) is None
         or not isinstance(replacement_store_identity, str)
         or _SHA256.fullmatch(replacement_store_identity) is None
-        or previous_store_identity == replacement_store_identity
+        or (
+            disposition == FORWARD_ONLY_RESET
+            and previous_store_identity == replacement_store_identity
+        )
         or type(pending_delivery_discarded) is not bool
         or not isinstance(archive_digest, str)
         or _SHA256.fullmatch(archive_digest) is None
         or type(previous_sequence) is not int
         or previous_sequence < 0
-        or disposition != FORWARD_ONLY_RESET
+        or disposition not in RESET_DISPOSITIONS
         or not isinstance(reset_at, str)
     ):
         raise ValidationError("local source checkpoint reset receipt is invalid")
@@ -2133,8 +2144,10 @@ def _has_exact_source_event(
 
 
 __all__ = [
+    "DISCARD_STALE_DELIVERY",
     "FORWARD_ONLY_RESET",
     "LOCAL_SOURCE_TOOL_BINDINGS",
+    "RESET_DISPOSITIONS",
     "SUPPORTED_LOCAL_SOURCES",
     "VERIFIED_PREFIX_ADOPTION",
     "LocalSourceDelivery",

@@ -73,7 +73,7 @@ from continuity_kernel.dispatch import (
 )
 from continuity_kernel.errors import ContinuityError, SetupError, ValidationError
 from continuity_kernel.local_source_delivery import (
-    FORWARD_ONLY_RESET,
+    RESET_DISPOSITIONS,
     SUPPORTED_LOCAL_SOURCES,
     VERIFIED_PREFIX_ADOPTION,
     LocalSourceDelivery,
@@ -2144,7 +2144,7 @@ def _parser() -> argparse.ArgumentParser:
     local_source_rebaseline.add_argument("--expected-sequence", type=int, required=True)
     local_source_rebaseline.add_argument(
         "--disposition",
-        choices=(FORWARD_ONLY_RESET,),
+        choices=RESET_DISPOSITIONS,
         required=True,
     )
     local_source_adopt_staged.add_argument("--expected-migration-revision", required=True)

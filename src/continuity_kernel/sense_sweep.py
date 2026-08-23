@@ -12,9 +12,9 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 
@@ -24,7 +24,12 @@ from continuity_kernel.errors import ContinuityError, ValidationError
 from continuity_kernel.records import TERMINAL_THREAD_STATUSES, format_time, parse_time
 from continuity_kernel.resident_signals import ResidentSignalStore, SignalAppendRequest
 from continuity_kernel.source_recipes import get_recipe
-from continuity_kernel.source_state import SourceCompleteness, SourceObservation
+from continuity_kernel.source_state import (
+    SourceCompleteness,
+    SourceObservation,
+    SourceResult,
+    SourceSnapshot,
+)
 from continuity_kernel.vault import Vault
 
 MAX_SWEEP_SECONDS: Final = 5.0
@@ -136,12 +141,11 @@ def sense_sweep(
                 _within_budget(monotonic, deadline)
                 snapshot = active_vault.get_source_snapshot()
                 counts["selected"] = len(snapshot.selected_sources)
-                for source_id in snapshot.selected_sources:
+                due_source_ids = order_due_sources(snapshot, observed_at=now)
+                for source_id in due_source_ids:
                     _within_budget(monotonic, deadline)
                     observation = snapshot.observation(source_id)
                     due_at = _source_due_at(source_id, observation)
-                    if due_at is not None and now < due_at:
-                        continue
                     pending.append(
                         SignalAppendRequest(
                             kind="source-due",
@@ -268,12 +272,142 @@ def heartbeat_status(vault_root: Path | str) -> dict[str, object] | None:
     )
 
 
+def order_due_sources(
+    snapshot: SourceSnapshot,
+    *,
+    observed_at: datetime | None = None,
+    credential_deadlines: Mapping[str, datetime | None] | None = None,
+    changed_incident_sources: frozenset[str] | set[str] | None = None,
+) -> tuple[str, ...]:
+    """Order due selected sources by deterministic fair acquisition rules.
+
+    WhatsApp remains mandatory each wake; afterward order due sources by
+    credential deadline inside the next two 30-minute wakes, newly changed
+    incident fingerprint, never-read, oldest due_at, then source ID.
+    Unchanged auth/tool-absent incidents do not fast-retry.
+    """
+    now = (observed_at or datetime.now(UTC)).astimezone(UTC)
+    two_wakes_horizon = now + timedelta(minutes=60)
+    deadlines = credential_deadlines or {}
+    changed_incidents = changed_incident_sources or frozenset()
+
+    due_sources: list[str] = []
+    for source_id in snapshot.selected_sources:
+        observation = snapshot.observation(source_id)
+        deadline = deadlines.get(source_id)
+        if deadline is not None:
+            deadline = deadline.astimezone(UTC)
+        is_changed_incident = source_id in changed_incidents
+
+        if source_id == "whatsapp":
+            due_sources.append(source_id)
+            continue
+
+        if deadline is not None and now <= deadline <= two_wakes_horizon:
+            due_sources.append(source_id)
+            continue
+
+        if is_changed_incident:
+            due_sources.append(source_id)
+            continue
+
+        if observation is None:
+            due_sources.append(source_id)
+            continue
+
+        if observation.last_success_at is None:
+            if observation.result is SourceResult.FAILURE:
+                attempted = parse_time(observation.attempted_at)
+                ttl = get_recipe(source_id).proof_ttl
+                if now >= attempted + ttl:
+                    due_sources.append(source_id)
+            else:
+                due_sources.append(source_id)
+            continue
+
+        if observation.completeness is SourceCompleteness.PARTIAL:
+            due_sources.append(source_id)
+            continue
+
+        if observation.result is SourceResult.FAILURE:
+            attempted = parse_time(observation.attempted_at)
+            ttl = get_recipe(source_id).proof_ttl
+            if now >= attempted + ttl:
+                due_sources.append(source_id)
+            continue
+
+        due_at = parse_time(observation.last_success_at) + get_recipe(source_id).proof_ttl
+        if now >= due_at:
+            due_sources.append(source_id)
+
+    def sort_key(source_id: str) -> tuple[int, tuple[int, float], int, int, float, str]:
+        observation = snapshot.observation(source_id)
+        deadline = deadlines.get(source_id)
+        if deadline is not None:
+            deadline = deadline.astimezone(UTC)
+        is_changed_incident = source_id in changed_incidents
+
+        # 0. WhatsApp mandatory each wake (first if present)
+        is_not_whatsapp = 0 if source_id == "whatsapp" else 1
+
+        # 1. Credential deadline inside next two 30-minute wakes (within 60m)
+        if deadline is not None and now <= deadline <= two_wakes_horizon:
+            deadline_priority = (0, deadline.timestamp())
+        else:
+            deadline_priority = (1, 0.0)
+
+        # 2. Newly changed incident fingerprint
+        is_not_changed_incident = 0 if is_changed_incident else 1
+
+        # 3. Never-read
+        is_not_never_read = 0 if (observation is None or observation.last_success_at is None) else 1
+
+        # 4. Oldest due_at (furthest in the past first)
+        if observation is None:
+            due_ts = datetime.min.replace(tzinfo=UTC).timestamp()
+        elif (
+            observation.last_success_at is None
+            or observation.completeness is SourceCompleteness.PARTIAL
+        ):
+            due_ts = parse_time(observation.attempted_at).timestamp()
+        elif observation.result is SourceResult.FAILURE:
+            due_ts = (
+                parse_time(observation.attempted_at) + get_recipe(source_id).proof_ttl
+            ).timestamp()
+        else:
+            due_ts = (
+                parse_time(observation.last_success_at) + get_recipe(source_id).proof_ttl
+            ).timestamp()
+
+        # 5. Alphabetical source ID
+        return (
+            is_not_whatsapp,
+            deadline_priority,
+            is_not_changed_incident,
+            is_not_never_read,
+            due_ts,
+            source_id,
+        )
+
+    return tuple(sorted(due_sources, key=sort_key))
+
+
 def _source_due_at(source_id: str, observation: SourceObservation | None) -> datetime | None:
-    if observation is None or observation.last_success_at is None:
+    if source_id == "whatsapp":
+        return (
+            parse_time(observation.attempted_at)
+            if observation and observation.attempted_at
+            else None
+        )
+    if observation is None:
         return None
     if observation.completeness is SourceCompleteness.PARTIAL:
         return parse_time(observation.attempted_at)
-    return parse_time(observation.last_success_at) + get_recipe(source_id).proof_ttl
+    if observation.last_success_at is not None:
+        return parse_time(observation.last_success_at) + get_recipe(source_id).proof_ttl
+    if observation.result is SourceResult.FAILURE:
+        return parse_time(observation.attempted_at) + get_recipe(source_id).proof_ttl
+    return None
 
 
 def _source_event_key(source_id: str, observation: SourceObservation | None) -> str:
