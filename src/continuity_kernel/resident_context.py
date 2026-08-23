@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import math
 import os
@@ -1160,8 +1161,8 @@ class GuidanceSourceFile:
     bytes: int
     sha256: str
     source_sha256: str
-    normalized_bytes: bytes
-    target_bytes: bytes
+    normalized_bytes: builtins.bytes
+    target_bytes: builtins.bytes
 
 
 @dataclass(frozen=True)

@@ -1309,7 +1309,7 @@ TOOLS: Final = [
                 "type": "string",
             },
         },
-        required=["checkout_root", "expected_guidance_revision", "expected_mind_revision"],
+        required=("checkout_root", "expected_guidance_revision", "expected_mind_revision"),
         read_only=False,
     ),
     _tool(
