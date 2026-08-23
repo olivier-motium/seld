@@ -17,10 +17,11 @@ from typing import Any, Final, Protocol, cast
 
 from continuity_kernel.atomic import (
     PINNED_PATH_ROOT_SUPPORTED,
+    atomic_write,
     exclusive_lock,
     read_regular_file,
 )
-from continuity_kernel.errors import ConflictError, ValidationError
+from continuity_kernel.errors import ConflictError, DegradedIntegrityError, ValidationError
 from continuity_kernel.privacy import AwarenessDecision, screen_local_content
 from continuity_kernel.records import (
     TERMINAL_TASK_STATUSES,
@@ -34,6 +35,7 @@ RESIDENT_GUIDANCE: Final = RESIDENT_ROOT / "AGENTS.md"
 RESIDENT_SKILLS: Final = RESIDENT_ROOT / "skills"
 LEGACY_RESIDENT_CONTROL: Final = RESIDENT_ROOT / "control"
 GUIDANCE_PROJECTION_MARKER: Final = PurePosixPath(".gsv/guidance-projection.json")
+GUIDANCE_PROJECTION_INTENT: Final = PurePosixPath(".gsv/guidance-projection-intent.json")
 GUIDANCE_SOURCE_AGENTS: Final = "AGENTS.md"
 GUIDANCE_SOURCE_MIND: Final = "brain/MIND.md"
 MAX_GUIDANCE_BYTES: Final = 256 * 1024
@@ -138,13 +140,95 @@ def execution_bindings(source: _ExecutionBindingSource) -> dict[str, Any]:
     }
 
 
+def recover_interrupted_guidance_projection(vault_root: Path) -> None:
+    """Durably recover the prior complete generation if an interrupted projection intent exists.
+
+    Fails closed with DegradedIntegrityError if the intent is malformed or unrecoverable.
+    Never unlinks malformed intent and continues.
+    """
+    intent_path = vault_root / GUIDANCE_PROJECTION_INTENT
+    if not intent_path.exists():
+        return
+
+    try:
+        metadata = os.lstat(intent_path)
+    except OSError as exc:
+        raise DegradedIntegrityError(
+            f"could not inspect guidance projection intent: {exc}"
+        ) from exc
+    if _is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode) or metadata.st_size == 0:
+        raise DegradedIntegrityError(
+            "guidance projection intent is invalid or non-regular; refusing to proceed"
+        )
+
+    try:
+        intent_raw = read_regular_file(
+            intent_path,
+            label="guidance projection intent",
+            max_bytes=MAX_DOCUMENT_BYTES,
+        )
+        intent_data = json.loads(intent_raw.decode("utf-8"))
+    except Exception as exc:
+        raise DegradedIntegrityError(
+            f"guidance projection intent could not be parsed: {exc}"
+        ) from exc
+
+    if not isinstance(intent_data, dict) or intent_data.get("format_version") != 1:
+        raise DegradedIntegrityError(
+            "guidance projection intent format version is invalid; refusing to proceed"
+        )
+
+    g_hex = intent_data.get("guidance_before_hex")
+    if g_hex is not None and (not isinstance(g_hex, str) or len(g_hex) % 2 != 0):
+        raise DegradedIntegrityError("guidance projection intent guidance snapshot is invalid")
+
+    m_hex = intent_data.get("mind_before_hex")
+    if m_hex is not None and (not isinstance(m_hex, str) or len(m_hex) % 2 != 0):
+        raise DegradedIntegrityError("guidance projection intent mind snapshot is invalid")
+
+    mk_hex = intent_data.get("marker_before_hex")
+    if mk_hex is not None and (not isinstance(mk_hex, str) or len(mk_hex) % 2 != 0):
+        raise DegradedIntegrityError("guidance projection intent marker snapshot is invalid")
+
+    try:
+        guidance_target = vault_root / "context/resident/AGENTS.md"
+        mind_target = vault_root / "MIND.md"
+        marker_target = vault_root / GUIDANCE_PROJECTION_MARKER
+
+        if g_hex is None:
+            if guidance_target.exists():
+                guidance_target.unlink(missing_ok=True)
+        else:
+            atomic_write(guidance_target, bytes.fromhex(g_hex))
+
+        if m_hex is None:
+            if mind_target.exists():
+                mind_target.unlink(missing_ok=True)
+        else:
+            atomic_write(mind_target, bytes.fromhex(m_hex))
+
+        if mk_hex is None:
+            if marker_target.exists():
+                marker_target.unlink(missing_ok=True)
+        else:
+            atomic_write(marker_target, bytes.fromhex(mk_hex))
+
+        intent_path.unlink(missing_ok=True)
+    except Exception as exc:
+        raise DegradedIntegrityError(
+            f"could not restore prior generation from guidance projection intent: {exc}"
+        ) from exc
+
+
 def read_resident_guidance(vault_root: Path) -> dict[str, Any]:
     """Read exact resident AGENTS guidance through one bounded no-follow path."""
 
     with (
         exclusive_lock(vault_root / ".gsv/locks/global.lock"),
+        exclusive_lock(vault_root / ".gsv/locks/document-mind.lock"),
         exclusive_lock(vault_root / ".gsv/locks/resident-guidance.lock"),
     ):
+        recover_interrupted_guidance_projection(vault_root)
         content = _read_resident_file(
             vault_root,
             RESIDENT_GUIDANCE,
@@ -177,8 +261,10 @@ def resident_context_status(vault_root: Path) -> dict[str, Any]:
 
     with (
         exclusive_lock(vault_root / ".gsv/locks/global.lock"),
+        exclusive_lock(vault_root / ".gsv/locks/document-mind.lock"),
         exclusive_lock(vault_root / ".gsv/locks/resident-guidance.lock"),
     ):
+        recover_interrupted_guidance_projection(vault_root)
         guidance = _read_resident_file(
             vault_root,
             RESIDENT_GUIDANCE,

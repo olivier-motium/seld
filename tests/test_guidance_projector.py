@@ -10,12 +10,19 @@ import pytest
 from continuity_kernel import mcp_server
 from continuity_kernel.atomic import atomic_write, sha256_bytes
 from continuity_kernel.cli import main
-from continuity_kernel.errors import ConflictError, PersistenceError, ValidationError
+from continuity_kernel.errors import (
+    ConflictError,
+    DegradedIntegrityError,
+    PersistenceError,
+    ValidationError,
+)
 from continuity_kernel.resident_context import (
+    GUIDANCE_PROJECTION_INTENT,
     GUIDANCE_PROJECTION_MARKER,
     MAX_DOCUMENT_BYTES,
     MAX_GUIDANCE_BYTES,
     read_resident_guidance,
+    resident_context_status,
     validate_checkout_guidance_sources,
 )
 from continuity_kernel.vault import Vault
@@ -184,24 +191,24 @@ def test_guidance_projector_comprehensive_behavior(vault: Vault, tmp_path: Path)
         assert (vault.root / "context/resident/AGENTS.md").read_bytes() == guidance_before_bytes
         assert (vault.root / "MIND.md").read_bytes() == mind_before_bytes
         assert marker_path.read_bytes() == marker_before_bytes
-        assert not (vault.state / "guidance-projection-intent.json").exists()
+        assert not (vault.root / GUIDANCE_PROJECTION_INTENT).exists()
 
 
-def test_guidance_projector_crash_interrupted_recovery(vault: Vault, tmp_path: Path) -> None:
-    """Test that an interrupted transaction intent durably recovers the prior generation."""
-    checkout_dir = tmp_path / "crash-checkout"
-    _setup_synthetic_checkout(checkout_dir)
-
-    initial_mind = vault.read_document("MIND.md")
+def test_guidance_projector_crash_interrupted_recovery_via_resident_readers(
+    vault: Vault, tmp_path: Path
+) -> None:
+    """Test that resident readers invoked first after interruption durably recover state."""
     initial_mind_bytes = (vault.root / "MIND.md").read_bytes()
 
-    # Create synthetic prior state
+    # Prior guidance state
     guidance_target = vault.root / "context/resident/AGENTS.md"
     guidance_target.parent.mkdir(parents=True, exist_ok=True)
     guidance_target.write_text("# Prior Guidance\n", encoding="utf-8")
     prior_guidance_bytes = guidance_target.read_bytes()
 
-    # Simulate a crash midway: intent exists with prior snapshot, but files were partly written
+    intent_file = vault.root / GUIDANCE_PROJECTION_INTENT
+
+    # 1. Simulate process death after AGENTS was written: call read_resident_guidance first
     intent_payload = {
         "format_version": 1,
         "guidance_before_hex": prior_guidance_bytes.hex(),
@@ -210,19 +217,56 @@ def test_guidance_projector_crash_interrupted_recovery(vault: Vault, tmp_path: P
         "target_guidance_sha256": "0" * 64,
         "target_mind_sha256": "1" * 64,
     }
-    intent_file = vault.state / "guidance-projection-intent.json"
     atomic_write(intent_file, json.dumps(intent_payload).encode("utf-8") + b"\n")
 
-    # Simulate dirty partial state written during crash
+    # Dirty post-crash bytes
     guidance_target.write_text("# Dirty Crashed Guidance\n", encoding="utf-8")
     (vault.root / "MIND.md").write_text("# Dirty Crashed Mind\n", encoding="utf-8")
 
-    # When reader accesses the vault, it recovers prior generation before returning
-    doc = vault.read_document("MIND.md")
-    assert doc["content"] == initial_mind["content"]
-    assert (vault.root / "MIND.md").read_bytes() == initial_mind_bytes
+    # read_resident_guidance called FIRST after interruption
+    guidance_res = read_resident_guidance(vault.root)
+    assert guidance_res["content"] == "# Prior Guidance\n"
     assert guidance_target.read_bytes() == prior_guidance_bytes
+    assert (vault.root / "MIND.md").read_bytes() == initial_mind_bytes
     assert not intent_file.exists()
+
+    # 2. Simulate another crash: call resident_context_status first
+    atomic_write(intent_file, json.dumps(intent_payload).encode("utf-8") + b"\n")
+    guidance_target.write_text("# Dirty Crashed Guidance 2\n", encoding="utf-8")
+    (vault.root / "MIND.md").write_text("# Dirty Crashed Mind 2\n", encoding="utf-8")
+
+    status_res = resident_context_status(vault.root)
+    assert status_res["guidance"]["present"] is True
+    assert status_res["guidance"]["sha256"] == sha256_bytes(prior_guidance_bytes)
+    assert guidance_target.read_bytes() == prior_guidance_bytes
+    assert (vault.root / "MIND.md").read_bytes() == initial_mind_bytes
+    assert not intent_file.exists()
+
+
+def test_guidance_projector_malformed_intent_fails_closed(vault: Vault) -> None:
+    """Test that malformed/corrupted intent fails closed without unlinking the intent file."""
+    intent_file = vault.root / GUIDANCE_PROJECTION_INTENT
+
+    # Corrupt intent
+    atomic_write(intent_file, b"corrupted-intent-content\n")
+
+    # read_resident_guidance must fail closed
+    with pytest.raises(DegradedIntegrityError):
+        read_resident_guidance(vault.root)
+    assert intent_file.exists()
+
+    # resident_context_status must fail closed
+    with pytest.raises(DegradedIntegrityError):
+        resident_context_status(vault.root)
+    assert intent_file.exists()
+
+    # read_document for MIND.md must fail closed
+    with pytest.raises(DegradedIntegrityError):
+        vault.read_document("MIND.md")
+    assert intent_file.exists()
+
+    # Clean up intent for subsequent tests
+    intent_file.unlink()
 
 
 def test_guidance_projector_malformed_marker_does_not_silently_block_mind(

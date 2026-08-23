@@ -153,8 +153,10 @@ from continuity_kernel.records import (
     title_text,
 )
 from continuity_kernel.resident_context import (
+    GUIDANCE_PROJECTION_INTENT,
     GUIDANCE_PROJECTION_MARKER,
     MAX_GUIDANCE_BYTES,
+    recover_interrupted_guidance_projection,
     validate_checkout_guidance_sources,
 )
 from continuity_kernel.resident_signals import (
@@ -2480,46 +2482,7 @@ class Vault:
 
     def _recover_interrupted_guidance_projection(self) -> None:
         """Durably recover the prior complete generation if an interrupted projection is found."""
-        intent_path = self.state / "guidance-projection-intent.json"
-        if not intent_path.exists():
-            return
-        try:
-            intent_raw = self._read_bytes(intent_path, max_bytes=MAX_DOCUMENT_BYTES)
-            intent_data = json.loads(intent_raw.decode("utf-8"))
-            if not isinstance(intent_data, dict) or intent_data.get("format_version") != 1:
-                intent_path.unlink(missing_ok=True)
-                return
-
-            guidance_target = self.root / "context/resident/AGENTS.md"
-            mind_target = self.root / "MIND.md"
-            marker_target = self.root / GUIDANCE_PROJECTION_MARKER
-
-            g_hex = intent_data.get("guidance_before_hex")
-            if g_hex is None:
-                if guidance_target.exists():
-                    guidance_target.unlink(missing_ok=True)
-            else:
-                atomic_write(guidance_target, bytes.fromhex(g_hex))
-
-            m_hex = intent_data.get("mind_before_hex")
-            if m_hex is None:
-                if mind_target.exists():
-                    mind_target.unlink(missing_ok=True)
-            else:
-                atomic_write(mind_target, bytes.fromhex(m_hex))
-
-            mk_hex = intent_data.get("marker_before_hex")
-            if mk_hex is None:
-                if marker_target.exists():
-                    marker_target.unlink(missing_ok=True)
-            else:
-                atomic_write(marker_target, bytes.fromhex(mk_hex))
-
-            intent_path.unlink(missing_ok=True)
-        except Exception as exc:
-            raise DegradedIntegrityError(
-                f"could not recover interrupted guidance projection: {exc}"
-            ) from exc
+        recover_interrupted_guidance_projection(self.root)
 
     def read_document(self, name: str) -> dict[str, str]:
         canonical_name = name.strip()
@@ -2528,6 +2491,7 @@ class Vault:
             with (
                 exclusive_lock(self.state / "locks/global.lock"),
                 exclusive_lock(self._record_lock("document", "mind")),
+                exclusive_lock(self.state / "locks/resident-guidance.lock"),
             ):
                 self._recover_interrupted_guidance_projection()
                 stored = self._read_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
@@ -2628,7 +2592,7 @@ class Vault:
         guidance_target = self.root / "context/resident/AGENTS.md"
         mind_target = self.root / "MIND.md"
         marker_target = self.root / GUIDANCE_PROJECTION_MARKER
-        intent_target = self.state / "guidance-projection-intent.json"
+        intent_target = self.root / GUIDANCE_PROJECTION_INTENT
 
         with (
             exclusive_lock(self.state / "locks/global.lock"),
@@ -3517,7 +3481,7 @@ class Vault:
             except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
                 issues.append(DoctorIssue("invalid-document", name, str(exc)))
 
-        intent_path = self.state / "guidance-projection-intent.json"
+        intent_path = self.root / GUIDANCE_PROJECTION_INTENT
         if intent_path.exists():
             try:
                 with (
@@ -3530,7 +3494,7 @@ class Vault:
                 issues.append(
                     DoctorIssue(
                         "interrupted-guidance-projection",
-                        ".gsv/guidance-projection-intent.json",
+                        GUIDANCE_PROJECTION_INTENT.as_posix(),
                         f"interrupted guidance projection could not be recovered: {exc}",
                     )
                 )
