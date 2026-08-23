@@ -17,6 +17,7 @@ FORMAT_VERSION: Final = 1
 TASK_FORMAT_VERSION: Final = 2
 TASK_RESIDENT_FORMAT_VERSION: Final = 3
 TASK_DISPATCH_FORMAT_VERSION: Final = 4
+TASK_AGENT_RUN_FORMAT_VERSION: Final = 5
 ENTITY_RESIDENT_FORMAT_VERSION: Final = 2
 THREAD_RESIDENT_FORMAT_VERSION: Final = 2
 TASK_FORMAT_VERSIONS: Final = frozenset(
@@ -25,6 +26,7 @@ TASK_FORMAT_VERSIONS: Final = frozenset(
         TASK_FORMAT_VERSION,
         TASK_RESIDENT_FORMAT_VERSION,
         TASK_DISPATCH_FORMAT_VERSION,
+        TASK_AGENT_RUN_FORMAT_VERSION,
     }
 )
 ENTITY_FORMAT_VERSIONS: Final = frozenset({FORMAT_VERSION, ENTITY_RESIDENT_FORMAT_VERSION})
@@ -141,7 +143,6 @@ _TASK_RESIDENT_KEYS: Final = _TASK_LEGACY_KEYS | {
     "workspace",
 }
 _TASK_DISPATCH_KEYS: Final = _TASK_RESIDENT_KEYS | {
-    "agent_run",
     "blocker_condition",
     "blocker_owner",
     "claim_by",
@@ -149,6 +150,9 @@ _TASK_DISPATCH_KEYS: Final = _TASK_RESIDENT_KEYS | {
     "dispatch_revision",
     "progress_check_by",
     "target_seat",
+}
+_TASK_AGENT_RUN_KEYS: Final = _TASK_DISPATCH_KEYS | {
+    "agent_run",
 }
 _ENTITY_LEGACY_KEYS: Final = frozenset(
     {"aliases", "created_at", "entity_type", "id", "kind", "refs", "updated_at", "version"}
@@ -436,6 +440,10 @@ def new_task(
     clean_blocker_condition = optional_line(blocker_condition, "blocker condition", 500)
     if clean_blocker_condition is not None and clean_waiting is None:
         clean_waiting = clean_blocker_condition
+    if clean_dispatch_id is not None or clean_dispatch_revision is not None:
+        raise ValidationError("task cannot be created with a dispatch ID or revision")
+    if clean_agent_run == "yes" and clean_active is not None:
+        raise ValidationError("agent-run task cannot be created with an active thread ID")
     _validate_dispatch_fields(
         clean_dispatch_id,
         clean_dispatch_revision,
@@ -679,7 +687,9 @@ def render_task(task: Task) -> str:
     review = validate_review_references(task.refs, terminal=task.status in TERMINAL_TASK_STATUSES)
     rich = _task_is_rich(task)
     stored_version = (
-        TASK_DISPATCH_FORMAT_VERSION
+        TASK_AGENT_RUN_FORMAT_VERSION
+        if task.agent_run is not None
+        else TASK_DISPATCH_FORMAT_VERSION
         if any(
             (
                 task.target_seat is not None,
@@ -689,7 +699,6 @@ def render_task(task: Task) -> str:
                 task.dispatch_revision is not None,
                 task.blocker_owner is not None,
                 task.blocker_condition is not None,
-                task.agent_run is not None,
             )
         )
         else TASK_RESIDENT_FORMAT_VERSION
@@ -735,10 +744,9 @@ def render_task(task: Task) -> str:
                 "workspace": optional_line(task.workspace, "workspace", 2_048),
             }
         )
-        if stored_version == TASK_DISPATCH_FORMAT_VERSION:
+        if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}:
             metadata.update(
                 {
-                    "agent_run": agent_run_value(task.agent_run),
                     "blocker_condition": optional_line(
                         task.blocker_condition, "blocker condition", 500
                     ),
@@ -752,6 +760,8 @@ def render_task(task: Task) -> str:
                     "target_seat": target_seat_value(task.target_seat),
                 }
             )
+            if stored_version == TASK_AGENT_RUN_FORMAT_VERSION:
+                metadata["agent_run"] = agent_run_value(task.agent_run)
         sections = (*sections, ("History", render_history(task.history)))
     return _render(
         metadata,
@@ -880,13 +890,16 @@ def parse_task(markdown: str) -> Task:
             TASK_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on"),
             TASK_RESIDENT_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on", "History"),
             TASK_DISPATCH_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on", "History"),
+            TASK_AGENT_RUN_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on", "History"),
         },
     )
     stored_version = meta["version"]
     _expect_metadata_keys(
         meta,
         (
-            _TASK_DISPATCH_KEYS
+            _TASK_AGENT_RUN_KEYS
+            if stored_version == TASK_AGENT_RUN_FORMAT_VERSION
+            else _TASK_DISPATCH_KEYS
             if stored_version == TASK_DISPATCH_FORMAT_VERSION
             else _TASK_RESIDENT_KEYS
             if stored_version == TASK_RESIDENT_FORMAT_VERSION
@@ -894,7 +907,11 @@ def parse_task(markdown: str) -> Task:
         ),
         "task",
     )
-    rich = stored_version in {TASK_RESIDENT_FORMAT_VERSION, TASK_DISPATCH_FORMAT_VERSION}
+    rich = stored_version in {
+        TASK_RESIDENT_FORMAT_VERSION,
+        TASK_DISPATCH_FORMAT_VERSION,
+        TASK_AGENT_RUN_FORMAT_VERSION,
+    }
     task = Task(
         identifier=task_id(_string(meta, "id")),
         title=title_text(title),
@@ -934,42 +951,42 @@ def parse_task(markdown: str) -> Task:
         history=(parse_history(sections["History"]) if rich else ()),
         target_seat=(
             target_seat_value(_optional_string(meta, "target_seat"))
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         claim_by=(
             optional_stored_time(_optional_string(meta, "claim_by"), "claim_by")
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         progress_check_by=(
             optional_stored_time(_optional_string(meta, "progress_check_by"), "progress_check_by")
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         dispatch_id=(
             dispatch_id_value(_optional_string(meta, "dispatch_id"))
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         dispatch_revision=(
             dispatch_revision_value(_optional_string(meta, "dispatch_revision"))
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         blocker_owner=(
             optional_line(_optional_string(meta, "blocker_owner"), "blocker owner", 120)
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         blocker_condition=(
             optional_line(_optional_string(meta, "blocker_condition"), "blocker condition", 500)
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         agent_run=(
             agent_run_value(_optional_string(meta, "agent_run"))
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version == TASK_AGENT_RUN_FORMAT_VERSION
             else None
         ),
     )
@@ -983,6 +1000,8 @@ def parse_task(markdown: str) -> Task:
         raise ValidationError("task record version 3 requires resident continuity fields")
     if stored_version == TASK_DISPATCH_FORMAT_VERSION and not _task_is_rich(task):
         raise ValidationError("task record version 4 requires dispatch continuity fields")
+    if stored_version == TASK_AGENT_RUN_FORMAT_VERSION and not _task_is_rich(task):
+        raise ValidationError("task record version 5 requires agent-run continuity fields")
     return task
 
 

@@ -485,8 +485,6 @@ def _call(
                 target_seat=_optional_string(values, "target_seat"),
                 claim_by=_optional_string(values, "claim_by"),
                 progress_check_by=_optional_string(values, "progress_check_by"),
-                dispatch_id=_optional_string(values, "dispatch_id"),
-                dispatch_revision=_optional_string(values, "dispatch_revision"),
                 blocker_owner=_optional_string(values, "blocker_owner"),
                 blocker_condition=_optional_string(values, "blocker_condition"),
                 agent_run=_optional_string(values, "agent_run"),
@@ -516,8 +514,6 @@ def _call(
                 target_seat=_optional_string(values, "target_seat"),
                 claim_by=_optional_string(values, "claim_by"),
                 progress_check_by=_optional_string(values, "progress_check_by"),
-                dispatch_id=_optional_string(values, "dispatch_id"),
-                dispatch_revision=_optional_string(values, "dispatch_revision"),
                 blocker_owner=_optional_string(values, "blocker_owner"),
                 blocker_condition=_optional_string(values, "blocker_condition"),
                 agent_run=_optional_string(values, "agent_run"),
@@ -534,8 +530,6 @@ def _call(
                 clear_target_seat=_boolean(values, "clear_target_seat"),
                 clear_claim_by=_boolean(values, "clear_claim_by"),
                 clear_progress_check_by=_boolean(values, "clear_progress_check_by"),
-                clear_dispatch_id=_boolean(values, "clear_dispatch_id"),
-                clear_dispatch_revision=_boolean(values, "clear_dispatch_revision"),
                 clear_blocker_owner=_boolean(values, "clear_blocker_owner"),
                 clear_blocker_condition=_boolean(values, "clear_blocker_condition"),
                 clear_agent_run=_boolean(values, "clear_agent_run"),
@@ -585,12 +579,16 @@ def _call(
     if name == "gsv_dispatch_eligible":
         return {"tasks": [record_dict(task) for task in dispatch_eligible(vault.root)]}
     if name == "gsv_dispatch_claim":
+        admission = values.get("admission")
+        if isinstance(admission, str):
+            admission = json.loads(admission)
         return record_dict(
             claim_task(
                 vault.root,
                 _string(values, "id"),
                 expected_revision=_string(values, "expected_revision"),
                 dispatch_id=_string(values, "dispatch_id"),
+                admission=admission,
                 observed_at=_optional_time(values, "observed_at"),
             )
         )
@@ -1702,8 +1700,6 @@ TOOLS: Final = [
             "blocker_owner": TEXT,
             "claim_by": TEXT,
             "codex_episode_ids": TEXTS,
-            "dispatch_id": TEXT,
-            "dispatch_revision": TEXT,
             "due": TEXT,
             "entity_links": TASK_ENTITY_LINKS,
             "next_action": TEXT,
@@ -1743,8 +1739,6 @@ TOOLS: Final = [
             "clear_blocker_owner": BOOLEAN,
             "clear_claim_by": BOOLEAN,
             "clear_due": BOOLEAN,
-            "clear_dispatch_id": BOOLEAN,
-            "clear_dispatch_revision": BOOLEAN,
             "clear_next_action": BOOLEAN,
             "clear_next_actor": BOOLEAN,
             "clear_progress_check_by": BOOLEAN,
@@ -1755,8 +1749,6 @@ TOOLS: Final = [
             "clear_rank": BOOLEAN,
             "clear_workspace": BOOLEAN,
             "due": TEXT,
-            "dispatch_id": TEXT,
-            "dispatch_revision": TEXT,
             "expected_revision": TEXT,
             "id": TEXT,
             "next_action": TEXT,
@@ -1823,6 +1815,10 @@ TOOLS: Final = [
         "gsv_dispatch_claim",
         "Claim one eligible task with its exact current revision and one dispatch ID.",
         {
+            "admission": {
+                "description": "Factory allocation admission object containing payload and signature.",
+                "type": "object",
+            },
             "dispatch_id": TEXT,
             "expected_revision": TEXT,
             "id": TEXT,

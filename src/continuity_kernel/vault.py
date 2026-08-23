@@ -581,13 +581,16 @@ class Vault:
                 if clear_agent_run
                 else before.agent_run
             )
-            if target_agent_run == "yes" and claim_by is None and before.agent_run != "yes":
-                target_claim_by = None
             if target_blocker_condition is not None and target_waiting is None:
                 target_waiting = target_blocker_condition
             if target_status in TERMINAL_TASK_STATUSES:
                 target_blocker_owner = None
                 target_blocker_condition = None
+            if target_dispatch_id is not None and target_dispatch_id != before.dispatch_id:
+                if before.dispatch_id is not None:
+                    raise ValidationError("task is already claimed by another dispatch")
+                if target_dispatch_revision != before.revision:
+                    raise ValidationError("dispatch claim requires exact dispatch revision")
             _validate_task_dispatch_update(
                 target_status,
                 target_waiting,
@@ -606,6 +609,12 @@ class Vault:
                 if clear_active_thread_id
                 else before.active_thread_id
             )
+            if target_agent_run == "yes" and target_active_thread_id is not None and target_active_thread_id != before.active_thread_id:
+                if before.dispatch_id is None or before.dispatch_revision is None or target_status != "doing":
+                    raise ValidationError("active thread ID on an agent-run task must be bound through dispatch")
+            if target_agent_run == "yes" and before.agent_run != "yes" and target_active_thread_id is not None:
+                if before.dispatch_id is None or before.dispatch_revision is None:
+                    raise ValidationError("active thread ID on an agent-run task must be bound through dispatch")
             target_superseded_by = (
                 task_id(superseded_by)
                 if superseded_by is not None

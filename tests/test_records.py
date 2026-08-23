@@ -427,13 +427,13 @@ def test_agent_run_field_serialization_and_validation() -> None:
 
     yes_rendered = render_task(yes_task)
     assert '"agent_run":"yes"' in yes_rendered.splitlines()[0]
-    assert '"version":4' in yes_rendered.splitlines()[0]
+    assert '"version":5' in yes_rendered.splitlines()[0]
     assert parse_task(yes_rendered) == yes_task
     assert parse_task(yes_rendered).agent_run == "yes"
 
     no_rendered = render_task(no_task)
     assert '"agent_run":"no"' in no_rendered.splitlines()[0]
-    assert '"version":4' in no_rendered.splitlines()[0]
+    assert '"version":5' in no_rendered.splitlines()[0]
     assert parse_task(no_rendered) == no_task
     assert parse_task(no_rendered).agent_run == "no"
 
@@ -450,3 +450,36 @@ def test_agent_run_field_serialization_and_validation() -> None:
                 agent_run=invalid,
                 observed_at=NOW,
             )
+
+
+def test_task_version_4_record_compatibility_and_rejection_of_unknown_keys() -> None:
+    v4_raw = """<!-- gsv:{"active_thread_id":null,"attention_at":null,"blocker_condition":null,"blocker_owner":null,"claim_by":"2026-07-22T12:05:00.000000Z","codex_episode_ids":[],"created_at":"2026-07-22T12:00:00.000000Z","dispatch_id":null,"dispatch_revision":null,"due":null,"entity_links":[],"id":"v4-legacy-task","kind":"task","next_action_present":false,"next_actor":"agent","progress_check_by":null,"project":null,"rank":0,"refs":[],"state_changed_at":"2026-07-22T12:00:00.000000Z","status":"ready","superseded_by":null,"target_seat":"worker-one","updated_at":"2026-07-22T12:00:00.000000Z","version":4,"waiting_on_present":false,"workspace":null} -->
+# v4 legacy task
+
+## Outcome
+Carry v4 shape.
+
+## Next action
+Not recorded.
+
+## Waiting on
+Not recorded.
+
+## History
+- 2026-07-22T12:00:00.000000Z: created
+"""
+    task = parse_task(v4_raw)
+    assert task.identifier == "v4-legacy-task"
+    assert task.agent_run is None
+    assert task.target_seat == "worker-one"
+    assert task.claim_by == "2026-07-22T12:05:00.000000Z"
+    rendered = render_task(task)
+    assert '"version":4' in rendered.splitlines()[0]
+    assert "agent_run" not in rendered.splitlines()[0]
+    parsed = parse_task(rendered)
+    assert parsed.agent_run is None
+    assert parse_task(render_task(parsed)) == parsed
+
+    v4_with_agent_run = v4_raw.replace('"version":4', '"version":4,"agent_run":"yes"')
+    with pytest.raises(ValidationError, match="unsupported field agent_run"):
+        parse_task(v4_with_agent_run)

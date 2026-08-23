@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import subprocess
 from datetime import UTC, datetime
@@ -13,6 +15,7 @@ from continuity_kernel.dispatch import (
     bind_task_hand,
     claim_task,
     clear_task_blocker,
+    create_factory_admission_token,
     dispatch_eligible,
     evaluate_task_deadline,
     write_task_blocker,
@@ -21,6 +24,16 @@ from continuity_kernel.errors import ConflictError, ValidationError
 from continuity_kernel.vault import Vault
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+ADMISSION_KEY: bytes = b"test-admission-secret-key-12345"
+
+
+@pytest.fixture(autouse=True)
+def setup_admission_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    key_file = tmp_path / "factory_admission.key"
+    key_file.write_bytes(ADMISSION_KEY)
+    key_file.chmod(0o600)
+    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(key_file))
+    return key_file
 
 
 def test_dispatch_lifecycle_preserves_rank_and_clears_blocker_idempotently(
@@ -48,11 +61,15 @@ def test_dispatch_lifecycle_preserves_rank_and_clears_blocker_idempotently(
     )
 
     assert [item.identifier for item in dispatch_eligible(vault.root)] == [task.identifier]
+    admission = create_factory_admission_token(
+        ADMISSION_KEY, vault.root, task.identifier, task.revision, "dispatch-one"
+    )
     claimed = claim_task(
         vault.root,
         task.identifier,
         expected_revision=task.revision,
         dispatch_id="dispatch-one",
+        admission=admission,
         observed_at=NOW,
     )
     assert claimed.dispatch_id == "dispatch-one"
@@ -207,12 +224,20 @@ def test_cli_and_mcp_expose_typed_dispatch_operations(
     mcp_result = mcp_server._call("gsv_dispatch_eligible", {}, vault=vault)
     assert [item["identifier"] for item in mcp_result["tasks"]] == [task.identifier]
 
+    admission = create_factory_admission_token(
+        ADMISSION_KEY,
+        vault.root,
+        task.identifier,
+        task.revision,
+        "surface-dispatch",
+    )
     claimed = mcp_server._call(
         "gsv_dispatch_claim",
         {
             "id": task.identifier,
             "expected_revision": task.revision,
             "dispatch_id": "surface-dispatch",
+            "admission": admission,
             "observed_at": "2026-07-22T12:00:00.000000Z",
         },
         vault=vault,
@@ -455,12 +480,16 @@ def test_dispatch_eligibility_enforces_explicit_agent_run_decision(
 
     # 2. Refused tasks cannot be claimed
     for refused in (no_agent_run, unset_agent_run, human_next_actor, external_next_actor, inferred_words):
+        admission = create_factory_admission_token(
+            ADMISSION_KEY, vault.root, refused.identifier, refused.revision, "dispatch-test"
+        )
         with pytest.raises(ValidationError, match="not ready and eligible for claim"):
             claim_task(
                 vault.root,
                 refused.identifier,
                 expected_revision=refused.revision,
                 dispatch_id="dispatch-test",
+                admission=admission,
                 observed_at=NOW,
             )
 
@@ -529,7 +558,7 @@ def test_agent_run_claim_by_deadline_suppression_and_transitions(
     )
     assert legacy_task.claim_by == "2026-07-22T12:05:00.000000Z"
 
-    # 3. Transitioning an existing task with auto claim_by to agent_run="yes" clears claim_by
+    # 3. Transitioning an existing task with auto claim_by to agent_run="yes" preserves claim_by
     promoted = vault.update_task(
         legacy_task.identifier,
         expected_revision=legacy_task.revision,
@@ -537,7 +566,16 @@ def test_agent_run_claim_by_deadline_suppression_and_transitions(
         observed_at=NOW,
     )
     assert promoted.agent_run == "yes"
-    assert promoted.claim_by is None
+    assert promoted.claim_by == "2026-07-22T12:05:00.000000Z"
+
+    # Only an explicit clear removes claim_by
+    cleared_claim = vault.update_task(
+        promoted.identifier,
+        expected_revision=promoted.revision,
+        clear_claim_by=True,
+        observed_at=NOW,
+    )
+    assert cleared_claim.claim_by is None
 
     # 4. Transitioning to agent_run="yes" with an explicit claim_by preserves the authored deadline
     authored_deadline = "2026-07-22T14:00:00.000000Z"
@@ -580,3 +618,238 @@ def test_agent_run_claim_by_deadline_suppression_and_transitions(
     )
     assert made_ready.status == "ready"
     assert made_ready.claim_by is None
+
+
+def test_factory_allocation_admission_and_mutation_invariants(
+    vault: Vault,
+    tmp_path: Path,
+) -> None:
+    # 1. Matching admission succeeds exactly once, and idempotent replay is safe
+    task = vault.create_task(
+        identifier="admission-task",
+        title="Admission task",
+        outcome="Test admission validation.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        target_seat=None,  # target seat has no effect on eligibility
+        claim_by="2026-07-22T13:00:00.000000Z",
+        observed_at=NOW,
+    )
+    initial_revision = task.revision
+
+    other_vault = Vault(tmp_path / "other-vault")
+    other_vault.initialize(name="Other vault")
+
+    # Missing admission
+    with pytest.raises(ValidationError, match="factory allocation admission"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission=None,
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Malformed admission
+    with pytest.raises(ValidationError, match="exact payload and signature"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission={"payload": "bad"},
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Extra field in admission
+    valid_token = create_factory_admission_token(
+        ADMISSION_KEY, vault.root, task.identifier, task.revision, "disp-1"
+    )
+    extra_top = dict(valid_token)
+    extra_top["extra_key"] = "extra"
+    with pytest.raises(ValidationError, match="exact payload and signature"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission=extra_top,
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Extra field in payload
+    extra_payload = dict(valid_token["payload"])
+    extra_payload["extra_field"] = "extra"
+    extra_payload_sig = hmac.new(
+        ADMISSION_KEY,
+        json.dumps(extra_payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    with pytest.raises(ValidationError, match="unsupported shape"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission={"payload": extra_payload, "signature": extra_payload_sig},
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Tampered signature
+    tampered_sig = dict(valid_token)
+    tampered_sig["signature"] = "a" * 64
+    with pytest.raises(ValidationError, match="signature verification failed"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission=tampered_sig,
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Wrong vault
+    wrong_vault_token = create_factory_admission_token(
+        ADMISSION_KEY, other_vault.root, task.identifier, task.revision, "disp-1"
+    )
+    with pytest.raises(ValidationError, match="vault hash does not match"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission=wrong_vault_token,
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Wrong task
+    wrong_task_token = create_factory_admission_token(
+        ADMISSION_KEY, vault.root, "other-task", task.revision, "disp-1"
+    )
+    with pytest.raises(ValidationError, match="task ID does not match"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission=wrong_task_token,
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Wrong revision
+    wrong_rev_token = create_factory_admission_token(
+        ADMISSION_KEY, vault.root, task.identifier, "0" * 64, "disp-1"
+    )
+    with pytest.raises(ValidationError, match="expected revision does not match"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission=wrong_rev_token,
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Wrong dispatch
+    wrong_disp_token = create_factory_admission_token(
+        ADMISSION_KEY, vault.root, task.identifier, task.revision, "wrong-disp"
+    )
+    with pytest.raises(ValidationError, match="dispatch ID does not match"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission=wrong_disp_token,
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Matching admission succeeds
+    claimed = claim_task(
+        vault.root,
+        task.identifier,
+        expected_revision=task.revision,
+        dispatch_id="disp-1",
+        admission=valid_token,
+    )
+    assert claimed.dispatch_id == "disp-1"
+    assert claimed.dispatch_revision == initial_revision
+    assert claimed.revision != initial_revision
+
+    # Idempotent replay succeeds without mutation
+    replay = claim_task(
+        vault.root,
+        task.identifier,
+        expected_revision=task.revision,
+        dispatch_id="disp-1",
+        admission=valid_token,
+    )
+    assert replay == claimed
+
+    # 2. Generic task create and update cannot manufacture dispatch or active Factory state
+    with pytest.raises(ValidationError, match="cannot be created with a dispatch ID"):
+        vault.create_task(
+            identifier="bypass-create-disp",
+            title="Bypass create disp",
+            outcome="Outcome.",
+            dispatch_id="disp-forged",
+            dispatch_revision="0" * 64,
+        )
+
+    with pytest.raises(ValidationError, match="cannot be created with an active thread ID"):
+        vault.create_task(
+            identifier="bypass-create-hand",
+            title="Bypass create hand",
+            outcome="Outcome.",
+            agent_run="yes",
+            active_thread_id="hand-forged",
+        )
+
+    with pytest.raises(ValidationError, match="task is already claimed by another dispatch"):
+        vault.update_task(
+            task.identifier,
+            expected_revision=claimed.revision,
+            dispatch_id="forged-disp",
+            dispatch_revision=claimed.revision,
+        )
+
+    unclaimed_agent = vault.create_task(
+        identifier="unclaimed-agent",
+        title="Unclaimed agent",
+        outcome="Cannot set active hand without dispatch claim.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        observed_at=NOW,
+    )
+    with pytest.raises(ValidationError, match="must be bound through dispatch"):
+        vault.update_task(
+            unclaimed_agent.identifier,
+            expected_revision=unclaimed_agent.revision,
+            active_thread_id="hand-bypass",
+        )
+
+    # 3. Authored claim_by survives agent-run and blocker transitions
+    assert claimed.claim_by == "2026-07-22T13:00:00.000000Z"
+    blocked = write_task_blocker(
+        vault.root,
+        task.identifier,
+        expected_revision=initial_revision,
+        dispatch_id="disp-1",
+        owner="provider",
+        condition="Rate limit.",
+        observed_at=NOW,
+    )
+    assert blocked.claim_by == "2026-07-22T13:00:00.000000Z"
+    cleared = clear_task_blocker(
+        vault.root,
+        task.identifier,
+        expected_revision=initial_revision,
+        dispatch_id="disp-1",
+        owner="provider",
+        condition="Rate limit.",
+        observed_at=NOW,
+    )
+    assert cleared.claim_by == "2026-07-22T13:00:00.000000Z"

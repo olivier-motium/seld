@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, Final
 
 from continuity_kernel.errors import ConflictError, ValidationError
 from continuity_kernel.records import (
@@ -25,6 +29,21 @@ from continuity_kernel.vault import Vault
 DISPATCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ACTIVE_THREAD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
+ADMISSION_SCHEMA: Final = "seld.factory-allocation-admission.v1"
+ADMISSION_ISSUER: Final = "ai-accounts-runtime"
+ADMISSION_PAYLOAD_KEYS: Final = frozenset(
+    {
+        "allocation_id",
+        "dispatch_id",
+        "expected_revision",
+        "issuer",
+        "schema",
+        "task_id",
+        "vault_sha256",
+    }
+)
+ADMISSION_TOP_KEYS: Final = frozenset({"payload", "signature"})
+
 
 @dataclass(frozen=True)
 class TaskAttentionFinding:
@@ -38,12 +57,111 @@ class TaskAttentionFinding:
     evidence_at: str
 
 
+def create_factory_admission_token(
+    key_bytes: bytes,
+    project_root: Path,
+    task_id: str,
+    expected_revision: str,
+    dispatch_id: str,
+    allocation_id: str = "alloc-1",
+) -> dict[str, Any]:
+    vault_sha256 = hashlib.sha256(str(project_root.resolve()).encode("utf-8")).hexdigest().lower()
+    payload = {
+        "allocation_id": allocation_id,
+        "dispatch_id": dispatch_id,
+        "expected_revision": expected_revision,
+        "issuer": ADMISSION_ISSUER,
+        "schema": ADMISSION_SCHEMA,
+        "task_id": task_id,
+        "vault_sha256": vault_sha256,
+    }
+    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(key_bytes.strip(), canonical_payload, hashlib.sha256).hexdigest().lower()
+    return {
+        "payload": payload,
+        "signature": signature,
+    }
+
+
+def _verify_factory_admission(
+    project_root: Path,
+    task_id: str,
+    expected_revision: str,
+    dispatch_id: str,
+    admission: object,
+) -> None:
+    if not isinstance(admission, dict) or set(admission.keys()) != ADMISSION_TOP_KEYS:
+        raise ValidationError(
+            "factory allocation admission must be an object with exact payload and signature"
+        )
+    payload = admission["payload"]
+    signature = admission["signature"]
+    if not isinstance(payload, dict) or set(payload.keys()) != ADMISSION_PAYLOAD_KEYS:
+        raise ValidationError("factory allocation admission payload has an unsupported shape")
+    if not isinstance(signature, str) or not signature.strip():
+        raise ValidationError("factory allocation admission signature must be a non-empty string")
+
+    if payload["schema"] != ADMISSION_SCHEMA:
+        raise ValidationError("unsupported factory allocation admission schema")
+    if payload["issuer"] != ADMISSION_ISSUER:
+        raise ValidationError("unsupported factory allocation admission issuer")
+    if not isinstance(payload["allocation_id"], str) or not payload["allocation_id"].strip():
+        raise ValidationError("invalid factory allocation ID")
+    if payload["dispatch_id"] != dispatch_id:
+        raise ValidationError("factory allocation admission dispatch ID does not match claim")
+    if payload["task_id"] != task_id:
+        raise ValidationError("factory allocation admission task ID does not match claim")
+    if payload["expected_revision"] != expected_revision:
+        raise ValidationError(
+            "factory allocation admission expected revision does not match claim"
+        )
+
+    vault_sha256 = (
+        hashlib.sha256(str(project_root.resolve()).encode("utf-8")).hexdigest().lower()
+    )
+    if payload["vault_sha256"] != vault_sha256:
+        raise ValidationError(
+            "factory allocation admission vault hash does not match current vault"
+        )
+
+    key_file_env = os.environ.get("SELD_FACTORY_ADMISSION_KEY_FILE")
+    if not key_file_env or not key_file_env.strip():
+        raise ValidationError("SELD_FACTORY_ADMISSION_KEY_FILE is not configured")
+    key_path = Path(key_file_env)
+    if not key_path.is_file():
+        raise ValidationError(
+            "factory admission key file does not exist or is not a regular file"
+        )
+
+    try:
+        st = key_path.stat()
+    except OSError as err:
+        raise ValidationError(f"failed to stat factory admission key file: {err}") from err
+
+    if hasattr(os, "getuid") and (st.st_mode & 0o077) != 0:
+        raise ValidationError("factory admission key file has insecure group or world permissions")
+
+    try:
+        key_bytes = key_path.read_bytes().strip()
+    except OSError as err:
+        raise ValidationError(f"failed to read factory admission key file: {err}") from err
+
+    if not key_bytes:
+        raise ValidationError("factory admission key file is empty")
+
+    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    computed_signature = hmac.new(key_bytes, canonical_payload, hashlib.sha256).hexdigest().lower()
+    if not hmac.compare_digest(signature.strip().casefold(), computed_signature):
+        raise ValidationError("factory allocation admission signature verification failed")
+
+
 def claim_task(
     project_root: Path,
     identifier: str,
     *,
     expected_revision: str,
     dispatch_id: str,
+    admission: dict[str, Any] | None = None,
     observed_at: datetime | None = None,
 ) -> Task:
     """Claim one ready task with agent_run=yes and next_actor=agent by exact revision and dispatch ID."""
@@ -52,6 +170,14 @@ def claim_task(
     clean_revision = _dispatch_revision(expected_revision)
     vault = Vault(project_root)
     current = vault.get_task(identifier)
+    if current.agent_run == "yes":
+        _verify_factory_admission(
+            project_root,
+            current.identifier,
+            clean_revision,
+            clean_dispatch,
+            admission,
+        )
     if current.dispatch_id == clean_dispatch and current.dispatch_revision == clean_revision:
         return current
     if current.revision != clean_revision:
@@ -208,13 +334,12 @@ def clear_task_blocker(
     ):
         raise ValidationError("task blocker does not match the expected owner and condition")
 
-    claim_by = None if current.agent_run == "yes" else _refreshed_claim_by(current, observed_at)
+    claim_by = current.claim_by if current.agent_run == "yes" else _refreshed_claim_by(current, observed_at)
     cleared = vault.update_task(
         current.identifier,
         status="ready",
         rank=current.rank,
         claim_by=claim_by,
-        clear_claim_by=current.agent_run == "yes" and current.claim_by is not None,
         clear_waiting_on=True,
         clear_blocker_owner=True,
         clear_blocker_condition=True,
