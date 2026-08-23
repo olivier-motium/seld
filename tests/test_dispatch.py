@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -996,14 +997,17 @@ def test_factory_admission_key_file_boundaries(
     insecure_key.write_bytes(ADMISSION_KEY)
     insecure_key.chmod(0o664)
     monkeypatch.setattr(dispatch_module, "FACTORY_ADMISSION_KEY_FILE", insecure_key)
-    with pytest.raises(ValidationError, match="insecure group or world permissions"):
-        claim_task(
-            vault.root,
-            task.identifier,
-            expected_revision=task.revision,
-            dispatch_id="disp-k",
-            admission=token,
-        )
+    if os.name == "posix":
+        with pytest.raises(ValidationError, match="insecure group or world permissions"):
+            claim_task(
+                vault.root,
+                task.identifier,
+                expected_revision=task.revision,
+                dispatch_id="disp-k",
+                admission=token,
+            )
+    else:
+        assert dispatch_module._read_factory_admission_key(insecure_key) == ADMISSION_KEY
 
     # 4. Zero byte key file
     zero_key = tmp_path / "zero.key"

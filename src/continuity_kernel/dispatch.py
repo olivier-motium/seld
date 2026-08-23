@@ -77,6 +77,10 @@ def _read_factory_admission_key(path: Path) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():
         raise ValidationError("factory admission key file must not be a symlink")
+    # Windows refuses to open a directory before ``fstat`` can classify it.
+    # Classify that case explicitly so every platform reports the same boundary.
+    if os.name != "posix" and path.is_dir():
+        raise ValidationError("factory admission key file is not a regular file")
     try:
         descriptor = os.open(path, flags)
     except OSError as err:
@@ -88,7 +92,9 @@ def _read_factory_admission_key(path: Path) -> bytes:
         effective_uid = getattr(os, "geteuid", None)
         if effective_uid is not None and metadata.st_uid != effective_uid():
             raise ValidationError("factory admission key file is not owned by the current user")
-        if metadata.st_mode & 0o077:
+        # POSIX mode bits express group/world access. Windows reports synthetic
+        # mode bits here, so applying the POSIX mask would reject every key.
+        if os.name == "posix" and metadata.st_mode & 0o077:
             raise ValidationError(
                 "factory admission key file has insecure group or world permissions"
             )
