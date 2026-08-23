@@ -10,7 +10,14 @@ from typing import Any
 
 import pytest
 
-from continuity_kernel import cli, mcp_server, task_pointer
+from continuity_kernel import (
+    cli,
+    mcp_server,
+    task_pointer,
+)
+from continuity_kernel import (
+    dispatch as dispatch_module,
+)
 from continuity_kernel.dispatch import (
     bind_task_hand,
     claim_task,
@@ -60,7 +67,7 @@ def setup_admission_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     key_file = tmp_path / "factory_admission.key"
     key_file.write_bytes(ADMISSION_KEY)
     key_file.chmod(0o600)
-    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(key_file))
+    monkeypatch.setattr(dispatch_module, "FACTORY_ADMISSION_KEY_FILE", key_file)
     return key_file
 
 
@@ -819,7 +826,7 @@ def test_factory_admission_key_file_boundaries(
 
     # 1. Key file does not exist
     missing_key = tmp_path / "missing.key"
-    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(missing_key))
+    monkeypatch.setattr(dispatch_module, "FACTORY_ADMISSION_KEY_FILE", missing_key)
     token = create_factory_admission_token(
         ADMISSION_KEY, vault.root, task.identifier, task.revision, "disp-k"
     )
@@ -835,7 +842,7 @@ def test_factory_admission_key_file_boundaries(
     # 2. Key file is a directory (not regular file)
     key_dir = tmp_path / "key_directory"
     key_dir.mkdir()
-    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(key_dir))
+    monkeypatch.setattr(dispatch_module, "FACTORY_ADMISSION_KEY_FILE", key_dir)
     with pytest.raises(ValidationError, match="not a regular file"):
         claim_task(
             vault.root,
@@ -849,7 +856,7 @@ def test_factory_admission_key_file_boundaries(
     insecure_key = tmp_path / "insecure.key"
     insecure_key.write_bytes(ADMISSION_KEY)
     insecure_key.chmod(0o664)
-    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(insecure_key))
+    monkeypatch.setattr(dispatch_module, "FACTORY_ADMISSION_KEY_FILE", insecure_key)
     with pytest.raises(ValidationError, match="insecure group or world permissions"):
         claim_task(
             vault.root,
@@ -863,7 +870,7 @@ def test_factory_admission_key_file_boundaries(
     zero_key = tmp_path / "zero.key"
     zero_key.write_bytes(b"")
     zero_key.chmod(0o600)
-    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(zero_key))
+    monkeypatch.setattr(dispatch_module, "FACTORY_ADMISSION_KEY_FILE", zero_key)
     with pytest.raises(ValidationError, match="factory admission key file is empty"):
         claim_task(
             vault.root,
@@ -877,7 +884,7 @@ def test_factory_admission_key_file_boundaries(
     huge_key = tmp_path / "huge.key"
     huge_key.write_bytes(b"x" * 4097)
     huge_key.chmod(0o600)
-    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(huge_key))
+    monkeypatch.setattr(dispatch_module, "FACTORY_ADMISSION_KEY_FILE", huge_key)
     with pytest.raises(ValidationError, match="exceeds maximum size of 4096 bytes"):
         claim_task(
             vault.root,
@@ -893,7 +900,7 @@ def test_factory_admission_key_file_boundaries(
     linked_target.chmod(0o600)
     linked_key = tmp_path / "linked.key"
     linked_key.symlink_to(linked_target)
-    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(linked_key))
+    monkeypatch.setattr(dispatch_module, "FACTORY_ADMISSION_KEY_FILE", linked_key)
     with pytest.raises(ValidationError, match="factory admission key file"):
         claim_task(
             vault.root,
@@ -914,7 +921,7 @@ def test_factory_admission_key_file_boundaries(
     bin_key_file = tmp_path / "binary.key"
     bin_key_file.write_bytes(binary_key)
     bin_key_file.chmod(0o600)
-    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(bin_key_file))
+    monkeypatch.setattr(dispatch_module, "FACTORY_ADMISSION_KEY_FILE", bin_key_file)
 
     bin_token = create_factory_admission_token(
         binary_key, vault.root, task.identifier, task.revision, "disp-bin"
@@ -927,6 +934,43 @@ def test_factory_admission_key_file_boundaries(
         admission=bin_token,
     )
     assert claimed_bin.dispatch_id == "disp-bin"
+
+
+def test_factory_admission_ignores_caller_selected_verifier_key(
+    vault: Vault, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = vault.create_task(
+        identifier="trusted-verifier-task",
+        title="Trusted verifier task",
+        outcome="Use the pre-established verifier instead of caller environment.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        observed_at=NOW,
+    )
+    attacker_key = b"caller-selected-attacker-key"
+    attacker_key_file = tmp_path / "attacker.key"
+    attacker_key_file.write_bytes(attacker_key)
+    attacker_key_file.chmod(0o600)
+    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(attacker_key_file))
+    attacker_token = create_factory_admission_token(
+        attacker_key,
+        vault.root,
+        task.identifier,
+        task.revision,
+        "dispatch-attacker",
+    )
+
+    with pytest.raises(ValidationError, match="signature verification failed"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="dispatch-attacker",
+            admission=attacker_token,
+        )
+
+    assert vault.get_task(task.identifier).revision == task.revision
 
 
 @pytest.mark.parametrize(
@@ -1120,6 +1164,41 @@ def test_generic_surfaces_refuse_dispatch_and_factory_hand_mutations(
         )
     assert vault.get_task(task.identifier).revision == initial_revision
 
+    claimed_task = vault.create_task(
+        identifier="claimed-surface-guard-task",
+        title="Claimed surface guard task",
+        outcome="Keep Factory hand binding on the guarded operation.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        observed_at=NOW,
+    )
+    admission = create_factory_admission_token(
+        ADMISSION_KEY,
+        vault.root,
+        claimed_task.identifier,
+        claimed_task.revision,
+        "dispatch-claimed-guard",
+    )
+    claimed_task = claim_task(
+        vault.root,
+        claimed_task.identifier,
+        expected_revision=claimed_task.revision,
+        dispatch_id="dispatch-claimed-guard",
+        admission=admission,
+    )
+    for hand_update in (
+        {"status": "doing", "active_thread_id": "generic-unverified-hand"},
+        {"clear_active_thread_id": True},
+    ):
+        with pytest.raises(ValidationError, match="dedicated dispatch operation"):
+            vault.update_task(
+                claimed_task.identifier,
+                expected_revision=claimed_task.revision,
+                **hand_update,
+            )
+        assert vault.get_task(claimed_task.identifier).revision == claimed_task.revision
+
     # Accepted public fields cannot introduce Factory claim or hand state.
     updated = vault.update_task(
         task.identifier,
@@ -1188,6 +1267,78 @@ def test_generic_surfaces_refuse_dispatch_and_factory_hand_mutations(
             vault=vault,
         )
     assert vault.get_task(task.identifier).revision == updated.revision
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_match"),
+    [
+        ("terminal", "not ready for hand binding"),
+        ("agent-run", "approval is no longer present"),
+        ("next-actor", "approval is no longer present"),
+    ],
+)
+def test_dispatch_bind_refuses_current_authored_revocation(
+    vault: Vault,
+    suffix: str,
+    expected_match: str,
+) -> None:
+    task = vault.create_task(
+        identifier=f"revoked-before-bind-{suffix}",
+        title="Revoked before bind",
+        outcome="Never resurrect work after current authored truth revokes it.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        observed_at=NOW,
+    )
+    dispatch_id = f"dispatch-revoked-{suffix}"
+    admission = create_factory_admission_token(
+        ADMISSION_KEY,
+        vault.root,
+        task.identifier,
+        task.revision,
+        dispatch_id,
+    )
+    claimed = claim_task(
+        vault.root,
+        task.identifier,
+        expected_revision=task.revision,
+        dispatch_id=dispatch_id,
+        admission=admission,
+    )
+    if suffix == "terminal":
+        changed = vault.update_task(
+            task.identifier,
+            expected_revision=claimed.revision,
+            status="done",
+            observed_at=NOW,
+        )
+    elif suffix == "agent-run":
+        changed = vault.update_task(
+            task.identifier,
+            expected_revision=claimed.revision,
+            agent_run="no",
+            observed_at=NOW,
+        )
+    else:
+        changed = vault.update_task(
+            task.identifier,
+            expected_revision=claimed.revision,
+            next_actor="human",
+            observed_at=NOW,
+        )
+
+    with pytest.raises(ValidationError, match=expected_match):
+        bind_task_hand(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id=dispatch_id,
+            active_thread_id="must-not-bind",
+            observed_at=NOW,
+        )
+
+    assert vault.get_task(task.identifier).revision == changed.revision
 
 
 def test_authored_claim_by_survives_agent_run_and_blocker_transitions(vault: Vault) -> None:

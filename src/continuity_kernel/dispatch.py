@@ -46,6 +46,15 @@ ADMISSION_PAYLOAD_KEYS: Final = frozenset(
 ADMISSION_TOP_KEYS: Final = frozenset({"payload", "signature"})
 ADMISSION_SIGNATURE_HEX: Final = re.compile(r"^[0-9a-f]{64}$")
 ADMISSION_KEY_MAX_BYTES: Final = 4096
+if os.name == "posix":
+    import pwd
+
+    _TRUSTED_USER_HOME = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+else:  # pragma: no cover - Factory serving is currently macOS; keep imports portable.
+    _TRUSTED_USER_HOME = Path.home()
+FACTORY_ADMISSION_KEY_FILE: Final = (
+    _TRUSTED_USER_HOME / ".ai-cli-accounts" / "runtime-launch" / "factory-admission.key"
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,9 @@ def _read_factory_admission_key(path: Path) -> bytes:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise ValidationError("factory admission key file is not a regular file")
+        effective_uid = getattr(os, "geteuid", None)
+        if effective_uid is not None and metadata.st_uid != effective_uid():
+            raise ValidationError("factory admission key file is not owned by the current user")
         if metadata.st_mode & 0o077:
             raise ValidationError(
                 "factory admission key file has insecure group or world permissions"
@@ -139,10 +151,7 @@ def _verify_factory_admission(
     if payload["vault_id"] != canonical_vault_id:
         raise ValidationError("factory allocation admission vault ID does not match current vault")
 
-    key_file_env = os.environ.get("SELD_FACTORY_ADMISSION_KEY_FILE")
-    if not key_file_env or not key_file_env.strip():
-        raise ValidationError("SELD_FACTORY_ADMISSION_KEY_FILE is not configured")
-    key_bytes = _read_factory_admission_key(Path(key_file_env))
+    key_bytes = _read_factory_admission_key(FACTORY_ADMISSION_KEY_FILE)
 
     canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     computed_signature = hmac.new(key_bytes, canonical_payload, hashlib.sha256).hexdigest()
@@ -214,8 +223,13 @@ def bind_task_hand(
     vault = Vault(project_root)
     current = vault.get_task(identifier)
     _require_claim(current, clean_dispatch, clean_revision)
+    if current.status not in {"ready", "doing"}:
+        raise ValidationError("claimed task is not ready for hand binding")
+    _require_factory_execution_approval(current)
     if current.status == "doing" and current.active_thread_id == clean_thread:
         return current
+    if current.status != "ready":
+        raise ValidationError("claimed task is not ready for hand binding")
     if current.active_thread_id is not None and current.active_thread_id != clean_thread:
         raise ValidationError("task is already bound to another active hand")
 
@@ -263,6 +277,9 @@ def write_task_blocker(
         and current.progress_check_by is None
     ):
         return current
+    _require_factory_execution_approval(current)
+    if current.status not in {"ready", "doing"}:
+        raise ValidationError("claimed task is not active for blocker handling")
     if current.waiting_on is not None and current.waiting_on != clean_condition:
         raise ValidationError("task already has a different named blocker")
     if current.blocker_owner is not None and current.blocker_owner != clean_owner:
@@ -320,6 +337,7 @@ def clear_task_blocker(
     if _is_clear_replay(current, marker):
         return current
     _require_claim(current, clean_dispatch, clean_revision)
+    _require_factory_execution_approval(current)
     if current.status != "waiting":
         raise ValidationError("task is not blocked")
     if (
@@ -474,6 +492,11 @@ def _eligible_for_claim(task: Task) -> bool:
 def _require_claim(task: Task, dispatch_id: str, revision: str) -> None:
     if task.dispatch_id != dispatch_id or task.dispatch_revision != revision:
         raise ValidationError("task is not claimed by this dispatch revision")
+
+
+def _require_factory_execution_approval(task: Task) -> None:
+    if task.agent_run != "yes" or task.next_actor != "agent":
+        raise ValidationError("Factory execution approval is no longer present")
 
 
 def _dispatch_id(value: str) -> str:

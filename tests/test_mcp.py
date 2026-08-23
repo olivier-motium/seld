@@ -177,6 +177,7 @@ def test_task_list_pages_large_ledgers_without_history_or_silent_snapshot_drift(
         encoded = json.dumps(page, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
         assert len(encoded) <= mcp_server.TASK_LIST_MAX_PAGE_BYTES
         for task in page["tasks"]:
+            assert task["agent_run"] is None
             assert {
                 "history",
                 "refs",

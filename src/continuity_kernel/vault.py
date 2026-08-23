@@ -534,6 +534,7 @@ class Vault:
         return self._update_task_record(
             identifier,
             expected_revision=expected_revision,
+            dispatch_operation=True,
             status=status,
             rank=rank,
             waiting_on=waiting_on,
@@ -606,6 +607,7 @@ class Vault:
         remove_refs: tuple[str, ...] = (),
         note: str | None = None,
         observed_at: datetime | None = None,
+        dispatch_operation: bool = False,
     ) -> Task:
         clean_id = task_id(identifier)
         path = self._path("task", clean_id)
@@ -615,6 +617,15 @@ class Vault:
         ):
             before = self._read_task(clean_id)
             self._expect(before.revision, expected_revision)
+            if (
+                not dispatch_operation
+                and (active_thread_id is not None or clear_active_thread_id)
+                and before.dispatch_id is not None
+                and before.dispatch_revision is not None
+            ):
+                raise ValidationError(
+                    "a claimed task hand must use the dedicated dispatch operation"
+                )
             _exclusive_choice(active_thread_id, clear_active_thread_id, "active Codex hand")
             _exclusive_choice(superseded_by, clear_superseded_by, "superseding task")
             _exclusive_choice(project, clear_project, "project")

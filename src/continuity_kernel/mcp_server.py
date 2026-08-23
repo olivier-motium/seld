@@ -1016,6 +1016,7 @@ def _compact_task(task: Task) -> dict[str, Any]:
     ]
     return {
         "active_thread_id": task.active_thread_id,
+        "agent_run": task.agent_run,
         "attention_at": task.attention_at,
         "blocker_condition": task.blocker_condition,
         "blocker_owner": task.blocker_owner,
