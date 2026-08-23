@@ -277,7 +277,7 @@ def write_task_blocker(
         and current.progress_check_by is None
     ):
         return current
-    _require_factory_execution_approval(current, allow_waiting=True)
+    _require_factory_execution_approval(current)
     if current.status not in {"ready", "doing"}:
         raise ValidationError("claimed task is not active for blocker handling")
     if current.waiting_on is not None and current.waiting_on != clean_condition:

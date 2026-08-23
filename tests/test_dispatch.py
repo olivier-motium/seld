@@ -1394,3 +1394,49 @@ def test_authored_claim_by_survives_agent_run_and_blocker_transitions(vault: Vau
         observed_at=NOW,
     )
     assert cleared.claim_by == "2026-07-22T13:00:00.000000Z"
+
+
+def test_dispatch_blocker_refuses_current_authored_wait(vault: Vault) -> None:
+    task = vault.create_task(
+        identifier="authored-wait-before-blocker",
+        title="Authored wait before blocker",
+        outcome="Preserve current authored waiting truth.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        observed_at=NOW,
+    )
+    admission = create_factory_admission_token(
+        ADMISSION_KEY,
+        vault.root,
+        task.identifier,
+        task.revision,
+        "dispatch-authored-wait",
+    )
+    claimed = claim_task(
+        vault.root,
+        task.identifier,
+        expected_revision=task.revision,
+        dispatch_id="dispatch-authored-wait",
+        admission=admission,
+        observed_at=NOW,
+    )
+    changed = vault.update_task(
+        task.identifier,
+        expected_revision=claimed.revision,
+        waiting_on="Olivier must decide.",
+        observed_at=NOW,
+    )
+
+    with pytest.raises(ValidationError, match="approval is no longer present"):
+        write_task_blocker(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="dispatch-authored-wait",
+            owner="owner",
+            condition="Olivier must decide.",
+            observed_at=NOW,
+        )
+
+    assert vault.get_task(task.identifier).revision == changed.revision
