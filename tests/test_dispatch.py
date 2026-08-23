@@ -15,7 +15,6 @@ from continuity_kernel.dispatch import (
     bind_task_hand,
     claim_task,
     clear_task_blocker,
-    create_factory_admission_token,
     dispatch_eligible,
     evaluate_task_deadline,
     write_task_blocker,
@@ -25,6 +24,32 @@ from continuity_kernel.vault import Vault
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
 ADMISSION_KEY: bytes = b"test-admission-secret-key-12345"
+
+
+def create_factory_admission_token(
+    key_bytes: bytes,
+    project_root: Path,
+    task_id: str,
+    expected_revision: str,
+    dispatch_id: str,
+    allocation_id: str = "alloc-1",
+) -> dict[str, Any]:
+    vault_sha256 = hashlib.sha256(str(project_root.resolve()).encode("utf-8")).hexdigest().lower()
+    payload = {
+        "allocation_id": allocation_id,
+        "dispatch_id": dispatch_id,
+        "expected_revision": expected_revision,
+        "issuer": "ai-accounts-runtime",
+        "schema": "seld.factory-allocation-admission.v1",
+        "task_id": task_id,
+        "vault_sha256": vault_sha256,
+    }
+    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(key_bytes, canonical_payload, hashlib.sha256).hexdigest()
+    return {
+        "payload": payload,
+        "signature": signature,
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -623,6 +648,7 @@ def test_agent_run_claim_by_deadline_suppression_and_transitions(
 def test_factory_allocation_admission_and_mutation_invariants(
     vault: Vault,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # 1. Matching admission succeeds exactly once, and idempotent replay is safe
     task = vault.create_task(
@@ -694,6 +720,45 @@ def test_factory_allocation_admission_and_mutation_invariants(
             expected_revision=task.revision,
             dispatch_id="disp-1",
             admission={"payload": extra_payload, "signature": extra_payload_sig},
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Uppercase hex signature rejected without case-folding
+    sig_upper = dict(valid_token)
+    sig_upper["signature"] = valid_token["signature"].upper()
+    with pytest.raises(ValidationError, match="64 lowercase hex characters"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission=sig_upper,
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Whitespace around signature rejected without stripping
+    sig_space = dict(valid_token)
+    sig_space["signature"] = f" {valid_token['signature']} "
+    with pytest.raises(ValidationError, match="64 lowercase hex characters"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission=sig_space,
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Non-64-char hex signature rejected
+    sig_short = dict(valid_token)
+    sig_short["signature"] = "a" * 63
+    with pytest.raises(ValidationError, match="64 lowercase hex characters"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-1",
+            admission=sig_short,
         )
     assert vault.get_task(task.identifier).revision == initial_revision
 
@@ -853,3 +918,68 @@ def test_factory_allocation_admission_and_mutation_invariants(
         observed_at=NOW,
     )
     assert cleared.claim_by == "2026-07-22T13:00:00.000000Z"
+
+    # 4. Binary key bytes with exact whitespace preserved and zero-length key rejection
+    binary_key = b" key\nwith\rspaces\t\x00"
+    bin_key_file = tmp_path / "binary_key.key"
+    bin_key_file.write_bytes(binary_key)
+    bin_key_file.chmod(0o600)
+    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(bin_key_file))
+
+    unclaimed_for_bin = vault.create_task(
+        identifier="bin-key-task",
+        title="Binary key task",
+        outcome="Outcome.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        observed_at=NOW,
+    )
+    bin_token = create_factory_admission_token(
+        binary_key,
+        vault.root,
+        unclaimed_for_bin.identifier,
+        unclaimed_for_bin.revision,
+        "disp-bin",
+        "alloc-bin",
+    )
+    claimed_bin = claim_task(
+        vault.root,
+        unclaimed_for_bin.identifier,
+        expected_revision=unclaimed_for_bin.revision,
+        dispatch_id="disp-bin",
+        admission=bin_token,
+    )
+    assert claimed_bin.dispatch_id == "disp-bin"
+
+    # Zero length key file rejected
+    zero_key_file = tmp_path / "zero_key.key"
+    zero_key_file.write_bytes(b"")
+    zero_key_file.chmod(0o600)
+    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(zero_key_file))
+
+    zero_task = vault.create_task(
+        identifier="zero-key-task",
+        title="Zero key task",
+        outcome="Outcome.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        observed_at=NOW,
+    )
+    zero_token = create_factory_admission_token(
+        ADMISSION_KEY,
+        vault.root,
+        zero_task.identifier,
+        zero_task.revision,
+        "disp-zero",
+        "alloc-zero",
+    )
+    with pytest.raises(ValidationError, match="factory admission key file is empty"):
+        claim_task(
+            vault.root,
+            zero_task.identifier,
+            expected_revision=zero_task.revision,
+            dispatch_id="disp-zero",
+            admission=zero_token,
+        )

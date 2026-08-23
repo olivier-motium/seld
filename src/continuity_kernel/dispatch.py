@@ -43,6 +43,7 @@ ADMISSION_PAYLOAD_KEYS: Final = frozenset(
     }
 )
 ADMISSION_TOP_KEYS: Final = frozenset({"payload", "signature"})
+ADMISSION_SIGNATURE_HEX: Final = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -55,32 +56,6 @@ class TaskAttentionFinding:
     band: str
     deadline: str
     evidence_at: str
-
-
-def create_factory_admission_token(
-    key_bytes: bytes,
-    project_root: Path,
-    task_id: str,
-    expected_revision: str,
-    dispatch_id: str,
-    allocation_id: str = "alloc-1",
-) -> dict[str, Any]:
-    vault_sha256 = hashlib.sha256(str(project_root.resolve()).encode("utf-8")).hexdigest().lower()
-    payload = {
-        "allocation_id": allocation_id,
-        "dispatch_id": dispatch_id,
-        "expected_revision": expected_revision,
-        "issuer": ADMISSION_ISSUER,
-        "schema": ADMISSION_SCHEMA,
-        "task_id": task_id,
-        "vault_sha256": vault_sha256,
-    }
-    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    signature = hmac.new(key_bytes.strip(), canonical_payload, hashlib.sha256).hexdigest().lower()
-    return {
-        "payload": payload,
-        "signature": signature,
-    }
 
 
 def _verify_factory_admission(
@@ -98,8 +73,10 @@ def _verify_factory_admission(
     signature = admission["signature"]
     if not isinstance(payload, dict) or set(payload.keys()) != ADMISSION_PAYLOAD_KEYS:
         raise ValidationError("factory allocation admission payload has an unsupported shape")
-    if not isinstance(signature, str) or not signature.strip():
-        raise ValidationError("factory allocation admission signature must be a non-empty string")
+    if not isinstance(signature, str) or ADMISSION_SIGNATURE_HEX.fullmatch(signature) is None:
+        raise ValidationError(
+            "factory allocation admission signature must be 64 lowercase hex characters"
+        )
 
     if payload["schema"] != ADMISSION_SCHEMA:
         raise ValidationError("unsupported factory allocation admission schema")
@@ -142,16 +119,16 @@ def _verify_factory_admission(
         raise ValidationError("factory admission key file has insecure group or world permissions")
 
     try:
-        key_bytes = key_path.read_bytes().strip()
+        key_bytes = key_path.read_bytes()
     except OSError as err:
         raise ValidationError(f"failed to read factory admission key file: {err}") from err
 
-    if not key_bytes:
+    if len(key_bytes) == 0:
         raise ValidationError("factory admission key file is empty")
 
     canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    computed_signature = hmac.new(key_bytes, canonical_payload, hashlib.sha256).hexdigest().lower()
-    if not hmac.compare_digest(signature.strip().casefold(), computed_signature):
+    computed_signature = hmac.new(key_bytes, canonical_payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, computed_signature):
         raise ValidationError("factory allocation admission signature verification failed")
 
 
