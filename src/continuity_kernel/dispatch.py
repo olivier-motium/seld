@@ -51,8 +51,9 @@ if os.name == "posix":
 
     # Keep the module type-checkable on Windows, where typeshed intentionally
     # omits the POSIX-only attributes even though this branch cannot run.
-    _posix_user = getattr(pwd, "getpwuid")(getattr(os, "geteuid")())
-    _TRUSTED_USER_HOME = Path(_posix_user.pw_dir)
+    _TRUSTED_USER_HOME = Path(
+        pwd.getpwuid(os.geteuid()).pw_dir  # type: ignore[attr-defined, unused-ignore]
+    )
 else:  # pragma: no cover - Factory serving is currently macOS; keep imports portable.
     _TRUSTED_USER_HOME = Path.home()
 FACTORY_ADMISSION_KEY_FILE: Final = (
