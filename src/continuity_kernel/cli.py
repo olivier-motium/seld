@@ -439,6 +439,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
         if args.resident_context_command == "show":
             guidance = read_resident_guidance(vault.root)
             return guidance["content"] if args.format == "markdown" else guidance
+        if args.resident_context_command == "project":
+            return vault.project_guidance(
+                args.checkout_root,
+                expected_guidance_revision=args.expected_guidance_revision,
+                expected_mind_revision=args.expected_mind_revision,
+            )
         raise AssertionError("unreachable resident-context command")
     if args.command == "execution-bindings":
         return execution_bindings(vault)
@@ -1820,6 +1826,26 @@ def _parser() -> argparse.ArgumentParser:
         default="markdown",
     )
     resident_context_show.set_defaults(raw=True)
+    resident_context_project = resident_context_commands.add_parser(
+        "project",
+        help="Project canonical AGENTS.md and brain/MIND.md from a checkout into the vault.",
+    )
+    resident_context_project.add_argument(
+        "--checkout-root",
+        type=Path,
+        required=True,
+        help="Path to the checkout directory containing AGENTS.md and brain/MIND.md.",
+    )
+    resident_context_project.add_argument(
+        "--expected-guidance-revision",
+        required=True,
+        help="Expected live revision (SHA-256) of context/resident/AGENTS.md, or 'absent'.",
+    )
+    resident_context_project.add_argument(
+        "--expected-mind-revision",
+        required=True,
+        help="Expected live revision (SHA-256) of MIND.md.",
+    )
 
     commands.add_parser(
         "execution-bindings",

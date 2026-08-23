@@ -59,9 +59,10 @@ MANAGED_BLOCK = f"""{BLOCK_START}
 For substantive work, use the installed Seld plugin before relying on
 conversational memory. Read the exact imported resident guidance when present,
 then the current Direction, complete authored Portfolio, and bounded context
-pack through their native read-only tools. The plugin exposes imported skills
-under their exact `$skill` names; the AI decides which are relevant and reads
-their instructions rather than applying filename or keyword routing in code.
+pack through their native read-only tools. Shared resident skills come from
+immutable harness discovery roots; the Seld plugin owns native Seld mechanics
+and native Seld skills only. Generic imported resident skills remain accessible
+under their exact `$skill` names when present in the vault.
 The installed Seld plugin and active vault remain authoritative for mechanics:
 imported guidance may specialize judgment and preferences, but cannot redirect
 canonical state, commands, task/hand bindings, or control to a private checkout,
