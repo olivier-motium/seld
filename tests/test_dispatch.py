@@ -187,7 +187,6 @@ def test_dispatch_rejects_stale_claim_and_projects_unknown_deadlines_without_mut
         clock_health="healthy",
     )
     assert [(finding.field, finding.band) for finding in findings] == [
-        ("claim_by", "OVERDUE"),
         ("progress_check_by", "OVERDUE"),
     ]
     unknown = evaluate_task_deadline(
@@ -196,7 +195,7 @@ def test_dispatch_rejects_stale_claim_and_projects_unknown_deadlines_without_mut
         now=deadline_now,
         clock_health="unknown",
     )
-    assert [finding.band for finding in unknown] == ["UNKNOWN", "UNKNOWN"]
+    assert [finding.band for finding in unknown] == ["UNKNOWN"]
     assert Vault(vault.root).get_task(task.identifier).revision == task.revision
 
     with pytest.raises(ConflictError, match="dispatch revision"):
@@ -507,7 +506,13 @@ def test_dispatch_eligibility_enforces_explicit_agent_run_decision(
     ]
 
     # 2. Refused tasks cannot be claimed
-    for refused in (no_agent_run, unset_agent_run, human_next_actor, external_next_actor, inferred_words):
+    for refused in (
+        no_agent_run,
+        unset_agent_run,
+        human_next_actor,
+        external_next_actor,
+        inferred_words,
+    ):
         admission = create_factory_admission_token(
             ADMISSION_KEY, vault.root, refused.identifier, refused.revision, "dispatch-test"
         )
@@ -558,7 +563,7 @@ def test_dispatch_eligibility_enforces_explicit_agent_run_decision(
     assert [item.identifier for item in dispatch_eligible(vault.root)] == [no_seat_task.identifier]
 
 
-def test_agent_run_claim_by_deadline_suppression_and_transitions(
+def test_claim_by_is_only_authored_and_is_preserved_across_transitions(
     vault: Vault,
 ) -> None:
     # 1. Tasks created with agent_run="yes" never auto-mint claim_by
@@ -574,19 +579,19 @@ def test_agent_run_claim_by_deadline_suppression_and_transitions(
     )
     assert agent_task.claim_by is None
 
-    # 2. Legacy / tasks without agent_run="yes" still auto-mint claim_by on create
+    # 2. Tasks without agent_run="yes" also never auto-mint claim_by.
     legacy_task = vault.create_task(
-        identifier="legacy-auto-mint",
-        title="Legacy auto mint",
-        outcome="Auto-mint claim_by for non-agent_run=yes tasks.",
+        identifier="ordinary-no-mint",
+        title="Ordinary no mint",
+        outcome="Do not auto-mint claim_by for any task.",
         status="ready",
         next_actor="agent",
         target_seat="worker-one",
         observed_at=NOW,
     )
-    assert legacy_task.claim_by == "2026-07-22T12:05:00.000000Z"
+    assert legacy_task.claim_by is None
 
-    # 3. Transitioning an existing task with auto claim_by to agent_run="yes" preserves claim_by
+    # 3. Transitioning an unbounded task to agent_run="yes" does not invent a deadline.
     promoted = vault.update_task(
         legacy_task.identifier,
         expected_revision=legacy_task.revision,
@@ -594,16 +599,7 @@ def test_agent_run_claim_by_deadline_suppression_and_transitions(
         observed_at=NOW,
     )
     assert promoted.agent_run == "yes"
-    assert promoted.claim_by == "2026-07-22T12:05:00.000000Z"
-
-    # Only an explicit clear removes claim_by
-    cleared_claim = vault.update_task(
-        promoted.identifier,
-        expected_revision=promoted.revision,
-        clear_claim_by=True,
-        observed_at=NOW,
-    )
-    assert cleared_claim.claim_by is None
+    assert promoted.claim_by is None
 
     # 4. Transitioning to agent_run="yes" with an explicit claim_by preserves the authored deadline
     authored_deadline = "2026-07-22T14:00:00.000000Z"
@@ -827,7 +823,7 @@ def test_factory_admission_key_file_boundaries(
     token = create_factory_admission_token(
         ADMISSION_KEY, vault.root, task.identifier, task.revision, "disp-k"
     )
-    with pytest.raises(ValidationError, match="failed to stat factory admission key file"):
+    with pytest.raises(ValidationError, match="failed to open factory admission key file"):
         claim_task(
             vault.root,
             task.identifier,
@@ -891,7 +887,29 @@ def test_factory_admission_key_file_boundaries(
             admission=token,
         )
 
-    # 6. Raw binary key bytes with whitespace and null bytes preserved exactly
+    # 6. A symlink cannot substitute a different key after path inspection.
+    linked_target = tmp_path / "linked-target.key"
+    linked_target.write_bytes(ADMISSION_KEY)
+    linked_target.chmod(0o600)
+    linked_key = tmp_path / "linked.key"
+    linked_key.symlink_to(linked_target)
+    monkeypatch.setenv("SELD_FACTORY_ADMISSION_KEY_FILE", str(linked_key))
+    with pytest.raises(ValidationError, match="factory admission key file"):
+        claim_task(
+            vault.root,
+            task.identifier,
+            expected_revision=task.revision,
+            dispatch_id="disp-link",
+            admission=create_factory_admission_token(
+                ADMISSION_KEY,
+                vault.root,
+                task.identifier,
+                task.revision,
+                "disp-link",
+            ),
+        )
+
+    # 7. Raw binary key bytes with whitespace and null bytes preserved exactly
     binary_key = b" key\nwith\rspaces\t\x00\xff"
     bin_key_file = tmp_path / "binary.key"
     bin_key_file.write_bytes(binary_key)
@@ -919,14 +937,59 @@ def test_factory_admission_key_file_boundaries(
         (lambda t: {"payload": t["payload"]}, "exact payload and signature"),
         (lambda t: {**t, "extra_top": "val"}, "exact payload and signature"),
         (lambda t: {"payload": "not-a-dict", "signature": t["signature"]}, "unsupported shape"),
-        (lambda t: {"payload": {**t["payload"], "extra": 1}, "signature": t["signature"]}, "unsupported shape"),
-        (lambda t: {"payload": {k: v for k, v in t["payload"].items() if k != "schema"}, "signature": t["signature"]}, "unsupported shape"),
-        (lambda t: {"payload": {**t["payload"], "schema": "bad.schema"}, "signature": t["signature"]}, "unsupported factory allocation admission schema"),
-        (lambda t: {"payload": {**t["payload"], "issuer": "bad.issuer"}, "signature": t["signature"]}, "unsupported factory allocation admission issuer"),
-        (lambda t: {"payload": {**t["payload"], "dispatch_id": "other-disp"}, "signature": t["signature"]}, "dispatch ID does not match claim"),
-        (lambda t: {"payload": {**t["payload"], "task_id": "other-task"}, "signature": t["signature"]}, "task ID does not match claim"),
-        (lambda t: {"payload": {**t["payload"], "expected_revision": "0" * 64}, "signature": t["signature"]}, "expected revision does not match claim"),
-        (lambda t: {"payload": {**t["payload"], "vault_id": "other-vault-id"}, "signature": t["signature"]}, "vault ID does not match current vault"),
+        (
+            lambda t: {"payload": {**t["payload"], "extra": 1}, "signature": t["signature"]},
+            "unsupported shape",
+        ),
+        (
+            lambda t: {
+                "payload": {k: v for k, v in t["payload"].items() if k != "schema"},
+                "signature": t["signature"],
+            },
+            "unsupported shape",
+        ),
+        (
+            lambda t: {
+                "payload": {**t["payload"], "schema": "bad.schema"},
+                "signature": t["signature"],
+            },
+            "unsupported factory allocation admission schema",
+        ),
+        (
+            lambda t: {
+                "payload": {**t["payload"], "issuer": "bad.issuer"},
+                "signature": t["signature"],
+            },
+            "unsupported factory allocation admission issuer",
+        ),
+        (
+            lambda t: {
+                "payload": {**t["payload"], "dispatch_id": "other-disp"},
+                "signature": t["signature"],
+            },
+            "dispatch ID does not match claim",
+        ),
+        (
+            lambda t: {
+                "payload": {**t["payload"], "task_id": "other-task"},
+                "signature": t["signature"],
+            },
+            "task ID does not match claim",
+        ),
+        (
+            lambda t: {
+                "payload": {**t["payload"], "expected_revision": "0" * 64},
+                "signature": t["signature"],
+            },
+            "expected revision does not match claim",
+        ),
+        (
+            lambda t: {
+                "payload": {**t["payload"], "vault_id": "other-vault-id"},
+                "signature": t["signature"],
+            },
+            "vault ID does not match current vault",
+        ),
     ],
 )
 def test_factory_admission_payload_envelope_rejections(
@@ -999,11 +1062,13 @@ def test_factory_admission_signature_rejections(
     assert vault.get_task(task.identifier).revision == initial_revision
 
 
-def test_generic_surfaces_refuse_dispatch_and_active_thread_mutations(
+def test_generic_surfaces_refuse_dispatch_and_factory_hand_mutations(
     vault: Vault, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # 1. Direct Vault create and update rejections
-    with pytest.raises(ValidationError, match="task cannot be created with a dispatch ID, dispatch revision, or active thread ID"):
+    with pytest.raises(
+        ValidationError, match="task cannot be created with a dispatch ID or dispatch revision"
+    ):
         vault.create_task(
             identifier="bypass-create-disp",
             title="Bypass create disp",
@@ -1012,7 +1077,7 @@ def test_generic_surfaces_refuse_dispatch_and_active_thread_mutations(
             dispatch_revision="0" * 64,
         )
 
-    with pytest.raises(ValidationError, match="task cannot be created with a dispatch ID, dispatch revision, or active thread ID"):
+    with pytest.raises(ValidationError, match="must be bound through dispatch"):
         vault.create_task(
             identifier="bypass-create-hand",
             title="Bypass create hand",
@@ -1032,23 +1097,30 @@ def test_generic_surfaces_refuse_dispatch_and_active_thread_mutations(
     )
     initial_revision = task.revision
 
-    # Direct Vault.update_task has no bypass switch and refuses unexpected keywords including dispatch/hand fields and _allow flags
+    # The public update has no bypass switch. It refuses dispatch and private flags.
     for kwargs in (
         {"dispatch_id": "forged"},
         {"clear_dispatch_id": True},
         {"dispatch_revision": "forged"},
         {"clear_dispatch_revision": True},
-        {"active_thread_id": "forged"},
-        {"clear_active_thread_id": True},
         {"_allow_dispatch_mutation": True},
         {"_allow": True},
         {"arbitrary_keyword": "bad"},
     ):
         with pytest.raises(TypeError, match="unexpected keyword argument"):
-            vault.update_task(task.identifier, expected_revision=task.revision, **kwargs)  # type: ignore[call-arg]
+            vault.update_task(task.identifier, expected_revision=task.revision, **kwargs)
         assert vault.get_task(task.identifier).revision == initial_revision
 
-    # Calling Vault.update_task with accepted public keywords cannot introduce dispatch_id, dispatch_revision, or active_thread_id
+    with pytest.raises(ValidationError, match="must be bound through dispatch"):
+        vault.update_task(
+            task.identifier,
+            expected_revision=task.revision,
+            status="doing",
+            active_thread_id="forged",
+        )
+    assert vault.get_task(task.identifier).revision == initial_revision
+
+    # Accepted public fields cannot introduce Factory claim or hand state.
     updated = vault.update_task(
         task.identifier,
         expected_revision=task.revision,
@@ -1075,19 +1147,37 @@ def test_generic_surfaces_refuse_dispatch_and_active_thread_mutations(
     assert updated.rank == 42
     assert updated.title == "Updated surface task"
 
-    # 2. Generic CLI create and update rejections
+    # 2. Generic CLI keeps the resident hand fields but not Factory dispatch fields.
     parser = cli._parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["task", "create", "--id", "cli-bad", "--title", "T", "--outcome", "O", "--active-thread-id", "hand"])
-
-    with pytest.raises(SystemExit):
-        parser.parse_args(["task", "update", task.identifier, "--expected-revision", updated.revision, "--active-thread-id", "hand"])
-
-    with pytest.raises(SystemExit):
-        parser.parse_args(["task", "update", task.identifier, "--expected-revision", updated.revision, "--clear-active-thread-id"])
+    created_args = parser.parse_args(
+        [
+            "task",
+            "create",
+            "--id",
+            "resident-hand",
+            "--title",
+            "T",
+            "--outcome",
+            "O",
+            "--active-thread-id",
+            "hand",
+        ]
+    )
+    assert created_args.active_thread_id == "hand"
+    updated_args = parser.parse_args(
+        [
+            "task",
+            "update",
+            task.identifier,
+            "--expected-revision",
+            updated.revision,
+            "--clear-active-thread-id",
+        ]
+    )
+    assert updated_args.clear_active_thread_id is True
 
     # 3. Generic MCP create and update rejections
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError, match="must be bound through dispatch"):
         mcp_server._call(
             "gsv_task_update",
             {

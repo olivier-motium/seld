@@ -61,21 +61,7 @@ def test_records_round_trip_unicode_and_stable_revisions() -> None:
 
 
 def test_task_round_trips_authored_rank_and_exact_active_hand() -> None:
-    with pytest.raises(ValidationError, match="cannot be created with an active thread ID"):
-        new_task(
-            identifier="review-session",
-            title="Review every open outcome",
-            outcome="Check every outcome without equating checked with resolved.",
-            status="doing",
-            next_actor="agent",
-            next_action="Present one exact outcome.",
-            rank=17,
-            active_thread_id="019f95fd-009e-7603-ab87-f9927cf31c4d",
-            refs=("review-scope:all-open",),
-            observed_at=NOW,
-        )
-
-    base = new_task(
+    task = new_task(
         identifier="review-session",
         title="Review every open outcome",
         outcome="Check every outcome without equating checked with resolved.",
@@ -83,10 +69,10 @@ def test_task_round_trips_authored_rank_and_exact_active_hand() -> None:
         next_actor="agent",
         next_action="Present one exact outcome.",
         rank=17,
+        active_thread_id="019f95fd-009e-7603-ab87-f9927cf31c4d",
         refs=("review-scope:all-open",),
         observed_at=NOW,
     )
-    task = replace(base, active_thread_id="019f95fd-009e-7603-ab87-f9927cf31c4d")
     rendered = render_task(task)
     parsed = parse_task(rendered)
     assert parsed.rank == 17
@@ -115,7 +101,7 @@ def test_typed_dispatch_fields_are_additive_and_nullable() -> None:
     assert '"version":1' in legacy_stored.splitlines()[0]
     assert parse_task(legacy_stored) == legacy
     assert '"version":4' in render_task(typed).splitlines()[0]
-    assert typed.claim_by == "2026-07-22T12:05:00.000000Z"
+    assert typed.claim_by is None
     assert typed.dispatch_id is None
     assert typed.blocker_condition is None
     assert parse_task(render_task(typed)) == typed
@@ -311,7 +297,7 @@ def test_terminal_task_cannot_claim_future_work() -> None:
             observed_at=NOW,
         )
 
-    with pytest.raises(ValidationError, match="cannot be created with an active thread ID"):
+    with pytest.raises(ValidationError, match="terminal tasks"):
         new_task(
             identifier="done-review",
             title="Done review",
@@ -468,7 +454,37 @@ def test_agent_run_field_serialization_and_validation() -> None:
 
 
 def test_task_version_4_record_compatibility_and_rejection_of_unknown_keys() -> None:
-    v4_raw = """<!-- gsv:{"active_thread_id":null,"attention_at":null,"blocker_condition":null,"blocker_owner":null,"claim_by":"2026-07-22T12:05:00.000000Z","codex_episode_ids":[],"created_at":"2026-07-22T12:00:00.000000Z","dispatch_id":null,"dispatch_revision":null,"due":null,"entity_links":[],"id":"v4-legacy-task","kind":"task","next_action_present":false,"next_actor":"agent","progress_check_by":null,"project":null,"rank":0,"refs":[],"state_changed_at":"2026-07-22T12:00:00.000000Z","status":"ready","superseded_by":null,"target_seat":"worker-one","updated_at":"2026-07-22T12:00:00.000000Z","version":4,"waiting_on_present":false,"workspace":null} -->
+    v4_metadata: dict[str, Any] = {
+        "active_thread_id": None,
+        "attention_at": None,
+        "blocker_condition": None,
+        "blocker_owner": None,
+        "claim_by": "2026-07-22T12:05:00.000000Z",
+        "codex_episode_ids": [],
+        "created_at": "2026-07-22T12:00:00.000000Z",
+        "dispatch_id": None,
+        "dispatch_revision": None,
+        "due": None,
+        "entity_links": [],
+        "id": "v4-legacy-task",
+        "kind": "task",
+        "next_action_present": False,
+        "next_actor": "agent",
+        "progress_check_by": None,
+        "project": None,
+        "rank": 0,
+        "refs": [],
+        "state_changed_at": "2026-07-22T12:00:00.000000Z",
+        "status": "ready",
+        "superseded_by": None,
+        "target_seat": "worker-one",
+        "updated_at": "2026-07-22T12:00:00.000000Z",
+        "version": 4,
+        "waiting_on_present": False,
+        "workspace": None,
+    }
+    encoded = json.dumps(v4_metadata, sort_keys=True, separators=(",", ":"))
+    v4_raw = f"""<!-- gsv:{encoded} -->
 # v4 legacy task
 
 ## Outcome

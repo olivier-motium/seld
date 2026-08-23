@@ -1023,7 +1023,7 @@ def test_update_mcp_surface_is_cache_only_and_cannot_apply_or_check(
 
 def test_task_schema_distinguishes_codex_hand_from_gsv_workthread_without_narrowing_type() -> None:
     tools = {tool["name"]: tool for tool in mcp_server.TOOLS}
-    for name in ("gsv_dispatch_bind",):
+    for name in ("gsv_dispatch_bind", "gsv_task_create", "gsv_task_update"):
         properties = tools[name]["inputSchema"]["properties"]
         active_hand = properties["active_thread_id"]
         description = active_hand["description"]
@@ -1032,11 +1032,8 @@ def test_task_schema_distinguishes_codex_hand_from_gsv_workthread_without_narrow
         assert "never a Seld WorkThread ID" in description
         assert "pattern" not in active_hand and "format" not in active_hand
 
-    for name in ("gsv_task_create", "gsv_task_update"):
-        properties = tools[name]["inputSchema"]["properties"]
-        assert "active_thread_id" not in properties
-
     update_properties = tools["gsv_task_update"]["inputSchema"]["properties"]
+    assert "clear_active_thread_id" in update_properties
     assert "codex-thread:*" in update_properties["add_refs"]["description"]
     assert "codex-thread:*" in update_properties["remove_refs"]["description"]
 

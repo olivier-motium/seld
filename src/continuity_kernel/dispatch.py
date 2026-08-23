@@ -9,13 +9,12 @@ import os
 import re
 import stat
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
 from continuity_kernel.errors import ConflictError, ValidationError
 from continuity_kernel.records import (
-    DEFAULT_CLAIM_WINDOW,
     SLA_CLOCK_HEALTH,
     TERMINAL_TASK_STATUSES,
     Task,
@@ -46,6 +45,7 @@ ADMISSION_PAYLOAD_KEYS: Final = frozenset(
 )
 ADMISSION_TOP_KEYS: Final = frozenset({"payload", "signature"})
 ADMISSION_SIGNATURE_HEX: Final = re.compile(r"^[0-9a-f]{64}$")
+ADMISSION_KEY_MAX_BYTES: Final = 4096
 
 
 @dataclass(frozen=True)
@@ -58,6 +58,44 @@ class TaskAttentionFinding:
     band: str
     deadline: str
     evidence_at: str
+
+
+def _read_factory_admission_key(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():
+        raise ValidationError("factory admission key file must not be a symlink")
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as err:
+        raise ValidationError(f"failed to open factory admission key file: {err}") from err
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValidationError("factory admission key file is not a regular file")
+        if metadata.st_mode & 0o077:
+            raise ValidationError(
+                "factory admission key file has insecure group or world permissions"
+            )
+        if metadata.st_size == 0:
+            raise ValidationError("factory admission key file is empty")
+        if metadata.st_size > ADMISSION_KEY_MAX_BYTES:
+            raise ValidationError("factory admission key file exceeds maximum size of 4096 bytes")
+        chunks: list[bytes] = []
+        remaining = ADMISSION_KEY_MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        key_bytes = b"".join(chunks)
+        if not key_bytes:
+            raise ValidationError("factory admission key file is empty")
+        if len(key_bytes) > ADMISSION_KEY_MAX_BYTES:
+            raise ValidationError("factory admission key file exceeds maximum size of 4096 bytes")
+        return key_bytes
+    finally:
+        os.close(descriptor)
 
 
 def _verify_factory_admission(
@@ -84,53 +122,27 @@ def _verify_factory_admission(
         raise ValidationError("unsupported factory allocation admission schema")
     if payload["issuer"] != ADMISSION_ISSUER:
         raise ValidationError("unsupported factory allocation admission issuer")
-    if not isinstance(payload["allocation_id"], str) or ALLOCATION_ID.fullmatch(payload["allocation_id"]) is None:
+    if (
+        not isinstance(payload["allocation_id"], str)
+        or ALLOCATION_ID.fullmatch(payload["allocation_id"]) is None
+    ):
         raise ValidationError("invalid factory allocation ID")
     if payload["dispatch_id"] != dispatch_id:
         raise ValidationError("factory allocation admission dispatch ID does not match claim")
     if payload["task_id"] != task_id:
         raise ValidationError("factory allocation admission task ID does not match claim")
     if payload["expected_revision"] != expected_revision:
-        raise ValidationError(
-            "factory allocation admission expected revision does not match claim"
-        )
+        raise ValidationError("factory allocation admission expected revision does not match claim")
 
     vault = Vault(project_root)
     canonical_vault_id = vault.identity()["vault_id"]
     if payload["vault_id"] != canonical_vault_id:
-        raise ValidationError(
-            "factory allocation admission vault ID does not match current vault"
-        )
+        raise ValidationError("factory allocation admission vault ID does not match current vault")
 
     key_file_env = os.environ.get("SELD_FACTORY_ADMISSION_KEY_FILE")
     if not key_file_env or not key_file_env.strip():
         raise ValidationError("SELD_FACTORY_ADMISSION_KEY_FILE is not configured")
-    key_path = Path(key_file_env)
-    try:
-        st = key_path.stat()
-    except OSError as err:
-        raise ValidationError(f"failed to stat factory admission key file: {err}") from err
-
-    if not stat.S_ISREG(st.st_mode):
-        raise ValidationError("factory admission key file is not a regular file")
-
-    if hasattr(os, "getuid") and (st.st_mode & 0o077) != 0:
-        raise ValidationError("factory admission key file has insecure group or world permissions")
-
-    if st.st_size == 0:
-        raise ValidationError("factory admission key file is empty")
-    if st.st_size > 4096:
-        raise ValidationError("factory admission key file exceeds maximum size of 4096 bytes")
-
-    try:
-        key_bytes = key_path.read_bytes()
-    except OSError as err:
-        raise ValidationError(f"failed to read factory admission key file: {err}") from err
-
-    if len(key_bytes) == 0:
-        raise ValidationError("factory admission key file is empty")
-    if len(key_bytes) > 4096:
-        raise ValidationError("factory admission key file exceeds maximum size of 4096 bytes")
+    key_bytes = _read_factory_admission_key(Path(key_file_env))
 
     canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     computed_signature = hmac.new(key_bytes, canonical_payload, hashlib.sha256).hexdigest()
@@ -147,7 +159,7 @@ def claim_task(
     admission: dict[str, Any] | None = None,
     observed_at: datetime | None = None,
 ) -> Task:
-    """Claim one ready task with agent_run=yes and next_actor=agent by exact revision and dispatch ID."""
+    """Claim one exactly-revisioned task approved for agent execution."""
 
     clean_dispatch = _dispatch_id(dispatch_id)
     clean_revision = _dispatch_revision(expected_revision)
@@ -317,7 +329,7 @@ def clear_task_blocker(
     ):
         raise ValidationError("task blocker does not match the expected owner and condition")
 
-    claim_by = current.claim_by if current.agent_run == "yes" else _refreshed_claim_by(current, observed_at)
+    claim_by = current.claim_by
     cleared = vault._update_task_dispatch(
         current.identifier,
         status="ready",
@@ -428,7 +440,7 @@ def project_task_attention(
 
 
 def dispatch_eligible(project_root: Path) -> tuple[Task, ...]:
-    """Return every ready, unblocked, unclaimed task with agent_run=yes and next_actor=agent in queue order."""
+    """Return every ready, unblocked, unclaimed, agent-approved task."""
 
     vault = Vault(project_root)
     eligible = tuple(task for task in vault.list_tasks() if _eligible_for_claim(task))
@@ -507,15 +519,6 @@ def _is_clear_replay(task: Task, marker: str) -> bool:
         and task.dispatch_revision is None
         and any(marker in entry for entry in task.history)
     )
-
-
-def _refreshed_claim_by(task: Task, observed_at: datetime | None) -> str:
-    base = observed_at or datetime.now(UTC)
-    base_time = parse_time(format_time(base))
-    updated_at = parse_time(task.updated_at)
-    if base_time <= updated_at:
-        base_time = updated_at + timedelta(microseconds=1)
-    return format_time(base_time + DEFAULT_CLAIM_WINDOW)
 
 
 def _clock_health(value: str) -> str:

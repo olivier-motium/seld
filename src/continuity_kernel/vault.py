@@ -87,7 +87,6 @@ from continuity_kernel.portfolio import (
     render_portfolio,
 )
 from continuity_kernel.records import (
-    DEFAULT_CLAIM_WINDOW,
     MAX_HISTORY_ENTRIES,
     REVIEW_WORK_THREAD_ID,
     SHA256_REVISION,
@@ -107,7 +106,6 @@ from continuity_kernel.records import (
     body_text,
     calendar_date,
     canonical_id,
-    claim_by_eligible,
     codex_episodes,
     dispatch_id_value,
     dispatch_revision_value,
@@ -386,13 +384,9 @@ class Vault:
 
     def create_task(self, **values: Any) -> Task:
         with exclusive_lock(self.state / "locks/global.lock"):
-            if (
-                values.get("dispatch_id") is not None
-                or values.get("dispatch_revision") is not None
-                or values.get("active_thread_id") is not None
-            ):
+            if values.get("dispatch_id") is not None or values.get("dispatch_revision") is not None:
                 raise ValidationError(
-                    "task cannot be created with a dispatch ID, dispatch revision, or active thread ID"
+                    "task cannot be created with a dispatch ID or dispatch revision"
                 )
             payload = dict(values)
             supplied_links = task_entity_links(tuple(payload.get("entity_links", ())))
@@ -434,6 +428,7 @@ class Vault:
         blocker_owner: str | None = None,
         blocker_condition: str | None = None,
         agent_run: str | None = None,
+        active_thread_id: str | None = None,
         superseded_by: str | None = None,
         project: str | None = None,
         workspace: str | None = None,
@@ -449,6 +444,7 @@ class Vault:
         clear_blocker_owner: bool = False,
         clear_blocker_condition: bool = False,
         clear_agent_run: bool = False,
+        clear_active_thread_id: bool = False,
         clear_superseded_by: bool = False,
         clear_project: bool = False,
         clear_workspace: bool = False,
@@ -479,6 +475,7 @@ class Vault:
             blocker_owner=blocker_owner,
             blocker_condition=blocker_condition,
             agent_run=agent_run,
+            active_thread_id=active_thread_id,
             superseded_by=superseded_by,
             project=project,
             workspace=workspace,
@@ -494,6 +491,7 @@ class Vault:
             clear_blocker_owner=clear_blocker_owner,
             clear_blocker_condition=clear_blocker_condition,
             clear_agent_run=clear_agent_run,
+            clear_active_thread_id=clear_active_thread_id,
             clear_superseded_by=clear_superseded_by,
             clear_project=clear_project,
             clear_workspace=clear_workspace,
@@ -757,12 +755,28 @@ class Vault:
                 if clear_active_thread_id
                 else before.active_thread_id
             )
-            if target_agent_run == "yes" and target_active_thread_id is not None and target_active_thread_id != before.active_thread_id:
-                if before.dispatch_id is None or before.dispatch_revision is None or target_status != "doing":
-                    raise ValidationError("active thread ID on an agent-run task must be bound through dispatch")
-            if target_agent_run == "yes" and before.agent_run != "yes" and target_active_thread_id is not None:
-                if before.dispatch_id is None or before.dispatch_revision is None:
-                    raise ValidationError("active thread ID on an agent-run task must be bound through dispatch")
+            if (
+                target_agent_run == "yes"
+                and target_active_thread_id is not None
+                and target_active_thread_id != before.active_thread_id
+                and (
+                    before.dispatch_id is None
+                    or before.dispatch_revision is None
+                    or target_status != "doing"
+                )
+            ):
+                raise ValidationError(
+                    "active thread ID on an agent-run task must be bound through dispatch"
+                )
+            if (
+                target_agent_run == "yes"
+                and before.agent_run != "yes"
+                and target_active_thread_id is not None
+                and (before.dispatch_id is None or before.dispatch_revision is None)
+            ):
+                raise ValidationError(
+                    "active thread ID on an agent-run task must be bound through dispatch"
+                )
             target_superseded_by = (
                 task_id(superseded_by)
                 if superseded_by is not None
@@ -866,19 +880,6 @@ class Vault:
                 (before, *((transfer_owner,) if transfer_owner is not None else ())),
                 observed_at,
             )
-            if (
-                before.claim_by is None
-                and target_claim_by is None
-                and target_agent_run != "yes"
-                and claim_by_eligible(target_status, target_target_seat, target_waiting)
-                and not clear_claim_by
-                and (
-                    target_status != before.status
-                    or target_target_seat != before.target_seat
-                    or target_waiting != before.waiting_on
-                )
-            ):
-                target_claim_by = format_time(parse_time(timestamp) + DEFAULT_CLAIM_WINDOW)
             changes = _changed_fields(
                 (
                     (

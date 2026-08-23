@@ -44,7 +44,6 @@ MAX_CODEX_EPISODES: Final = 50
 MAX_HISTORY_ENTRIES: Final = 2_000
 MAX_HISTORY_LINE_LENGTH: Final = 2_000
 MAX_TASK_RANK: Final = 2_147_483_647
-DEFAULT_CLAIM_WINDOW: Final = timedelta(minutes=5)
 SLA_CLOCK_HEALTH: Final = ("healthy", "unknown")
 SAFE_ID = re.compile(r"^[a-z][a-z0-9]*(?::[a-z0-9][a-z0-9-]{0,95})$")
 SAFE_TASK_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
@@ -442,8 +441,10 @@ def new_task(
         clean_waiting = clean_blocker_condition
     if clean_dispatch_id is not None or clean_dispatch_revision is not None:
         raise ValidationError("task cannot be created with a dispatch ID or revision")
-    if clean_active is not None:
-        raise ValidationError("task cannot be created with an active thread ID")
+    if clean_active is not None and clean_agent_run == "yes":
+        raise ValidationError(
+            "active thread ID on an agent-run task must be bound through dispatch"
+        )
     _validate_dispatch_fields(
         clean_dispatch_id,
         clean_dispatch_revision,
@@ -452,12 +453,6 @@ def new_task(
         clean_blocker_owner,
         clean_blocker_condition,
     )
-    if (
-        clean_claim_by is None
-        and clean_agent_run != "yes"
-        and claim_by_eligible(clean_status, clean_target_seat, clean_waiting)
-    ):
-        clean_claim_by = format_time(parse_time(now) + DEFAULT_CLAIM_WINDOW)
     clean_episodes = codex_episodes(
         (*codex_episode_ids, *((clean_active,) if clean_active is not None else ()))
     )

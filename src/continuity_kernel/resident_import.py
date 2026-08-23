@@ -979,7 +979,11 @@ def _semantic_payload(
 
 
 def _task_from_private(value: object) -> Task:
-    if not isinstance(value, dict) or set(value) not in {_TASK_KEYS, _TASK_DISPATCH_KEYS, _TASK_AGENT_RUN_KEYS}:
+    if not isinstance(value, dict) or set(value) not in {
+        _TASK_KEYS,
+        _TASK_DISPATCH_KEYS,
+        _TASK_AGENT_RUN_KEYS,
+    }:
         raise ValidationError("private task has an unsupported shape")
     raw = value
     candidate = Task(

@@ -581,7 +581,7 @@ def test_cli_local_file_read_is_bounded_and_does_not_mutate_vault(
     assert "not found for this vault" in json.loads(capsys.readouterr().err)["error"]
 
 
-def test_cli_authors_rank_and_complete_portfolio(
+def test_cli_authors_rank_hand_and_complete_portfolio(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -604,6 +604,8 @@ def test_cli_authors_rank_and_complete_portfolio(
                 "Keep exact authored order.",
                 "--rank",
                 "3",
+                "--active-thread-id",
+                "exact-hand",
             ]
         )
         == 0
@@ -643,6 +645,7 @@ def test_cli_authors_rank_and_complete_portfolio(
     shown = json.loads(capsys.readouterr().out)["result"]
     assert shown == portfolio
     assert task["rank"] == 3
+    assert task["active_thread_id"] == "exact-hand"
 
 
 def test_cli_does_not_advertise_unsupported_control_lane(

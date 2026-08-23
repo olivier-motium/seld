@@ -488,6 +488,7 @@ def _call(
                 blocker_owner=_optional_string(values, "blocker_owner"),
                 blocker_condition=_optional_string(values, "blocker_condition"),
                 agent_run=_optional_string(values, "agent_run"),
+                active_thread_id=_optional_string(values, "active_thread_id"),
                 superseded_by=_optional_string(values, "superseded_by"),
                 project=_optional_string(values, "project"),
                 workspace=_optional_string(values, "workspace"),
@@ -516,6 +517,7 @@ def _call(
                 blocker_owner=_optional_string(values, "blocker_owner"),
                 blocker_condition=_optional_string(values, "blocker_condition"),
                 agent_run=_optional_string(values, "agent_run"),
+                active_thread_id=_optional_string(values, "active_thread_id"),
                 superseded_by=_optional_string(values, "superseded_by"),
                 project=_optional_string(values, "project"),
                 workspace=_optional_string(values, "workspace"),
@@ -531,6 +533,7 @@ def _call(
                 clear_blocker_owner=_boolean(values, "clear_blocker_owner"),
                 clear_blocker_condition=_boolean(values, "clear_blocker_condition"),
                 clear_agent_run=_boolean(values, "clear_agent_run"),
+                clear_active_thread_id=_boolean(values, "clear_active_thread_id"),
                 clear_superseded_by=_boolean(values, "clear_superseded_by"),
                 clear_project=_boolean(values, "clear_project"),
                 clear_workspace=_boolean(values, "clear_workspace"),
@@ -1691,6 +1694,7 @@ TOOLS: Final = [
         {
             "id": TEXT,
             "agent_run": {"enum": ["yes", "no"], "type": "string"},
+            "active_thread_id": TASK_ACTIVE_THREAD_ID,
             "attention_at": TEXT,
             "blocker_condition": TEXT,
             "blocker_owner": TEXT,
@@ -1723,11 +1727,13 @@ TOOLS: Final = [
             "add_entity_links": TASK_ENTITY_LINKS,
             "add_refs": TASK_REFS,
             "agent_run": {"enum": ["yes", "no"], "type": "string"},
+            "active_thread_id": TASK_ACTIVE_THREAD_ID,
             "attention_at": TEXT,
             "blocker_condition": TEXT,
             "blocker_owner": TEXT,
             "claim_by": TEXT,
             "clear_agent_run": BOOLEAN,
+            "clear_active_thread_id": BOOLEAN,
             "clear_attention_at": BOOLEAN,
             "clear_blocker_condition": BOOLEAN,
             "clear_blocker_owner": BOOLEAN,
@@ -1810,7 +1816,9 @@ TOOLS: Final = [
         "Claim one eligible task with its exact current revision and one dispatch ID.",
         {
             "admission": {
-                "description": "Factory allocation admission object containing payload and signature.",
+                "description": (
+                    "Factory allocation admission object containing payload and signature."
+                ),
                 "type": "object",
             },
             "dispatch_id": TEXT,
