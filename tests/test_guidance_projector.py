@@ -71,11 +71,13 @@ def test_guidance_projector_comprehensive_behavior(vault: Vault, tmp_path: Path)
 
     # Readback verification
     published_guidance = read_resident_guidance(vault.root)
-    assert published_guidance["content"] == agents_src.read_bytes().decode("utf-8")
+    assert published_guidance["content"] == (
+        agents_src.read_bytes().decode("utf-8").rstrip() + "\n"
+    )
     assert published_guidance["sha256"] == result["guidance"]["revision"]
 
     published_mind = vault.read_document("MIND.md")
-    assert published_mind["content"] == mind_src.read_bytes().decode("utf-8")
+    assert published_mind["content"] == mind_src.read_bytes().decode("utf-8").rstrip() + "\n"
     assert published_mind["revision"] == result["mind"]["revision"]
 
     # Managed marker verification
