@@ -277,7 +277,7 @@ def write_task_blocker(
         and current.progress_check_by is None
     ):
         return current
-    _require_factory_execution_approval(current)
+    _require_factory_execution_approval(current, allow_waiting=True)
     if current.status not in {"ready", "doing"}:
         raise ValidationError("claimed task is not active for blocker handling")
     if current.waiting_on is not None and current.waiting_on != clean_condition:
@@ -337,7 +337,7 @@ def clear_task_blocker(
     if _is_clear_replay(current, marker):
         return current
     _require_claim(current, clean_dispatch, clean_revision)
-    _require_factory_execution_approval(current)
+    _require_factory_execution_approval(current, allow_waiting=True)
     if current.status != "waiting":
         raise ValidationError("task is not blocked")
     if (
@@ -494,8 +494,12 @@ def _require_claim(task: Task, dispatch_id: str, revision: str) -> None:
         raise ValidationError("task is not claimed by this dispatch revision")
 
 
-def _require_factory_execution_approval(task: Task) -> None:
-    if task.agent_run != "yes" or task.next_actor != "agent":
+def _require_factory_execution_approval(task: Task, *, allow_waiting: bool = False) -> None:
+    if (
+        task.agent_run != "yes"
+        or task.next_actor != "agent"
+        or (task.waiting_on is not None and not allow_waiting)
+    ):
         raise ValidationError("Factory execution approval is no longer present")
 
 

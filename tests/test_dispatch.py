@@ -1275,6 +1275,7 @@ def test_generic_surfaces_refuse_dispatch_and_factory_hand_mutations(
         ("terminal", "not ready for hand binding"),
         ("agent-run", "approval is no longer present"),
         ("next-actor", "approval is no longer present"),
+        ("waiting", "approval is no longer present"),
     ],
 )
 def test_dispatch_bind_refuses_current_authored_revocation(
@@ -1320,11 +1321,18 @@ def test_dispatch_bind_refuses_current_authored_revocation(
             agent_run="no",
             observed_at=NOW,
         )
-    else:
+    elif suffix == "next-actor":
         changed = vault.update_task(
             task.identifier,
             expected_revision=claimed.revision,
             next_actor="human",
+            observed_at=NOW,
+        )
+    else:
+        changed = vault.update_task(
+            task.identifier,
+            expected_revision=claimed.revision,
+            waiting_on="Olivier must decide.",
             observed_at=NOW,
         )
 
