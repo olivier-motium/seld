@@ -104,7 +104,7 @@ def test_dispatch_lifecycle_preserves_rank_and_clears_blocker_idempotently(
     assert cleared.dispatch_revision is None
     assert cleared.active_thread_id is None
     assert cleared.rank == task.rank
-    assert cleared.claim_by is not None
+    assert cleared.claim_by is None
     assert [item.identifier for item in dispatch_eligible(vault.root)] == [task.identifier]
 
     replay = clear_task_blocker(
@@ -501,3 +501,82 @@ def test_dispatch_eligibility_enforces_explicit_agent_run_decision(
     assert [item.identifier for item in dispatch_eligible(vault.root)] == [no_seat_task.identifier]
 
 
+def test_agent_run_claim_by_deadline_suppression_and_transitions(
+    vault: Vault,
+) -> None:
+    # 1. Tasks created with agent_run="yes" never auto-mint claim_by
+    agent_task = vault.create_task(
+        identifier="agent-auto-suppress",
+        title="Agent auto suppress",
+        outcome="Do not auto-mint claim_by.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        target_seat="worker-one",
+        observed_at=NOW,
+    )
+    assert agent_task.claim_by is None
+
+    # 2. Legacy / tasks without agent_run="yes" still auto-mint claim_by on create
+    legacy_task = vault.create_task(
+        identifier="legacy-auto-mint",
+        title="Legacy auto mint",
+        outcome="Auto-mint claim_by for non-agent_run=yes tasks.",
+        status="ready",
+        next_actor="agent",
+        target_seat="worker-one",
+        observed_at=NOW,
+    )
+    assert legacy_task.claim_by == "2026-07-22T12:05:00.000000Z"
+
+    # 3. Transitioning an existing task with auto claim_by to agent_run="yes" clears claim_by
+    promoted = vault.update_task(
+        legacy_task.identifier,
+        expected_revision=legacy_task.revision,
+        agent_run="yes",
+        observed_at=NOW,
+    )
+    assert promoted.agent_run == "yes"
+    assert promoted.claim_by is None
+
+    # 4. Transitioning to agent_run="yes" with an explicit claim_by preserves the authored deadline
+    authored_deadline = "2026-07-22T14:00:00.000000Z"
+    authored_task = vault.create_task(
+        identifier="authored-deadline-task",
+        title="Authored deadline task",
+        outcome="Preserve explicitly supplied deadline.",
+        status="ready",
+        next_actor="agent",
+        target_seat="worker-one",
+        observed_at=NOW,
+    )
+    updated_authored = vault.update_task(
+        authored_task.identifier,
+        expected_revision=authored_task.revision,
+        agent_run="yes",
+        claim_by=authored_deadline,
+        observed_at=NOW,
+    )
+    assert updated_authored.agent_run == "yes"
+    assert updated_authored.claim_by == authored_deadline
+
+    # 5. Updating an agent_run="yes" task to ready does NOT auto-mint claim_by
+    captured = vault.create_task(
+        identifier="captured-agent-task",
+        title="Captured agent task",
+        outcome="Remain without claim_by when moving to ready.",
+        status="captured",
+        next_actor="agent",
+        agent_run="yes",
+        target_seat="worker-one",
+        observed_at=NOW,
+    )
+    assert captured.claim_by is None
+    made_ready = vault.update_task(
+        captured.identifier,
+        expected_revision=captured.revision,
+        status="ready",
+        observed_at=NOW,
+    )
+    assert made_ready.status == "ready"
+    assert made_ready.claim_by is None

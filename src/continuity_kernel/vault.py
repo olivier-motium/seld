@@ -581,6 +581,8 @@ class Vault:
                 if clear_agent_run
                 else before.agent_run
             )
+            if target_agent_run == "yes" and claim_by is None and before.agent_run != "yes":
+                target_claim_by = None
             if target_blocker_condition is not None and target_waiting is None:
                 target_waiting = target_blocker_condition
             if target_status in TERMINAL_TASK_STATUSES:
@@ -710,6 +712,7 @@ class Vault:
             if (
                 before.claim_by is None
                 and target_claim_by is None
+                and target_agent_run != "yes"
                 and claim_by_eligible(target_status, target_target_seat, target_waiting)
                 and not clear_claim_by
                 and (

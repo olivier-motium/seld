@@ -444,7 +444,11 @@ def new_task(
         clean_blocker_owner,
         clean_blocker_condition,
     )
-    if clean_claim_by is None and claim_by_eligible(clean_status, clean_target_seat, clean_waiting):
+    if (
+        clean_claim_by is None
+        and clean_agent_run != "yes"
+        and claim_by_eligible(clean_status, clean_target_seat, clean_waiting)
+    ):
         clean_claim_by = format_time(parse_time(now) + DEFAULT_CLAIM_WINDOW)
     clean_episodes = codex_episodes(
         (*codex_episode_ids, *((clean_active,) if clean_active is not None else ()))

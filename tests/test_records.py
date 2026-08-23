@@ -450,4 +450,3 @@ def test_agent_run_field_serialization_and_validation() -> None:
                 agent_run=invalid,
                 observed_at=NOW,
             )
-

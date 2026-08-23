@@ -208,12 +208,13 @@ def clear_task_blocker(
     ):
         raise ValidationError("task blocker does not match the expected owner and condition")
 
-    claim_by = _refreshed_claim_by(current, observed_at)
+    claim_by = None if current.agent_run == "yes" else _refreshed_claim_by(current, observed_at)
     cleared = vault.update_task(
         current.identifier,
         status="ready",
         rank=current.rank,
         claim_by=claim_by,
+        clear_claim_by=current.agent_run == "yes" and current.claim_by is not None,
         clear_waiting_on=True,
         clear_blocker_owner=True,
         clear_blocker_condition=True,
