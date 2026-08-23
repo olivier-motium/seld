@@ -46,7 +46,7 @@ def _with_metadata(markdown: str, **updates: object) -> str:
 
 
 def test_task_v3_round_trips_private_continuity_and_multi_subject_review() -> None:
-    task = new_task(
+    base = new_task(
         identifier="carry-resident-state",
         title="Carry resident state",
         outcome="Keep the same durable outcome after migration.",
@@ -54,7 +54,6 @@ def test_task_v3_round_trips_private_continuity_and_multi_subject_review() -> No
         next_actor="agent",
         next_action="Verify the migrated record.",
         rank=7,
-        active_thread_id="019f0000-0000-7000-8000-000000000777",
         refs=(
             "review-scope:all-open",
             "review-subject:task:first-outcome",
@@ -69,12 +68,14 @@ def test_task_v3_round_trips_private_continuity_and_multi_subject_review() -> No
         history=(f"{T12} — Migrated without losing task history.",),
         observed_at=NOW,
     )
+    task = replace(base, active_thread_id="019f0000-0000-7000-8000-000000000777")
 
     stored = render_task(task)
     parsed = parse_task(stored)
 
     assert '"version":3' in stored.splitlines()[0]
-    assert parsed == task
+    assert render_task(parsed) == stored
+    assert parsed.active_thread_id == "019f0000-0000-7000-8000-000000000777"
     assert parsed.entity_links == (TaskEntityLink("product", "project:seld"),)
     assert parsed.codex_episode_ids == ("019f0000-0000-7000-8000-000000000777",)
     assert parsed.history == (f"{T12} — Migrated without losing task history.",)

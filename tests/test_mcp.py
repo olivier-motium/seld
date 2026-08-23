@@ -177,6 +177,7 @@ def test_task_list_pages_large_ledgers_without_history_or_silent_snapshot_drift(
         encoded = json.dumps(page, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
         assert len(encoded) <= mcp_server.TASK_LIST_MAX_PAGE_BYTES
         for task in page["tasks"]:
+            assert task["agent_run"] is None
             assert {
                 "history",
                 "refs",
@@ -345,7 +346,12 @@ def test_resident_activation_mcp_surfaces_are_exact_bounded_and_fresh_process(
         status="doing",
         next_actor="agent",
         next_action="Read the activation tools.",
+    )
+    task = vault._update_task_dispatch(
+        task.identifier,
+        status="doing",
         active_thread_id="resident-mcp-hand",
+        expected_revision=task.revision,
     )
     vault.create_thread(
         identifier="thread:resident-mcp",
@@ -744,6 +750,7 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         "gsv_connector_source_read",
         "gsv_execution_bindings",
         "gsv_dispatch_bind",
+        "gsv_dispatch_hand_clear",
         "gsv_dispatch_blocker",
         "gsv_dispatch_blocker_clear",
         "gsv_dispatch_claim",
@@ -1018,7 +1025,12 @@ def test_update_mcp_surface_is_cache_only_and_cannot_apply_or_check(
 
 def test_task_schema_distinguishes_codex_hand_from_gsv_workthread_without_narrowing_type() -> None:
     tools = {tool["name"]: tool for tool in mcp_server.TOOLS}
-    for name in ("gsv_task_create", "gsv_task_update"):
+    for name in (
+        "gsv_dispatch_bind",
+        "gsv_dispatch_hand_clear",
+        "gsv_task_create",
+        "gsv_task_update",
+    ):
         properties = tools[name]["inputSchema"]["properties"]
         active_hand = properties["active_thread_id"]
         description = active_hand["description"]
@@ -1028,6 +1040,7 @@ def test_task_schema_distinguishes_codex_hand_from_gsv_workthread_without_narrow
         assert "pattern" not in active_hand and "format" not in active_hand
 
     update_properties = tools["gsv_task_update"]["inputSchema"]["properties"]
+    assert "clear_active_thread_id" in update_properties
     assert "codex-thread:*" in update_properties["add_refs"]["description"]
     assert "codex-thread:*" in update_properties["remove_refs"]["description"]
 
@@ -1177,7 +1190,6 @@ def test_mcp_authors_and_reads_complete_portfolio(tmp_path: Path) -> None:
             {
                 "name": "gsv_task_create",
                 "arguments": {
-                    "active_thread_id": "exact-hand",
                     "id": "mcp-ranked-outcome",
                     "outcome": "Remain exact across processes.",
                     "rank": 5,
@@ -1218,7 +1230,6 @@ def test_mcp_authors_and_reads_complete_portfolio(tmp_path: Path) -> None:
     assert {"gsv_portfolio_show", "gsv_portfolio_set"} <= names
     assert authored == shown
     assert created["rank"] == 5
-    assert created["active_thread_id"] == "exact-hand"
 
 
 def test_cli_explicit_vault_overrides_mcp_environment_for_process_lifetime(
@@ -1488,7 +1499,6 @@ def test_direct_protocol_surface_exercises_all_record_types(
             "status": "doing",
             "next_actor": "agent",
             "next_action": "Update through MCP.",
-            "active_thread_id": "legacy-free-form-hand",
             "refs": ["test:direct"],
         },
     )["result"]["structuredContent"]
@@ -1588,7 +1598,6 @@ def test_direct_protocol_surface_exercises_all_record_types(
     assert ping and ping["result"] == {}
     assert listed_tools and len(listed_tools["result"]["tools"]) >= 10
     assert updated_task["next_action"] == "Create related records."
-    assert updated_task["active_thread_id"] == "legacy-free-form-hand"
     assert updated_entity["aliases"] == ["Owner", "Reviewer"]
     assert updated_thread["summary"] == "Records verified."
     assert "Direct MCP state" in updated_document["content"]

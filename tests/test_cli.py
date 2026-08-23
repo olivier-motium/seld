@@ -48,7 +48,12 @@ def test_cli_resident_activation_survives_a_fresh_process(tmp_path: Path) -> Non
         status="doing",
         next_actor="agent",
         next_action="Read through a new process.",
+    )
+    task = vault._update_task_dispatch(
+        task.identifier,
+        status="doing",
         active_thread_id="fresh-process-hand",
+        expected_revision=task.revision,
     )
     vault.create_thread(
         identifier="thread:fresh-process",

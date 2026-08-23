@@ -87,7 +87,6 @@ from continuity_kernel.portfolio import (
     render_portfolio,
 )
 from continuity_kernel.records import (
-    DEFAULT_CLAIM_WINDOW,
     MAX_HISTORY_ENTRIES,
     REVIEW_WORK_THREAD_ID,
     SHA256_REVISION,
@@ -103,10 +102,10 @@ from continuity_kernel.records import (
     WorkThreadEntityLink,
     WorkThreadTaskLink,
     actor,
+    agent_run_value,
     body_text,
     calendar_date,
     canonical_id,
-    claim_by_eligible,
     codex_episodes,
     dispatch_id_value,
     dispatch_revision_value,
@@ -385,6 +384,10 @@ class Vault:
 
     def create_task(self, **values: Any) -> Task:
         with exclusive_lock(self.state / "locks/global.lock"):
+            if values.get("dispatch_id") is not None or values.get("dispatch_revision") is not None:
+                raise ValidationError(
+                    "task cannot be created with a dispatch ID or dispatch revision"
+                )
             payload = dict(values)
             supplied_links = task_entity_links(tuple(payload.get("entity_links", ())))
             payload["entity_links"] = self._resolved_task_entity_links(supplied_links)
@@ -422,10 +425,156 @@ class Vault:
         target_seat: str | None = None,
         claim_by: str | None = None,
         progress_check_by: str | None = None,
+        blocker_owner: str | None = None,
+        blocker_condition: str | None = None,
+        agent_run: str | None = None,
+        active_thread_id: str | None = None,
+        superseded_by: str | None = None,
+        project: str | None = None,
+        workspace: str | None = None,
+        attention_at: str | None = None,
+        due: str | None = None,
+        clear_next_actor: bool = False,
+        clear_next_action: bool = False,
+        clear_waiting_on: bool = False,
+        clear_rank: bool = False,
+        clear_target_seat: bool = False,
+        clear_claim_by: bool = False,
+        clear_progress_check_by: bool = False,
+        clear_blocker_owner: bool = False,
+        clear_blocker_condition: bool = False,
+        clear_agent_run: bool = False,
+        clear_active_thread_id: bool = False,
+        clear_superseded_by: bool = False,
+        clear_project: bool = False,
+        clear_workspace: bool = False,
+        clear_attention_at: bool = False,
+        clear_due: bool = False,
+        add_entity_links: tuple[TaskEntityLink, ...] = (),
+        remove_entity_links: tuple[TaskEntityLink, ...] = (),
+        add_codex_episode_ids: tuple[str, ...] = (),
+        remove_codex_episode_ids: tuple[str, ...] = (),
+        add_refs: tuple[str, ...] = (),
+        remove_refs: tuple[str, ...] = (),
+        note: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> Task:
+        return self._update_task_record(
+            identifier,
+            expected_revision=expected_revision,
+            title=title,
+            outcome=outcome,
+            status=status,
+            next_actor=next_actor,
+            next_action=next_action,
+            waiting_on=waiting_on,
+            rank=rank,
+            target_seat=target_seat,
+            claim_by=claim_by,
+            progress_check_by=progress_check_by,
+            blocker_owner=blocker_owner,
+            blocker_condition=blocker_condition,
+            agent_run=agent_run,
+            active_thread_id=active_thread_id,
+            superseded_by=superseded_by,
+            project=project,
+            workspace=workspace,
+            attention_at=attention_at,
+            due=due,
+            clear_next_actor=clear_next_actor,
+            clear_next_action=clear_next_action,
+            clear_waiting_on=clear_waiting_on,
+            clear_rank=clear_rank,
+            clear_target_seat=clear_target_seat,
+            clear_claim_by=clear_claim_by,
+            clear_progress_check_by=clear_progress_check_by,
+            clear_blocker_owner=clear_blocker_owner,
+            clear_blocker_condition=clear_blocker_condition,
+            clear_agent_run=clear_agent_run,
+            clear_active_thread_id=clear_active_thread_id,
+            clear_superseded_by=clear_superseded_by,
+            clear_project=clear_project,
+            clear_workspace=clear_workspace,
+            clear_attention_at=clear_attention_at,
+            clear_due=clear_due,
+            add_entity_links=add_entity_links,
+            remove_entity_links=remove_entity_links,
+            add_codex_episode_ids=add_codex_episode_ids,
+            remove_codex_episode_ids=remove_codex_episode_ids,
+            add_refs=add_refs,
+            remove_refs=remove_refs,
+            note=note,
+            observed_at=observed_at,
+        )
+
+    def _update_task_dispatch(
+        self,
+        identifier: str,
+        *,
+        expected_revision: str,
+        status: str | None = None,
+        rank: int | None = None,
+        waiting_on: str | None = None,
+        claim_by: str | None = None,
+        dispatch_id: str | None = None,
+        dispatch_revision: str | None = None,
+        active_thread_id: str | None = None,
+        blocker_owner: str | None = None,
+        blocker_condition: str | None = None,
+        clear_waiting_on: bool = False,
+        clear_dispatch_id: bool = False,
+        clear_dispatch_revision: bool = False,
+        clear_active_thread_id: bool = False,
+        clear_blocker_owner: bool = False,
+        clear_blocker_condition: bool = False,
+        clear_progress_check_by: bool = False,
+        note: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> Task:
+        return self._update_task_record(
+            identifier,
+            expected_revision=expected_revision,
+            dispatch_operation=True,
+            status=status,
+            rank=rank,
+            waiting_on=waiting_on,
+            claim_by=claim_by,
+            dispatch_id=dispatch_id,
+            dispatch_revision=dispatch_revision,
+            active_thread_id=active_thread_id,
+            blocker_owner=blocker_owner,
+            blocker_condition=blocker_condition,
+            clear_waiting_on=clear_waiting_on,
+            clear_dispatch_id=clear_dispatch_id,
+            clear_dispatch_revision=clear_dispatch_revision,
+            clear_active_thread_id=clear_active_thread_id,
+            clear_blocker_owner=clear_blocker_owner,
+            clear_blocker_condition=clear_blocker_condition,
+            clear_progress_check_by=clear_progress_check_by,
+            note=note,
+            observed_at=observed_at,
+        )
+
+    def _update_task_record(
+        self,
+        identifier: str,
+        *,
+        expected_revision: str,
+        title: str | None = None,
+        outcome: str | None = None,
+        status: str | None = None,
+        next_actor: str | None = None,
+        next_action: str | None = None,
+        waiting_on: str | None = None,
+        rank: int | None = None,
+        target_seat: str | None = None,
+        claim_by: str | None = None,
+        progress_check_by: str | None = None,
         dispatch_id: str | None = None,
         dispatch_revision: str | None = None,
         blocker_owner: str | None = None,
         blocker_condition: str | None = None,
+        agent_run: str | None = None,
         active_thread_id: str | None = None,
         superseded_by: str | None = None,
         project: str | None = None,
@@ -443,6 +592,7 @@ class Vault:
         clear_dispatch_revision: bool = False,
         clear_blocker_owner: bool = False,
         clear_blocker_condition: bool = False,
+        clear_agent_run: bool = False,
         clear_active_thread_id: bool = False,
         clear_superseded_by: bool = False,
         clear_project: bool = False,
@@ -457,6 +607,7 @@ class Vault:
         remove_refs: tuple[str, ...] = (),
         note: str | None = None,
         observed_at: datetime | None = None,
+        dispatch_operation: bool = False,
     ) -> Task:
         clean_id = task_id(identifier)
         path = self._path("task", clean_id)
@@ -466,6 +617,15 @@ class Vault:
         ):
             before = self._read_task(clean_id)
             self._expect(before.revision, expected_revision)
+            if (
+                not dispatch_operation
+                and (active_thread_id is not None or clear_active_thread_id)
+                and before.dispatch_id is not None
+                and before.dispatch_revision is not None
+            ):
+                raise ValidationError(
+                    "a claimed task hand must use the dedicated dispatch operation"
+                )
             _exclusive_choice(active_thread_id, clear_active_thread_id, "active Codex hand")
             _exclusive_choice(superseded_by, clear_superseded_by, "superseding task")
             _exclusive_choice(project, clear_project, "project")
@@ -495,6 +655,7 @@ class Vault:
                 clear_blocker_condition,
                 "blocker condition",
             )
+            _exclusive_choice(agent_run, clear_agent_run, "agent run")
 
             target_status = task_status(status) if status is not None else before.status
             target_actor = (
@@ -570,11 +731,23 @@ class Vault:
                 if clear_blocker_condition
                 else before.blocker_condition
             )
+            target_agent_run = (
+                agent_run_value(agent_run)
+                if agent_run is not None
+                else None
+                if clear_agent_run
+                else before.agent_run
+            )
             if target_blocker_condition is not None and target_waiting is None:
                 target_waiting = target_blocker_condition
             if target_status in TERMINAL_TASK_STATUSES:
                 target_blocker_owner = None
                 target_blocker_condition = None
+            if target_dispatch_id is not None and target_dispatch_id != before.dispatch_id:
+                if before.dispatch_id is not None:
+                    raise ValidationError("task is already claimed by another dispatch")
+                if target_dispatch_revision != before.revision:
+                    raise ValidationError("dispatch claim requires exact dispatch revision")
             _validate_task_dispatch_update(
                 target_status,
                 target_waiting,
@@ -593,6 +766,28 @@ class Vault:
                 if clear_active_thread_id
                 else before.active_thread_id
             )
+            if (
+                target_agent_run == "yes"
+                and target_active_thread_id is not None
+                and target_active_thread_id != before.active_thread_id
+                and (
+                    before.dispatch_id is None
+                    or before.dispatch_revision is None
+                    or target_status != "doing"
+                )
+            ):
+                raise ValidationError(
+                    "active thread ID on an agent-run task must be bound through dispatch"
+                )
+            if (
+                target_agent_run == "yes"
+                and before.agent_run != "yes"
+                and target_active_thread_id is not None
+                and (before.dispatch_id is None or before.dispatch_revision is None)
+            ):
+                raise ValidationError(
+                    "active thread ID on an agent-run task must be bound through dispatch"
+                )
             target_superseded_by = (
                 task_id(superseded_by)
                 if superseded_by is not None
@@ -696,18 +891,6 @@ class Vault:
                 (before, *((transfer_owner,) if transfer_owner is not None else ())),
                 observed_at,
             )
-            if (
-                before.claim_by is None
-                and target_claim_by is None
-                and claim_by_eligible(target_status, target_target_seat, target_waiting)
-                and not clear_claim_by
-                and (
-                    target_status != before.status
-                    or target_target_seat != before.target_seat
-                    or target_waiting != before.waiting_on
-                )
-            ):
-                target_claim_by = format_time(parse_time(timestamp) + DEFAULT_CLAIM_WINDOW)
             changes = _changed_fields(
                 (
                     (
@@ -746,6 +929,7 @@ class Vault:
                         before.blocker_condition,
                         target_blocker_condition,
                     ),
+                    ("agent run", before.agent_run, target_agent_run),
                     ("active Codex hand", before.active_thread_id, target_active_thread_id),
                     ("superseding task", before.superseded_by, target_superseded_by),
                     ("project", before.project, target_project),
@@ -777,6 +961,7 @@ class Vault:
                     target_dispatch_revision is not None,
                     target_blocker_owner is not None,
                     target_blocker_condition is not None,
+                    target_agent_run is not None,
                     clean_note is not None,
                 )
             )
@@ -805,6 +990,7 @@ class Vault:
                 dispatch_revision=target_dispatch_revision,
                 blocker_owner=target_blocker_owner,
                 blocker_condition=target_blocker_condition,
+                agent_run=target_agent_run,
                 active_thread_id=target_active_thread_id,
                 refs=refs,
                 superseded_by=target_superseded_by,

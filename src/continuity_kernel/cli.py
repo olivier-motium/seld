@@ -67,6 +67,7 @@ from continuity_kernel.dispatch import (
     bind_task_hand,
     claim_task,
     clear_task_blocker,
+    clear_task_hand,
     dispatch_eligible,
     evaluate_task_deadline,
     write_task_blocker,
@@ -118,6 +119,7 @@ ROLLBACK_PROBE_MAX_OUTPUT_BYTES = 64 * 1024
 DISPATCH_ELIGIBLE_ALIAS = "task-" + "dispatch-eligible"
 DISPATCH_CLAIM_ALIAS = "task-" + "dispatch-claim"
 DISPATCH_BIND_ALIAS = "task-" + "dispatch-bind"
+DISPATCH_HAND_CLEAR_ALIAS = "task-" + "dispatch-hand-clear"
 DISPATCH_BLOCKER_ALIAS = "task-" + "dispatch-blocker"
 DISPATCH_BLOCKER_CLEAR_ALIAS = "task-" + "dispatch-blocker-clear"
 DISPATCH_DEADLINE_ALIAS = "task-" + "dispatch-deadline-eval"
@@ -664,12 +666,14 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command in {"dispatch-eligible", DISPATCH_ELIGIBLE_ALIAS}:
         return [record_dict(task) for task in dispatch_eligible(vault.root)]
     if args.command in {"dispatch-claim", DISPATCH_CLAIM_ALIAS}:
+        admission = json.loads(args.admission_json) if args.admission_json else None
         return record_dict(
             claim_task(
                 vault.root,
                 args.task_id,
                 expected_revision=args.expected_revision,
                 dispatch_id=args.dispatch_id,
+                admission=admission,
                 observed_at=_optional_observed_at(args.observed_at),
             )
         )
@@ -681,6 +685,19 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 expected_revision=args.expected_revision,
                 dispatch_id=args.dispatch_id,
                 active_thread_id=args.active_thread_id,
+                observed_at=_optional_observed_at(args.observed_at),
+            )
+        )
+    if args.command in {"dispatch-hand-clear", DISPATCH_HAND_CLEAR_ALIAS}:
+        admission = json.loads(args.admission_json)
+        return record_dict(
+            clear_task_hand(
+                vault.root,
+                args.task_id,
+                expected_revision=args.expected_revision,
+                dispatch_id=args.dispatch_id,
+                active_thread_id=args.active_thread_id,
+                admission=admission,
                 observed_at=_optional_observed_at(args.observed_at),
             )
         )
@@ -1244,10 +1261,9 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
                 target_seat=args.target_seat,
                 claim_by=args.claim_by,
                 progress_check_by=args.progress_check_by,
-                dispatch_id=args.dispatch_id,
-                dispatch_revision=args.dispatch_revision,
                 blocker_owner=args.blocker_owner,
                 blocker_condition=args.blocker_condition,
+                agent_run=args.agent_run,
                 active_thread_id=args.active_thread_id,
                 superseded_by=args.superseded_by,
                 project=args.project,
@@ -1277,6 +1293,7 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
             progress_check_by=args.progress_check_by,
             blocker_owner=args.blocker_owner,
             blocker_condition=args.blocker_condition,
+            agent_run=args.agent_run,
             project=args.project,
             workspace=args.workspace,
             observed_at=_optional_observed_at(args.observed_at),
@@ -1308,10 +1325,9 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
             target_seat=args.target_seat,
             claim_by=args.claim_by,
             progress_check_by=args.progress_check_by,
-            dispatch_id=args.dispatch_id,
-            dispatch_revision=args.dispatch_revision,
             blocker_owner=args.blocker_owner,
             blocker_condition=args.blocker_condition,
+            agent_run=args.agent_run,
             active_thread_id=args.active_thread_id,
             superseded_by=args.superseded_by,
             project=args.project,
@@ -1325,10 +1341,9 @@ def _task(vault: Vault, args: argparse.Namespace) -> Any:
             clear_target_seat=args.clear_target_seat,
             clear_claim_by=args.clear_claim_by,
             clear_progress_check_by=args.clear_progress_check_by,
-            clear_dispatch_id=args.clear_dispatch_id,
-            clear_dispatch_revision=args.clear_dispatch_revision,
             clear_blocker_owner=args.clear_blocker_owner,
             clear_blocker_condition=args.clear_blocker_condition,
+            clear_agent_run=args.clear_agent_run,
             clear_active_thread_id=args.clear_active_thread_id,
             clear_superseded_by=args.clear_superseded_by,
             clear_project=args.clear_project,
@@ -2282,6 +2297,7 @@ def _parser() -> argparse.ArgumentParser:
     dispatch_claim_command.add_argument("task_id")
     dispatch_claim_command.add_argument("--expected-revision", required=True)
     dispatch_claim_command.add_argument("--dispatch-id", required=True)
+    dispatch_claim_command.add_argument("--admission-json")
     dispatch_claim_command.add_argument("--observed-at")
 
     dispatch_bind_command = commands.add_parser(
@@ -2294,6 +2310,18 @@ def _parser() -> argparse.ArgumentParser:
     dispatch_bind_command.add_argument("--dispatch-id", required=True)
     dispatch_bind_command.add_argument("--active-thread-id", required=True)
     dispatch_bind_command.add_argument("--observed-at")
+
+    dispatch_hand_clear_command = commands.add_parser(
+        "dispatch-hand-clear",
+        aliases=[DISPATCH_HAND_CLEAR_ALIAS],
+        help="Clear one exact claimed Factory hand without changing task truth.",
+    )
+    dispatch_hand_clear_command.add_argument("task_id")
+    dispatch_hand_clear_command.add_argument("--expected-revision", required=True)
+    dispatch_hand_clear_command.add_argument("--dispatch-id", required=True)
+    dispatch_hand_clear_command.add_argument("--active-thread-id", required=True)
+    dispatch_hand_clear_command.add_argument("--admission-json", required=True)
+    dispatch_hand_clear_command.add_argument("--observed-at")
 
     dispatch_blocker_command = commands.add_parser(
         "dispatch-blocker",
@@ -2365,10 +2393,9 @@ def _parser() -> argparse.ArgumentParser:
     task_update.add_argument("--target-seat")
     task_update.add_argument("--claim-by")
     task_update.add_argument("--progress-check-by")
-    task_update.add_argument("--dispatch-id")
-    task_update.add_argument("--dispatch-revision")
     task_update.add_argument("--blocker-owner")
     task_update.add_argument("--blocker-condition")
+    task_update.add_argument("--agent-run", choices=("yes", "no"))
     task_update.add_argument("--active-thread-id")
     task_update.add_argument("--superseded-by")
     task_update.add_argument("--project")
@@ -2382,10 +2409,9 @@ def _parser() -> argparse.ArgumentParser:
     task_update.add_argument("--clear-target-seat", action="store_true")
     task_update.add_argument("--clear-claim-by", action="store_true")
     task_update.add_argument("--clear-progress-check-by", action="store_true")
-    task_update.add_argument("--clear-dispatch-id", action="store_true")
-    task_update.add_argument("--clear-dispatch-revision", action="store_true")
     task_update.add_argument("--clear-blocker-owner", action="store_true")
     task_update.add_argument("--clear-blocker-condition", action="store_true")
+    task_update.add_argument("--clear-agent-run", action="store_true")
     task_update.add_argument("--clear-active-thread-id", action="store_true")
     task_update.add_argument("--clear-superseded-by", action="store_true")
     task_update.add_argument("--clear-project", action="store_true")
@@ -2858,10 +2884,9 @@ def _task_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target-seat")
     parser.add_argument("--claim-by")
     parser.add_argument("--progress-check-by")
-    parser.add_argument("--dispatch-id")
-    parser.add_argument("--dispatch-revision")
     parser.add_argument("--blocker-owner")
     parser.add_argument("--blocker-condition")
+    parser.add_argument("--agent-run", choices=("yes", "no"))
     parser.add_argument("--active-thread-id")
     parser.add_argument("--superseded-by")
     parser.add_argument("--project")
@@ -2889,6 +2914,7 @@ def _task_pointer_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--progress-check-by")
     parser.add_argument("--blocker-owner")
     parser.add_argument("--blocker-condition")
+    parser.add_argument("--agent-run", choices=("yes", "no"))
     parser.add_argument("--project")
     parser.add_argument("--workspace")
     parser.add_argument("--observed-at")
