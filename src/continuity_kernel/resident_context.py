@@ -221,14 +221,30 @@ def recover_interrupted_guidance_projection(vault_root: Path) -> None:
         ) from exc
 
 
-def read_resident_guidance(vault_root: Path) -> dict[str, Any]:
-    """Read exact resident AGENTS guidance through one bounded no-follow path."""
+@contextmanager
+def _locked_resident_snapshot(vault_root: Path) -> Iterator[bool]:
+    """Lock one existing vault generation without creating an absent vault."""
+
+    try:
+        os.lstat(vault_root)
+    except FileNotFoundError:
+        yield False
+        return
 
     with (
         exclusive_lock(vault_root / ".gsv/locks/global.lock"),
         exclusive_lock(vault_root / ".gsv/locks/document-mind.lock"),
         exclusive_lock(vault_root / ".gsv/locks/resident-guidance.lock"),
     ):
+        yield True
+
+
+def read_resident_guidance(vault_root: Path) -> dict[str, Any]:
+    """Read exact resident AGENTS guidance through one bounded no-follow path."""
+
+    with _locked_resident_snapshot(vault_root) as vault_present:
+        if not vault_present:
+            raise ValidationError("resident AGENTS guidance is missing")
         recover_interrupted_guidance_projection(vault_root)
         content = _read_resident_file(
             vault_root,
@@ -260,11 +276,19 @@ def read_resident_guidance(vault_root: Path) -> dict[str, Any]:
 def resident_context_status(vault_root: Path) -> dict[str, Any]:
     """Return content-free activation status for imported guidance and skills."""
 
-    with (
-        exclusive_lock(vault_root / ".gsv/locks/global.lock"),
-        exclusive_lock(vault_root / ".gsv/locks/document-mind.lock"),
-        exclusive_lock(vault_root / ".gsv/locks/resident-guidance.lock"),
-    ):
+    with _locked_resident_snapshot(vault_root) as vault_present:
+        if not vault_present:
+            return {
+                "available": False,
+                "excluded_paths": [LEGACY_RESIDENT_CONTROL.as_posix()],
+                "format_version": 1,
+                "guidance": {
+                    "path": RESIDENT_GUIDANCE.as_posix(),
+                    "present": False,
+                },
+                "skills": [],
+                "shared_files": [],
+            }
         recover_interrupted_guidance_projection(vault_root)
         guidance = _read_resident_file(
             vault_root,
