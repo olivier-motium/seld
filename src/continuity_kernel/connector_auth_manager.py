@@ -395,6 +395,14 @@ class ConnectorAuthManager:
                     lock_timeout_seconds=remaining(),
                     updated_at=now,
                 )
+                credential = OAuthCredential.from_bytes(resolved.value)
+                credential = self._canonicalize_oauth_credential(metadata, credential)
+                self._validate_oauth_credential(metadata, credential)
+                return ResolvedOAuthAccessToken(
+                    access_token=credential.access_token,
+                    state=resolved.state,
+                    scopes=credential.scopes,
+                )
             except OAuthTokenEndpointError as exc:
                 health = (
                     ConnectionHealth.REAUTHORIZATION_REQUIRED
@@ -418,14 +426,16 @@ class ConnectorAuthManager:
                     ),
                 )
                 raise
-            credential = OAuthCredential.from_bytes(resolved.value)
-            credential = self._canonicalize_oauth_credential(metadata, credential)
-            self._validate_oauth_credential(metadata, credential)
-            return ResolvedOAuthAccessToken(
-                access_token=credential.access_token,
-                state=resolved.state,
-                scopes=credential.scopes,
-            )
+            except OAuthPermissionGrantError:
+                self._mark_health(
+                    metadata.connection_id,
+                    ConnectionHealth.REAUTHORIZATION_REQUIRED,
+                    observed_at=max(
+                        now,
+                        metadata.updated_at + timedelta(microseconds=1),
+                    ),
+                )
+                raise
 
     def inspect_custody(self, connection: ConnectionMetadata) -> CustodyStatus:
         """Parse-validate one host credential without requiring verified identity."""

@@ -1554,6 +1554,39 @@ def test_gmail_purge_selection_reports_a_missing_supplemental_grant(tmp_path: Pa
     assert manager.tokens.state(CONNECTION_ID) is None
 
 
+def test_runtime_permission_grant_drift_marks_reauthorization_required(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    before = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert before is not None
+    assert before.health is ConnectionHealth.READY
+    original = _import_oauth_credential(manager, _expired_credential())
+    drifted = replace(
+        _expired_credential(),
+        access_token="drifted-access",
+        scopes=(GOOGLE_SCOPE, "https://www.googleapis.com/auth/drive"),
+        expires_at=BASE_TIME + timedelta(hours=1),
+    )
+    manager.tokens.update(
+        CONNECTION_ID,
+        expected_version=original.version,
+        value=drifted.to_bytes(),
+        updated_at=BASE_TIME,
+    )
+
+    with pytest.raises(OAuthPermissionGrantError) as failure:
+        manager.resolve_oauth_access_token_state(
+            CONNECTION_ID,
+            observed_at=BASE_TIME,
+        )
+
+    assert failure.value.reason == "outside_selected_tier"
+    connection = manager.vault.get_connection_snapshot().connection(CONNECTION_ID)
+    assert connection is not None
+    assert connection.health is ConnectionHealth.REAUTHORIZATION_REQUIRED
+
+
 def test_gmail_purge_scope_satisfies_modify_but_retains_the_settings_grant(
     tmp_path: Path,
 ) -> None:
