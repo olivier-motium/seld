@@ -141,7 +141,33 @@ def sense_sweep(
                 _within_budget(monotonic, deadline)
                 snapshot = active_vault.get_source_snapshot()
                 counts["selected"] = len(snapshot.selected_sources)
-                due_source_ids = order_due_sources(snapshot, observed_at=now)
+                deadlines: dict[str, datetime] = {}
+                existing_incident_keys = {
+                    signal.event_key
+                    for signal in ResidentSignalStore(active_vault.root).list().signals
+                    if signal.event_key and signal.event_key.startswith("source-incident:")
+                }
+                changed_incidents: set[str] = set()
+                for source_id in snapshot.selected_sources:
+                    obs = snapshot.observation(source_id)
+                    if source_id == "slack" and obs is not None and obs.last_success_at is not None:
+                        deadlines["slack"] = (
+                            parse_time(obs.last_success_at) + get_recipe("slack").proof_ttl
+                        )
+                    if (
+                        obs is not None
+                        and obs.result is SourceResult.FAILURE
+                        and obs.error_code in AUTH_OR_TOOL_INCIDENT_ERROR_CODES
+                    ):
+                        key = f"source-incident:{source_id}:{_error_fingerprint(obs)}"
+                        if key not in existing_incident_keys:
+                            changed_incidents.add(source_id)
+                due_source_ids = order_due_sources(
+                    snapshot,
+                    observed_at=now,
+                    credential_deadlines=deadlines,
+                    changed_incident_sources=changed_incidents,
+                )
                 for source_id in due_source_ids:
                     _within_budget(monotonic, deadline)
                     observation = snapshot.observation(source_id)
@@ -315,25 +341,22 @@ def order_due_sources(
             due_sources.append(source_id)
             continue
 
-        if observation.last_success_at is None:
-            if observation.result is SourceResult.FAILURE:
+        if observation.result is SourceResult.FAILURE:
+            if is_changed_incident:
+                due_sources.append(source_id)
+            else:
                 attempted = parse_time(observation.attempted_at)
                 ttl = get_recipe(source_id).proof_ttl
                 if now >= attempted + ttl:
                     due_sources.append(source_id)
-            else:
-                due_sources.append(source_id)
+            continue
+
+        if observation.last_success_at is None:
+            due_sources.append(source_id)
             continue
 
         if observation.completeness is SourceCompleteness.PARTIAL:
             due_sources.append(source_id)
-            continue
-
-        if observation.result is SourceResult.FAILURE:
-            attempted = parse_time(observation.attempted_at)
-            ttl = get_recipe(source_id).proof_ttl
-            if now >= attempted + ttl:
-                due_sources.append(source_id)
             continue
 
         due_at = parse_time(observation.last_success_at) + get_recipe(source_id).proof_ttl
@@ -410,8 +433,41 @@ def _source_due_at(source_id: str, observation: SourceObservation | None) -> dat
     return None
 
 
+AUTH_OR_TOOL_INCIDENT_ERROR_CODES: Final = frozenset(
+    {
+        "auth_expired",
+        "auth_required",
+        "identity_mismatch",
+        "local_path_rejected",
+        "permission_denied",
+        "policy_blocked",
+        "secret_quarantined",
+        "tool_absent",
+    }
+)
+
+
+def _error_fingerprint(observation: SourceObservation) -> str:
+    parts = (
+        str(observation.error_code or ""),
+        str(observation.attempted_tool_fingerprint or observation.tool_fingerprint or ""),
+        str(observation.account_fingerprint or ""),
+        str(observation.host_fingerprint or ""),
+        str(observation.recipe_version or ""),
+    )
+    payload = ":".join(parts).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:24]
+
+
 def _source_event_key(source_id: str, observation: SourceObservation | None) -> str:
-    anchor = observation.attempted_at if observation is not None else "never-read"
+    if observation is None:
+        return f"source-due:{source_id}:{get_recipe(source_id).recipe_version}:never-read"
+    if (
+        observation.result is SourceResult.FAILURE
+        and observation.error_code in AUTH_OR_TOOL_INCIDENT_ERROR_CODES
+    ):
+        return f"source-incident:{source_id}:{_error_fingerprint(observation)}"
+    anchor = observation.last_success_at or observation.attempted_at
     return f"source-due:{source_id}:{get_recipe(source_id).recipe_version}:{anchor}"
 
 

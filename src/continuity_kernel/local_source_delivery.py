@@ -510,13 +510,16 @@ class LocalSourceDelivery:
                 f"local source replacement requires disposition {FORWARD_ONLY_RESET} "
                 f"or {DISCARD_STALE_DELIVERY}"
             )
-        if disposition == DISCARD_STALE_DELIVERY and (
-            expected_source_revision is None
-            or _REVISION.fullmatch(expected_source_revision) is None
-        ):
-            raise ValidationError(
-                "discard_stale_delivery requires a valid expected_source_revision"
-            )
+        if disposition == DISCARD_STALE_DELIVERY:
+            if source != "apple_messages":
+                raise ValidationError("discard_stale_delivery is only supported for apple_messages")
+            if (
+                expected_source_revision is None
+                or _REVISION.fullmatch(expected_source_revision) is None
+            ):
+                raise ValidationError(
+                    "discard_stale_delivery requires a valid expected_source_revision"
+                )
         self._selected_snapshot(source)
         binding = self._required_binding(source)
         with self._locked_storage(binding, create=True) as store:
@@ -570,8 +573,46 @@ class LocalSourceDelivery:
             ):
                 raise ConflictError("local source store identity has not changed")
             if disposition == DISCARD_STALE_DELIVERY:
+                if source != "apple_messages":
+                    raise ValidationError(
+                        "discard_stale_delivery is only supported for apple_messages"
+                    )
                 if state.pending_token is None:
                     raise ConflictError("no local source delivery is pending to discard")
+                prepared = _decode_token(state.pending_token, binding)
+                self._validate_prepared_state(state, prepared)
+                content_changed = False
+                try:
+                    delta = self._replay_delta(
+                        source,
+                        cursor=state.cursor,
+                        target_cursor=prepared.target_cursor,
+                        complete=prepared.completeness == "complete",
+                        limit=prepared.limit,
+                        store_root=store_root,
+                    )
+                    self._verify_replayed_delta(prepared, delta)
+                    if prepared.adapter_token is not None:
+                        self._verify_prepared_delivery(
+                            prepared,
+                            state.cursor,
+                            store_root=store_root,
+                        )
+                except ContinuityError as exc:
+                    exc_msg = str(exc).lower()
+                    if (
+                        "content changed" in exc_msg
+                        or "prefix changed" in exc_msg
+                        or "checkpoint changed" in exc_msg
+                    ):
+                        content_changed = True
+                    else:
+                        raise
+                if not content_changed:
+                    raise ConflictError(
+                        "local source pending delivery is healthy and does not have "
+                        "delivered content changed"
+                    )
                 snapshot = self.vault.get_source_snapshot()
                 if expected_source_revision != snapshot.revision:
                     raise ConflictError(
