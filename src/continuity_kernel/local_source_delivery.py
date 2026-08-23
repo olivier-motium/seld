@@ -602,11 +602,9 @@ class LocalSourceDelivery:
                             store_root=store_root,
                         )
                 except ContinuityError as exc:
-                    exc_msg = str(exc).lower()
                     if (
-                        "content changed" in exc_msg
-                        or "prefix changed" in exc_msg
-                        or "checkpoint changed" in exc_msg
+                        str(exc).strip()
+                        == "Apple Messages delivered content changed before acknowledgement"
                     ):
                         content_changed = True
                     else:

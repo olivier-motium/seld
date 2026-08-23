@@ -574,3 +574,48 @@ def test_apple_messages_discard_recovery_rejects_complete_observation(
             expected_source_revision=complete_obs_rev,
             actor_ref="task-apple-complete",
         )
+
+
+def test_apple_messages_discard_stale_delivery_rejects_non_content_changed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preferences = tmp_path / "test-home/Library/Preferences/com.apple.imservice.ids.iMessage.plist"
+    preferences.parent.mkdir(parents=True, exist_ok=True)
+    preferences.write_bytes(plistlib.dumps({"ActiveAccounts": ["test-active-account"]}))
+    monkeypatch.setattr(apple_adapter, "default_account_preferences", lambda: preferences)
+
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Apple prefix error test")
+    vault.select_sources(expected_revision="absent", sources=("apple_messages",))
+
+    store = tmp_path / "Messages"
+    database = _apple_store(store)
+    delivery = LocalSourceDelivery(vault, store_root=store)
+    delivery.baseline("apple_messages")
+
+    _append_apple(database, "message before prefix error")
+    delivery.poll("apple_messages")
+    before = delivery.status("apple_messages")
+    assert before["pending"] is True
+
+    # Simulate prefix changed or store metadata error during replay
+    def failing_replay(*args: Any, **kwargs: Any) -> None:
+        raise ContinuityError("Apple Messages prefix changed unexpectedly")
+
+    monkeypatch.setattr(delivery, "_replay_delta", failing_replay)
+
+    with pytest.raises(ContinuityError, match="prefix changed unexpectedly"):
+        delivery.rebaseline(
+            "apple_messages",
+            expected_checkpoint_digest=cast(str, before["checkpoint_digest"]),
+            expected_sequence=cast(int, before["sequence"]),
+            disposition=DISCARD_STALE_DELIVERY,
+            expected_source_revision=vault.get_source_snapshot().revision,
+            actor_ref="task-apple-prefix-error",
+        )
+
+    # Pending delivery remains untouched
+    after = delivery.status("apple_messages")
+    assert after["pending"] is True
+    assert after["checkpoint_digest"] == before["checkpoint_digest"]
+    assert after["sequence"] == before["sequence"]
