@@ -489,6 +489,7 @@ def _call(
                 dispatch_revision=_optional_string(values, "dispatch_revision"),
                 blocker_owner=_optional_string(values, "blocker_owner"),
                 blocker_condition=_optional_string(values, "blocker_condition"),
+                agent_run=_optional_string(values, "agent_run"),
                 active_thread_id=_optional_string(values, "active_thread_id"),
                 superseded_by=_optional_string(values, "superseded_by"),
                 project=_optional_string(values, "project"),
@@ -519,6 +520,7 @@ def _call(
                 dispatch_revision=_optional_string(values, "dispatch_revision"),
                 blocker_owner=_optional_string(values, "blocker_owner"),
                 blocker_condition=_optional_string(values, "blocker_condition"),
+                agent_run=_optional_string(values, "agent_run"),
                 active_thread_id=_optional_string(values, "active_thread_id"),
                 superseded_by=_optional_string(values, "superseded_by"),
                 project=_optional_string(values, "project"),
@@ -536,6 +538,7 @@ def _call(
                 clear_dispatch_revision=_boolean(values, "clear_dispatch_revision"),
                 clear_blocker_owner=_boolean(values, "clear_blocker_owner"),
                 clear_blocker_condition=_boolean(values, "clear_blocker_condition"),
+                clear_agent_run=_boolean(values, "clear_agent_run"),
                 clear_active_thread_id=_boolean(values, "clear_active_thread_id"),
                 clear_superseded_by=_boolean(values, "clear_superseded_by"),
                 clear_project=_boolean(values, "clear_project"),
@@ -569,6 +572,7 @@ def _call(
             progress_check_by=_optional_string(values, "progress_check_by"),
             blocker_owner=_optional_string(values, "blocker_owner"),
             blocker_condition=_optional_string(values, "blocker_condition"),
+            agent_run=_optional_string(values, "agent_run"),
             project=_optional_string(values, "project"),
             workspace=_optional_string(values, "workspace"),
             observed_at=_optional_time(values, "observed_at"),
@@ -1692,6 +1696,7 @@ TOOLS: Final = [
         {
             "id": TEXT,
             "active_thread_id": TASK_ACTIVE_THREAD_ID,
+            "agent_run": {"enum": ["yes", "no"], "type": "string"},
             "attention_at": TEXT,
             "blocker_condition": TEXT,
             "blocker_owner": TEXT,
@@ -1726,11 +1731,13 @@ TOOLS: Final = [
             "add_entity_links": TASK_ENTITY_LINKS,
             "add_refs": TASK_REFS,
             "active_thread_id": TASK_ACTIVE_THREAD_ID,
+            "agent_run": {"enum": ["yes", "no"], "type": "string"},
             "attention_at": TEXT,
             "blocker_condition": TEXT,
             "blocker_owner": TEXT,
             "claim_by": TEXT,
             "clear_active_thread_id": BOOLEAN,
+            "clear_agent_run": BOOLEAN,
             "clear_attention_at": BOOLEAN,
             "clear_blocker_condition": BOOLEAN,
             "clear_blocker_owner": BOOLEAN,
@@ -1780,6 +1787,7 @@ TOOLS: Final = [
             "identity is inferred."
         ),
         {
+            "agent_run": {"enum": ["yes", "no"], "type": "string"},
             "authoring_seat": TEXT,
             "blocker_condition": TEXT,
             "blocker_owner": TEXT,
@@ -1805,7 +1813,7 @@ TOOLS: Final = [
     _tool(
         "gsv_dispatch_eligible",
         (
-            "List every ready task with an explicit typed target that is unblocked and unclaimed. "
+            "List every ready, unblocked, unclaimed task with agent_run=yes and next_actor=agent. "
             "The result is ordered by authored rank, then creation time."
         ),
         {},

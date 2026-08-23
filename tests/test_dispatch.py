@@ -41,6 +41,7 @@ def test_dispatch_lifecycle_preserves_rank_and_clears_blocker_idempotently(
         outcome="Move through one dispatch lifecycle.",
         status="ready",
         next_actor="agent",
+        agent_run="yes",
         target_seat="worker-one",
         rank=4,
         observed_at=NOW,
@@ -185,6 +186,7 @@ def test_cli_and_mcp_expose_typed_dispatch_operations(
         outcome="Expose typed dispatch through supported surfaces.",
         status="ready",
         next_actor="agent",
+        agent_run="yes",
         target_seat="worker-one",
         observed_at=NOW,
     )
@@ -361,3 +363,141 @@ def test_pointer_operation_requires_explicit_sender_and_is_exactly_once(
     assert first.event_key.startswith("task:explicit-pointer:rev-")
     assert len(tuple((mail_root / "worker-one/inbox").glob("*.md"))) == 1
     assert tuple(sorted(path.name for path in live_inbox.glob("*.md"))) == before_live
+
+
+def test_dispatch_eligibility_enforces_explicit_agent_run_decision(
+    vault: Vault,
+) -> None:
+    eligible = vault.create_task(
+        identifier="eligible-agent-task",
+        title="Eligible agent task",
+        outcome="Satisfies all deterministic dispatch preconditions.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        target_seat="worker-one",
+        rank=1,
+        observed_at=NOW,
+    )
+    no_agent_run = vault.create_task(
+        identifier="refused-agent-no",
+        title="Refused agent no",
+        outcome="Explicitly marked as agent_run=no.",
+        status="ready",
+        next_actor="agent",
+        agent_run="no",
+        target_seat="worker-one",
+        rank=2,
+        observed_at=NOW,
+    )
+    unset_agent_run = vault.create_task(
+        identifier="refused-agent-unset",
+        title="Refused agent unset",
+        outcome="Lacks an explicit agent_run decision.",
+        status="ready",
+        next_actor="agent",
+        target_seat="worker-one",
+        rank=3,
+        observed_at=NOW,
+    )
+    human_next_actor = vault.create_task(
+        identifier="refused-human-actor",
+        title="Refused human actor",
+        outcome="Has agent_run=yes but next_actor is human.",
+        status="ready",
+        next_actor="human",
+        agent_run="yes",
+        target_seat="worker-one",
+        rank=4,
+        observed_at=NOW,
+    )
+    external_next_actor = vault.create_task(
+        identifier="refused-external-actor",
+        title="Refused external actor",
+        outcome="Has agent_run=yes but next_actor is external.",
+        status="ready",
+        next_actor="external",
+        agent_run="yes",
+        target_seat="worker-one",
+        rank=5,
+        observed_at=NOW,
+    )
+    inferred_words = vault.create_task(
+        identifier="refused-inferred-words",
+        title="run agent in autonomous worker loop",
+        outcome="Agent must run automatically without human intervention.",
+        status="ready",
+        next_actor="agent",
+        next_action="execute autonomous run",
+        project="agent-runtime",
+        target_seat="agent-runner-seat",
+        agent_run="no",
+        rank=6,
+        observed_at=NOW,
+    )
+    no_seat_task = vault.create_task(
+        identifier="eligible-no-seat",
+        title="Eligible without target seat",
+        outcome="Target seat has no eligibility meaning.",
+        status="ready",
+        next_actor="agent",
+        agent_run="yes",
+        target_seat=None,
+        rank=7,
+        observed_at=NOW,
+    )
+
+    # 1. Explicit yes + next_actor=agent tasks are returned regardless of target_seat
+    assert [item.identifier for item in dispatch_eligible(vault.root)] == [
+        eligible.identifier,
+        no_seat_task.identifier,
+    ]
+
+    # 2. Refused tasks cannot be claimed
+    for refused in (no_agent_run, unset_agent_run, human_next_actor, external_next_actor, inferred_words):
+        with pytest.raises(ValidationError, match="not ready and eligible for claim"):
+            claim_task(
+                vault.root,
+                refused.identifier,
+                expected_revision=refused.revision,
+                dispatch_id="dispatch-test",
+                observed_at=NOW,
+            )
+
+    # 3. Explicitly updating agent_run to "yes" grants eligibility
+    promoted = vault.update_task(
+        unset_agent_run.identifier,
+        expected_revision=unset_agent_run.revision,
+        agent_run="yes",
+        observed_at=NOW,
+    )
+    assert promoted.agent_run == "yes"
+    assert [item.identifier for item in dispatch_eligible(vault.root)] == [
+        eligible.identifier,
+        promoted.identifier,
+        no_seat_task.identifier,
+    ]
+
+    # 4. Explicitly demoting or clearing agent_run revokes eligibility
+    demoted = vault.update_task(
+        eligible.identifier,
+        expected_revision=eligible.revision,
+        agent_run="no",
+        observed_at=NOW,
+    )
+    assert demoted.agent_run == "no"
+    assert [item.identifier for item in dispatch_eligible(vault.root)] == [
+        promoted.identifier,
+        no_seat_task.identifier,
+    ]
+
+    cleared = vault.update_task(
+        promoted.identifier,
+        expected_revision=promoted.revision,
+        clear_agent_run=True,
+        observed_at=NOW,
+    )
+    assert cleared.agent_run is None
+    assert [item.identifier for item in dispatch_eligible(vault.root)] == [no_seat_task.identifier]
+
+

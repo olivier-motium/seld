@@ -46,7 +46,7 @@ def claim_task(
     dispatch_id: str,
     observed_at: datetime | None = None,
 ) -> Task:
-    """Claim one ready typed-target task by exact revision and dispatch ID."""
+    """Claim one ready task with agent_run=yes and next_actor=agent by exact revision and dispatch ID."""
 
     clean_dispatch = _dispatch_id(dispatch_id)
     clean_revision = _dispatch_revision(expected_revision)
@@ -59,7 +59,7 @@ def claim_task(
     if current.dispatch_id is not None or current.dispatch_revision is not None:
         raise ValidationError("task is already claimed by another dispatch")
     if not _eligible_for_claim(current):
-        raise ValidationError("task is not ready, typed-target, and unblocked")
+        raise ValidationError("task is not ready and eligible for claim")
 
     claimed = vault.update_task(
         current.identifier,
@@ -319,7 +319,7 @@ def project_task_attention(
 
 
 def dispatch_eligible(project_root: Path) -> tuple[Task, ...]:
-    """Return every ready, typed-target, unblocked, unclaimed task in queue order."""
+    """Return every ready, unblocked, unclaimed task with agent_run=yes and next_actor=agent in queue order."""
 
     vault = Vault(project_root)
     eligible = tuple(task for task in vault.list_tasks() if _eligible_for_claim(task))
@@ -338,7 +338,12 @@ def dispatch_eligible(project_root: Path) -> tuple[Task, ...]:
 
 def _eligible_for_claim(task: Task) -> bool:
     return (
-        claim_by_eligible(task.status, task.target_seat, task.waiting_on)
+        task.status == "ready"
+        and task.waiting_on is None
+        and task.next_actor == "agent"
+        and task.agent_run == "yes"
+        and task.blocker_owner is None
+        and task.blocker_condition is None
         and task.dispatch_id is None
         and task.dispatch_revision is None
         and task.active_thread_id is None

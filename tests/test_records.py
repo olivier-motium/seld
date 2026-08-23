@@ -401,3 +401,53 @@ def test_empty_actor_is_not_a_silent_clear_operation() -> None:
             next_actor="",
             observed_at=NOW,
         )
+
+
+def test_agent_run_field_serialization_and_validation() -> None:
+    yes_task = new_task(
+        identifier="agent-run-yes",
+        title="Agent run yes",
+        outcome="Explicitly run agent.",
+        agent_run="yes",
+        observed_at=NOW,
+    )
+    no_task = new_task(
+        identifier="agent-run-no",
+        title="Agent run no",
+        outcome="Explicitly refuse agent.",
+        agent_run="no",
+        observed_at=NOW,
+    )
+    unset_task = new_task(
+        identifier="agent-run-unset",
+        title="Agent run unset",
+        outcome="Unset agent run.",
+        observed_at=NOW,
+    )
+
+    yes_rendered = render_task(yes_task)
+    assert '"agent_run":"yes"' in yes_rendered.splitlines()[0]
+    assert '"version":4' in yes_rendered.splitlines()[0]
+    assert parse_task(yes_rendered) == yes_task
+    assert parse_task(yes_rendered).agent_run == "yes"
+
+    no_rendered = render_task(no_task)
+    assert '"agent_run":"no"' in no_rendered.splitlines()[0]
+    assert '"version":4' in no_rendered.splitlines()[0]
+    assert parse_task(no_rendered) == no_task
+    assert parse_task(no_rendered).agent_run == "no"
+
+    unset_rendered = render_task(unset_task)
+    assert "agent_run" not in unset_rendered.splitlines()[0]
+    assert parse_task(unset_rendered).agent_run is None
+
+    for invalid in ("maybe", "true", "false", "1", "0", ""):
+        with pytest.raises(ValidationError, match="invalid agent run"):
+            new_task(
+                identifier="invalid-agent-run",
+                title="Invalid agent run",
+                outcome="Outcome.",
+                agent_run=invalid,
+                observed_at=NOW,
+            )
+

@@ -103,6 +103,7 @@ from continuity_kernel.records import (
     WorkThreadEntityLink,
     WorkThreadTaskLink,
     actor,
+    agent_run_value,
     body_text,
     calendar_date,
     canonical_id,
@@ -426,6 +427,7 @@ class Vault:
         dispatch_revision: str | None = None,
         blocker_owner: str | None = None,
         blocker_condition: str | None = None,
+        agent_run: str | None = None,
         active_thread_id: str | None = None,
         superseded_by: str | None = None,
         project: str | None = None,
@@ -443,6 +445,7 @@ class Vault:
         clear_dispatch_revision: bool = False,
         clear_blocker_owner: bool = False,
         clear_blocker_condition: bool = False,
+        clear_agent_run: bool = False,
         clear_active_thread_id: bool = False,
         clear_superseded_by: bool = False,
         clear_project: bool = False,
@@ -495,6 +498,7 @@ class Vault:
                 clear_blocker_condition,
                 "blocker condition",
             )
+            _exclusive_choice(agent_run, clear_agent_run, "agent run")
 
             target_status = task_status(status) if status is not None else before.status
             target_actor = (
@@ -569,6 +573,13 @@ class Vault:
                 else None
                 if clear_blocker_condition
                 else before.blocker_condition
+            )
+            target_agent_run = (
+                agent_run_value(agent_run)
+                if agent_run is not None
+                else None
+                if clear_agent_run
+                else before.agent_run
             )
             if target_blocker_condition is not None and target_waiting is None:
                 target_waiting = target_blocker_condition
@@ -746,6 +757,7 @@ class Vault:
                         before.blocker_condition,
                         target_blocker_condition,
                     ),
+                    ("agent run", before.agent_run, target_agent_run),
                     ("active Codex hand", before.active_thread_id, target_active_thread_id),
                     ("superseding task", before.superseded_by, target_superseded_by),
                     ("project", before.project, target_project),
@@ -777,6 +789,7 @@ class Vault:
                     target_dispatch_revision is not None,
                     target_blocker_owner is not None,
                     target_blocker_condition is not None,
+                    target_agent_run is not None,
                     clean_note is not None,
                 )
             )
@@ -805,6 +818,7 @@ class Vault:
                 dispatch_revision=target_dispatch_revision,
                 blocker_owner=target_blocker_owner,
                 blocker_condition=target_blocker_condition,
+                agent_run=target_agent_run,
                 active_thread_id=target_active_thread_id,
                 refs=refs,
                 superseded_by=target_superseded_by,

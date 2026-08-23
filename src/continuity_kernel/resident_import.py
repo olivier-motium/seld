@@ -148,6 +148,7 @@ _TASK_KEYS: Final = frozenset(
     }
 )
 _TASK_DISPATCH_KEYS: Final = _TASK_KEYS | {
+    "agent_run",
     "blocker_condition",
     "blocker_owner",
     "claim_by",
@@ -995,6 +996,7 @@ def _task_from_private(value: object) -> Task:
         dispatch_revision=raw.get("dispatch_revision"),
         blocker_owner=raw.get("blocker_owner"),
         blocker_condition=raw.get("blocker_condition"),
+        agent_run=raw.get("agent_run"),
         active_thread_id=raw["active_thread_id"],
         refs=_string_tuple(raw["refs"], "task refs"),
         created_at=raw["created_at"],
