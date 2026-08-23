@@ -15,7 +15,11 @@ from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, Protocol, cast
 
-from continuity_kernel.atomic import PINNED_PATH_ROOT_SUPPORTED, read_regular_file
+from continuity_kernel.atomic import (
+    PINNED_PATH_ROOT_SUPPORTED,
+    exclusive_lock,
+    read_regular_file,
+)
 from continuity_kernel.errors import ConflictError, ValidationError
 from continuity_kernel.privacy import AwarenessDecision, screen_local_content
 from continuity_kernel.records import (
@@ -135,81 +139,105 @@ def execution_bindings(source: _ExecutionBindingSource) -> dict[str, Any]:
 
 
 def read_resident_guidance(vault_root: Path) -> dict[str, Any]:
-    """Read exact imported AGENTS guidance through one bounded no-follow path."""
+    """Read exact resident AGENTS guidance through one bounded no-follow path."""
 
-    content = _read_resident_file(
-        vault_root,
-        RESIDENT_GUIDANCE,
-        label="imported resident AGENTS guidance",
-        max_bytes=MAX_GUIDANCE_BYTES,
-        missing_ok=False,
-    )
-    assert content is not None
-    text = validate_imported_resident_content(
-        content,
-        label="imported resident AGENTS guidance",
-    )
-    return {
-        "bytes": len(content),
-        "content": text,
-        "path": RESIDENT_GUIDANCE.as_posix(),
-        "sha256": sha256(content).hexdigest(),
-    }
+    with (
+        exclusive_lock(vault_root / ".gsv/locks/global.lock"),
+        exclusive_lock(vault_root / ".gsv/locks/resident-guidance.lock"),
+    ):
+        content = _read_resident_file(
+            vault_root,
+            RESIDENT_GUIDANCE,
+            label="resident AGENTS guidance",
+            max_bytes=MAX_GUIDANCE_BYTES,
+            missing_ok=False,
+        )
+        assert content is not None
+        try:
+            text = content.decode("utf-8")
+        except UnicodeError as exc:
+            raise ValidationError("resident AGENTS guidance must be UTF-8 text") from exc
+
+        marker_path = vault_root / GUIDANCE_PROJECTION_MARKER
+        if not marker_path.exists():
+            text = validate_imported_resident_content(
+                content,
+                label="imported resident AGENTS guidance",
+            )
+        return {
+            "bytes": len(content),
+            "content": text,
+            "path": RESIDENT_GUIDANCE.as_posix(),
+            "sha256": sha256(content).hexdigest(),
+        }
 
 
 def resident_context_status(vault_root: Path) -> dict[str, Any]:
     """Return content-free activation status for imported guidance and skills."""
 
-    guidance = _read_resident_file(
-        vault_root,
-        RESIDENT_GUIDANCE,
-        label="imported resident AGENTS guidance",
-        max_bytes=MAX_GUIDANCE_BYTES,
-        missing_ok=True,
-    )
-    guidance_status: dict[str, Any]
-    if guidance is None:
-        guidance_status = {"path": RESIDENT_GUIDANCE.as_posix(), "present": False}
-    else:
-        validate_imported_resident_content(
-            guidance,
-            label="imported resident AGENTS guidance",
+    with (
+        exclusive_lock(vault_root / ".gsv/locks/global.lock"),
+        exclusive_lock(vault_root / ".gsv/locks/resident-guidance.lock"),
+    ):
+        guidance = _read_resident_file(
+            vault_root,
+            RESIDENT_GUIDANCE,
+            label="resident AGENTS guidance",
+            max_bytes=MAX_GUIDANCE_BYTES,
+            missing_ok=True,
         )
-        guidance_status = {
-            "bytes": len(guidance),
-            "path": RESIDENT_GUIDANCE.as_posix(),
-            "present": True,
-            "sha256": sha256(guidance).hexdigest(),
+        guidance_status: dict[str, Any]
+        if guidance is None:
+            guidance_status = {"path": RESIDENT_GUIDANCE.as_posix(), "present": False}
+        else:
+            try:
+                guidance.decode("utf-8")
+                marker_path = vault_root / GUIDANCE_PROJECTION_MARKER
+                if not marker_path.exists():
+                    validate_imported_resident_content(
+                        guidance,
+                        label="imported resident AGENTS guidance",
+                    )
+                guidance_status = {
+                    "bytes": len(guidance),
+                    "path": RESIDENT_GUIDANCE.as_posix(),
+                    "present": True,
+                    "sha256": sha256(guidance).hexdigest(),
+                }
+            except (ValidationError, UnicodeError) as exc:
+                guidance_status = {
+                    "bytes": len(guidance),
+                    "error": str(exc),
+                    "path": RESIDENT_GUIDANCE.as_posix(),
+                    "present": True,
+                    "sha256": sha256(guidance).hexdigest(),
+                }
+        skills, shared_files = _resident_skill_inventory(vault_root)
+        return {
+            "available": guidance is not None or bool(skills),
+            "excluded_paths": [LEGACY_RESIDENT_CONTROL.as_posix()],
+            "format_version": 1,
+            "guidance": guidance_status,
+            "skills": [
+                {
+                    "files": len(skill.files),
+                    "directory": skill.directory,
+                    "name": skill.name,
+                    "sha256": skill.sha256,
+                    "total_bytes": skill.total_bytes,
+                }
+                for skill in skills
+            ],
+            "shared_files": [
+                {
+                    "bytes": len(item.content),
+                    "path": path,
+                    "sha256": sha256(item.content).hexdigest(),
+                }
+                for path, item in sorted(shared_files.items())
+            ],
+            "skills_total": len(skills),
         }
-    skills, shared_files = _resident_skill_inventory(vault_root)
-    return {
-        "available": guidance is not None or bool(skills),
-        # Legacy private-host control projections are deliberately inert. Host
-        # task and hand identity must be established by installed onboarding,
-        # never revived from imported vault context.
-        "excluded_paths": [LEGACY_RESIDENT_CONTROL.as_posix()],
-        "format_version": 1,
-        "guidance": guidance_status,
-        "skills": [
-            {
-                "files": len(skill.files),
-                "directory": skill.directory,
-                "name": skill.name,
-                "sha256": skill.sha256,
-                "total_bytes": skill.total_bytes,
-            }
-            for skill in skills
-        ],
-        "shared_files": [
-            {
-                "bytes": len(item.content),
-                "path": path,
-                "sha256": sha256(item.content).hexdigest(),
-            }
-            for path, item in sorted(shared_files.items())
-        ],
-        "skills_total": len(skills),
-    }
 
 
 def resident_skills(vault_root: Path) -> tuple[ResidentSkill, ...]:
@@ -1038,95 +1066,96 @@ def _stable_snapshot(metadata: os.stat_result) -> tuple[int, int, int, int, int]
     )
 
 
-def validate_checkout_guidance_sources(checkout_root: Path | str) -> dict[str, Any]:
+@dataclass(frozen=True)
+class GuidanceSourceFile:
+    path: str
+    relative_path: str
+    content: str
+    bytes: int
+    sha256: str
+    source_sha256: str
+    normalized_bytes: bytes
+    target_bytes: bytes
+
+
+@dataclass(frozen=True)
+class GuidanceProjectionSources:
+    checkout_root: str
+    guidance: GuidanceSourceFile
+    mind: GuidanceSourceFile
+
+
+def read_guidance_source_file(
+    checkout_root: Path,
+    relative_path: str,
+    *,
+    label: str,
+    max_bytes: int,
+) -> GuidanceSourceFile:
+    """Read and validate a bounded regular UTF-8 checkout source file."""
+
+    file_path = checkout_root / relative_path
+    if not file_path.exists():
+        raise ValidationError(f"checkout {label} is missing: {relative_path}")
+    try:
+        metadata = os.lstat(file_path)
+    except OSError as exc:
+        raise ValidationError(f"could not inspect checkout {label} {relative_path}: {exc}") from exc
+    if _is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise ValidationError(f"checkout {label} must be a regular file: {relative_path}")
+    raw_bytes = read_regular_file(
+        file_path,
+        label=f"checkout {label} {relative_path}",
+        max_bytes=max_bytes,
+    )
+    if b"\x00" in raw_bytes:
+        raise ValidationError(f"checkout {label} contains a null byte")
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValidationError(f"checkout {label} is not valid UTF-8: {exc}") from exc
+
+    normalized_text = text.rstrip() + "\n"
+    target_bytes = normalized_text.encode("utf-8")
+    if len(target_bytes) > max_bytes:
+        raise ValidationError(f"checkout {label} exceeds its size bound")
+
+    return GuidanceSourceFile(
+        path=str(file_path.resolve()),
+        relative_path=relative_path,
+        content=normalized_text,
+        bytes=len(target_bytes),
+        sha256=sha256(target_bytes).hexdigest(),
+        source_sha256=sha256(raw_bytes).hexdigest(),
+        normalized_bytes=target_bytes,
+        target_bytes=target_bytes,
+    )
+
+
+def validate_checkout_guidance_sources(
+    checkout_root: Path | str,
+) -> GuidanceProjectionSources:
     """Validate bounded canonical AGENTS.md and brain/MIND.md in an explicit checkout root."""
 
     root = Path(checkout_root)
     if not root.is_dir():
         raise ValidationError(f"checkout root is not a directory: {checkout_root}")
 
-    # Validate AGENTS.md
-    agents_path = root / GUIDANCE_SOURCE_AGENTS
-    if not agents_path.exists():
-        raise ValidationError(f"checkout guidance file is missing: {GUIDANCE_SOURCE_AGENTS}")
-    try:
-        agents_metadata = os.lstat(agents_path)
-    except OSError as exc:
-        raise ValidationError(
-            f"could not inspect checkout guidance file {GUIDANCE_SOURCE_AGENTS}: {exc}"
-        ) from exc
-    if _is_link_or_reparse(agents_metadata) or not stat.S_ISREG(agents_metadata.st_mode):
-        raise ValidationError(
-            f"checkout guidance file must be a regular file: {GUIDANCE_SOURCE_AGENTS}"
-        )
-    agents_raw_bytes = read_regular_file(
-        agents_path,
-        label="checkout guidance file AGENTS.md",
+    guidance = read_guidance_source_file(
+        root,
+        GUIDANCE_SOURCE_AGENTS,
+        label="guidance file",
         max_bytes=MAX_GUIDANCE_BYTES,
     )
-    if b"\x00" in agents_raw_bytes:
-        raise ValidationError("checkout guidance file contains a null byte")
-    agents_text = validate_imported_resident_content(
-        agents_raw_bytes,
-        label="checkout guidance file AGENTS.md",
-    )
-    normalized_agents = agents_text.rstrip() + "\n"
-    agents_bytes = normalized_agents.encode("utf-8")
-    if len(agents_bytes) > MAX_GUIDANCE_BYTES:
-        raise ValidationError("checkout guidance file exceeds its size bound")
-    agents_sha256 = sha256(agents_bytes).hexdigest()
-    raw_agents_sha256 = sha256(agents_raw_bytes).hexdigest()
-
-    # Validate brain/MIND.md
-    mind_path = root / GUIDANCE_SOURCE_MIND
-    if not mind_path.exists():
-        raise ValidationError(f"checkout document file is missing: {GUIDANCE_SOURCE_MIND}")
-    try:
-        mind_metadata = os.lstat(mind_path)
-    except OSError as exc:
-        raise ValidationError(
-            f"could not inspect checkout document file {GUIDANCE_SOURCE_MIND}: {exc}"
-        ) from exc
-    if _is_link_or_reparse(mind_metadata) or not stat.S_ISREG(mind_metadata.st_mode):
-        raise ValidationError(
-            f"checkout document file must be a regular file: {GUIDANCE_SOURCE_MIND}"
-        )
-    mind_raw_bytes = read_regular_file(
-        mind_path,
-        label="checkout document file brain/MIND.md",
+    mind = read_guidance_source_file(
+        root,
+        GUIDANCE_SOURCE_MIND,
+        label="document file",
         max_bytes=MAX_DOCUMENT_BYTES,
     )
-    if b"\x00" in mind_raw_bytes:
-        raise ValidationError("checkout document file contains a null byte")
-    mind_text = validate_imported_resident_content(
-        mind_raw_bytes,
-        label="checkout document file brain/MIND.md",
-    )
-    normalized_mind = mind_text.rstrip() + "\n"
-    mind_bytes = normalized_mind.encode("utf-8")
-    if len(mind_bytes) > MAX_DOCUMENT_BYTES:
-        raise ValidationError("checkout document file exceeds its size bound")
-    mind_sha256 = sha256(mind_bytes).hexdigest()
-    raw_mind_sha256 = sha256(mind_raw_bytes).hexdigest()
 
-    return {
-        "checkout_root": str(root.resolve()),
-        "guidance": {
-            "bytes": len(agents_bytes),
-            "content": normalized_agents,
-            "path": str(agents_path),
-            "raw_bytes": agents_bytes,
-            "relative_path": GUIDANCE_SOURCE_AGENTS,
-            "sha256": agents_sha256,
-            "source_sha256": raw_agents_sha256,
-        },
-        "mind": {
-            "bytes": len(mind_bytes),
-            "content": normalized_mind,
-            "path": str(mind_path),
-            "raw_bytes": mind_bytes,
-            "relative_path": GUIDANCE_SOURCE_MIND,
-            "sha256": mind_sha256,
-            "source_sha256": raw_mind_sha256,
-        },
-    }
+    return GuidanceProjectionSources(
+        checkout_root=str(root.resolve()),
+        guidance=guidance,
+        mind=mind,
+    )

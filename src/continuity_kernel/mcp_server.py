@@ -329,12 +329,11 @@ def _call(
         return resident_context_status(vault.root)
     if name == "gsv_resident_guidance_show":
         return read_resident_guidance(vault.root)
-    if name in ("gsv_resident_guidance_project", "gsv_guidance_project"):
+    if name == "gsv_resident_guidance_project":
         return vault.project_guidance(
             checkout_root=Path(_string(values, "checkout_root")),
-            expected_guidance_revision=_optional_string(values, "expected_guidance_revision"),
+            expected_guidance_revision=_string(values, "expected_guidance_revision"),
             expected_mind_revision=_string(values, "expected_mind_revision"),
-            expected_guidance_sha256=_optional_string(values, "expected_guidance_sha256"),
         )
     if name == "gsv_execution_bindings":
         return execution_bindings(vault)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import uuid
 from collections.abc import Callable
@@ -152,6 +153,7 @@ from continuity_kernel.records import (
     title_text,
 )
 from continuity_kernel.resident_context import (
+    GUIDANCE_PROJECTION_MARKER,
     MAX_GUIDANCE_BYTES,
     validate_checkout_guidance_sources,
 )
@@ -208,6 +210,66 @@ MAX_JOURNAL_LINE_BYTES: Final = 64 * 1024
 DEFAULT_TASK_HISTORY_KEEP: Final = 50
 RecordKind = Literal["task", "entity", "thread"]
 RecordValue = TypeVar("RecordValue", Task, Entity, WorkThread)
+_HEX_SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & 0x0400
+    )
+
+
+def _validate_guidance_projection_marker_dict(data: Any) -> bool:
+    """Strictly validate complete marker schema and all required source/target hashes."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("format_version") != 1:
+        return False
+    if not isinstance(data.get("checkout_root"), str) or not data["checkout_root"].strip():
+        return False
+    if not isinstance(data.get("projected_at"), str) or not data["projected_at"].strip():
+        return False
+
+    sources = data.get("sources")
+    if not isinstance(sources, dict):
+        return False
+    for src_name in ("AGENTS.md", "brain/MIND.md"):
+        entry = sources.get(src_name)
+        if not isinstance(entry, dict):
+            return False
+        if not isinstance(entry.get("path"), str) or not entry["path"].strip():
+            return False
+        if entry.get("relative_path") != src_name:
+            return False
+        sha = entry.get("sha256")
+        if not isinstance(sha, str) or not _HEX_SHA256.fullmatch(sha):
+            return False
+        b_count = entry.get("bytes")
+        if not isinstance(b_count, int) or b_count < 0:
+            return False
+
+    targets = data.get("vault_targets")
+    if not isinstance(targets, dict):
+        return False
+    expected_targets = (
+        ("AGENTS.md", "context/resident/AGENTS.md"),
+        ("MIND.md", "MIND.md"),
+    )
+    for tgt_name, tgt_path in expected_targets:
+        entry = targets.get(tgt_name)
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("path") != tgt_path:
+            return False
+        sha = entry.get("sha256")
+        if not isinstance(sha, str) or not _HEX_SHA256.fullmatch(sha):
+            return False
+        b_count = entry.get("bytes")
+        if not isinstance(b_count, int) or b_count < 0:
+            return False
+
+    return True
+
 
 MIND_TEMPLATE = """# Mind
 
@@ -2416,32 +2478,89 @@ class Vault:
                 direction=direction,
             )
 
+    def _recover_interrupted_guidance_projection(self) -> None:
+        """Durably recover the prior complete generation if an interrupted projection is found."""
+        intent_path = self.state / "guidance-projection-intent.json"
+        if not intent_path.exists():
+            return
+        try:
+            intent_raw = self._read_bytes(intent_path, max_bytes=MAX_DOCUMENT_BYTES)
+            intent_data = json.loads(intent_raw.decode("utf-8"))
+            if not isinstance(intent_data, dict) or intent_data.get("format_version") != 1:
+                intent_path.unlink(missing_ok=True)
+                return
+
+            guidance_target = self.root / "context/resident/AGENTS.md"
+            mind_target = self.root / "MIND.md"
+            marker_target = self.root / GUIDANCE_PROJECTION_MARKER
+
+            g_hex = intent_data.get("guidance_before_hex")
+            if g_hex is None:
+                if guidance_target.exists():
+                    guidance_target.unlink(missing_ok=True)
+            else:
+                atomic_write(guidance_target, bytes.fromhex(g_hex))
+
+            m_hex = intent_data.get("mind_before_hex")
+            if m_hex is None:
+                if mind_target.exists():
+                    mind_target.unlink(missing_ok=True)
+            else:
+                atomic_write(mind_target, bytes.fromhex(m_hex))
+
+            mk_hex = intent_data.get("marker_before_hex")
+            if mk_hex is None:
+                if marker_target.exists():
+                    marker_target.unlink(missing_ok=True)
+            else:
+                atomic_write(marker_target, bytes.fromhex(mk_hex))
+
+            intent_path.unlink(missing_ok=True)
+        except Exception as exc:
+            raise DegradedIntegrityError(
+                f"could not recover interrupted guidance projection: {exc}"
+            ) from exc
+
     def read_document(self, name: str) -> dict[str, str]:
-        path = self._document_path(name)
+        canonical_name = name.strip()
+        path = self._document_path(canonical_name)
+        if canonical_name.casefold() in ("mind.md", "mind"):
+            with (
+                exclusive_lock(self.state / "locks/global.lock"),
+                exclusive_lock(self._record_lock("document", "mind")),
+            ):
+                self._recover_interrupted_guidance_projection()
+                stored = self._read_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
+                content = stored.decode("utf-8")
+                return {"content": content, "name": path.name, "revision": sha256_bytes(stored)}
         stored = self._read_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
         content = stored.decode("utf-8")
         return {"content": content, "name": path.name, "revision": sha256_bytes(stored)}
 
     def is_guidance_managed(self) -> bool:
-        """Check if checkout guidance projection is active."""
+        """Check if valid checkout guidance projection is active."""
 
-        marker = self.state / "guidance-projection.json"
+        marker = self.root / GUIDANCE_PROJECTION_MARKER
         if not marker.exists():
             return False
         try:
             metadata = os.lstat(marker)
-            return (
-                not stat.S_ISLNK(metadata.st_mode)
-                and stat.S_ISREG(metadata.st_mode)
-                and metadata.st_size > 0
-            )
-        except OSError:
+            if (
+                _is_link_or_reparse(metadata)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size == 0
+            ):
+                return False
+            raw = self._read_bytes(marker, max_bytes=MAX_DOCUMENT_BYTES)
+            data = json.loads(raw.decode("utf-8"))
+            return _validate_guidance_projection_marker_dict(data)
+        except Exception:
             return False
 
     def read_guidance_projection(self) -> dict[str, Any] | None:
         """Read the managed guidance projection marker if active."""
 
-        marker = self.state / "guidance-projection.json"
+        marker = self.root / GUIDANCE_PROJECTION_MARKER
         if not marker.exists():
             return None
         raw = self._read_bytes(marker, max_bytes=MAX_DOCUMENT_BYTES)
@@ -2451,10 +2570,11 @@ class Vault:
         return data
 
     def write_document(self, name: str, content: str, *, expected_revision: str) -> dict[str, str]:
-        path = self._document_path(name)
+        canonical_name = name.strip()
+        path = self._document_path(canonical_name)
         if len(content.encode("utf-8")) > MAX_DOCUMENT_BYTES or "\x00" in content:
             raise ValidationError("document is too large or contains a null byte")
-        if name == "MIND.md" and self.is_guidance_managed():
+        if canonical_name.casefold() in ("mind.md", "mind") and self.is_guidance_managed():
             raise ConflictError(
                 "MIND.md is managed by checkout guidance projection; "
                 "update it through the guidance projector"
@@ -2463,7 +2583,7 @@ class Vault:
             exclusive_lock(self.state / "locks/global.lock"),
             exclusive_lock(self._record_lock("document", path.stem.lower())),
         ):
-            if name == "MIND.md" and self.is_guidance_managed():
+            if canonical_name.casefold() in ("mind.md", "mind") and self.is_guidance_managed():
                 raise ConflictError(
                     "MIND.md is managed by checkout guidance projection; "
                     "update it through the guidance projector"
@@ -2493,31 +2613,30 @@ class Vault:
         self,
         checkout_root: Path | str,
         *,
-        expected_guidance_revision: str | None = None,
+        expected_guidance_revision: str,
         expected_mind_revision: str,
-        expected_guidance_sha256: str | None = None,
         _fail_during: str | None = None,
     ) -> dict[str, Any]:
         """Project canonical AGENTS.md and brain/MIND.md atomically from a checkout root."""
 
-        expected_guidance = (
-            expected_guidance_sha256
-            if expected_guidance_sha256 is not None
-            else expected_guidance_revision
-        )
-        if expected_guidance is None:
+        if not expected_guidance_revision:
             raise ValidationError("expected guidance revision must be specified")
+        if not expected_mind_revision:
+            raise ValidationError("expected mind revision must be specified")
 
-        source_data = validate_checkout_guidance_sources(checkout_root)
+        sources = validate_checkout_guidance_sources(checkout_root)
         guidance_target = self.root / "context/resident/AGENTS.md"
         mind_target = self.root / "MIND.md"
-        marker_target = self.state / "guidance-projection.json"
+        marker_target = self.root / GUIDANCE_PROJECTION_MARKER
+        intent_target = self.state / "guidance-projection-intent.json"
 
         with (
             exclusive_lock(self.state / "locks/global.lock"),
             exclusive_lock(self._record_lock("document", "mind")),
             exclusive_lock(self.state / "locks/resident-guidance.lock"),
         ):
+            self._recover_interrupted_guidance_projection()
+
             guidance_before: bytes | None = None
             live_guidance_revision = "absent"
             if guidance_target.exists():
@@ -2534,44 +2653,40 @@ class Vault:
             if marker_target.exists():
                 marker_before = self._read_bytes(marker_target, max_bytes=MAX_DOCUMENT_BYTES)
 
-            self._expect(live_guidance_revision, expected_guidance)
+            self._expect(live_guidance_revision, expected_guidance_revision)
             self._expect(live_mind_revision, expected_mind_revision)
 
             source_recheck = validate_checkout_guidance_sources(checkout_root)
-            guidance_source_drift = (
-                source_recheck["guidance"]["source_sha256"]
-                != source_data["guidance"]["source_sha256"]
-            )
-            mind_source_drift = (
-                source_recheck["mind"]["source_sha256"] != source_data["mind"]["source_sha256"]
-            )
-            if guidance_source_drift or mind_source_drift:
+            if (
+                source_recheck.guidance.source_sha256 != sources.guidance.source_sha256
+                or source_recheck.mind.source_sha256 != sources.mind.source_sha256
+            ):
                 raise ConflictError(
                     "checkout guidance source files changed while projection was pending"
                 )
 
-            guidance_bytes = source_data["guidance"]["raw_bytes"]
-            guidance_sha256 = source_data["guidance"]["sha256"]
-            mind_bytes = source_data["mind"]["raw_bytes"]
-            mind_sha256 = source_data["mind"]["sha256"]
+            guidance_bytes = sources.guidance.target_bytes
+            guidance_sha256 = sources.guidance.sha256
+            mind_bytes = sources.mind.target_bytes
+            mind_sha256 = sources.mind.sha256
 
             now_utc = datetime.now(UTC).isoformat()
             marker_payload = {
-                "checkout_root": str(source_data["checkout_root"]),
+                "checkout_root": str(sources.checkout_root),
                 "format_version": 1,
                 "projected_at": now_utc,
                 "sources": {
                     "AGENTS.md": {
-                        "bytes": source_data["guidance"]["bytes"],
-                        "path": source_data["guidance"]["path"],
-                        "relative_path": source_data["guidance"]["relative_path"],
-                        "sha256": source_data["guidance"]["source_sha256"],
+                        "bytes": sources.guidance.bytes,
+                        "path": sources.guidance.path,
+                        "relative_path": sources.guidance.relative_path,
+                        "sha256": sources.guidance.source_sha256,
                     },
                     "brain/MIND.md": {
-                        "bytes": source_data["mind"]["bytes"],
-                        "path": source_data["mind"]["path"],
-                        "relative_path": source_data["mind"]["relative_path"],
-                        "sha256": source_data["mind"]["source_sha256"],
+                        "bytes": sources.mind.bytes,
+                        "path": sources.mind.path,
+                        "relative_path": sources.mind.relative_path,
+                        "sha256": sources.mind.source_sha256,
                     },
                 },
                 "vault_targets": {
@@ -2591,8 +2706,28 @@ class Vault:
             marker_bytes = marker_json.encode("utf-8") + b"\n"
 
             try:
-                if _fail_during == "before_publish":
-                    raise OSError("injected failure before publish")
+                if _fail_during == "before_intent":
+                    raise OSError("injected failure before intent")
+
+                intent_payload = {
+                    "format_version": 1,
+                    "guidance_before_hex": (
+                        guidance_before.hex() if guidance_before is not None else None
+                    ),
+                    "mind_before_hex": (mind_before.hex() if mind_before is not None else None),
+                    "marker_before_hex": (
+                        marker_before.hex() if marker_before is not None else None
+                    ),
+                    "target_guidance_sha256": guidance_sha256,
+                    "target_mind_sha256": mind_sha256,
+                }
+                atomic_write(
+                    intent_target,
+                    json.dumps(intent_payload).encode("utf-8") + b"\n",
+                )
+
+                if _fail_during == "after_intent":
+                    raise OSError("injected failure after intent")
 
                 (self.root / "context/resident").mkdir(parents=True, exist_ok=True)
                 (self.state / "locks").mkdir(parents=True, exist_ok=True)
@@ -2612,23 +2747,6 @@ class Vault:
                 if _fail_during == "after_marker_publish":
                     raise OSError("injected failure after marker publish")
 
-                self._event(
-                    "document.update",
-                    "MIND.md",
-                    live_mind_revision,
-                    mind_sha256,
-                )
-                self._event(
-                    "resident_guidance.project",
-                    "context/resident/AGENTS.md",
-                    live_guidance_revision,
-                    guidance_sha256,
-                )
-
-                if _fail_during == "after_audit":
-                    raise OSError("injected failure after audit")
-
-                # Readback verification
                 guidance_readback = guidance_target.read_bytes()
                 if (
                     guidance_readback != guidance_bytes
@@ -2647,26 +2765,39 @@ class Vault:
                 if _fail_during == "after_readback":
                     raise OSError("injected failure after readback")
 
+                self._event(
+                    "guidance.project",
+                    "AGENTS.md+MIND.md",
+                    f"{live_guidance_revision}+{live_mind_revision}",
+                    f"{guidance_sha256}+{mind_sha256}",
+                )
+
+                if _fail_during == "after_audit":
+                    raise OSError("injected failure after audit")
+
+                intent_target.unlink(missing_ok=True)
+
             except Exception as exc:
-                # Rollback to exact prior state
                 try:
                     if guidance_before is None:
                         if guidance_target.exists():
-                            guidance_target.unlink()
+                            guidance_target.unlink(missing_ok=True)
                     else:
                         atomic_write(guidance_target, guidance_before)
 
                     if mind_before is None:
                         if mind_target.exists():
-                            mind_target.unlink()
+                            mind_target.unlink(missing_ok=True)
                     else:
                         atomic_write(mind_target, mind_before)
 
                     if marker_before is None:
                         if marker_target.exists():
-                            marker_target.unlink()
+                            marker_target.unlink(missing_ok=True)
                     else:
                         atomic_write(marker_target, marker_before)
+
+                    intent_target.unlink(missing_ok=True)
 
                     if guidance_before is None:
                         if guidance_target.exists():
@@ -2701,7 +2832,7 @@ class Vault:
                 ) from exc
 
             return {
-                "checkout_root": str(source_data["checkout_root"]),
+                "checkout_root": str(sources.checkout_root),
                 "format_version": 1,
                 "guidance": {
                     "before_revision": live_guidance_revision,
@@ -3386,16 +3517,34 @@ class Vault:
             except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
                 issues.append(DoctorIssue("invalid-document", name, str(exc)))
 
-        marker_path = self.state / "guidance-projection.json"
+        intent_path = self.state / "guidance-projection-intent.json"
+        if intent_path.exists():
+            try:
+                with (
+                    exclusive_lock(self.state / "locks/global.lock"),
+                    exclusive_lock(self._record_lock("document", "mind")),
+                    exclusive_lock(self.state / "locks/resident-guidance.lock"),
+                ):
+                    self._recover_interrupted_guidance_projection()
+            except Exception as exc:
+                issues.append(
+                    DoctorIssue(
+                        "interrupted-guidance-projection",
+                        ".gsv/guidance-projection-intent.json",
+                        f"interrupted guidance projection could not be recovered: {exc}",
+                    )
+                )
+
+        marker_path = self.root / GUIDANCE_PROJECTION_MARKER
         if marker_path.exists():
             try:
                 marker_raw = self._read_bytes(marker_path, max_bytes=MAX_DOCUMENT_BYTES)
                 marker_data = json.loads(marker_raw.decode("utf-8"))
-                if not isinstance(marker_data, dict) or marker_data.get("format_version") != 1:
+                if not _validate_guidance_projection_marker_dict(marker_data):
                     issues.append(
                         DoctorIssue(
                             "invalid-guidance-projection",
-                            ".gsv/guidance-projection.json",
+                            GUIDANCE_PROJECTION_MARKER.as_posix(),
                             "invalid guidance projection marker format",
                         )
                     )
@@ -3517,7 +3666,7 @@ class Vault:
                 issues.append(
                     DoctorIssue(
                         "invalid-guidance-projection",
-                        ".gsv/guidance-projection.json",
+                        GUIDANCE_PROJECTION_MARKER.as_posix(),
                         str(exc),
                     )
                 )

@@ -1838,8 +1838,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     resident_context_project.add_argument(
         "--expected-guidance-revision",
-        "--expected-guidance-sha256",
-        dest="expected_guidance_revision",
         required=True,
         help="Expected live revision (SHA-256) of context/resident/AGENTS.md, or 'absent'.",
     )

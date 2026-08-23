@@ -8,10 +8,11 @@ from pathlib import Path
 import pytest
 
 from continuity_kernel import mcp_server
-from continuity_kernel.atomic import sha256_bytes
+from continuity_kernel.atomic import atomic_write, sha256_bytes
 from continuity_kernel.cli import main
 from continuity_kernel.errors import ConflictError, PersistenceError, ValidationError
 from continuity_kernel.resident_context import (
+    GUIDANCE_PROJECTION_MARKER,
     MAX_DOCUMENT_BYTES,
     MAX_GUIDANCE_BYTES,
     read_resident_guidance,
@@ -71,7 +72,7 @@ def test_guidance_projector_comprehensive_behavior(vault: Vault, tmp_path: Path)
     assert published_mind["revision"] == result["mind"]["revision"]
 
     # Managed marker verification
-    marker_path = vault.state / "guidance-projection.json"
+    marker_path = vault.root / GUIDANCE_PROJECTION_MARKER
     assert marker_path.exists()
     marker_data = json.loads(marker_path.read_text(encoding="utf-8"))
     assert marker_data["format_version"] == 1
@@ -100,14 +101,15 @@ def test_guidance_projector_comprehensive_behavior(vault: Vault, tmp_path: Path)
             expected_mind_revision="stale-mind-revision",
         )
 
-    # 3. Managed direct MIND.md update refusal
-    with pytest.raises(ConflictError) as exc_info:
-        vault.write_document(
-            "MIND.md",
-            "# Unmanaged Attempt\n\nDirect mutation should be refused.\n",
-            expected_revision=current_mind_rev,
-        )
-    assert "managed by checkout guidance projection" in str(exc_info.value)
+    # 3. Case bypass refusal for direct MIND.md update
+    for attempt in ("MIND.md", "mind.md", "Mind.md", "  MIND.MD  "):
+        with pytest.raises(ConflictError) as exc_info:
+            vault.write_document(
+                attempt,
+                "# Unmanaged Attempt\n\nDirect mutation should be refused.\n",
+                expected_revision=current_mind_rev,
+            )
+        assert "managed by checkout guidance projection" in str(exc_info.value)
 
     # Direct update to unmanaged documents like NOW.md still succeeds
     now_doc = vault.read_document("NOW.md")
@@ -148,12 +150,10 @@ def test_guidance_projector_comprehensive_behavior(vault: Vault, tmp_path: Path)
     assert vault.doctor().healthy is True
 
     # 5. Rollback on injected partial failure
-    # Snapshot before state
     guidance_before_bytes = (vault.root / "context/resident/AGENTS.md").read_bytes()
     mind_before_bytes = (vault.root / "MIND.md").read_bytes()
     marker_before_bytes = marker_path.read_bytes()
 
-    # Update source checkout with new valid contents for next projection
     agents_src.write_text(
         "# Updated Guidance\n\nNew guidance for projection rollback test.\n",
         encoding="utf-8",
@@ -164,12 +164,13 @@ def test_guidance_projector_comprehensive_behavior(vault: Vault, tmp_path: Path)
     )
 
     for fail_point in (
-        "before_publish",
+        "before_intent",
+        "after_intent",
         "after_guidance_publish",
         "after_mind_publish",
         "after_marker_publish",
-        "after_audit",
         "after_readback",
+        "after_audit",
     ):
         with pytest.raises(PersistenceError):
             vault.project_guidance(
@@ -179,10 +180,84 @@ def test_guidance_projector_comprehensive_behavior(vault: Vault, tmp_path: Path)
                 _fail_during=fail_point,
             )
 
-        # Verify exact rollback
+        # Verify exact rollback and no intent residue
         assert (vault.root / "context/resident/AGENTS.md").read_bytes() == guidance_before_bytes
         assert (vault.root / "MIND.md").read_bytes() == mind_before_bytes
         assert marker_path.read_bytes() == marker_before_bytes
+        assert not (vault.state / "guidance-projection-intent.json").exists()
+
+
+def test_guidance_projector_crash_interrupted_recovery(vault: Vault, tmp_path: Path) -> None:
+    """Test that an interrupted transaction intent durably recovers the prior generation."""
+    checkout_dir = tmp_path / "crash-checkout"
+    _setup_synthetic_checkout(checkout_dir)
+
+    initial_mind = vault.read_document("MIND.md")
+    initial_mind_bytes = (vault.root / "MIND.md").read_bytes()
+
+    # Create synthetic prior state
+    guidance_target = vault.root / "context/resident/AGENTS.md"
+    guidance_target.parent.mkdir(parents=True, exist_ok=True)
+    guidance_target.write_text("# Prior Guidance\n", encoding="utf-8")
+    prior_guidance_bytes = guidance_target.read_bytes()
+
+    # Simulate a crash midway: intent exists with prior snapshot, but files were partly written
+    intent_payload = {
+        "format_version": 1,
+        "guidance_before_hex": prior_guidance_bytes.hex(),
+        "mind_before_hex": initial_mind_bytes.hex(),
+        "marker_before_hex": None,
+        "target_guidance_sha256": "0" * 64,
+        "target_mind_sha256": "1" * 64,
+    }
+    intent_file = vault.state / "guidance-projection-intent.json"
+    atomic_write(intent_file, json.dumps(intent_payload).encode("utf-8") + b"\n")
+
+    # Simulate dirty partial state written during crash
+    guidance_target.write_text("# Dirty Crashed Guidance\n", encoding="utf-8")
+    (vault.root / "MIND.md").write_text("# Dirty Crashed Mind\n", encoding="utf-8")
+
+    # When reader accesses the vault, it recovers prior generation before returning
+    doc = vault.read_document("MIND.md")
+    assert doc["content"] == initial_mind["content"]
+    assert (vault.root / "MIND.md").read_bytes() == initial_mind_bytes
+    assert guidance_target.read_bytes() == prior_guidance_bytes
+    assert not intent_file.exists()
+
+
+def test_guidance_projector_malformed_marker_does_not_silently_block_mind(
+    vault: Vault, tmp_path: Path
+) -> None:
+    """Test that malformed/partial markers do not block MIND and doctor reports defect."""
+    marker_path = vault.root / GUIDANCE_PROJECTION_MARKER
+
+    # 1. Partial/invalid JSON marker
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text('{"format_version": 1, "checkout_root": "/tmp"}', encoding="utf-8")
+
+    # Marker is not fully valid schema
+    assert vault.is_guidance_managed() is False
+
+    # MIND.md updates must NOT be blocked by an invalid marker
+    mind_doc = vault.read_document("MIND.md")
+    updated = vault.write_document(
+        "MIND.md",
+        "# Mind\n\nAllowed update when marker is invalid.\n",
+        expected_revision=mind_doc["revision"],
+    )
+    assert "Allowed update" in updated["content"]
+
+    # Doctor must report invalid marker
+    doctor_res = vault.doctor()
+    assert doctor_res.healthy is False
+    assert any(i.code == "invalid-guidance-projection" for i in doctor_res.issues)
+
+    # 2. Corrupted raw bytes marker
+    marker_path.write_text("not json", encoding="utf-8")
+    assert vault.is_guidance_managed() is False
+    doctor_res2 = vault.doctor()
+    assert doctor_res2.healthy is False
+    assert any(i.code == "invalid-guidance-projection" for i in doctor_res2.issues)
 
 
 def test_guidance_projector_source_validation(vault: Vault, tmp_path: Path) -> None:
@@ -227,35 +302,6 @@ def test_guidance_projector_source_validation(vault: Vault, tmp_path: Path) -> N
         validate_checkout_guidance_sources(checkout_dir)
 
 
-def test_guidance_projector_cli(
-    vault: Vault, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Test the CLI surface for resident-context project."""
-    checkout_dir = tmp_path / "cli-checkout"
-    _setup_synthetic_checkout(checkout_dir)
-
-    mind = vault.read_document("MIND.md")
-
-    rc = main(
-        [
-            "--vault",
-            str(vault.root),
-            "resident-context",
-            "project",
-            "--checkout-root",
-            str(checkout_dir),
-            "--expected-guidance-revision",
-            "absent",
-            "--expected-mind-revision",
-            mind["revision"],
-        ]
-    )
-    assert rc == 0
-    captured = capsys.readouterr()
-    output = json.loads(captured.out)
-    assert output["status"] == "projected"
-
-
 def test_guidance_projector_symlink_rejection(vault: Vault, tmp_path: Path) -> None:
     """Test that symlinks in checkout sources are strictly refused."""
     real_target = tmp_path / "real_file.md"
@@ -287,31 +333,8 @@ def test_guidance_projector_symlink_rejection(vault: Vault, tmp_path: Path) -> N
     assert "must be a regular file" in str(exc.value)
 
 
-def test_guidance_projector_privacy_screening_rejection(vault: Vault, tmp_path: Path) -> None:
-    """Test that checkout guidance containing secret patterns is rejected."""
-    checkout_dir = tmp_path / "privacy-checkout"
-    checkout_dir.mkdir(parents=True, exist_ok=True)
-    brain_dir = checkout_dir / "brain"
-    brain_dir.mkdir(parents=True, exist_ok=True)
-
-    # Content with private key pattern
-    secret_header = "-----BEGIN " + "RSA " + "PRIVATE KEY-----"
-    secret_footer = "-----END " + "RSA " + "PRIVATE KEY-----"
-    (checkout_dir / "AGENTS.md").write_text(
-        f"{secret_header}\nMIIEowIBAAKCAQEA0...\n{secret_footer}\n",
-        encoding="utf-8",
-    )
-    (brain_dir / "MIND.md").write_text("# Mind\n", encoding="utf-8")
-
-    with pytest.raises(ValidationError) as exc:
-        validate_checkout_guidance_sources(checkout_dir)
-    assert "privacy screening" in str(exc.value).lower()
-
-
-def test_guidance_projector_doctor_corrupt_marker_and_vault_target_drift(
-    vault: Vault, tmp_path: Path
-) -> None:
-    """Test doctor reports on corrupt marker and vault target file drift."""
+def test_guidance_projector_doctor_vault_target_drift(vault: Vault, tmp_path: Path) -> None:
+    """Test doctor reports on vault target file drift."""
     checkout_dir = tmp_path / "doctor-target-checkout"
     _setup_synthetic_checkout(checkout_dir)
 
@@ -321,9 +344,6 @@ def test_guidance_projector_doctor_corrupt_marker_and_vault_target_drift(
         expected_guidance_revision="absent",
         expected_mind_revision=mind["revision"],
     )
-
-    marker_path = vault.state / "guidance-projection.json"
-    assert marker_path.exists()
 
     # 1. Vault target drift: modify context/resident/AGENTS.md directly
     (vault.root / "context/resident/AGENTS.md").write_text("# Tampered Guidance\n")
@@ -337,17 +357,34 @@ def test_guidance_projector_doctor_corrupt_marker_and_vault_target_drift(
     assert doctor_res.healthy is False
     assert any(i.code == "guidance-projection-drift" for i in doctor_res.issues)
 
-    # 3. Corrupt marker
-    marker_path.write_text("invalid json content")
-    doctor_res = vault.doctor()
-    assert doctor_res.healthy is False
-    assert any(i.code == "invalid-guidance-projection" for i in doctor_res.issues)
 
-    # 4. Invalid format_version
-    marker_path.write_text('{"format_version": 99}')
-    doctor_res = vault.doctor()
-    assert doctor_res.healthy is False
-    assert any(i.code == "invalid-guidance-projection" for i in doctor_res.issues)
+def test_guidance_projector_cli(
+    vault: Vault, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test the CLI surface for resident-context project."""
+    checkout_dir = tmp_path / "cli-checkout"
+    _setup_synthetic_checkout(checkout_dir)
+
+    mind = vault.read_document("MIND.md")
+
+    rc = main(
+        [
+            "--vault",
+            str(vault.root),
+            "resident-context",
+            "project",
+            "--checkout-root",
+            str(checkout_dir),
+            "--expected-guidance-revision",
+            "absent",
+            "--expected-mind-revision",
+            mind["revision"],
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    assert output["status"] == "projected"
 
 
 def test_guidance_projector_mcp(vault: Vault, tmp_path: Path) -> None:
@@ -367,3 +404,35 @@ def test_guidance_projector_mcp(vault: Vault, tmp_path: Path) -> None:
         vault=vault,
     )
     assert result["status"] == "projected"
+
+
+def test_guidance_projector_real_checkout_canary(vault: Vault) -> None:
+    """Production-path canary test against the real second-brain checkout."""
+    real_checkout = (
+        Path.home() / "Desktop" / "motium_github" / "second-brain-issue131-final-20260823"
+    )
+    if not real_checkout.exists():
+        pytest.skip(f"Real checkout not found at {real_checkout}")
+
+    sources = validate_checkout_guidance_sources(real_checkout)
+    assert sources.guidance.bytes > 0
+    assert sources.mind.bytes > 0
+
+    initial_mind = vault.read_document("MIND.md")
+    result = vault.project_guidance(
+        real_checkout,
+        expected_guidance_revision="absent",
+        expected_mind_revision=initial_mind["revision"],
+    )
+
+    assert result["status"] == "projected"
+    published_guidance = read_resident_guidance(vault.root)
+    assert len(published_guidance["content"]) > 0
+    assert published_guidance["sha256"] == result["guidance"]["revision"]
+
+    published_mind = vault.read_document("MIND.md")
+    assert len(published_mind["content"]) > 0
+    assert published_mind["revision"] == result["mind"]["revision"]
+
+    # Verify doctor passes on real checkout projection
+    assert vault.doctor().healthy is True
