@@ -563,6 +563,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 expected_checkpoint_digest=args.expected_checkpoint_digest,
                 expected_sequence=args.expected_sequence,
                 disposition=args.disposition,
+                expected_source_revision=args.expected_source_revision,
             )
         if args.local_source_command == "acknowledge":
             return delivery.acknowledge(
@@ -2147,6 +2148,7 @@ def _parser() -> argparse.ArgumentParser:
         choices=RESET_DISPOSITIONS,
         required=True,
     )
+    local_source_rebaseline.add_argument("--expected-source-revision")
     local_source_adopt_staged.add_argument("--expected-migration-revision", required=True)
     local_source_adopt_staged.add_argument("--expected-source-revision", required=True)
     local_source_adopt_staged.add_argument(

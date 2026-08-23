@@ -26,6 +26,7 @@ from continuity_kernel.errors import ConflictError, ContinuityError, ValidationE
 from continuity_kernel.records import format_time, parse_time
 from continuity_kernel.source_recipes import get_recipe
 from continuity_kernel.source_state import (
+    SourceCompleteness,
     SourceSnapshot,
     source_fingerprint,
 )
@@ -495,8 +496,9 @@ class LocalSourceDelivery:
         expected_checkpoint_digest: str,
         expected_sequence: int,
         disposition: str,
+        expected_source_revision: str | None = None,
     ) -> dict[str, Any]:
-        """Explicitly accept a replaced store and retain the prior checkpoint as history."""
+        """Explicitly accept a replaced store or discard a stale pending delivery."""
 
         source = _source(source)
         if _SHA256.fullmatch(expected_checkpoint_digest) is None:
@@ -507,6 +509,13 @@ class LocalSourceDelivery:
             raise ValidationError(
                 f"local source replacement requires disposition {FORWARD_ONLY_RESET} "
                 f"or {DISCARD_STALE_DELIVERY}"
+            )
+        if disposition == DISCARD_STALE_DELIVERY and (
+            expected_source_revision is None
+            or _REVISION.fullmatch(expected_source_revision) is None
+        ):
+            raise ValidationError(
+                "discard_stale_delivery requires a valid expected_source_revision"
             )
         self._selected_snapshot(source)
         binding = self._required_binding(source)
@@ -560,8 +569,46 @@ class LocalSourceDelivery:
                 and previous_store_identity == replacement_store_identity
             ):
                 raise ConflictError("local source store identity has not changed")
-            if disposition == DISCARD_STALE_DELIVERY and state.pending_token is None:
-                raise ConflictError("no local source delivery is pending to discard")
+            if disposition == DISCARD_STALE_DELIVERY:
+                if state.pending_token is None:
+                    raise ConflictError("no local source delivery is pending to discard")
+                snapshot = self.vault.get_source_snapshot()
+                if expected_source_revision != snapshot.revision:
+                    raise ConflictError(
+                        "source-state revision does not match expected recovery revision"
+                    )
+                observation = snapshot.observation(source)
+                if observation is None:
+                    raise ConflictError("source state has no recorded observation for gap recovery")
+                if observation.completeness is not SourceCompleteness.PARTIAL:
+                    raise ConflictError(
+                        "source observation must record partial completeness for gap recovery"
+                    )
+                token_digest = _digest(state.pending_token)
+                valid_digests = {
+                    source_fingerprint(
+                        f"seld-local-source-gap:{token_digest}", "source evidence reference"
+                    ),
+                    source_fingerprint(
+                        f"seld-local-source-token:{token_digest}", "source evidence reference"
+                    ),
+                    source_fingerprint(
+                        f"seld-local-source-delivery:{token_digest}", "source evidence reference"
+                    ),
+                    source_fingerprint(
+                        f"seld-local-source-checkpoint:{expected_checkpoint_digest}",
+                        "source evidence reference",
+                    ),
+                    source_fingerprint(token_digest, "source evidence reference"),
+                    token_digest,
+                }
+                if not any(
+                    d in observation.evidence_digests for d in valid_digests if d is not None
+                ):
+                    raise ConflictError(
+                        "source observation does not verify the exact stale delivery "
+                        "evidence digest"
+                    )
 
             archive_relative = self._checkpoint_archive_relative(binding, state)
             store.ensure_directory(_HISTORY_RELATIVE)
