@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import IO, Any, Final, cast
 
 import continuity_kernel.update as self_update
@@ -99,6 +100,7 @@ GUIDED_REVIEW_TOOL_NAMES: Final = frozenset(
         "gsv_execution_bindings",
         "gsv_resident_context_status",
         "gsv_resident_guidance_show",
+        "gsv_resident_guidance_project",
         "gsv_task_list",
         "gsv_task_show",
         "gsv_task_create",
@@ -327,6 +329,13 @@ def _call(
         return resident_context_status(vault.root)
     if name == "gsv_resident_guidance_show":
         return read_resident_guidance(vault.root)
+    if name in ("gsv_resident_guidance_project", "gsv_guidance_project"):
+        return vault.project_guidance(
+            checkout_root=Path(_string(values, "checkout_root")),
+            expected_guidance_revision=_optional_string(values, "expected_guidance_revision"),
+            expected_mind_revision=_string(values, "expected_mind_revision"),
+            expected_guidance_sha256=_optional_string(values, "expected_guidance_sha256"),
+        )
     if name == "gsv_execution_bindings":
         return execution_bindings(vault)
     if name == "gsv_local_file_read":
@@ -1276,6 +1285,33 @@ TOOLS: Final = [
         ),
         {},
         read_only=True,
+    ),
+    _tool(
+        "gsv_resident_guidance_project",
+        (
+            "Project canonical AGENTS.md and brain/MIND.md from an explicit checkout root into the "
+            "vault with atomic compare-and-swap protection and managed source tracking."
+        ),
+        {
+            "checkout_root": {
+                "description": (
+                    "Path to the checkout directory containing AGENTS.md and brain/MIND.md."
+                ),
+                "type": "string",
+            },
+            "expected_guidance_revision": {
+                "description": (
+                    "Expected live revision (SHA-256) of context/resident/AGENTS.md, or 'absent'."
+                ),
+                "type": "string",
+            },
+            "expected_mind_revision": {
+                "description": "Expected live revision (SHA-256) of MIND.md.",
+                "type": "string",
+            },
+        },
+        required=["checkout_root", "expected_guidance_revision", "expected_mind_revision"],
+        read_only=False,
     ),
     _tool(
         "gsv_execution_bindings",

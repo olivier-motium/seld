@@ -794,6 +794,7 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         "gsv_recall_search",
         "gsv_recall_status",
         "gsv_resident_context_status",
+        "gsv_resident_guidance_project",
         "gsv_resident_guidance_show",
         "gsv_status",
         "gsv_source_list",

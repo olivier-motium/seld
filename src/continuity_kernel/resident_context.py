@@ -29,7 +29,11 @@ RESIDENT_ROOT: Final = PurePosixPath("context/resident")
 RESIDENT_GUIDANCE: Final = RESIDENT_ROOT / "AGENTS.md"
 RESIDENT_SKILLS: Final = RESIDENT_ROOT / "skills"
 LEGACY_RESIDENT_CONTROL: Final = RESIDENT_ROOT / "control"
+GUIDANCE_PROJECTION_MARKER: Final = PurePosixPath(".gsv/guidance-projection.json")
+GUIDANCE_SOURCE_AGENTS: Final = "AGENTS.md"
+GUIDANCE_SOURCE_MIND: Final = "brain/MIND.md"
 MAX_GUIDANCE_BYTES: Final = 256 * 1024
+MAX_DOCUMENT_BYTES: Final = 512 * 1024
 MAX_SKILL_FILE_BYTES: Final = 256 * 1024
 MAX_SKILL_TOTAL_BYTES: Final = 16 * 1024 * 1024
 MAX_SKILLS: Final = 256
@@ -1032,3 +1036,97 @@ def _stable_snapshot(metadata: os.stat_result) -> tuple[int, int, int, int, int]
         int(metadata.st_mtime_ns),
         int(metadata.st_mode),
     )
+
+
+def validate_checkout_guidance_sources(checkout_root: Path | str) -> dict[str, Any]:
+    """Validate bounded canonical AGENTS.md and brain/MIND.md in an explicit checkout root."""
+
+    root = Path(checkout_root)
+    if not root.is_dir():
+        raise ValidationError(f"checkout root is not a directory: {checkout_root}")
+
+    # Validate AGENTS.md
+    agents_path = root / GUIDANCE_SOURCE_AGENTS
+    if not agents_path.exists():
+        raise ValidationError(f"checkout guidance file is missing: {GUIDANCE_SOURCE_AGENTS}")
+    try:
+        agents_metadata = os.lstat(agents_path)
+    except OSError as exc:
+        raise ValidationError(
+            f"could not inspect checkout guidance file {GUIDANCE_SOURCE_AGENTS}: {exc}"
+        ) from exc
+    if _is_link_or_reparse(agents_metadata) or not stat.S_ISREG(agents_metadata.st_mode):
+        raise ValidationError(
+            f"checkout guidance file must be a regular file: {GUIDANCE_SOURCE_AGENTS}"
+        )
+    agents_raw_bytes = read_regular_file(
+        agents_path,
+        label="checkout guidance file AGENTS.md",
+        max_bytes=MAX_GUIDANCE_BYTES,
+    )
+    if b"\x00" in agents_raw_bytes:
+        raise ValidationError("checkout guidance file contains a null byte")
+    agents_text = validate_imported_resident_content(
+        agents_raw_bytes,
+        label="checkout guidance file AGENTS.md",
+    )
+    normalized_agents = agents_text.rstrip() + "\n"
+    agents_bytes = normalized_agents.encode("utf-8")
+    if len(agents_bytes) > MAX_GUIDANCE_BYTES:
+        raise ValidationError("checkout guidance file exceeds its size bound")
+    agents_sha256 = sha256(agents_bytes).hexdigest()
+    raw_agents_sha256 = sha256(agents_raw_bytes).hexdigest()
+
+    # Validate brain/MIND.md
+    mind_path = root / GUIDANCE_SOURCE_MIND
+    if not mind_path.exists():
+        raise ValidationError(f"checkout document file is missing: {GUIDANCE_SOURCE_MIND}")
+    try:
+        mind_metadata = os.lstat(mind_path)
+    except OSError as exc:
+        raise ValidationError(
+            f"could not inspect checkout document file {GUIDANCE_SOURCE_MIND}: {exc}"
+        ) from exc
+    if _is_link_or_reparse(mind_metadata) or not stat.S_ISREG(mind_metadata.st_mode):
+        raise ValidationError(
+            f"checkout document file must be a regular file: {GUIDANCE_SOURCE_MIND}"
+        )
+    mind_raw_bytes = read_regular_file(
+        mind_path,
+        label="checkout document file brain/MIND.md",
+        max_bytes=MAX_DOCUMENT_BYTES,
+    )
+    if b"\x00" in mind_raw_bytes:
+        raise ValidationError("checkout document file contains a null byte")
+    mind_text = validate_imported_resident_content(
+        mind_raw_bytes,
+        label="checkout document file brain/MIND.md",
+    )
+    normalized_mind = mind_text.rstrip() + "\n"
+    mind_bytes = normalized_mind.encode("utf-8")
+    if len(mind_bytes) > MAX_DOCUMENT_BYTES:
+        raise ValidationError("checkout document file exceeds its size bound")
+    mind_sha256 = sha256(mind_bytes).hexdigest()
+    raw_mind_sha256 = sha256(mind_raw_bytes).hexdigest()
+
+    return {
+        "checkout_root": str(root.resolve()),
+        "guidance": {
+            "bytes": len(agents_bytes),
+            "content": normalized_agents,
+            "path": str(agents_path),
+            "raw_bytes": agents_bytes,
+            "relative_path": GUIDANCE_SOURCE_AGENTS,
+            "sha256": agents_sha256,
+            "source_sha256": raw_agents_sha256,
+        },
+        "mind": {
+            "bytes": len(mind_bytes),
+            "content": normalized_mind,
+            "path": str(mind_path),
+            "raw_bytes": mind_bytes,
+            "relative_path": GUIDANCE_SOURCE_MIND,
+            "sha256": mind_sha256,
+            "source_sha256": raw_mind_sha256,
+        },
+    }
