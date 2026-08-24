@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import plistlib
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -431,6 +432,7 @@ def _append_apple(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="secure checkpoint storage is POSIX-only")
 def test_apple_messages_same_store_stale_delivery_discard_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -620,6 +622,7 @@ def test_apple_messages_same_store_stale_delivery_discard_recovery(
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="secure checkpoint storage is POSIX-only")
 def test_apple_messages_discard_recovery_rejects_complete_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -672,6 +675,7 @@ def test_apple_messages_discard_recovery_rejects_complete_observation(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="secure checkpoint storage is POSIX-only")
 def test_apple_messages_discard_stale_delivery_rejects_non_content_changed_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
