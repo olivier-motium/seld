@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import os
-import ssl
 import stat
 import subprocess
 from pathlib import Path
@@ -39,6 +37,17 @@ def test_cert_generation_produces_a_leaf_signed_by_the_ca(tmp_path: Path) -> Non
     if os.name != "nt":
         assert _file_mode(ca_key) == 0o600
         assert _file_mode(ca_crt) == 0o600
+
+    constraints = subprocess.run(
+        ["openssl", "x509", "-in", str(ca_crt), "-text", "-noout"],
+        capture_output=True,
+        check=False,
+    )
+    assert constraints.returncode == 0
+    assert b"X509v3 Name Constraints: critical" in constraints.stdout
+    assert b"DNS:localhost" in constraints.stdout
+    assert b"127.0.0.1" in constraints.stdout
+    assert b"0:0:0:0:0:0:0:1" in constraints.stdout
 
     issue_leaf_certificate(ca_key, ca_crt, leaf_key, leaf_crt)
     assert leaf_key.is_file()
@@ -115,6 +124,7 @@ def test_install_ca_to_trust_store_surfaces_prompt_sentence(tmp_path: Path) -> N
     with (
         patch("sys.platform", "darwin"),
         patch("shutil.which", return_value="/usr/bin/security"),
+        patch("continuity_kernel.connector_local_tls.is_ca_trusted", return_value=True) as trusted,
         patch("subprocess.run") as mock_run,
     ):
         mock_run.return_value = MagicMock(returncode=0)
@@ -137,29 +147,35 @@ def test_install_ca_to_trust_store_surfaces_prompt_sentence(tmp_path: Path) -> N
             capture_output=True,
             check=False,
         )
+        trusted.assert_called_once_with(ca_crt)
 
 
-def test_is_ca_trusted_checks_macos_keychain_presence(tmp_path: Path) -> None:
+def test_is_ca_trusted_checks_macos_ssl_trust_policy(tmp_path: Path) -> None:
     ca_crt = tmp_path / CA_CERT_FILENAME
-    generate_local_ca(tmp_path / CA_KEY_FILENAME, ca_crt)
-    certificate_der = ssl.PEM_cert_to_DER_cert(ca_crt.read_text(encoding="ascii"))
-    certificate_hash = hashlib.sha1(certificate_der, usedforsecurity=False).hexdigest().upper()
-
-    def mock_run(command: list[str], **_: object) -> MagicMock:
-        assert command[:4] == ["/usr/bin/security", "find-certificate", "-a", "-Z"]
-        return MagicMock(returncode=0, stdout=b"")
+    ca_crt.write_bytes(b"diagnostic certificate")
 
     with (
         patch("sys.platform", "darwin"),
         patch("shutil.which", return_value="/usr/bin/security"),
-        patch("continuity_kernel.connector_local_tls.Path.home", return_value=tmp_path),
-        patch("subprocess.run", side_effect=mock_run) as mock_run,
+        patch("subprocess.run") as mock_run,
     ):
+        mock_run.return_value = MagicMock(returncode=1)
         assert is_ca_trusted(ca_crt) is False
-        assert mock_run.call_count == 2
+        mock_run.assert_called_with(
+            [
+                "/usr/bin/security",
+                "verify-cert",
+                "-c",
+                str(ca_crt),
+                "-p",
+                "ssl",
+                "-L",
+                "-l",
+                "-q",
+            ],
+            capture_output=True,
+            check=False,
+        )
 
-        mock_run.side_effect = [
-            MagicMock(returncode=0, stdout=f"SHA-1 hash: {certificate_hash}\n".encode()),
-        ]
+        mock_run.return_value = MagicMock(returncode=0)
         assert is_ca_trusted(ca_crt) is True
-        assert mock_run.call_count == 3

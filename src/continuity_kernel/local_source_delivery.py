@@ -617,30 +617,16 @@ class LocalSourceDelivery:
                 account_digest = self._account_digest(source, store_root=store_root)
                 token_digest = _digest(state.pending_token)
                 gap_evidence_ref = f"seld-local-source-gap:{token_digest}"
-                valid_digests = {
-                    source_fingerprint(gap_evidence_ref, "source evidence reference"),
-                    source_fingerprint(
-                        f"seld-local-source-token:{token_digest}", "source evidence reference"
-                    ),
-                    source_fingerprint(
-                        f"seld-local-source-delivery:{token_digest}", "source evidence reference"
-                    ),
-                    source_fingerprint(
-                        f"seld-local-source-checkpoint:{expected_checkpoint_digest}",
-                        "source evidence reference",
-                    ),
-                    source_fingerprint(token_digest, "source evidence reference"),
-                    token_digest,
-                }
+                gap_evidence_digest = source_fingerprint(
+                    gap_evidence_ref, "source evidence reference"
+                )
 
                 snapshot = self.vault.get_source_snapshot()
                 observation = snapshot.observation(source)
                 is_gap_receipt_recorded = (
                     observation is not None
                     and observation.completeness is SourceCompleteness.PARTIAL
-                    and any(
-                        d in observation.evidence_digests for d in valid_digests if d is not None
-                    )
+                    and gap_evidence_digest in observation.evidence_digests
                 )
 
                 if is_gap_receipt_recorded:
@@ -666,6 +652,13 @@ class LocalSourceDelivery:
                         evidence_refs=(gap_evidence_ref,),
                         _account_fingerprint=account_digest,
                     )
+                    recorded = self.vault.get_source_snapshot().observation(source)
+                    if (
+                        recorded is None
+                        or recorded.completeness is not SourceCompleteness.PARTIAL
+                        or gap_evidence_digest not in recorded.evidence_digests
+                    ):
+                        raise ContinuityError("Apple Messages partial gap receipt readback failed")
 
             archive_relative = self._checkpoint_archive_relative(binding, state)
             store.ensure_directory(_HISTORY_RELATIVE)

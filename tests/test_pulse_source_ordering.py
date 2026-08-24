@@ -163,7 +163,7 @@ def test_pulse_source_ordering_never_read_and_oldest_due_at_tie_breakers() -> No
     assert ordered == ("github", "notion", "box", "asana")
 
 
-def test_unchanged_auth_or_tool_absent_incidents_do_not_fast_retry() -> None:
+def test_unchanged_auth_or_tool_absent_incidents_wait_for_fingerprint_change() -> None:
     now = datetime(2026, 8, 23, 10, 0, tzinfo=UTC)
     selected = select_sources(
         empty_source_snapshot(),
@@ -183,7 +183,7 @@ def test_unchanged_auth_or_tool_absent_incidents_do_not_fast_retry() -> None:
         observed_at=now - timedelta(minutes=15),
     )
 
-    # Unchanged incident: gmail does not fast-retry every wake
+    # Unchanged incident: gmail does not retry every wake
     ordered_unchanged = order_due_sources(failed, observed_at=now)
     assert "gmail" not in ordered_unchanged
     assert ordered_unchanged == ("slack",)
@@ -196,9 +196,9 @@ def test_unchanged_auth_or_tool_absent_incidents_do_not_fast_retry() -> None:
     )
     assert ordered_changed == ("gmail", "slack")
 
-    # After full proof TTL (24h), gmail becomes due again
+    # Elapsed proof TTL alone is not an underlying auth or tool state change.
     ordered_after_ttl = order_due_sources(failed, observed_at=now + timedelta(hours=25))
-    assert "gmail" in ordered_after_ttl
+    assert "gmail" not in ordered_after_ttl
 
 
 def test_integration_sense_sweep_orders_slack_deadline_and_dedupes_auth_incident(
@@ -305,6 +305,102 @@ def test_integration_sense_sweep_orders_slack_deadline_and_dedupes_auth_incident
     # Gmail signal deduped in resident signal store; total count is unchanged
     assert len(gmail_signals2) == 1
     assert len(signals2) == initial_count
+
+
+def test_sweep_failure_after_success_keeps_event_key_and_envelope_consistent(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 23, 10, 0, tzinfo=UTC)
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Sweep failure retry test")
+    vault.select_sources(expected_revision="absent", sources=("whatsapp",))
+
+    first_revision = cast(
+        str,
+        vault.record_source_observation(
+            expected_revision=vault.get_source_snapshot().revision,
+            source_id="whatsapp",
+            actor_ref="task-wa",
+            result="success",
+            covered_through="2026-08-23T09:50:00Z",
+            completeness="complete",
+            account_binding="whatsapp-account",
+            tool_binding="seld.local.whatsapp-wacli.read.v1",
+            observed_at=now - timedelta(minutes=10),
+        )["revision"],
+    )
+    assert sense_sweep(vault, observed_at=now).status == "complete"
+
+    second_revision = cast(
+        str,
+        vault.record_source_observation(
+            expected_revision=first_revision,
+            source_id="whatsapp",
+            actor_ref="task-wa",
+            result="failure",
+            account_binding="whatsapp-account",
+            tool_binding="seld.local.whatsapp-wacli.read.v1",
+            error_code="timeout",
+            observed_at=now + timedelta(minutes=1),
+        )["revision"],
+    )
+    assert sense_sweep(vault, observed_at=now + timedelta(minutes=1)).status == "complete"
+
+    vault.record_source_observation(
+        expected_revision=second_revision,
+        source_id="whatsapp",
+        actor_ref="task-wa",
+        result="failure",
+        account_binding="whatsapp-account",
+        tool_binding="seld.local.whatsapp-wacli.read.v1",
+        error_code="timeout",
+        observed_at=now + timedelta(minutes=2),
+    )
+    assert sense_sweep(vault, observed_at=now + timedelta(minutes=2)).status == "complete"
+
+    source_signals = [
+        signal
+        for signal in ResidentSignalStore(vault.root).list().signals
+        if signal.kind == "source-due"
+    ]
+    assert len(source_signals) == 3
+    assert len({signal.event_key for signal in source_signals}) == 3
+
+
+def test_acknowledged_and_settled_incident_is_not_new_again(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 23, 10, 0, tzinfo=UTC)
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Settled incident test")
+    vault.select_sources(expected_revision="absent", sources=("gmail",))
+    vault.record_source_observation(
+        expected_revision=vault.get_source_snapshot().revision,
+        source_id="gmail",
+        actor_ref="task-gmail",
+        result="failure",
+        account_binding="gmail-account",
+        tool_binding="gmail.messages.recent_read",
+        error_code="auth_required",
+        observed_at=now - timedelta(minutes=15),
+    )
+
+    first = sense_sweep(vault, observed_at=now)
+    assert first.status == "complete"
+    assert first.source_due == 1
+
+    store = ResidentSignalStore(vault.root)
+    pending = store.list()
+    assert len(pending.signals) == 1
+    store.acknowledge(
+        [pending.signals[0].input_id],
+        expected_revision=pending.revision,
+        consumer="resident-pulse",
+    )
+    store.compact(retain_recent=0)
+
+    repeated = sense_sweep(vault, observed_at=now + timedelta(minutes=5))
+    assert repeated.status == "complete"
+    assert repeated.source_due == 0
+    assert store.list().signals == ()
 
 
 def _apple_store(root: Path, *, old_body: str = "already covered") -> Path:

@@ -24,7 +24,8 @@ When acquiring due sources on a Pulse wake:
    - Source ID (alphabetical tie-breaker).
 3. Continue acquisition until the seven-minute no-new-acquisition boundary stops
    new work.
-4. Unchanged auth/tool-absent incidents do not fast-retry.
+4. Unchanged auth/tool-absent incidents retry only after their fingerprint
+   changes.
 
 WhatsApp is the always-on local sense. When selected, check it on every Pulse
 wake even when its stored proof remains fresh. Treat each returned batch as one

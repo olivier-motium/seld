@@ -262,6 +262,37 @@ class ResidentSignalStore:
             ),
         )
 
+    def existing_event_keys(self, event_keys: Sequence[str]) -> frozenset[str]:
+        """Return exact keys already present in live or settled signal storage."""
+
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for value in event_keys:
+            key = _optional_line(value, 1_000, "signal event key")
+            if key is None:
+                raise ValidationError("signal event key is required")
+            if key not in seen:
+                seen.add(key)
+                cleaned.append(key)
+        if len(cleaned) > MAX_SIGNAL_RESULTS:
+            raise ValidationError(f"check at most {MAX_SIGNAL_RESULTS} resident signal event keys")
+        if not cleaned:
+            return frozenset()
+
+        with self._transaction() as store:
+            inputs_state, acknowledgements_state, settled_state = self._read_state(store)
+            signals = _parse_signals(inputs_state or b"")
+            acknowledgements = _parse_acknowledgements(acknowledgements_state or b"")
+            settled = _parse_settled_event_keys(settled_state or b"")
+            _validate_acknowledgement_targets(signals, acknowledgements)
+            _validate_live_settled_separation(signals, settled)
+
+        live = {item.event_key for item in signals if item.event_key is not None}
+        settled_digests = {item.event_key_digest for item in settled}
+        return frozenset(
+            key for key in cleaned if key in live or _event_key_digest(key) in settled_digests
+        )
+
     def get(self, input_id: str) -> ResidentSignal:
         clean_id = _uuid(input_id, "signal ID")
         with self._transaction() as store:

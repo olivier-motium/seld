@@ -10,7 +10,6 @@ import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
-from hashlib import sha1
 from pathlib import Path
 from typing import Final
 
@@ -53,6 +52,11 @@ def generate_local_ca(
     openssl = _find_openssl()
     with tempfile.TemporaryDirectory() as temp_dir:
         ca_config_path = Path(temp_dir) / "ca.cnf"
+        name_constraints = (
+            "nameConstraints = critical, permitted;DNS:localhost, "
+            "permitted;IP:127.0.0.1/255.255.255.255, "
+            "permitted;IP:0:0:0:0:0:0:0:1/FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF"
+        )
         ca_config = f"""[req]
 distinguished_name = req_distinguished_name
 x509_extensions = v3_ca
@@ -66,6 +70,7 @@ basicConstraints = critical,CA:TRUE
 keyUsage = critical, digitalSignature, cRLSign, keyCertSign
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid:always,issuer
+{name_constraints}
 """
         ca_config_path.write_text(ca_config, encoding="utf-8")
         temp_ca_key = Path(temp_dir) / "ca.key"
@@ -203,36 +208,28 @@ subjectAltName = @alt_names
 
 
 def is_ca_trusted(ca_cert_path: Path) -> bool:
-    """Check if the CA certificate is already trusted in the macOS trust store."""
+    """Verify the CA against the active macOS SSL trust policy."""
     if sys.platform != "darwin":
         return True
     security_bin = shutil.which("security")
     if not security_bin:
         return False
-    try:
-        certificate_der = ssl.PEM_cert_to_DER_cert(ca_cert_path.read_text(encoding="ascii"))
-    except (OSError, UnicodeError, ValueError):
-        return False
-
-    expected_hash = sha1(certificate_der, usedforsecurity=False).hexdigest().upper()
-    for keychain_path in (
-        Path("/Library/Keychains/System.keychain"),
-        Path.home() / "Library/Keychains/login.keychain-db",
-    ):
-        res = subprocess.run(
-            [security_bin, "find-certificate", "-a", "-Z", str(keychain_path)],
-            capture_output=True,
-            check=False,
-        )
-        if res.returncode != 0:
-            continue
-        for line in res.stdout.decode("utf-8", errors="replace").splitlines():
-            if not line.startswith("SHA-1 hash:"):
-                continue
-            observed_hash = line.partition(":")[2].replace(":", "").strip().upper()
-            if observed_hash == expected_hash:
-                return True
-    return False
+    res = subprocess.run(
+        [
+            security_bin,
+            "verify-cert",
+            "-c",
+            str(ca_cert_path),
+            "-p",
+            "ssl",
+            "-L",
+            "-l",
+            "-q",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    return res.returncode == 0
 
 
 def install_ca_to_trust_store(
@@ -274,6 +271,8 @@ def install_ca_to_trust_store(
     if res.returncode != 0:
         err = res.stderr.decode("utf-8", errors="replace").strip()
         raise SetupError(f"Failed to install CA certificate into macOS trust store: {err}")
+    if not is_ca_trusted(ca_cert_path):
+        raise SetupError("macOS did not verify the local connector CA as an SSL trust root")
     return True
 
 

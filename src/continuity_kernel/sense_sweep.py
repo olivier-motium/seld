@@ -142,12 +142,7 @@ def sense_sweep(
                 snapshot = active_vault.get_source_snapshot()
                 counts["selected"] = len(snapshot.selected_sources)
                 deadlines: dict[str, datetime] = {}
-                existing_incident_keys = {
-                    signal.event_key
-                    for signal in ResidentSignalStore(active_vault.root).list().signals
-                    if signal.event_key and signal.event_key.startswith("source-incident:")
-                }
-                changed_incidents: set[str] = set()
+                incident_keys: dict[str, str] = {}
                 for source_id in snapshot.selected_sources:
                     obs = snapshot.observation(source_id)
                     if source_id == "slack" and obs is not None and obs.last_success_at is not None:
@@ -159,9 +154,14 @@ def sense_sweep(
                         and obs.result is SourceResult.FAILURE
                         and obs.error_code in AUTH_OR_TOOL_INCIDENT_ERROR_CODES
                     ):
-                        key = f"source-incident:{source_id}:{_error_fingerprint(obs)}"
-                        if key not in existing_incident_keys:
-                            changed_incidents.add(source_id)
+                        incident_keys[source_id] = _source_event_key(source_id, obs)
+                _within_budget(monotonic, deadline)
+                existing_incident_keys = store.existing_event_keys(tuple(incident_keys.values()))
+                changed_incidents = {
+                    source_id
+                    for source_id, event_key in incident_keys.items()
+                    if event_key not in existing_incident_keys
+                }
                 due_source_ids = order_due_sources(
                     snapshot,
                     observed_at=now,
@@ -172,27 +172,19 @@ def sense_sweep(
                     _within_budget(monotonic, deadline)
                     observation = snapshot.observation(source_id)
                     due_at = _source_due_at(source_id, observation)
+                    event_key = _source_event_key(source_id, observation)
+                    counts["source"] += 1
+                    if event_key in existing_incident_keys:
+                        continue
                     pending.append(
                         SignalAppendRequest(
                             kind="source-due",
                             ref=f"source:{source_id}",
-                            event_key=_source_event_key(source_id, observation),
-                            envelope={
-                                "source_id": source_id,
-                                "recipe_version": get_recipe(source_id).recipe_version,
-                                "attempted_at": observation.attempted_at if observation else None,
-                                "last_success_at": (
-                                    observation.last_success_at if observation else None
-                                ),
-                                "covered_through": (
-                                    observation.covered_through if observation else None
-                                ),
-                                "due_at": format_time(due_at) if due_at else None,
-                            },
+                            event_key=event_key,
+                            envelope=_source_signal_envelope(source_id, observation, due_at),
                             observed_at=now,
                         )
                     )
-                    counts["source"] += 1
 
                 _within_budget(monotonic, deadline)
                 for thread in active_vault.list_threads():
@@ -310,7 +302,7 @@ def order_due_sources(
     WhatsApp remains mandatory each wake; afterward order due sources by
     credential deadline inside the next two 30-minute wakes, newly changed
     incident fingerprint, never-read, oldest due_at, then source ID.
-    Unchanged auth/tool-absent incidents do not fast-retry.
+    Unchanged auth/tool-absent incidents retry only after their fingerprint changes.
     """
     now = (observed_at or datetime.now(UTC)).astimezone(UTC)
     two_wakes_horizon = now + timedelta(minutes=60)
@@ -329,6 +321,15 @@ def order_due_sources(
             due_sources.append(source_id)
             continue
 
+        if (
+            observation is not None
+            and observation.result is SourceResult.FAILURE
+            and observation.error_code in AUTH_OR_TOOL_INCIDENT_ERROR_CODES
+        ):
+            if is_changed_incident:
+                due_sources.append(source_id)
+            continue
+
         if deadline is not None and now <= deadline <= two_wakes_horizon:
             due_sources.append(source_id)
             continue
@@ -342,13 +343,10 @@ def order_due_sources(
             continue
 
         if observation.result is SourceResult.FAILURE:
-            if is_changed_incident:
+            attempted = parse_time(observation.attempted_at)
+            ttl = get_recipe(source_id).proof_ttl
+            if now >= attempted + ttl:
                 due_sources.append(source_id)
-            else:
-                attempted = parse_time(observation.attempted_at)
-                ttl = get_recipe(source_id).proof_ttl
-                if now >= attempted + ttl:
-                    due_sources.append(source_id)
             continue
 
         if observation.last_success_at is None:
@@ -426,10 +424,12 @@ def _source_due_at(source_id: str, observation: SourceObservation | None) -> dat
         return None
     if observation.completeness is SourceCompleteness.PARTIAL:
         return parse_time(observation.attempted_at)
+    if observation.result is SourceResult.FAILURE:
+        if observation.error_code in AUTH_OR_TOOL_INCIDENT_ERROR_CODES:
+            return None
+        return parse_time(observation.attempted_at) + get_recipe(source_id).proof_ttl
     if observation.last_success_at is not None:
         return parse_time(observation.last_success_at) + get_recipe(source_id).proof_ttl
-    if observation.result is SourceResult.FAILURE:
-        return parse_time(observation.attempted_at) + get_recipe(source_id).proof_ttl
     return None
 
 
@@ -467,8 +467,40 @@ def _source_event_key(source_id: str, observation: SourceObservation | None) -> 
         and observation.error_code in AUTH_OR_TOOL_INCIDENT_ERROR_CODES
     ):
         return f"source-incident:{source_id}:{_error_fingerprint(observation)}"
-    anchor = observation.last_success_at or observation.attempted_at
+    anchor = (
+        observation.attempted_at
+        if observation.result is SourceResult.FAILURE
+        else observation.last_success_at or observation.attempted_at
+    )
     return f"source-due:{source_id}:{get_recipe(source_id).recipe_version}:{anchor}"
+
+
+def _source_signal_envelope(
+    source_id: str,
+    observation: SourceObservation | None,
+    due_at: datetime | None,
+) -> dict[str, object]:
+    recipe_version = get_recipe(source_id).recipe_version
+    if (
+        observation is not None
+        and observation.result is SourceResult.FAILURE
+        and observation.error_code in AUTH_OR_TOOL_INCIDENT_ERROR_CODES
+    ):
+        return {
+            "source_id": source_id,
+            "recipe_version": recipe_version,
+            "result": "failure",
+            "error_code": observation.error_code,
+            "incident_fingerprint": _error_fingerprint(observation),
+        }
+    return {
+        "source_id": source_id,
+        "recipe_version": recipe_version,
+        "attempted_at": observation.attempted_at if observation else None,
+        "last_success_at": observation.last_success_at if observation else None,
+        "covered_through": observation.covered_through if observation else None,
+        "due_at": format_time(due_at) if due_at else None,
+    }
 
 
 def _within_budget(monotonic: Callable[[], float], deadline: float) -> None:

@@ -56,7 +56,8 @@ or signal disposition. Use targeted recall only for a concrete retrieval gap.
 Order due sources deterministically: WhatsApp remains mandatory each wake;
 afterward order due sources by credential deadline inside the next two
 30-minute wakes, newly changed incident fingerprint, never-read, oldest due_at,
-then source ID. Unchanged auth/tool-absent incidents do not fast-retry.
+then source ID. Unchanged auth/tool-absent incidents retry only after their
+fingerprint changes.
 
 Keep the episode inside its cadence. At seven elapsed minutes begin no new
 source, recall, or hand inspection; at eight minutes stop acquiring and finish
