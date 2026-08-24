@@ -10,6 +10,7 @@ import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha1
 from pathlib import Path
 from typing import Final
 
@@ -208,12 +209,30 @@ def is_ca_trusted(ca_cert_path: Path) -> bool:
     security_bin = shutil.which("security")
     if not security_bin:
         return False
-    res = subprocess.run(
-        [security_bin, "verify-cert", "-c", str(ca_cert_path), "-p", "ssl"],
-        capture_output=True,
-        check=False,
-    )
-    return res.returncode == 0
+    try:
+        certificate_der = ssl.PEM_cert_to_DER_cert(ca_cert_path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+    expected_hash = sha1(certificate_der, usedforsecurity=False).hexdigest().upper()
+    for keychain_path in (
+        Path("/Library/Keychains/System.keychain"),
+        Path.home() / "Library/Keychains/login.keychain-db",
+    ):
+        res = subprocess.run(
+            [security_bin, "find-certificate", "-a", "-Z", str(keychain_path)],
+            capture_output=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            continue
+        for line in res.stdout.decode("utf-8", errors="replace").splitlines():
+            if not line.startswith("SHA-1 hash:"):
+                continue
+            observed_hash = line.partition(":")[2].replace(":", "").strip().upper()
+            if observed_hash == expected_hash:
+                return True
+    return False
 
 
 def install_ca_to_trust_store(

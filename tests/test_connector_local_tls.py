@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import ssl
 import stat
 import subprocess
 from pathlib import Path
@@ -137,22 +139,27 @@ def test_install_ca_to_trust_store_surfaces_prompt_sentence(tmp_path: Path) -> N
         )
 
 
-def test_is_ca_trusted_checks_security_verify_cert(tmp_path: Path) -> None:
+def test_is_ca_trusted_checks_macos_keychain_presence(tmp_path: Path) -> None:
     ca_crt = tmp_path / CA_CERT_FILENAME
-    ca_crt.write_bytes(b"dummy cert")
+    generate_local_ca(tmp_path / CA_KEY_FILENAME, ca_crt)
+    certificate_der = ssl.PEM_cert_to_DER_cert(ca_crt.read_text(encoding="ascii"))
+    certificate_hash = hashlib.sha1(certificate_der, usedforsecurity=False).hexdigest().upper()
+
+    def mock_run(command: list[str], **_: object) -> MagicMock:
+        assert command[:4] == ["/usr/bin/security", "find-certificate", "-a", "-Z"]
+        return MagicMock(returncode=0, stdout=b"")
 
     with (
         patch("sys.platform", "darwin"),
         patch("shutil.which", return_value="/usr/bin/security"),
-        patch("subprocess.run") as mock_run,
+        patch("continuity_kernel.connector_local_tls.Path.home", return_value=tmp_path),
+        patch("subprocess.run", side_effect=mock_run) as mock_run,
     ):
-        mock_run.return_value = MagicMock(returncode=0)
-        assert is_ca_trusted(ca_crt) is True
-        mock_run.assert_called_with(
-            ["/usr/bin/security", "verify-cert", "-c", str(ca_crt), "-p", "ssl"],
-            capture_output=True,
-            check=False,
-        )
-
-        mock_run.return_value = MagicMock(returncode=1)
         assert is_ca_trusted(ca_crt) is False
+        assert mock_run.call_count == 2
+
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=f"SHA-1 hash: {certificate_hash}\n".encode()),
+        ]
+        assert is_ca_trusted(ca_crt) is True
+        assert mock_run.call_count == 3
