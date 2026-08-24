@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import selectors
 import socket
+import ssl
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -96,10 +97,12 @@ class BoundLoopbackCallback:
         *,
         host: str,
         path: str,
+        tls_context: ssl.SSLContext | None = None,
     ) -> None:
         self._servers = servers
         self._host = host
         self._path = path
+        self._tls_context = tls_context
         self._closed = False
 
     @classmethod
@@ -109,11 +112,13 @@ class BoundLoopbackCallback:
         host: str = "127.0.0.1",
         port: int = 0,
         path: str = "/oauth/callback",
+        tls_context: ssl.SSLContext | None = None,
     ) -> BoundLoopbackCallback:
         if host not in {"127.0.0.1", "::1", "localhost"}:
             raise ValidationError("OAuth callback host must be loopback")
         if (path and not path.startswith("/")) or "?" in path or "#" in path or "\x00" in path:
             raise ValidationError("OAuth callback path is invalid")
+
         if host == "localhost":
             try:
                 ipv4 = _OneShotServer(("127.0.0.1", port), _CallbackHandler)
@@ -136,16 +141,22 @@ class BoundLoopbackCallback:
                 servers = (server_type((host, port), _CallbackHandler),)
             except OSError as exc:
                 raise ValidationError("OAuth callback could not bind the loopback port") from exc
+
+        if tls_context is not None:
+            for server in servers:
+                server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+
         for server in servers:
             server.expected_path = path or "/"
-        return cls(servers, host=host, path=path)
+        return cls(servers, host=host, path=path, tls_context=tls_context)
 
     @property
     def redirect_uri(self) -> str:
         address = self._servers[0].server_address
         port = int(address[1])
         host = f"[{self._host}]" if self._host == "::1" else self._host
-        return f"http://{host}:{port}{self._path}"
+        scheme = "https" if self._tls_context is not None else "http"
+        return f"{scheme}://{host}:{port}{self._path}"
 
     def configure(
         self,

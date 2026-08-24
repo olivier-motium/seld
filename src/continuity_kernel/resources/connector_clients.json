@@ -12,7 +12,7 @@
     },
     "slack": {
       "client_id": "8699719993504.11763118985744",
-      "redirect_template": "http://localhost:8767/oauth/callback"
+      "redirect_template": "https://localhost:8767/oauth/callback"
     }
   }
 }

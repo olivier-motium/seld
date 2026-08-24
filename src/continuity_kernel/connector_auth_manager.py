@@ -6,6 +6,7 @@ import base64
 import hashlib
 import math
 import secrets
+import ssl
 import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -37,6 +38,7 @@ from continuity_kernel.connector_identifiers import (
     parse_connection_id,
     parse_secret_name,
 )
+from continuity_kernel.connector_local_tls import ensure_local_tls
 from continuity_kernel.connector_oauth import (
     OAuthClientConfig,
     OAuthDialect,
@@ -393,6 +395,14 @@ class ConnectorAuthManager:
                     lock_timeout_seconds=remaining(),
                     updated_at=now,
                 )
+                credential = OAuthCredential.from_bytes(resolved.value)
+                credential = self._canonicalize_oauth_credential(metadata, credential)
+                self._validate_oauth_credential(metadata, credential)
+                return ResolvedOAuthAccessToken(
+                    access_token=credential.access_token,
+                    state=resolved.state,
+                    scopes=credential.scopes,
+                )
             except OAuthTokenEndpointError as exc:
                 health = (
                     ConnectionHealth.REAUTHORIZATION_REQUIRED
@@ -416,14 +426,16 @@ class ConnectorAuthManager:
                     ),
                 )
                 raise
-            credential = OAuthCredential.from_bytes(resolved.value)
-            credential = self._canonicalize_oauth_credential(metadata, credential)
-            self._validate_oauth_credential(metadata, credential)
-            return ResolvedOAuthAccessToken(
-                access_token=credential.access_token,
-                state=resolved.state,
-                scopes=credential.scopes,
-            )
+            except OAuthPermissionGrantError:
+                self._mark_health(
+                    metadata.connection_id,
+                    ConnectionHealth.REAUTHORIZATION_REQUIRED,
+                    observed_at=max(
+                        now,
+                        metadata.updated_at + timedelta(microseconds=1),
+                    ),
+                )
+                raise
 
     def inspect_custody(self, connection: ConnectionMetadata) -> CustodyStatus:
         """Parse-validate one host credential without requiring verified identity."""
@@ -778,10 +790,28 @@ class ConnectorAuthManager:
         host = template.hostname
         if host not in {"127.0.0.1", "::1", "localhost"}:
             raise ValidationError("OAuth redirect template must use loopback")
+        tls_context: ssl.SSLContext | None = None
+        if template.scheme == "https":
+            try:
+                material = ensure_local_tls()
+                tls_context = material.create_ssl_context()
+            except SetupError:
+                raise
+            except Exception as exc:
+                raise SetupError(
+                    f"Failed to initialize local TLS for HTTPS redirect: {exc}"
+                ) from exc
+        elif template.scheme == "http":
+            tls_context = None
+        else:
+            raise ValidationError(
+                f"OAuth redirect template scheme must be http or https: {template.scheme}"
+            )
         listener = BoundLoopbackCallback.bind(
             host=host,
             port=template.port or 0,
             path=template.path,
+            tls_context=tls_context,
         )
         authorization_may_remain = False
         try:
@@ -1209,6 +1239,19 @@ class ConnectorAuthManager:
             # but judge this logical connector only by the scopes its closed
             # operation surface can exercise.
             relevant_grant &= purge_authority
+        elif metadata.provider == "slack" and profile.name == "slack":
+            provider_profile = get_profile("slack")
+            grant_authority = ConnectorAuthManager._canonical_oauth_access_scopes(
+                metadata.provider,
+                (*provider_profile.read_scopes, *provider_profile.full_scopes),
+            )
+            # Slack returns the union of workspace permissions already granted to
+            # the app. Keep rejecting unknown provider grants, but judge this
+            # connection only by the scopes its closed operation surface can exercise.
+            relevant_surface = (
+                read_authority if configured_tier is ConnectorAccessTier.READ else purge_authority
+            )
+            relevant_grant &= relevant_surface
         if not granted_access.issubset(grant_authority):
             raise OAuthPermissionGrantError("outside_selected_tier")
         if relevant_grant.issubset(read_authority):

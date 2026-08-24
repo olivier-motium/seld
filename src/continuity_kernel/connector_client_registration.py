@@ -180,7 +180,7 @@ def _redirect_template(provider: str, value: object) -> str:
     except ValueError as exc:
         raise ValidationError(f"{provider} redirect template is invalid") from exc
     if (
-        parsed.scheme != "http"
+        parsed.scheme not in {"http", "https"}
         or parsed.hostname is None
         or parsed.username is not None
         or parsed.password is not None
@@ -190,14 +190,26 @@ def _redirect_template(provider: str, value: object) -> str:
         raise ValidationError(f"{provider} redirect template is invalid")
     host = parsed.hostname.casefold()
     if provider == "google":
-        valid = host in _LOOPBACK_IPS and port == 0 and parsed.path == ""
+        valid = (
+            parsed.scheme == "http" and host in _LOOPBACK_IPS and port == 0 and parsed.path == ""
+        )
     elif provider == "microsoft":
         # Microsoft public desktop clients ignore the ephemeral port only for
         # localhost redirect URIs. Numeric loopback hosts require an exact
         # registered port and therefore cannot support Seld's dynamic listener.
-        valid = host == "localhost" and port == 0 and parsed.path == "/oauth/callback"
+        valid = (
+            parsed.scheme == "http"
+            and host == "localhost"
+            and port == 0
+            and parsed.path == "/oauth/callback"
+        )
     else:
-        valid = host == "localhost" and port not in {None, 0} and parsed.path == "/oauth/callback"
+        valid = (
+            parsed.scheme in {"http", "https"}
+            and host == "localhost"
+            and port not in {None, 0}
+            and parsed.path == "/oauth/callback"
+        )
     if not valid:
         raise ValidationError(f"{provider} redirect template is invalid")
     return redirect

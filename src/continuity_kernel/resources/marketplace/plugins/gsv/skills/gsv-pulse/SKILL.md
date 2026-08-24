@@ -53,6 +53,12 @@ Freeze the exact input IDs and source windows to inspect. New arrivals wait for
 the next wake. Re-read only an exact record immediately before its CAS mutation
 or signal disposition. Use targeted recall only for a concrete retrieval gap.
 
+Order due sources deterministically: WhatsApp remains mandatory each wake;
+afterward order due sources by credential deadline inside the next two
+30-minute wakes, newly changed incident fingerprint, never-read, oldest due_at,
+then source ID. Unchanged auth/tool-absent incidents retry only after their
+fingerprint changes.
+
 Keep the episode inside its cadence. At seven elapsed minutes begin no new
 source, recall, or hand inspection; at eight minutes stop acquiring and finish
 the smallest honest judgment and readback already in hand. Bounds protect
@@ -163,11 +169,14 @@ poll is permitted only after the prior acknowledgement succeeds. If time runs
 out, leave the exact remaining delivery pending for the next wake.
 
 Apple Messages and WhatsApp derive account identity inside their read-only
-local adapters. Never invent or submit an account binding for either source. A
-binding, adapter, replay, or acknowledgement failure is a critical source
-incident. On its first occurrence, send one content-free alert to the exact
-Chief of Staff task in the same wake. Carry a compact incident marker in
-`NOW.md`, and alert again only when the failure materially changes or clears.
+local adapters. Never invent or submit an account binding for either source.
+Apple Messages must record an honest content-free partial gap before
+acknowledging across any uncovered horizon, then use existing
+record-readback-ack. A binding, adapter, replay, or acknowledgement failure is a
+critical source incident. On its first occurrence, send one content-free alert
+to the exact Chief of Staff task in the same wake. Carry a compact incident
+marker in `NOW.md`, and alert again only when the failure materially changes or
+clears.
 
 When a due Google or Outlook calendar read has no connector tool, check the
 content-free `gsv codex status` through the installed CLI before calling it an

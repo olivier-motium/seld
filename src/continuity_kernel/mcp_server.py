@@ -39,7 +39,7 @@ from continuity_kernel.dispatch import (
 )
 from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
 from continuity_kernel.local_source_delivery import (
-    FORWARD_ONLY_RESET,
+    RESET_DISPOSITIONS,
     SUPPORTED_LOCAL_SOURCES,
     VERIFIED_PREFIX_ADOPTION,
     LocalSourceDelivery,
@@ -415,6 +415,8 @@ def _call(
             expected_checkpoint_digest=_string(values, "expected_checkpoint_digest"),
             expected_sequence=_integer(values, "expected_sequence", -1),
             disposition=_string(values, "disposition"),
+            expected_source_revision=_optional_string(values, "expected_source_revision"),
+            actor_ref=_optional_string(values, "actor_ref"),
         )
     if name == "gsv_local_source_acknowledge":
         return LocalSourceDelivery(vault).acknowledge(
@@ -1559,15 +1561,18 @@ TOOLS: Final = [
     _tool(
         "gsv_local_source_rebaseline",
         (
-            "Only after an operator explicitly accepts a verified local store replacement, "
-            "archive the exact old checkpoint and establish a forward-only replacement baseline. "
-            "This discards any pending delivery, requires exact checkpoint CAS, leaves source "
-            "health needing reproof, and never writes provider state."
+            "After an operator explicitly accepts a verified local store replacement or "
+            "discards a stale pending delivery, archive the exact old checkpoint and "
+            "establish a forward-only baseline. This discards any pending delivery, requires "
+            "exact checkpoint CAS, leaves source health needing reproof, and never writes "
+            "provider state."
         ),
         {
-            "disposition": {"enum": [FORWARD_ONLY_RESET], "type": "string"},
+            "actor_ref": TEXT,
+            "disposition": {"enum": list(RESET_DISPOSITIONS), "type": "string"},
             "expected_checkpoint_digest": TEXT,
             "expected_sequence": {"minimum": 0, "type": "integer"},
+            "expected_source_revision": TEXT,
             "source": {"enum": list(SUPPORTED_LOCAL_SOURCES), "type": "string"},
         },
         (

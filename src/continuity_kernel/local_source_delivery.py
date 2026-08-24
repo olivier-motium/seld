@@ -26,6 +26,7 @@ from continuity_kernel.errors import ConflictError, ContinuityError, ValidationE
 from continuity_kernel.records import format_time, parse_time
 from continuity_kernel.source_recipes import get_recipe
 from continuity_kernel.source_state import (
+    SourceCompleteness,
     SourceSnapshot,
     source_fingerprint,
 )
@@ -54,6 +55,8 @@ MAX_ADAPTER_BINDING_BYTES: Final = 16 * 1024
 MAX_STORE_ROOT_CHARACTERS: Final = 4_096
 ADAPTER_BINDING_VERSION: Final = 1
 FORWARD_ONLY_RESET: Final = "forward_only_reset"
+DISCARD_STALE_DELIVERY: Final = "discard_stale_delivery"
+RESET_DISPOSITIONS: Final = (FORWARD_ONLY_RESET, DISCARD_STALE_DELIVERY)
 VERIFIED_PREFIX_ADOPTION: Final = "adopt_verified_prefix"
 _AUTHORITY_RELATIVE: Final = Path("local-source-delivery")
 _CHECKPOINTS_RELATIVE: Final = _AUTHORITY_RELATIVE / "checkpoints"
@@ -493,18 +496,33 @@ class LocalSourceDelivery:
         expected_checkpoint_digest: str,
         expected_sequence: int,
         disposition: str,
+        expected_source_revision: str | None = None,
+        actor_ref: str | None = None,
     ) -> dict[str, Any]:
-        """Explicitly accept a replaced store and retain the prior checkpoint as history."""
+        """Explicitly accept a replaced store or discard a stale pending delivery."""
 
         source = _source(source)
         if _SHA256.fullmatch(expected_checkpoint_digest) is None:
             raise ValidationError("expected local source checkpoint digest is invalid")
         if type(expected_sequence) is not int or expected_sequence < 0:
             raise ValidationError("expected local source checkpoint sequence is invalid")
-        if disposition != FORWARD_ONLY_RESET:
+        if disposition not in RESET_DISPOSITIONS:
             raise ValidationError(
-                "local source replacement requires disposition forward_only_reset"
+                f"local source replacement requires disposition {FORWARD_ONLY_RESET} "
+                f"or {DISCARD_STALE_DELIVERY}"
             )
+        if disposition == DISCARD_STALE_DELIVERY:
+            if source != "apple_messages":
+                raise ValidationError("discard_stale_delivery is only supported for apple_messages")
+            if (
+                expected_source_revision is None
+                or _REVISION.fullmatch(expected_source_revision) is None
+            ):
+                raise ValidationError(
+                    "discard_stale_delivery requires a valid expected_source_revision"
+                )
+            if not actor_ref or not actor_ref.strip():
+                raise ValidationError("discard_stale_delivery requires actor_ref")
         self._selected_snapshot(source)
         binding = self._required_binding(source)
         with self._locked_storage(binding, create=True) as store:
@@ -552,8 +570,95 @@ class LocalSourceDelivery:
             replacement_digest = _digest(cursor)
             previous_store_identity = _cursor_store_identity(state.cursor)
             replacement_store_identity = _cursor_store_identity(cursor)
-            if previous_store_identity == replacement_store_identity:
+            if (
+                disposition == FORWARD_ONLY_RESET
+                and previous_store_identity == replacement_store_identity
+            ):
                 raise ConflictError("local source store identity has not changed")
+            if disposition == DISCARD_STALE_DELIVERY:
+                if source != "apple_messages":
+                    raise ValidationError(
+                        "discard_stale_delivery is only supported for apple_messages"
+                    )
+                if state.pending_token is None:
+                    raise ConflictError("no local source delivery is pending to discard")
+                prepared = _decode_token(state.pending_token, binding)
+                self._validate_prepared_state(state, prepared)
+                content_changed = False
+                try:
+                    delta = self._replay_delta(
+                        source,
+                        cursor=state.cursor,
+                        target_cursor=prepared.target_cursor,
+                        complete=prepared.completeness == "complete",
+                        limit=prepared.limit,
+                        store_root=store_root,
+                    )
+                    self._verify_replayed_delta(prepared, delta)
+                    if prepared.adapter_token is not None:
+                        self._verify_prepared_delivery(
+                            prepared,
+                            state.cursor,
+                            store_root=store_root,
+                        )
+                except ContinuityError as exc:
+                    if (
+                        str(exc).strip()
+                        == "Apple Messages delivered content changed before acknowledgement"
+                    ):
+                        content_changed = True
+                    else:
+                        raise
+                if not content_changed:
+                    raise ConflictError(
+                        "local source pending delivery is healthy and does not have "
+                        "delivered content changed"
+                    )
+                account_digest = self._account_digest(source, store_root=store_root)
+                token_digest = _digest(state.pending_token)
+                gap_evidence_ref = f"seld-local-source-gap:{token_digest}"
+                gap_evidence_digest = source_fingerprint(
+                    gap_evidence_ref, "source evidence reference"
+                )
+
+                snapshot = self.vault.get_source_snapshot()
+                observation = snapshot.observation(source)
+                is_gap_receipt_recorded = (
+                    observation is not None
+                    and observation.completeness is SourceCompleteness.PARTIAL
+                    and gap_evidence_digest in observation.evidence_digests
+                )
+
+                if is_gap_receipt_recorded:
+                    if expected_source_revision != snapshot.revision:
+                        raise ConflictError(
+                            "source-state revision does not match expected recovery revision"
+                        )
+                else:
+                    if expected_source_revision != snapshot.revision:
+                        raise ConflictError(
+                            "source-state revision does not match expected recovery revision"
+                        )
+                    horizon = replacement.newest_message_at or replacement.observed_at
+                    assert actor_ref is not None
+                    self.vault.record_source_observation(
+                        expected_revision=expected_source_revision,
+                        source_id=source,
+                        actor_ref=actor_ref,
+                        result="success",
+                        covered_through=horizon,
+                        completeness="partial",
+                        tool_binding=LOCAL_SOURCE_TOOL_BINDINGS[source],
+                        evidence_refs=(gap_evidence_ref,),
+                        _account_fingerprint=account_digest,
+                    )
+                    recorded = self.vault.get_source_snapshot().observation(source)
+                    if (
+                        recorded is None
+                        or recorded.completeness is not SourceCompleteness.PARTIAL
+                        or gap_evidence_digest not in recorded.evidence_digests
+                    ):
+                        raise ContinuityError("Apple Messages partial gap receipt readback failed")
 
             archive_relative = self._checkpoint_archive_relative(binding, state)
             store.ensure_directory(_HISTORY_RELATIVE)
@@ -1973,13 +2078,16 @@ def _parse_reset_receipt(value: object) -> _ResetReceipt | None:
         or _SHA256.fullmatch(previous_store_identity) is None
         or not isinstance(replacement_store_identity, str)
         or _SHA256.fullmatch(replacement_store_identity) is None
-        or previous_store_identity == replacement_store_identity
+        or (
+            disposition == FORWARD_ONLY_RESET
+            and previous_store_identity == replacement_store_identity
+        )
         or type(pending_delivery_discarded) is not bool
         or not isinstance(archive_digest, str)
         or _SHA256.fullmatch(archive_digest) is None
         or type(previous_sequence) is not int
         or previous_sequence < 0
-        or disposition != FORWARD_ONLY_RESET
+        or disposition not in RESET_DISPOSITIONS
         or not isinstance(reset_at, str)
     ):
         raise ValidationError("local source checkpoint reset receipt is invalid")
@@ -2133,8 +2241,10 @@ def _has_exact_source_event(
 
 
 __all__ = [
+    "DISCARD_STALE_DELIVERY",
     "FORWARD_ONLY_RESET",
     "LOCAL_SOURCE_TOOL_BINDINGS",
+    "RESET_DISPOSITIONS",
     "SUPPORTED_LOCAL_SOURCES",
     "VERIFIED_PREFIX_ADOPTION",
     "LocalSourceDelivery",

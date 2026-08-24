@@ -21,8 +21,24 @@ from continuity_kernel.atomic import durable_replace as actual_durable_replace
 from continuity_kernel.codex_integration import CodexInstallResult
 from continuity_kernel.config import config_path, load_config, save_config
 from continuity_kernel.errors import SetupError, ValidationError
+from continuity_kernel.sense_sweep import SweepRecallStatus
 from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
 from continuity_kernel.vault import Vault
+
+
+def test_scheduled_recall_refresh_defers_without_load_average(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = Vault(tmp_path / "recall-refresh-vault")
+    vault.initialize(name="Recall refresh without load average")
+    monkeypatch.delattr(os, "getloadavg", raising=False)
+
+    assert cli._scheduled_recall_refresh(vault) == SweepRecallStatus(
+        False,
+        None,
+        False,
+        "deferred_budget",
+    )
 
 
 def test_cli_resident_activation_survives_a_fresh_process(tmp_path: Path) -> None:
@@ -114,6 +130,11 @@ def test_cli_pulse_sweep_is_visible_from_a_fresh_process(
     Vault(vault_path).initialize(name="Fresh process Pulse")
     monkeypatch.setenv("GSV_DATA_DIR", str(host_data))
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(
+        cli,
+        "_scheduled_recall_refresh",
+        lambda _vault: SweepRecallStatus(True, True, True, None),
+    )
 
     assert cli.main(["--json", "--vault", str(vault_path), "pulse", "sweep"]) == 0
     swept = json.loads(capsys.readouterr().out)["result"]
@@ -138,6 +159,12 @@ def test_cli_pulse_sweep_is_visible_from_a_fresh_process(
     assert completed.returncode == 0, completed.stderr
     restarted = json.loads(completed.stdout)["result"]
     assert swept["status"] == "complete"
+    assert swept["recall"] == {
+        "attempted": True,
+        "changed": True,
+        "failure": None,
+        "updated": True,
+    }
     assert restarted["heartbeat"]["observed_at"] == swept["observed_at"]
     assert restarted["heartbeat"]["sequence"] == 1
     assert restarted["signals"]["pending"] == 0
