@@ -26,6 +26,21 @@ from continuity_kernel.source_state import ABSENT_SOURCE_REVISION
 from continuity_kernel.vault import Vault
 
 
+def test_scheduled_recall_refresh_defers_without_load_average(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = Vault(tmp_path / "recall-refresh-vault")
+    vault.initialize(name="Recall refresh without load average")
+    monkeypatch.delattr(os, "getloadavg", raising=False)
+
+    assert cli._scheduled_recall_refresh(vault) == SweepRecallStatus(
+        False,
+        None,
+        False,
+        "deferred_budget",
+    )
+
+
 def test_cli_resident_activation_survives_a_fresh_process(tmp_path: Path) -> None:
     vault_path = tmp_path / "resident-activation-vault"
     vault = Vault(vault_path)

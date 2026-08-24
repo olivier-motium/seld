@@ -1177,8 +1177,11 @@ def _pulse_status(vault: Vault) -> dict[str, object]:
 def _scheduled_recall_refresh(vault: Vault) -> SweepRecallStatus:
     """Refresh recall once when the host has enough spare capacity."""
 
+    getloadavg = getattr(os, "getloadavg", None)
+    if getloadavg is None:
+        return SweepRecallStatus(False, None, False, "deferred_budget")
     try:
-        load = os.getloadavg()[0]
+        load = getloadavg()[0]
     except OSError:
         return SweepRecallStatus(False, None, False, "deferred_budget")
     if load >= RECALL_REFRESH_LOAD_CEILING:
