@@ -84,7 +84,7 @@ PATTERNS = (
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(rb"AKIA[0-9A-Z]{16}"),
     re.compile(rb"gh[pousr]_[A-Za-z0-9]{30,}"),
-    re.compile(rb"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(rb"(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     re.compile(rb"xox[baprs]-[A-Za-z0-9-]{20,}"),
     re.compile(rb"AIza[0-9A-Za-z_-]{30,}"),
     re.compile(rb"/Users/[A-Za-z0-9._-]+/"),
@@ -517,6 +517,12 @@ def _relative(path: Path, root: Path) -> str:
 
 
 def _self_test() -> None:
+    secret_key_pattern = PATTERNS[3]
+    if secret_key_pattern.search(b"task-apple-rebaseline-retry"):
+        raise RuntimeError("privacy scanner secret-key pattern matched an embedded task suffix")
+    if not secret_key_pattern.search(b" " + b"sk-" + (b"a" * 20)):
+        raise RuntimeError("privacy scanner secret-key pattern missed the canary")
+
     with tempfile.TemporaryDirectory(prefix="gsv-privacy-self-test-") as raw:
         root = Path(raw)
         clean = root / "clean.txt"
