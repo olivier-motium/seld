@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import uuid
 from collections.abc import Callable
@@ -62,6 +63,7 @@ from continuity_kernel.direction import (
 )
 from continuity_kernel.errors import (
     ConflictError,
+    ContinuityError,
     DegradedIntegrityError,
     MutationCommittedError,
     NotFoundError,
@@ -87,7 +89,6 @@ from continuity_kernel.portfolio import (
     render_portfolio,
 )
 from continuity_kernel.records import (
-    DEFAULT_CLAIM_WINDOW,
     MAX_HISTORY_ENTRIES,
     REVIEW_WORK_THREAD_ID,
     SHA256_REVISION,
@@ -103,10 +104,10 @@ from continuity_kernel.records import (
     WorkThreadEntityLink,
     WorkThreadTaskLink,
     actor,
+    agent_run_value,
     body_text,
     calendar_date,
     canonical_id,
-    claim_by_eligible,
     codex_episodes,
     dispatch_id_value,
     dispatch_revision_value,
@@ -150,6 +151,13 @@ from continuity_kernel.records import (
     thread_status,
     thread_task_links,
     title_text,
+)
+from continuity_kernel.resident_context import (
+    GUIDANCE_PROJECTION_INTENT,
+    GUIDANCE_PROJECTION_MARKER,
+    MAX_GUIDANCE_BYTES,
+    recover_interrupted_guidance_projection,
+    validate_checkout_guidance_sources,
 )
 from continuity_kernel.resident_signals import (
     ResidentSignal,
@@ -204,6 +212,66 @@ MAX_JOURNAL_LINE_BYTES: Final = 64 * 1024
 DEFAULT_TASK_HISTORY_KEEP: Final = 50
 RecordKind = Literal["task", "entity", "thread"]
 RecordValue = TypeVar("RecordValue", Task, Entity, WorkThread)
+_HEX_SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & 0x0400
+    )
+
+
+def _validate_guidance_projection_marker_dict(data: Any) -> bool:
+    """Strictly validate complete marker schema and all required source/target hashes."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("format_version") != 1:
+        return False
+    if not isinstance(data.get("checkout_root"), str) or not data["checkout_root"].strip():
+        return False
+    if not isinstance(data.get("projected_at"), str) or not data["projected_at"].strip():
+        return False
+
+    sources = data.get("sources")
+    if not isinstance(sources, dict):
+        return False
+    for src_name in ("AGENTS.md", "brain/MIND.md"):
+        entry = sources.get(src_name)
+        if not isinstance(entry, dict):
+            return False
+        if not isinstance(entry.get("path"), str) or not entry["path"].strip():
+            return False
+        if entry.get("relative_path") != src_name:
+            return False
+        sha = entry.get("sha256")
+        if not isinstance(sha, str) or not _HEX_SHA256.fullmatch(sha):
+            return False
+        b_count = entry.get("bytes")
+        if not isinstance(b_count, int) or b_count < 0:
+            return False
+
+    targets = data.get("vault_targets")
+    if not isinstance(targets, dict):
+        return False
+    expected_targets = (
+        ("AGENTS.md", "context/resident/AGENTS.md"),
+        ("MIND.md", "MIND.md"),
+    )
+    for tgt_name, tgt_path in expected_targets:
+        entry = targets.get(tgt_name)
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("path") != tgt_path:
+            return False
+        sha = entry.get("sha256")
+        if not isinstance(sha, str) or not _HEX_SHA256.fullmatch(sha):
+            return False
+        b_count = entry.get("bytes")
+        if not isinstance(b_count, int) or b_count < 0:
+            return False
+
+    return True
+
 
 MIND_TEMPLATE = """# Mind
 
@@ -385,6 +453,10 @@ class Vault:
 
     def create_task(self, **values: Any) -> Task:
         with exclusive_lock(self.state / "locks/global.lock"):
+            if values.get("dispatch_id") is not None or values.get("dispatch_revision") is not None:
+                raise ValidationError(
+                    "task cannot be created with a dispatch ID or dispatch revision"
+                )
             payload = dict(values)
             supplied_links = task_entity_links(tuple(payload.get("entity_links", ())))
             payload["entity_links"] = self._resolved_task_entity_links(supplied_links)
@@ -422,10 +494,156 @@ class Vault:
         target_seat: str | None = None,
         claim_by: str | None = None,
         progress_check_by: str | None = None,
+        blocker_owner: str | None = None,
+        blocker_condition: str | None = None,
+        agent_run: str | None = None,
+        active_thread_id: str | None = None,
+        superseded_by: str | None = None,
+        project: str | None = None,
+        workspace: str | None = None,
+        attention_at: str | None = None,
+        due: str | None = None,
+        clear_next_actor: bool = False,
+        clear_next_action: bool = False,
+        clear_waiting_on: bool = False,
+        clear_rank: bool = False,
+        clear_target_seat: bool = False,
+        clear_claim_by: bool = False,
+        clear_progress_check_by: bool = False,
+        clear_blocker_owner: bool = False,
+        clear_blocker_condition: bool = False,
+        clear_agent_run: bool = False,
+        clear_active_thread_id: bool = False,
+        clear_superseded_by: bool = False,
+        clear_project: bool = False,
+        clear_workspace: bool = False,
+        clear_attention_at: bool = False,
+        clear_due: bool = False,
+        add_entity_links: tuple[TaskEntityLink, ...] = (),
+        remove_entity_links: tuple[TaskEntityLink, ...] = (),
+        add_codex_episode_ids: tuple[str, ...] = (),
+        remove_codex_episode_ids: tuple[str, ...] = (),
+        add_refs: tuple[str, ...] = (),
+        remove_refs: tuple[str, ...] = (),
+        note: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> Task:
+        return self._update_task_record(
+            identifier,
+            expected_revision=expected_revision,
+            title=title,
+            outcome=outcome,
+            status=status,
+            next_actor=next_actor,
+            next_action=next_action,
+            waiting_on=waiting_on,
+            rank=rank,
+            target_seat=target_seat,
+            claim_by=claim_by,
+            progress_check_by=progress_check_by,
+            blocker_owner=blocker_owner,
+            blocker_condition=blocker_condition,
+            agent_run=agent_run,
+            active_thread_id=active_thread_id,
+            superseded_by=superseded_by,
+            project=project,
+            workspace=workspace,
+            attention_at=attention_at,
+            due=due,
+            clear_next_actor=clear_next_actor,
+            clear_next_action=clear_next_action,
+            clear_waiting_on=clear_waiting_on,
+            clear_rank=clear_rank,
+            clear_target_seat=clear_target_seat,
+            clear_claim_by=clear_claim_by,
+            clear_progress_check_by=clear_progress_check_by,
+            clear_blocker_owner=clear_blocker_owner,
+            clear_blocker_condition=clear_blocker_condition,
+            clear_agent_run=clear_agent_run,
+            clear_active_thread_id=clear_active_thread_id,
+            clear_superseded_by=clear_superseded_by,
+            clear_project=clear_project,
+            clear_workspace=clear_workspace,
+            clear_attention_at=clear_attention_at,
+            clear_due=clear_due,
+            add_entity_links=add_entity_links,
+            remove_entity_links=remove_entity_links,
+            add_codex_episode_ids=add_codex_episode_ids,
+            remove_codex_episode_ids=remove_codex_episode_ids,
+            add_refs=add_refs,
+            remove_refs=remove_refs,
+            note=note,
+            observed_at=observed_at,
+        )
+
+    def _update_task_dispatch(
+        self,
+        identifier: str,
+        *,
+        expected_revision: str,
+        status: str | None = None,
+        rank: int | None = None,
+        waiting_on: str | None = None,
+        claim_by: str | None = None,
+        dispatch_id: str | None = None,
+        dispatch_revision: str | None = None,
+        active_thread_id: str | None = None,
+        blocker_owner: str | None = None,
+        blocker_condition: str | None = None,
+        clear_waiting_on: bool = False,
+        clear_dispatch_id: bool = False,
+        clear_dispatch_revision: bool = False,
+        clear_active_thread_id: bool = False,
+        clear_blocker_owner: bool = False,
+        clear_blocker_condition: bool = False,
+        clear_progress_check_by: bool = False,
+        note: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> Task:
+        return self._update_task_record(
+            identifier,
+            expected_revision=expected_revision,
+            dispatch_operation=True,
+            status=status,
+            rank=rank,
+            waiting_on=waiting_on,
+            claim_by=claim_by,
+            dispatch_id=dispatch_id,
+            dispatch_revision=dispatch_revision,
+            active_thread_id=active_thread_id,
+            blocker_owner=blocker_owner,
+            blocker_condition=blocker_condition,
+            clear_waiting_on=clear_waiting_on,
+            clear_dispatch_id=clear_dispatch_id,
+            clear_dispatch_revision=clear_dispatch_revision,
+            clear_active_thread_id=clear_active_thread_id,
+            clear_blocker_owner=clear_blocker_owner,
+            clear_blocker_condition=clear_blocker_condition,
+            clear_progress_check_by=clear_progress_check_by,
+            note=note,
+            observed_at=observed_at,
+        )
+
+    def _update_task_record(
+        self,
+        identifier: str,
+        *,
+        expected_revision: str,
+        title: str | None = None,
+        outcome: str | None = None,
+        status: str | None = None,
+        next_actor: str | None = None,
+        next_action: str | None = None,
+        waiting_on: str | None = None,
+        rank: int | None = None,
+        target_seat: str | None = None,
+        claim_by: str | None = None,
+        progress_check_by: str | None = None,
         dispatch_id: str | None = None,
         dispatch_revision: str | None = None,
         blocker_owner: str | None = None,
         blocker_condition: str | None = None,
+        agent_run: str | None = None,
         active_thread_id: str | None = None,
         superseded_by: str | None = None,
         project: str | None = None,
@@ -443,6 +661,7 @@ class Vault:
         clear_dispatch_revision: bool = False,
         clear_blocker_owner: bool = False,
         clear_blocker_condition: bool = False,
+        clear_agent_run: bool = False,
         clear_active_thread_id: bool = False,
         clear_superseded_by: bool = False,
         clear_project: bool = False,
@@ -457,6 +676,7 @@ class Vault:
         remove_refs: tuple[str, ...] = (),
         note: str | None = None,
         observed_at: datetime | None = None,
+        dispatch_operation: bool = False,
     ) -> Task:
         clean_id = task_id(identifier)
         path = self._path("task", clean_id)
@@ -466,6 +686,15 @@ class Vault:
         ):
             before = self._read_task(clean_id)
             self._expect(before.revision, expected_revision)
+            if (
+                not dispatch_operation
+                and (active_thread_id is not None or clear_active_thread_id)
+                and before.dispatch_id is not None
+                and before.dispatch_revision is not None
+            ):
+                raise ValidationError(
+                    "a claimed task hand must use the dedicated dispatch operation"
+                )
             _exclusive_choice(active_thread_id, clear_active_thread_id, "active Codex hand")
             _exclusive_choice(superseded_by, clear_superseded_by, "superseding task")
             _exclusive_choice(project, clear_project, "project")
@@ -495,6 +724,7 @@ class Vault:
                 clear_blocker_condition,
                 "blocker condition",
             )
+            _exclusive_choice(agent_run, clear_agent_run, "agent run")
 
             target_status = task_status(status) if status is not None else before.status
             target_actor = (
@@ -570,11 +800,23 @@ class Vault:
                 if clear_blocker_condition
                 else before.blocker_condition
             )
+            target_agent_run = (
+                agent_run_value(agent_run)
+                if agent_run is not None
+                else None
+                if clear_agent_run
+                else before.agent_run
+            )
             if target_blocker_condition is not None and target_waiting is None:
                 target_waiting = target_blocker_condition
             if target_status in TERMINAL_TASK_STATUSES:
                 target_blocker_owner = None
                 target_blocker_condition = None
+            if target_dispatch_id is not None and target_dispatch_id != before.dispatch_id:
+                if before.dispatch_id is not None:
+                    raise ValidationError("task is already claimed by another dispatch")
+                if target_dispatch_revision != before.revision:
+                    raise ValidationError("dispatch claim requires exact dispatch revision")
             _validate_task_dispatch_update(
                 target_status,
                 target_waiting,
@@ -593,6 +835,28 @@ class Vault:
                 if clear_active_thread_id
                 else before.active_thread_id
             )
+            if (
+                target_agent_run == "yes"
+                and target_active_thread_id is not None
+                and target_active_thread_id != before.active_thread_id
+                and (
+                    before.dispatch_id is None
+                    or before.dispatch_revision is None
+                    or target_status != "doing"
+                )
+            ):
+                raise ValidationError(
+                    "active thread ID on an agent-run task must be bound through dispatch"
+                )
+            if (
+                target_agent_run == "yes"
+                and before.agent_run != "yes"
+                and target_active_thread_id is not None
+                and (before.dispatch_id is None or before.dispatch_revision is None)
+            ):
+                raise ValidationError(
+                    "active thread ID on an agent-run task must be bound through dispatch"
+                )
             target_superseded_by = (
                 task_id(superseded_by)
                 if superseded_by is not None
@@ -696,18 +960,6 @@ class Vault:
                 (before, *((transfer_owner,) if transfer_owner is not None else ())),
                 observed_at,
             )
-            if (
-                before.claim_by is None
-                and target_claim_by is None
-                and claim_by_eligible(target_status, target_target_seat, target_waiting)
-                and not clear_claim_by
-                and (
-                    target_status != before.status
-                    or target_target_seat != before.target_seat
-                    or target_waiting != before.waiting_on
-                )
-            ):
-                target_claim_by = format_time(parse_time(timestamp) + DEFAULT_CLAIM_WINDOW)
             changes = _changed_fields(
                 (
                     (
@@ -746,6 +998,7 @@ class Vault:
                         before.blocker_condition,
                         target_blocker_condition,
                     ),
+                    ("agent run", before.agent_run, target_agent_run),
                     ("active Codex hand", before.active_thread_id, target_active_thread_id),
                     ("superseding task", before.superseded_by, target_superseded_by),
                     ("project", before.project, target_project),
@@ -777,6 +1030,7 @@ class Vault:
                     target_dispatch_revision is not None,
                     target_blocker_owner is not None,
                     target_blocker_condition is not None,
+                    target_agent_run is not None,
                     clean_note is not None,
                 )
             )
@@ -805,6 +1059,7 @@ class Vault:
                 dispatch_revision=target_dispatch_revision,
                 blocker_owner=target_blocker_owner,
                 blocker_condition=target_blocker_condition,
+                agent_run=target_agent_run,
                 active_thread_id=target_active_thread_id,
                 refs=refs,
                 superseded_by=target_superseded_by,
@@ -2225,20 +2480,78 @@ class Vault:
                 direction=direction,
             )
 
+    def _recover_interrupted_guidance_projection(self) -> None:
+        """Durably recover the prior complete generation if an interrupted projection is found."""
+        recover_interrupted_guidance_projection(self.root)
+
     def read_document(self, name: str) -> dict[str, str]:
-        path = self._document_path(name)
+        canonical_name = name.strip()
+        path = self._document_path(canonical_name)
+        if canonical_name.casefold() in ("mind.md", "mind"):
+            with (
+                exclusive_lock(self.state / "locks/global.lock"),
+                exclusive_lock(self._record_lock("document", "mind")),
+                exclusive_lock(self.state / "locks/resident-guidance.lock"),
+            ):
+                self._recover_interrupted_guidance_projection()
+                stored = self._read_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
+                content = stored.decode("utf-8")
+                return {"content": content, "name": path.name, "revision": sha256_bytes(stored)}
         stored = self._read_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
         content = stored.decode("utf-8")
         return {"content": content, "name": path.name, "revision": sha256_bytes(stored)}
 
+    def is_guidance_managed(self) -> bool:
+        """Check if valid checkout guidance projection is active."""
+
+        marker = self.root / GUIDANCE_PROJECTION_MARKER
+        if not marker.exists():
+            return False
+        try:
+            metadata = os.lstat(marker)
+            if (
+                _is_link_or_reparse(metadata)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size == 0
+            ):
+                return False
+            raw = self._read_bytes(marker, max_bytes=MAX_DOCUMENT_BYTES)
+            data = json.loads(raw.decode("utf-8"))
+            return _validate_guidance_projection_marker_dict(data)
+        except Exception:
+            return False
+
+    def read_guidance_projection(self) -> dict[str, Any] | None:
+        """Read the managed guidance projection marker if active."""
+
+        marker = self.root / GUIDANCE_PROJECTION_MARKER
+        if not marker.exists():
+            return None
+        raw = self._read_bytes(marker, max_bytes=MAX_DOCUMENT_BYTES)
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValidationError("guidance projection marker must be a JSON object")
+        return data
+
     def write_document(self, name: str, content: str, *, expected_revision: str) -> dict[str, str]:
-        path = self._document_path(name)
+        canonical_name = name.strip()
+        path = self._document_path(canonical_name)
         if len(content.encode("utf-8")) > MAX_DOCUMENT_BYTES or "\x00" in content:
             raise ValidationError("document is too large or contains a null byte")
+        if canonical_name.casefold() in ("mind.md", "mind") and self.is_guidance_managed():
+            raise ConflictError(
+                "MIND.md is managed by checkout guidance projection; "
+                "update it through the guidance projector"
+            )
         with (
             exclusive_lock(self.state / "locks/global.lock"),
             exclusive_lock(self._record_lock("document", path.stem.lower())),
         ):
+            if canonical_name.casefold() in ("mind.md", "mind") and self.is_guidance_managed():
+                raise ConflictError(
+                    "MIND.md is managed by checkout guidance projection; "
+                    "update it through the guidance projector"
+                )
             before_bytes = self._read_bytes(path, max_bytes=MAX_DOCUMENT_BYTES)
             before_bytes.decode("utf-8")
             self._expect(sha256_bytes(before_bytes), expected_revision)
@@ -2258,6 +2571,247 @@ class Vault:
                 "content": normalized,
                 "name": path.name,
                 "revision": after_revision,
+            }
+
+    def project_guidance(
+        self,
+        checkout_root: Path | str,
+        *,
+        expected_guidance_revision: str,
+        expected_mind_revision: str,
+        _fail_during: str | None = None,
+    ) -> dict[str, Any]:
+        """Project canonical AGENTS.md and brain/MIND.md atomically from a checkout root."""
+
+        if not expected_guidance_revision:
+            raise ValidationError("expected guidance revision must be specified")
+        if not expected_mind_revision:
+            raise ValidationError("expected mind revision must be specified")
+
+        sources = validate_checkout_guidance_sources(checkout_root)
+        guidance_target = self.root / "context/resident/AGENTS.md"
+        mind_target = self.root / "MIND.md"
+        marker_target = self.root / GUIDANCE_PROJECTION_MARKER
+        intent_target = self.root / GUIDANCE_PROJECTION_INTENT
+
+        with (
+            exclusive_lock(self.state / "locks/global.lock"),
+            exclusive_lock(self._record_lock("document", "mind")),
+            exclusive_lock(self.state / "locks/resident-guidance.lock"),
+        ):
+            self._recover_interrupted_guidance_projection()
+
+            guidance_before: bytes | None = None
+            live_guidance_revision = "absent"
+            if guidance_target.exists():
+                guidance_before = self._read_bytes(guidance_target, max_bytes=MAX_GUIDANCE_BYTES)
+                live_guidance_revision = sha256_bytes(guidance_before)
+
+            mind_before: bytes | None = None
+            live_mind_revision = "absent"
+            if mind_target.exists():
+                mind_before = self._read_bytes(mind_target, max_bytes=MAX_DOCUMENT_BYTES)
+                live_mind_revision = sha256_bytes(mind_before)
+
+            marker_before: bytes | None = None
+            if marker_target.exists():
+                marker_before = self._read_bytes(marker_target, max_bytes=MAX_DOCUMENT_BYTES)
+
+            self._expect(live_guidance_revision, expected_guidance_revision)
+            self._expect(live_mind_revision, expected_mind_revision)
+
+            source_recheck = validate_checkout_guidance_sources(checkout_root)
+            if (
+                source_recheck.guidance.source_sha256 != sources.guidance.source_sha256
+                or source_recheck.mind.source_sha256 != sources.mind.source_sha256
+            ):
+                raise ConflictError(
+                    "checkout guidance source files changed while projection was pending"
+                )
+
+            guidance_bytes = sources.guidance.target_bytes
+            guidance_sha256 = sources.guidance.sha256
+            mind_bytes = sources.mind.target_bytes
+            mind_sha256 = sources.mind.sha256
+
+            now_utc = datetime.now(UTC).isoformat()
+            marker_payload = {
+                "checkout_root": str(sources.checkout_root),
+                "format_version": 1,
+                "projected_at": now_utc,
+                "sources": {
+                    "AGENTS.md": {
+                        "bytes": sources.guidance.bytes,
+                        "path": sources.guidance.path,
+                        "relative_path": sources.guidance.relative_path,
+                        "sha256": sources.guidance.source_sha256,
+                    },
+                    "brain/MIND.md": {
+                        "bytes": sources.mind.bytes,
+                        "path": sources.mind.path,
+                        "relative_path": sources.mind.relative_path,
+                        "sha256": sources.mind.source_sha256,
+                    },
+                },
+                "vault_targets": {
+                    "AGENTS.md": {
+                        "bytes": len(guidance_bytes),
+                        "path": "context/resident/AGENTS.md",
+                        "sha256": guidance_sha256,
+                    },
+                    "MIND.md": {
+                        "bytes": len(mind_bytes),
+                        "path": "MIND.md",
+                        "sha256": mind_sha256,
+                    },
+                },
+            }
+            marker_json = json.dumps(marker_payload, indent=2, sort_keys=True)
+            marker_bytes = marker_json.encode("utf-8") + b"\n"
+
+            try:
+                if _fail_during == "before_intent":
+                    raise OSError("injected failure before intent")
+
+                intent_payload = {
+                    "format_version": 1,
+                    "guidance_before_hex": (
+                        guidance_before.hex() if guidance_before is not None else None
+                    ),
+                    "mind_before_hex": (mind_before.hex() if mind_before is not None else None),
+                    "marker_before_hex": (
+                        marker_before.hex() if marker_before is not None else None
+                    ),
+                    "target_guidance_sha256": guidance_sha256,
+                    "target_mind_sha256": mind_sha256,
+                }
+                atomic_write(
+                    intent_target,
+                    json.dumps(intent_payload).encode("utf-8") + b"\n",
+                )
+
+                if _fail_during == "after_intent":
+                    raise OSError("injected failure after intent")
+
+                (self.root / "context/resident").mkdir(parents=True, exist_ok=True)
+                (self.state / "locks").mkdir(parents=True, exist_ok=True)
+
+                atomic_write(guidance_target, guidance_bytes)
+
+                if _fail_during == "after_guidance_publish":
+                    raise OSError("injected failure after guidance publish")
+
+                atomic_write(mind_target, mind_bytes)
+
+                if _fail_during == "after_mind_publish":
+                    raise OSError("injected failure after mind publish")
+
+                atomic_write(marker_target, marker_bytes)
+
+                if _fail_during == "after_marker_publish":
+                    raise OSError("injected failure after marker publish")
+
+                guidance_readback = guidance_target.read_bytes()
+                if (
+                    guidance_readback != guidance_bytes
+                    or sha256_bytes(guidance_readback) != guidance_sha256
+                ):
+                    raise ValidationError("resident AGENTS.md readback verification failed")
+
+                mind_readback = mind_target.read_bytes()
+                if mind_readback != mind_bytes or sha256_bytes(mind_readback) != mind_sha256:
+                    raise ValidationError("MIND.md readback verification failed")
+
+                marker_readback = marker_target.read_bytes()
+                if marker_readback != marker_bytes:
+                    raise ValidationError("guidance projection marker readback verification failed")
+
+                if _fail_during == "after_readback":
+                    raise OSError("injected failure after readback")
+
+                self._event(
+                    "guidance.project",
+                    "AGENTS.md+MIND.md",
+                    f"{live_guidance_revision}+{live_mind_revision}",
+                    f"{guidance_sha256}+{mind_sha256}",
+                )
+
+                if _fail_during == "after_audit":
+                    raise OSError("injected failure after audit")
+
+                intent_target.unlink(missing_ok=True)
+
+            except Exception as exc:
+                try:
+                    if guidance_before is None:
+                        if guidance_target.exists():
+                            guidance_target.unlink(missing_ok=True)
+                    else:
+                        atomic_write(guidance_target, guidance_before)
+
+                    if mind_before is None:
+                        if mind_target.exists():
+                            mind_target.unlink(missing_ok=True)
+                    else:
+                        atomic_write(mind_target, mind_before)
+
+                    if marker_before is None:
+                        if marker_target.exists():
+                            marker_target.unlink(missing_ok=True)
+                    else:
+                        atomic_write(marker_target, marker_before)
+
+                    intent_target.unlink(missing_ok=True)
+
+                    if guidance_before is None:
+                        if guidance_target.exists():
+                            raise OSError("guidance target was not removed during rollback")
+                    else:
+                        if guidance_target.read_bytes() != guidance_before:
+                            raise OSError("guidance target was not restored during rollback")
+
+                    if mind_before is None:
+                        if mind_target.exists():
+                            raise OSError("mind target was not removed during rollback")
+                    else:
+                        if mind_target.read_bytes() != mind_before:
+                            raise OSError("mind target was not restored during rollback")
+
+                    if marker_before is None:
+                        if marker_target.exists():
+                            raise OSError("marker target was not removed during rollback")
+                    else:
+                        if marker_target.read_bytes() != marker_before:
+                            raise OSError("marker target was not restored during rollback")
+                except Exception as rollback_err:
+                    raise DegradedIntegrityError(
+                        "guidance projection failed and rollback could not be completed: "
+                        f"{rollback_err}"
+                    ) from rollback_err
+
+                if isinstance(exc, ContinuityError):
+                    raise
+                raise PersistenceError(
+                    f"guidance projection failed and was rolled back: {exc}"
+                ) from exc
+
+            return {
+                "checkout_root": str(sources.checkout_root),
+                "format_version": 1,
+                "guidance": {
+                    "before_revision": live_guidance_revision,
+                    "bytes": len(guidance_bytes),
+                    "path": "context/resident/AGENTS.md",
+                    "revision": guidance_sha256,
+                },
+                "mind": {
+                    "before_revision": live_mind_revision,
+                    "bytes": len(mind_bytes),
+                    "path": "MIND.md",
+                    "revision": mind_sha256,
+                },
+                "sources": marker_payload["sources"],
+                "status": "projected",
             }
 
     def context_pack(self, *, max_characters: int = 48_000) -> str:
@@ -2926,6 +3480,160 @@ class Vault:
                 self._read_text(self.root / name, max_bytes=MAX_DOCUMENT_BYTES)
             except (NotFoundError, OSError, UnicodeDecodeError, ValidationError) as exc:
                 issues.append(DoctorIssue("invalid-document", name, str(exc)))
+
+        intent_path = self.root / GUIDANCE_PROJECTION_INTENT
+        if intent_path.exists():
+            try:
+                with (
+                    exclusive_lock(self.state / "locks/global.lock"),
+                    exclusive_lock(self._record_lock("document", "mind")),
+                    exclusive_lock(self.state / "locks/resident-guidance.lock"),
+                ):
+                    self._recover_interrupted_guidance_projection()
+            except Exception as exc:
+                issues.append(
+                    DoctorIssue(
+                        "interrupted-guidance-projection",
+                        GUIDANCE_PROJECTION_INTENT.as_posix(),
+                        f"interrupted guidance projection could not be recovered: {exc}",
+                    )
+                )
+
+        marker_path = self.root / GUIDANCE_PROJECTION_MARKER
+        if marker_path.exists():
+            try:
+                marker_raw = self._read_bytes(marker_path, max_bytes=MAX_DOCUMENT_BYTES)
+                marker_data = json.loads(marker_raw.decode("utf-8"))
+                if not _validate_guidance_projection_marker_dict(marker_data):
+                    issues.append(
+                        DoctorIssue(
+                            "invalid-guidance-projection",
+                            GUIDANCE_PROJECTION_MARKER.as_posix(),
+                            "invalid guidance projection marker format",
+                        )
+                    )
+                else:
+                    sources = marker_data.get("sources", {})
+                    for src_key, src_info in sorted(sources.items()):
+                        if not isinstance(src_info, dict):
+                            continue
+                        src_path_str = src_info.get("path")
+                        expected_hash = src_info.get("sha256")
+                        rel_name = src_info.get("relative_path", src_key)
+                        if not src_path_str or not expected_hash:
+                            continue
+                        src_path = Path(src_path_str)
+                        if not src_path.exists():
+                            issues.append(
+                                DoctorIssue(
+                                    "guidance-source-drift",
+                                    src_path_str,
+                                    f"managed checkout source {rel_name} is missing",
+                                )
+                            )
+                        else:
+                            try:
+                                src_content = read_regular_file(
+                                    src_path,
+                                    label=f"managed checkout source {rel_name}",
+                                    max_bytes=MAX_DOCUMENT_BYTES,
+                                )
+                                current_hash = sha256_bytes(src_content)
+                                if current_hash != expected_hash:
+                                    issues.append(
+                                        DoctorIssue(
+                                            "guidance-source-drift",
+                                            src_path_str,
+                                            f"managed checkout source {rel_name} has drifted "
+                                            f"from projected hash {expected_hash}",
+                                        )
+                                    )
+                            except Exception as src_exc:
+                                issues.append(
+                                    DoctorIssue(
+                                        "guidance-source-drift",
+                                        src_path_str,
+                                        f"could not inspect managed checkout source {rel_name}: "
+                                        f"{src_exc}",
+                                    )
+                                )
+                    vault_targets = marker_data.get("vault_targets", {})
+                    if "AGENTS.md" in vault_targets:
+                        target_path = self.root / "context/resident/AGENTS.md"
+                        if not target_path.exists():
+                            issues.append(
+                                DoctorIssue(
+                                    "guidance-projection-drift",
+                                    "context/resident/AGENTS.md",
+                                    "managed resident guidance file is missing",
+                                )
+                            )
+                        else:
+                            try:
+                                t_content = self._read_bytes(
+                                    target_path,
+                                    max_bytes=MAX_GUIDANCE_BYTES,
+                                )
+                                expected_target_hash = vault_targets["AGENTS.md"].get("sha256")
+                                if sha256_bytes(t_content) != expected_target_hash:
+                                    issues.append(
+                                        DoctorIssue(
+                                            "guidance-projection-drift",
+                                            "context/resident/AGENTS.md",
+                                            "managed resident guidance content has drifted "
+                                            "from projected state",
+                                        )
+                                    )
+                            except Exception as t_exc:
+                                issues.append(
+                                    DoctorIssue(
+                                        "guidance-projection-drift",
+                                        "context/resident/AGENTS.md",
+                                        f"could not inspect managed resident guidance: {t_exc}",
+                                    )
+                                )
+                    if "MIND.md" in vault_targets:
+                        target_path = self.root / "MIND.md"
+                        if not target_path.exists():
+                            issues.append(
+                                DoctorIssue(
+                                    "guidance-projection-drift",
+                                    "MIND.md",
+                                    "managed MIND.md document is missing",
+                                )
+                            )
+                        else:
+                            try:
+                                t_content = self._read_bytes(
+                                    target_path,
+                                    max_bytes=MAX_DOCUMENT_BYTES,
+                                )
+                                expected_target_hash = vault_targets["MIND.md"].get("sha256")
+                                if sha256_bytes(t_content) != expected_target_hash:
+                                    issues.append(
+                                        DoctorIssue(
+                                            "guidance-projection-drift",
+                                            "MIND.md",
+                                            "managed MIND.md content has drifted "
+                                            "from projected state",
+                                        )
+                                    )
+                            except Exception as t_exc:
+                                issues.append(
+                                    DoctorIssue(
+                                        "guidance-projection-drift",
+                                        "MIND.md",
+                                        f"could not inspect managed MIND.md document: {t_exc}",
+                                    )
+                                )
+            except Exception as exc:
+                issues.append(
+                    DoctorIssue(
+                        "invalid-guidance-projection",
+                        GUIDANCE_PROJECTION_MARKER.as_posix(),
+                        str(exc),
+                    )
+                )
 
         direction_path = self.root / "DIRECTION.md"
         if os.path.lexists(direction_path):

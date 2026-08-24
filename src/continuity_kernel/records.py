@@ -17,6 +17,7 @@ FORMAT_VERSION: Final = 1
 TASK_FORMAT_VERSION: Final = 2
 TASK_RESIDENT_FORMAT_VERSION: Final = 3
 TASK_DISPATCH_FORMAT_VERSION: Final = 4
+TASK_AGENT_RUN_FORMAT_VERSION: Final = 5
 ENTITY_RESIDENT_FORMAT_VERSION: Final = 2
 THREAD_RESIDENT_FORMAT_VERSION: Final = 2
 TASK_FORMAT_VERSIONS: Final = frozenset(
@@ -25,6 +26,7 @@ TASK_FORMAT_VERSIONS: Final = frozenset(
         TASK_FORMAT_VERSION,
         TASK_RESIDENT_FORMAT_VERSION,
         TASK_DISPATCH_FORMAT_VERSION,
+        TASK_AGENT_RUN_FORMAT_VERSION,
     }
 )
 ENTITY_FORMAT_VERSIONS: Final = frozenset({FORMAT_VERSION, ENTITY_RESIDENT_FORMAT_VERSION})
@@ -42,7 +44,6 @@ MAX_CODEX_EPISODES: Final = 50
 MAX_HISTORY_ENTRIES: Final = 2_000
 MAX_HISTORY_LINE_LENGTH: Final = 2_000
 MAX_TASK_RANK: Final = 2_147_483_647
-DEFAULT_CLAIM_WINDOW: Final = timedelta(minutes=5)
 SLA_CLOCK_HEALTH: Final = ("healthy", "unknown")
 SAFE_ID = re.compile(r"^[a-z][a-z0-9]*(?::[a-z0-9][a-z0-9-]{0,95})$")
 SAFE_TASK_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
@@ -58,6 +59,7 @@ TaskStatus = Literal[
     "captured", "ready", "doing", "waiting", "someday", "done", "dropped", "superseded"
 ]
 Actor = Literal["agent", "human", "external"]
+AgentRun = Literal["yes", "no"]
 ThreadStatus = Literal[
     "active", "waiting", "dormant", "closed", "resolved", "dropped", "superseded"
 ]
@@ -69,6 +71,7 @@ TASK_STATUSES: Final = frozenset(
 )
 TERMINAL_TASK_STATUSES: Final = frozenset({"done", "dropped", "superseded"})
 ACTORS: Final = frozenset({"agent", "human", "external"})
+AGENT_RUNS: Final = frozenset({"yes", "no"})
 THREAD_STATUSES: Final = frozenset(
     {"active", "waiting", "dormant", "closed", "resolved", "dropped", "superseded"}
 )
@@ -146,6 +149,9 @@ _TASK_DISPATCH_KEYS: Final = _TASK_RESIDENT_KEYS | {
     "dispatch_revision",
     "progress_check_by",
     "target_seat",
+}
+_TASK_AGENT_RUN_KEYS: Final = _TASK_DISPATCH_KEYS | {
+    "agent_run",
 }
 _ENTITY_LEGACY_KEYS: Final = frozenset(
     {"aliases", "created_at", "entity_type", "id", "kind", "refs", "updated_at", "version"}
@@ -277,6 +283,7 @@ class Task:
     dispatch_revision: str | None = None
     blocker_owner: str | None = None
     blocker_condition: str | None = None
+    agent_run: AgentRun | None = None
 
 
 @dataclass(frozen=True)
@@ -400,6 +407,7 @@ def new_task(
     dispatch_revision: str | None = None,
     blocker_owner: str | None = None,
     blocker_condition: str | None = None,
+    agent_run: str | None = None,
     active_thread_id: str | None = None,
     refs: tuple[str, ...] = (),
     superseded_by: str | None = None,
@@ -424,12 +432,19 @@ def new_task(
     clean_progress_check_by = optional_stored_time(progress_check_by, "progress_check_by")
     clean_dispatch_id = dispatch_id_value(dispatch_id)
     clean_dispatch_revision = dispatch_revision_value(dispatch_revision)
+    clean_agent_run = agent_run_value(agent_run)
     clean_status = task_status(status)
     clean_waiting = optional_body(waiting_on, "waiting on")
     clean_blocker_owner = optional_line(blocker_owner, "blocker owner", 120)
     clean_blocker_condition = optional_line(blocker_condition, "blocker condition", 500)
     if clean_blocker_condition is not None and clean_waiting is None:
         clean_waiting = clean_blocker_condition
+    if clean_dispatch_id is not None or clean_dispatch_revision is not None:
+        raise ValidationError("task cannot be created with a dispatch ID or revision")
+    if clean_active is not None and clean_agent_run == "yes":
+        raise ValidationError(
+            "active thread ID on an agent-run task must be bound through dispatch"
+        )
     _validate_dispatch_fields(
         clean_dispatch_id,
         clean_dispatch_revision,
@@ -438,8 +453,6 @@ def new_task(
         clean_blocker_owner,
         clean_blocker_condition,
     )
-    if clean_claim_by is None and claim_by_eligible(clean_status, clean_target_seat, clean_waiting):
-        clean_claim_by = format_time(parse_time(now) + DEFAULT_CLAIM_WINDOW)
     clean_episodes = codex_episodes(
         (*codex_episode_ids, *((clean_active,) if clean_active is not None else ()))
     )
@@ -460,6 +473,7 @@ def new_task(
             clean_dispatch_revision is not None,
             clean_blocker_owner is not None,
             clean_blocker_condition is not None,
+            clean_agent_run is not None,
         )
     )
     task = Task(
@@ -498,6 +512,7 @@ def new_task(
         dispatch_revision=clean_dispatch_revision,
         blocker_owner=clean_blocker_owner,
         blocker_condition=clean_blocker_condition,
+        agent_run=clean_agent_run,
     )
     _validate_task_state(task)
     return parse_task(render_task(task))
@@ -667,7 +682,9 @@ def render_task(task: Task) -> str:
     review = validate_review_references(task.refs, terminal=task.status in TERMINAL_TASK_STATUSES)
     rich = _task_is_rich(task)
     stored_version = (
-        TASK_DISPATCH_FORMAT_VERSION
+        TASK_AGENT_RUN_FORMAT_VERSION
+        if task.agent_run is not None
+        else TASK_DISPATCH_FORMAT_VERSION
         if any(
             (
                 task.target_seat is not None,
@@ -722,7 +739,7 @@ def render_task(task: Task) -> str:
                 "workspace": optional_line(task.workspace, "workspace", 2_048),
             }
         )
-        if stored_version == TASK_DISPATCH_FORMAT_VERSION:
+        if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}:
             metadata.update(
                 {
                     "blocker_condition": optional_line(
@@ -738,6 +755,8 @@ def render_task(task: Task) -> str:
                     "target_seat": target_seat_value(task.target_seat),
                 }
             )
+            if stored_version == TASK_AGENT_RUN_FORMAT_VERSION:
+                metadata["agent_run"] = agent_run_value(task.agent_run)
         sections = (*sections, ("History", render_history(task.history)))
     return _render(
         metadata,
@@ -866,13 +885,16 @@ def parse_task(markdown: str) -> Task:
             TASK_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on"),
             TASK_RESIDENT_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on", "History"),
             TASK_DISPATCH_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on", "History"),
+            TASK_AGENT_RUN_FORMAT_VERSION: ("Outcome", "Next action", "Waiting on", "History"),
         },
     )
     stored_version = meta["version"]
     _expect_metadata_keys(
         meta,
         (
-            _TASK_DISPATCH_KEYS
+            _TASK_AGENT_RUN_KEYS
+            if stored_version == TASK_AGENT_RUN_FORMAT_VERSION
+            else _TASK_DISPATCH_KEYS
             if stored_version == TASK_DISPATCH_FORMAT_VERSION
             else _TASK_RESIDENT_KEYS
             if stored_version == TASK_RESIDENT_FORMAT_VERSION
@@ -880,7 +902,11 @@ def parse_task(markdown: str) -> Task:
         ),
         "task",
     )
-    rich = stored_version in {TASK_RESIDENT_FORMAT_VERSION, TASK_DISPATCH_FORMAT_VERSION}
+    rich = stored_version in {
+        TASK_RESIDENT_FORMAT_VERSION,
+        TASK_DISPATCH_FORMAT_VERSION,
+        TASK_AGENT_RUN_FORMAT_VERSION,
+    }
     task = Task(
         identifier=task_id(_string(meta, "id")),
         title=title_text(title),
@@ -920,37 +946,42 @@ def parse_task(markdown: str) -> Task:
         history=(parse_history(sections["History"]) if rich else ()),
         target_seat=(
             target_seat_value(_optional_string(meta, "target_seat"))
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         claim_by=(
             optional_stored_time(_optional_string(meta, "claim_by"), "claim_by")
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         progress_check_by=(
             optional_stored_time(_optional_string(meta, "progress_check_by"), "progress_check_by")
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         dispatch_id=(
             dispatch_id_value(_optional_string(meta, "dispatch_id"))
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         dispatch_revision=(
             dispatch_revision_value(_optional_string(meta, "dispatch_revision"))
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         blocker_owner=(
             optional_line(_optional_string(meta, "blocker_owner"), "blocker owner", 120)
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
             else None
         ),
         blocker_condition=(
             optional_line(_optional_string(meta, "blocker_condition"), "blocker condition", 500)
-            if stored_version == TASK_DISPATCH_FORMAT_VERSION
+            if stored_version in {TASK_DISPATCH_FORMAT_VERSION, TASK_AGENT_RUN_FORMAT_VERSION}
+            else None
+        ),
+        agent_run=(
+            agent_run_value(_optional_string(meta, "agent_run"))
+            if stored_version == TASK_AGENT_RUN_FORMAT_VERSION
             else None
         ),
     )
@@ -964,6 +995,8 @@ def parse_task(markdown: str) -> Task:
         raise ValidationError("task record version 3 requires resident continuity fields")
     if stored_version == TASK_DISPATCH_FORMAT_VERSION and not _task_is_rich(task):
         raise ValidationError("task record version 4 requires dispatch continuity fields")
+    if stored_version == TASK_AGENT_RUN_FORMAT_VERSION and not _task_is_rich(task):
+        raise ValidationError("task record version 5 requires agent-run continuity fields")
     return task
 
 
@@ -1259,6 +1292,16 @@ def dispatch_revision_value(value: str | None) -> str | None:
     if TASK_REVISION.fullmatch(clean) is None:
         raise ValidationError("dispatch revision must be a task SHA-256 revision")
     return clean
+
+
+def agent_run_value(value: str | None) -> AgentRun | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        clean = value.strip().casefold()
+        if clean in AGENT_RUNS:
+            return clean  # type: ignore[return-value]
+    raise ValidationError(f"invalid agent run: {value}")
 
 
 def claim_by_eligible(status: str, target_seat: str | None, waiting_on: str | None) -> bool:
@@ -1913,6 +1956,7 @@ def _task_is_rich(task: Task) -> bool:
             task.dispatch_revision is not None,
             task.blocker_owner is not None,
             task.blocker_condition is not None,
+            task.agent_run is not None,
         )
     )
 

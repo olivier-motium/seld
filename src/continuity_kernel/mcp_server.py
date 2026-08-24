@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import IO, Any, Final, cast
 
 import continuity_kernel.update as self_update
@@ -31,6 +32,7 @@ from continuity_kernel.dispatch import (
     bind_task_hand,
     claim_task,
     clear_task_blocker,
+    clear_task_hand,
     dispatch_eligible,
     evaluate_task_deadline,
     write_task_blocker,
@@ -98,6 +100,7 @@ GUIDED_REVIEW_TOOL_NAMES: Final = frozenset(
         "gsv_execution_bindings",
         "gsv_resident_context_status",
         "gsv_resident_guidance_show",
+        "gsv_resident_guidance_project",
         "gsv_task_list",
         "gsv_task_show",
         "gsv_task_create",
@@ -106,6 +109,7 @@ GUIDED_REVIEW_TOOL_NAMES: Final = frozenset(
         "gsv_dispatch_eligible",
         "gsv_dispatch_claim",
         "gsv_dispatch_bind",
+        "gsv_dispatch_hand_clear",
         "gsv_dispatch_blocker",
         "gsv_dispatch_blocker_clear",
         "gsv_dispatch_deadline_eval",
@@ -325,6 +329,12 @@ def _call(
         return resident_context_status(vault.root)
     if name == "gsv_resident_guidance_show":
         return read_resident_guidance(vault.root)
+    if name == "gsv_resident_guidance_project":
+        return vault.project_guidance(
+            checkout_root=Path(_string(values, "checkout_root")),
+            expected_guidance_revision=_string(values, "expected_guidance_revision"),
+            expected_mind_revision=_string(values, "expected_mind_revision"),
+        )
     if name == "gsv_execution_bindings":
         return execution_bindings(vault)
     if name == "gsv_local_file_read":
@@ -487,10 +497,9 @@ def _call(
                 target_seat=_optional_string(values, "target_seat"),
                 claim_by=_optional_string(values, "claim_by"),
                 progress_check_by=_optional_string(values, "progress_check_by"),
-                dispatch_id=_optional_string(values, "dispatch_id"),
-                dispatch_revision=_optional_string(values, "dispatch_revision"),
                 blocker_owner=_optional_string(values, "blocker_owner"),
                 blocker_condition=_optional_string(values, "blocker_condition"),
+                agent_run=_optional_string(values, "agent_run"),
                 active_thread_id=_optional_string(values, "active_thread_id"),
                 superseded_by=_optional_string(values, "superseded_by"),
                 project=_optional_string(values, "project"),
@@ -517,10 +526,9 @@ def _call(
                 target_seat=_optional_string(values, "target_seat"),
                 claim_by=_optional_string(values, "claim_by"),
                 progress_check_by=_optional_string(values, "progress_check_by"),
-                dispatch_id=_optional_string(values, "dispatch_id"),
-                dispatch_revision=_optional_string(values, "dispatch_revision"),
                 blocker_owner=_optional_string(values, "blocker_owner"),
                 blocker_condition=_optional_string(values, "blocker_condition"),
+                agent_run=_optional_string(values, "agent_run"),
                 active_thread_id=_optional_string(values, "active_thread_id"),
                 superseded_by=_optional_string(values, "superseded_by"),
                 project=_optional_string(values, "project"),
@@ -534,10 +542,9 @@ def _call(
                 clear_target_seat=_boolean(values, "clear_target_seat"),
                 clear_claim_by=_boolean(values, "clear_claim_by"),
                 clear_progress_check_by=_boolean(values, "clear_progress_check_by"),
-                clear_dispatch_id=_boolean(values, "clear_dispatch_id"),
-                clear_dispatch_revision=_boolean(values, "clear_dispatch_revision"),
                 clear_blocker_owner=_boolean(values, "clear_blocker_owner"),
                 clear_blocker_condition=_boolean(values, "clear_blocker_condition"),
+                clear_agent_run=_boolean(values, "clear_agent_run"),
                 clear_active_thread_id=_boolean(values, "clear_active_thread_id"),
                 clear_superseded_by=_boolean(values, "clear_superseded_by"),
                 clear_project=_boolean(values, "clear_project"),
@@ -571,6 +578,7 @@ def _call(
             progress_check_by=_optional_string(values, "progress_check_by"),
             blocker_owner=_optional_string(values, "blocker_owner"),
             blocker_condition=_optional_string(values, "blocker_condition"),
+            agent_run=_optional_string(values, "agent_run"),
             project=_optional_string(values, "project"),
             workspace=_optional_string(values, "workspace"),
             observed_at=_optional_time(values, "observed_at"),
@@ -583,12 +591,16 @@ def _call(
     if name == "gsv_dispatch_eligible":
         return {"tasks": [record_dict(task) for task in dispatch_eligible(vault.root)]}
     if name == "gsv_dispatch_claim":
+        admission = values.get("admission")
+        if isinstance(admission, str):
+            admission = json.loads(admission)
         return record_dict(
             claim_task(
                 vault.root,
                 _string(values, "id"),
                 expected_revision=_string(values, "expected_revision"),
                 dispatch_id=_string(values, "dispatch_id"),
+                admission=admission,
                 observed_at=_optional_time(values, "observed_at"),
             )
         )
@@ -600,6 +612,21 @@ def _call(
                 expected_revision=_string(values, "expected_revision"),
                 dispatch_id=_string(values, "dispatch_id"),
                 active_thread_id=_string(values, "active_thread_id"),
+                observed_at=_optional_time(values, "observed_at"),
+            )
+        )
+    if name == "gsv_dispatch_hand_clear":
+        admission = values.get("admission")
+        if isinstance(admission, str):
+            admission = json.loads(admission)
+        return record_dict(
+            clear_task_hand(
+                vault.root,
+                _string(values, "id"),
+                expected_revision=_string(values, "expected_revision"),
+                dispatch_id=_string(values, "dispatch_id"),
+                active_thread_id=_string(values, "active_thread_id"),
+                admission=admission,
                 observed_at=_optional_time(values, "observed_at"),
             )
         )
@@ -1016,6 +1043,7 @@ def _compact_task(task: Task) -> dict[str, Any]:
     ]
     return {
         "active_thread_id": task.active_thread_id,
+        "agent_run": task.agent_run,
         "attention_at": task.attention_at,
         "blocker_condition": task.blocker_condition,
         "blocker_owner": task.blocker_owner,
@@ -1258,6 +1286,33 @@ TOOLS: Final = [
         ),
         {},
         read_only=True,
+    ),
+    _tool(
+        "gsv_resident_guidance_project",
+        (
+            "Project canonical AGENTS.md and brain/MIND.md from an explicit checkout root into the "
+            "vault with atomic compare-and-swap protection and managed source tracking."
+        ),
+        {
+            "checkout_root": {
+                "description": (
+                    "Path to the checkout directory containing AGENTS.md and brain/MIND.md."
+                ),
+                "type": "string",
+            },
+            "expected_guidance_revision": {
+                "description": (
+                    "Expected live revision (SHA-256) of context/resident/AGENTS.md, or 'absent'."
+                ),
+                "type": "string",
+            },
+            "expected_mind_revision": {
+                "description": "Expected live revision (SHA-256) of MIND.md.",
+                "type": "string",
+            },
+        },
+        required=("checkout_root", "expected_guidance_revision", "expected_mind_revision"),
+        read_only=False,
     ),
     _tool(
         "gsv_execution_bindings",
@@ -1696,14 +1751,13 @@ TOOLS: Final = [
         "Create one explicit durable outcome. Do not infer task meaning from source text.",
         {
             "id": TEXT,
+            "agent_run": {"enum": ["yes", "no"], "type": "string"},
             "active_thread_id": TASK_ACTIVE_THREAD_ID,
             "attention_at": TEXT,
             "blocker_condition": TEXT,
             "blocker_owner": TEXT,
             "claim_by": TEXT,
             "codex_episode_ids": TEXTS,
-            "dispatch_id": TEXT,
-            "dispatch_revision": TEXT,
             "due": TEXT,
             "entity_links": TASK_ENTITY_LINKS,
             "next_action": TEXT,
@@ -1730,19 +1784,19 @@ TOOLS: Final = [
             "add_codex_episode_ids": TEXTS,
             "add_entity_links": TASK_ENTITY_LINKS,
             "add_refs": TASK_REFS,
+            "agent_run": {"enum": ["yes", "no"], "type": "string"},
             "active_thread_id": TASK_ACTIVE_THREAD_ID,
             "attention_at": TEXT,
             "blocker_condition": TEXT,
             "blocker_owner": TEXT,
             "claim_by": TEXT,
+            "clear_agent_run": BOOLEAN,
             "clear_active_thread_id": BOOLEAN,
             "clear_attention_at": BOOLEAN,
             "clear_blocker_condition": BOOLEAN,
             "clear_blocker_owner": BOOLEAN,
             "clear_claim_by": BOOLEAN,
             "clear_due": BOOLEAN,
-            "clear_dispatch_id": BOOLEAN,
-            "clear_dispatch_revision": BOOLEAN,
             "clear_next_action": BOOLEAN,
             "clear_next_actor": BOOLEAN,
             "clear_progress_check_by": BOOLEAN,
@@ -1753,8 +1807,6 @@ TOOLS: Final = [
             "clear_rank": BOOLEAN,
             "clear_workspace": BOOLEAN,
             "due": TEXT,
-            "dispatch_id": TEXT,
-            "dispatch_revision": TEXT,
             "expected_revision": TEXT,
             "id": TEXT,
             "next_action": TEXT,
@@ -1785,6 +1837,7 @@ TOOLS: Final = [
             "identity is inferred."
         ),
         {
+            "agent_run": {"enum": ["yes", "no"], "type": "string"},
             "authoring_seat": TEXT,
             "blocker_condition": TEXT,
             "blocker_owner": TEXT,
@@ -1810,7 +1863,7 @@ TOOLS: Final = [
     _tool(
         "gsv_dispatch_eligible",
         (
-            "List every ready task with an explicit typed target that is unblocked and unclaimed. "
+            "List every ready, unblocked, unclaimed task with agent_run=yes and next_actor=agent. "
             "The result is ordered by authored rank, then creation time."
         ),
         {},
@@ -1820,6 +1873,12 @@ TOOLS: Final = [
         "gsv_dispatch_claim",
         "Claim one eligible task with its exact current revision and one dispatch ID.",
         {
+            "admission": {
+                "description": (
+                    "Factory allocation admission object containing payload and signature."
+                ),
+                "type": "object",
+            },
             "dispatch_id": TEXT,
             "expected_revision": TEXT,
             "id": TEXT,
@@ -1839,6 +1898,25 @@ TOOLS: Final = [
             "observed_at": TEXT,
         },
         ("id", "expected_revision", "dispatch_id", "active_thread_id"),
+        read_only=False,
+    ),
+    _tool(
+        "gsv_dispatch_hand_clear",
+        "Clear one exact claimed Factory hand without changing task truth.",
+        {
+            "active_thread_id": TASK_ACTIVE_THREAD_ID,
+            "admission": {
+                "description": (
+                    "Factory allocation admission object containing payload and signature."
+                ),
+                "type": "object",
+            },
+            "dispatch_id": TEXT,
+            "expected_revision": TEXT,
+            "id": TEXT,
+            "observed_at": TEXT,
+        },
+        ("id", "expected_revision", "dispatch_id", "active_thread_id", "admission"),
         read_only=False,
     ),
     _tool(
