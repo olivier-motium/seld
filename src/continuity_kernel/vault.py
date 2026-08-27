@@ -3029,9 +3029,7 @@ class Vault:
             or parse_time(attempted_at) != parse_time(prior_attempted_at)
         ):
             return
-        raise ConflictError(
-            "source remains due; record one source attempt before acknowledging"
-        )
+        raise ConflictError("source remains due; record one source attempt before acknowledging")
 
     def get_source_snapshot(self) -> SourceSnapshot:
         """Read the portable source ledger, or one explicit absent revision."""
