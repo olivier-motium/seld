@@ -238,14 +238,15 @@ def test_slack_search_reads_each_page_once_and_skips_no_match(tmp_path: Path) ->
 
 
 def test_every_slack_search_reference_resolves_after_the_same_read(tmp_path: Path) -> None:
-    runtime = _PagedRuntime(total=250)
+    runtime = _PagedRuntime(total=313)
     _vault, reader = _reader(tmp_path, runtime=runtime)
 
-    searched = reader.search("after:2026-08-01", max_pages=2, max_results=150)
+    searched = reader.search("after:2026-08-01", max_pages=4, max_results=313)
 
     messages = cast(list[dict[str, object]], searched["messages"])
     references = [cast(str, message["ref"]) for message in messages]
-    assert len(set(references)) == 150
+    assert len(set(references)) == 313
+    assert cast(dict[str, object], searched["coverage"])["status"] == "complete"
     for reference in references:
         expanded = reader.context(reference, before=0, after=0, include_thread=False)
         assert expanded["focus_ref"] == reference
