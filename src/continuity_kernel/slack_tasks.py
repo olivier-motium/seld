@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import zlib
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Final, cast
@@ -24,9 +25,11 @@ MAX_SNIPPET_CHARS: Final = 4_000
 MAX_SEARCH_PAGE_SIZE: Final = 100
 # Keep the store larger than one bounded read so a read never evicts its own references.
 MAX_REFERENCE_ENTRIES: Final = 4_096
+MAX_REFERENCE_MAP_BYTES: Final = 4 * 1024 * 1024
 REFERENCE_TTL: Final = timedelta(hours=6)
 _REFERENCE_NAME: Final = SecretName("slack-reference-map")
 _REFERENCE = re.compile(r"^slack:v1:(?P<token>[A-Za-z0-9_-]{16,64})$")
+_REFERENCE_MAP_ENCODING: Final = b"z1:"
 
 
 RuntimeFactory = Callable[[], ConnectorRuntime]
@@ -463,7 +466,7 @@ class _SlackReferenceStore:
         self.manager.secret_store.set_secret(
             self.connection_id,
             _REFERENCE_NAME,
-            json.dumps(dict(ordered), separators=(",", ":"), sort_keys=True).encode("utf-8"),
+            _encode_reference_map(dict(ordered)),
         )
         return references
 
@@ -482,8 +485,8 @@ class _SlackReferenceStore:
         if encoded is None:
             return {}
         try:
-            value = json.loads(encoded.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as exc:
+            value = json.loads(_decode_reference_map(encoded).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, zlib.error) as exc:
             raise ValidationError("stored Slack references are invalid") from exc
         if not isinstance(value, dict) or len(value) > MAX_REFERENCE_ENTRIES:
             raise ValidationError("stored Slack references are invalid")
@@ -500,6 +503,33 @@ class _SlackReferenceStore:
             if now - issued <= REFERENCE_TTL:
                 current[token] = dict(entry)
         return current
+
+
+def _encode_reference_map(entries: dict[str, dict[str, object]]) -> bytes:
+    raw = json.dumps(entries, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    if len(raw) > MAX_REFERENCE_MAP_BYTES:
+        raise ValidationError("Slack reference map exceeds its size bound")
+    return _REFERENCE_MAP_ENCODING + zlib.compress(raw, level=9)
+
+
+def _decode_reference_map(encoded: bytes) -> bytes:
+    if not encoded.startswith(_REFERENCE_MAP_ENCODING):
+        if len(encoded) > MAX_REFERENCE_MAP_BYTES:
+            raise ValidationError("stored Slack references are invalid")
+        return encoded
+    inflater = zlib.decompressobj()
+    decoded = inflater.decompress(
+        encoded[len(_REFERENCE_MAP_ENCODING) :],
+        MAX_REFERENCE_MAP_BYTES + 1,
+    )
+    if (
+        len(decoded) > MAX_REFERENCE_MAP_BYTES
+        or not inflater.eof
+        or inflater.unconsumed_tail
+        or inflater.unused_data
+    ):
+        raise ValidationError("stored Slack references are invalid")
+    return decoded
 
 
 def _mapping(value: object, label: str) -> Mapping[str, object]:

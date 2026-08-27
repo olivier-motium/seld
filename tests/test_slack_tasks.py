@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -16,7 +17,7 @@ from continuity_kernel.connector_auth import (
     CredentialKind,
 )
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
-from continuity_kernel.connector_identifiers import parse_connection_id
+from continuity_kernel.connector_identifiers import parse_connection_id, parse_secret_name
 from continuity_kernel.connector_profiles import get_profile
 from continuity_kernel.connector_runtime import ConnectorRuntime
 from continuity_kernel.connector_secrets import InMemorySecretStore
@@ -241,15 +242,50 @@ def test_every_slack_search_reference_resolves_after_the_same_read(tmp_path: Pat
     runtime = _PagedRuntime(total=313)
     _vault, reader = _reader(tmp_path, runtime=runtime)
 
+    reader.search("after:2026-08-01", max_pages=4, max_results=313)
     searched = reader.search("after:2026-08-01", max_pages=4, max_results=313)
 
     messages = cast(list[dict[str, object]], searched["messages"])
     references = [cast(str, message["ref"]) for message in messages]
     assert len(set(references)) == 313
     assert cast(dict[str, object], searched["coverage"])["status"] == "complete"
+    stored = reader.auth.secret_store.get_secret(
+        CONNECTION_ID,
+        parse_secret_name("slack-reference-map"),
+    )
+    assert stored is not None
+    assert stored.startswith(b"z1:")
+    assert len(stored) < 100_000
     for reference in references:
         expanded = reader.context(reference, before=0, after=0, include_thread=False)
         assert expanded["focus_ref"] == reference
+
+
+def test_legacy_plain_slack_reference_map_remains_readable(tmp_path: Path) -> None:
+    _vault, reader = _reader(tmp_path)
+    token = "a" * 18
+    legacy = {
+        token: {
+            "channel": CHANNEL_ID,
+            "issued_at": NOW.isoformat(),
+            "thread_ts": None,
+            "ts": MESSAGE_TS,
+        }
+    }
+    reader.auth.secret_store.set_secret(
+        CONNECTION_ID,
+        parse_secret_name("slack-reference-map"),
+        json.dumps(legacy).encode("utf-8"),
+    )
+
+    expanded = reader.context(
+        f"slack:v1:{token}",
+        before=0,
+        after=0,
+        include_thread=False,
+    )
+
+    assert expanded["focus_ref"] == f"slack:v1:{token}"
 
 
 def test_slack_poll_records_the_canonical_source_checkpoint(
