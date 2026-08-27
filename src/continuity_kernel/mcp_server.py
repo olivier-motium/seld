@@ -1658,7 +1658,8 @@ TOOLS: Final = [
         (
             "CAS-acknowledge evidence only after this AI has accepted or rejected it and can cite "
             "the exact durable result revision. WorkThread rechecks additionally require the "
-            "thread to be closed or re-armed to a new future horizon."
+            "thread to be closed or re-armed to a new future horizon. Source-due signals require "
+            "a source attempt recorded after the signal was emitted."
         ),
         {
             "consumer": TEXT,

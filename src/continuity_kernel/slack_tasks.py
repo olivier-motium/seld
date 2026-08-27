@@ -17,13 +17,13 @@ from continuity_kernel.connector_sources import read_connector_source
 from continuity_kernel.errors import NotFoundError, SetupError, ValidationError
 from continuity_kernel.vault import Vault
 
-MAX_SEARCH_PAGES: Final = 10
-MAX_SEARCH_RESULTS: Final = 200
+MAX_SEARCH_PAGES: Final = 20
+MAX_SEARCH_RESULTS: Final = 2_000
 MAX_CONTEXT_SIDE: Final = 50
 MAX_SNIPPET_CHARS: Final = 4_000
 MAX_SEARCH_PAGE_SIZE: Final = 100
 # Keep the store larger than one bounded read so a read never evicts its own references.
-MAX_REFERENCE_ENTRIES: Final = 256
+MAX_REFERENCE_ENTRIES: Final = 4_096
 REFERENCE_TTL: Final = timedelta(hours=6)
 _REFERENCE_NAME: Final = SecretName("slack-reference-map")
 _REFERENCE = re.compile(r"^slack:v1:(?P<token>[A-Za-z0-9_-]{16,64})$")

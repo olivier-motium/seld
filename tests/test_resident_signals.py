@@ -1487,6 +1487,79 @@ def test_work_thread_recheck_ack_requires_closed_or_rearmed_current_revision(
     assert closed.status == "resolved"
 
 
+def test_source_due_ack_requires_a_new_source_attempt(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Source due guard")
+    observed = datetime(2026, 8, 27, 8, tzinfo=UTC)
+    selected = vault.select_sources(
+        expected_revision=vault.get_source_snapshot().revision,
+        sources=("slack",),
+    )
+    first = vault.record_source_observation(
+        expected_revision=selected["revision"],
+        source_id="slack",
+        actor_ref="task-slack",
+        result="success",
+        covered_through="2026-08-27T08:00:00Z",
+        completeness="partial",
+        account_binding="slack-account",
+        tool_binding="slack.messages.recent_read",
+        observed_at=observed,
+    )
+    task = vault.create_task(
+        identifier="resident-pulse",
+        title="Resident Pulse",
+        outcome="Keep selected sources current.",
+        observed_at=observed,
+    )
+    signal = vault.append_resident_signal(
+        kind="source-due",
+        ref="source:slack",
+        event_key="source-due:slack:2:2026-08-27T08:00:00Z",
+        envelope={
+            "source_id": "slack",
+            "recipe_version": "2",
+            "attempted_at": "2026-08-27T08:00:00Z",
+            "last_success_at": "2026-08-27T08:00:00Z",
+            "covered_through": "2026-08-27T08:00:00Z",
+            "due_at": "2026-08-27T08:00:00Z",
+        },
+        observed_at=observed + timedelta(hours=1),
+    )
+    before = vault.resident_signal_status()
+    result_ref = f"task:{task.identifier}@{task.revision}"
+    with pytest.raises(ConflictError, match="record one source attempt"):
+        vault.acknowledge_resident_signals(
+            (signal["input_id"],),
+            expected_revision=before["revision"],
+            consumer="resident-pulse",
+            disposition="accepted",
+            result_refs=(result_ref,),
+            acknowledged_at=observed + timedelta(hours=1),
+        )
+
+    vault.record_source_observation(
+        expected_revision=first["revision"],
+        source_id="slack",
+        actor_ref="task-slack",
+        result="explicit_empty",
+        covered_through="2026-08-27T09:00:00Z",
+        completeness="complete",
+        account_binding="slack-account",
+        tool_binding="slack.messages.recent_read",
+        observed_at=observed + timedelta(hours=1),
+    )
+    acknowledgements = vault.acknowledge_resident_signals(
+        (signal["input_id"],),
+        expected_revision=before["revision"],
+        consumer="resident-pulse",
+        disposition="accepted",
+        result_refs=(result_ref,),
+        acknowledged_at=observed + timedelta(hours=1),
+    )
+    assert acknowledgements[0]["disposition"] == "accepted"
+
+
 def test_doctor_validates_the_complete_resident_mailbox(tmp_path: Path) -> None:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Signal doctor")

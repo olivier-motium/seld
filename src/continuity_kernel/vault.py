@@ -2977,6 +2977,9 @@ class Vault:
         result_refs: tuple[str, ...],
         acknowledged_at: datetime,
     ) -> None:
+        if signal.kind == "source-due":
+            self._validate_source_due_disposition(signal)
+            return
         if signal.kind != "work-thread-recheck":
             return
         thread_identifier = signal.envelope.get("work_thread_id")
@@ -3008,6 +3011,27 @@ class Vault:
             raise ConflictError(
                 "work-thread recheck remains due; close it or author a new future horizon first"
             )
+
+    def _validate_source_due_disposition(self, signal: ResidentSignal) -> None:
+        source_id = signal.envelope.get("source_id")
+        if not isinstance(source_id, str):
+            raise ValidationError("source-due signal is malformed")
+        snapshot = self.get_source_snapshot()
+        if source_id not in snapshot.selected_sources:
+            return
+        if isinstance(signal.envelope.get("incident_fingerprint"), str):
+            return
+        observation = snapshot.observation(source_id)
+        attempted_at = observation.attempted_at if observation is not None else None
+        prior_attempted_at = signal.envelope.get("attempted_at")
+        if attempted_at is not None and (
+            not isinstance(prior_attempted_at, str)
+            or parse_time(attempted_at) != parse_time(prior_attempted_at)
+        ):
+            return
+        raise ConflictError(
+            "source remains due; record one source attempt before acknowledging"
+        )
 
     def get_source_snapshot(self) -> SourceSnapshot:
         """Read the portable source ledger, or one explicit absent revision."""

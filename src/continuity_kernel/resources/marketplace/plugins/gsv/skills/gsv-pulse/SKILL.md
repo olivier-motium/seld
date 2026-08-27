@@ -152,6 +152,13 @@ For each frozen signal or source observation:
    receipt. Success, explicit emptiness, partial coverage, authentication
    failure, rate limiting, and tool absence remain distinct.
 
+A normal `source-due` signal remains pending until that exact source has one
+new recorded attempt. Never acknowledge it against only the Pulse Task or NOW.
+If the source cannot be attempted inside the wake, leave the signal pending so
+the next wake receives it again. A stable authentication or tool incident may
+be dispositioned without a fast retry because its incident fingerprint is the
+durable boundary.
+
 If no durable truth changed, make that an explicit AI judgment before
 acknowledging. Never acknowledge first and promise integration later.
 
