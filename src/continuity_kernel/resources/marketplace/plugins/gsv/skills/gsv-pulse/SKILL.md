@@ -10,9 +10,10 @@ serialized cognition episode it reads current Seld truth and useful new source
 evidence, updates only the canon that genuinely changed, and either helps
 through the foreground Chief of Staff task or stays silent.
 
-Use [registration](references/registration.md) only for an explicit setup or
-repair. Use [source acquisition](references/source-acquisition.md) when a
-selected source is due or materially relevant.
+Use [canonical terminology](../gsv/references/terminology.md) for system roles
+and unit lifecycles. Use [registration](references/registration.md) only for an
+explicit setup or repair. Use [source acquisition](references/source-acquisition.md)
+when a selected source is due or materially relevant.
 
 ## Prove both resident identities
 
@@ -60,12 +61,12 @@ then source ID. Unchanged auth/tool-absent incidents retry only after their
 fingerprint changes.
 
 Keep the episode inside its cadence. At seven elapsed minutes begin no new
-source, recall, or hand inspection; at eight minutes stop acquiring and finish
-the smallest honest judgment and readback already in hand. Bounds protect
-reliability, but do not impose an arbitrary item count: inspect the incremental
-evidence needed to make the current judgment.
+source, recall, or execution unit inspection; at eight minutes stop acquiring
+and finish the smallest honest judgment and readback already acquired. Bounds
+protect reliability, but do not impose an arbitrary item count: inspect the
+incremental evidence needed to make the current judgment.
 
-## Apply the task-birth gate
+## Apply the task-creation gate
 
 Create an ordinary Task only when the evidence shows one of these:
 
@@ -104,7 +105,7 @@ task only for:
 - an emergency;
 - a person genuinely blocked on Olivier;
 - a critical source, authentication, resident, or system failure;
-- a newly created Task that passed the task-birth gate;
+- a newly created Task that passed the task-creation gate;
 - a due reminder whose timing and context now make it useful; or
 - the scheduled morning or evening orientation.
 
@@ -207,17 +208,17 @@ Do not copy the task ledger, Portfolio, provider messages, or a source digest
 into NOW. Preserve an earlier successful coverage horizon when a later attempt
 fails and name both facts.
 
-## Use one visible hand for sustained work
+## Use one visible droid for sustained work
 
 Pulse may update reversible local canon, prepare a small local draft, surface
 an intervention, or remain silent. It does not run a long implementation,
 browser session, or investigation inline.
 
 Continue an existing approved durable outcome in its one visible Codex task.
-Create a new sustained-work hand only when the task-birth gate already produced
+Create a new sustained-work droid only when the task-creation gate already produced
 or identified a real durable outcome. Bind the real returned task UUID through
 fresh CAS. Never invent an ID, dispatch a duplicate, or treat a stopped Codex
-turn as completion. A wake creates at most one new hand.
+turn as completion. A wake launches at most one new droid.
 
 ## Unattended authority and privacy
 

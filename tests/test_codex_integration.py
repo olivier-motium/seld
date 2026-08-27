@@ -500,6 +500,9 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
     )
     assert "set up seld" in plugin_manifest["interface"]["defaultPrompt"][0].casefold()
     assert "$gsv-onboard" in agents.read_text(encoding="utf-8")
+    gsv_skill = generated_marketplace / "plugins/gsv/skills/gsv"
+    assert (gsv_skill / "SKILL.md").is_file()
+    assert (gsv_skill / "references/terminology.md").is_file()
     onboard = generated_marketplace / "plugins/gsv/skills/gsv-onboard"
     assert (onboard / "SKILL.md").is_file()
     assert (onboard / "agents/openai.yaml").is_file()

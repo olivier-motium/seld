@@ -14,13 +14,13 @@ behavior.
    structural ref `system-role:resident-pulse`, its exact Pulse task UUID as
    `active_thread_id`, and exactly one
    `codex-chief-of-staff:<foreground-task-uuid>` ref. Require explicit takeover
-   before changing an existing bound hand.
+   before changing an existing bound execution unit.
 5. Run `$gsv-pulse` manually once. Prove both identity guards, one bounded
    context/source read, reversible local CAS and readback, compact NOW, silence
    when no delivery gate is crossed, and the unattended authority boundary.
 6. Register one active app-native heartbeat targeting that exact Pulse task at
    a reliable thirty-minute cadence. Its prompt must invoke `$gsv-pulse`, apply
-   the task-birth and delivery gates, route foreground output to the exact Chief
+   the task-creation and delivery gates, route foreground output to the exact Chief
    of Staff ref. Foreground output must be answer-first, concise, visibly
    progressive, and state one obvious next move; prohibit guilt-based nudges,
    Bridge, raw payload persistence, duplicate schedules, parallel memory/task/

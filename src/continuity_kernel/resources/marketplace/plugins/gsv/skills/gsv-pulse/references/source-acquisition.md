@@ -75,7 +75,7 @@ transient and never persist it raw. Follow links or open attachments only in an
 interactive task with a concrete need and appropriate authority.
 
 A source observation alone is not a Task or a foreground interruption. Apply
-the Pulse task-birth and delivery gates; keep useful non-task context on its
+the Pulse task-creation and delivery gates; keep useful non-task context on its
 Entity or WorkThread, or in the current orientation.
 
 ## Record honest coverage

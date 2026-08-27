@@ -20,8 +20,9 @@ the current Mind and `gsv_resident_context_status`. When imported resident
 guidance is present, read it with `gsv_resident_guidance_show`. Treat the
 existing Mind and the user-context, preferences, provenance, corrections, and
 uncertainty in that guidance as retained context. The installed Seld tools
-remain authoritative for mechanics, but onboarding must augment this retained
-context rather than replace it with a cleaner new summary.
+remain authoritative for mechanics, and resident guidance defers to
+[canonical terminology](../gsv/references/terminology.md), but onboarding must
+augment this retained context rather than replace it with a cleaner new summary.
 
 Read [context intake](references/context-intake.md). Ask one compact, skippable
 batch:
