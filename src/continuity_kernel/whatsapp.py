@@ -388,7 +388,7 @@ def read_whatsapp_delta(
     drift = _cursor_drift(previous, status)
     database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
     store_reconciled = False
-    if reconcile_store_replacement:
+    if reconcile_store_replacement or _schema_migrated_in_place(previous, status, database):
         previous, store_reconciled = _reconcile_cursor(previous, status, database)
     else:
         _validate_cursor(previous, status)
@@ -1112,6 +1112,10 @@ def _validate_cursor(cursor: _Cursor, status: WhatsAppStatus) -> None:
 def _validate_cursor_aggregates(cursor: _Cursor, status: WhatsAppStatus) -> None:
     if cursor.schema != status.schema:
         raise ContinuityError("standalone WhatsApp schema changed; cursor preserved")
+    _validate_row_high_water(cursor, status)
+
+
+def _validate_row_high_water(cursor: _Cursor, status: WhatsAppStatus) -> None:
     assert status.messages is not None and status.chats is not None and status.max_rowid is not None
     # Counts and timestamps describe mutable inventory, not delivery order.
     # Deletion, expiry, revocation, or correction may legitimately move them
@@ -1136,16 +1140,55 @@ def _cursor_drift(cursor: _Cursor, status: WhatsAppStatus) -> tuple[str, ...]:
     return tuple(drift)
 
 
+def _same_store_under_prior_schema(cursor: _Cursor, database: Path) -> bool:
+    """Whether the live file is the one the cursor was taken from, schema aside.
+
+    A generation binds the file identity and the schema fingerprint together, so a
+    schema that moved makes the generation move with it. Recomputing the generation
+    from the live file under the cursor's own schema separates the two: equal means
+    the same inode and birth time, so the store was migrated in place by a newer
+    wacli; different means the file itself was replaced.
+    """
+
+    with _connect(database) as (_connection, identity):
+        return _generation(identity, cursor.schema) == cursor.generation
+
+
+def _schema_migrated_in_place(cursor: _Cursor, status: WhatsAppStatus, database: Path) -> bool:
+    """A current cursor whose schema moved while its store file did not."""
+
+    return (
+        cursor.version == CURSOR_VERSION
+        and status.schema is not None
+        and cursor.schema != status.schema
+        and _same_store_under_prior_schema(cursor, database)
+    )
+
+
 def _reconcile_cursor(
     cursor: _Cursor, status: WhatsAppStatus, database: Path
 ) -> tuple[_Cursor, bool]:
-    """Rebase a cursor only when the old aggregate prefix still exists exactly."""
+    """Rebase a cursor only when the old aggregate prefix still exists exactly.
 
-    _validate_cursor_aggregates(cursor, status)
+    Two cursors qualify: a legacy version-1 cursor, and a current cursor whose schema
+    fingerprint moved while the store file stayed the same, which is what an in-place
+    column migration by a newer wacli leaves behind (29 August 2026: three columns
+    were added to ``messages`` and every read refused as "schema changed" until this
+    path existed). A current cursor whose file identity moved is a replaced store and
+    is refused here exactly as before.
+    """
+
     if cursor.version == CURSOR_VERSION:
-        if cursor.generation != status.generation:
+        if cursor.schema == status.schema:
+            _validate_cursor_aggregates(cursor, status)
+            if cursor.generation != status.generation:
+                raise ContinuityError("standalone WhatsApp store changed; cursor preserved")
+            return cursor, False
+        if not _same_store_under_prior_schema(cursor, database):
             raise ContinuityError("standalone WhatsApp store changed; cursor preserved")
-        return cursor, False
+        _validate_row_high_water(cursor, status)
+    else:
+        _validate_cursor_aggregates(cursor, status)
     assert status.schema is not None and status.generation is not None
     prefix_messages, prefix_rowid, prefix_newest = _prefix_aggregates(
         database,

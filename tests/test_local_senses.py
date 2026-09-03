@@ -834,3 +834,109 @@ def test_whatsapp_connect_time_aba_cannot_redirect_the_snapshot(
     assert [message.body for message in delta.messages] == ["BENIGN-ORIGINAL"]
     with original_connect(database) as connection:
         assert connection.execute("SELECT text FROM messages").fetchone()[0] == "BENIGN-ORIGINAL"
+
+
+# ------------------------------------------------------- in-place schema migration
+#
+# 29 August 2026: a newer wacli added three columns to ``messages`` in the same
+# store file. The schema fingerprint moved, the generation moved with it, and every
+# checkpoint verification refused as "schema changed" for five days while the file
+# on disk was the one the checkpoint was taken from. These pin the distinction: a
+# migrated store is reconciled through prefix verification; a replaced store is
+# still refused.
+
+
+def _migrate_whatsapp_in_place(database: Path) -> None:
+    with sqlite3.connect(database) as connection:
+        for column in ("deleted_at INTEGER", "deletion_reason TEXT", "payload_purged_at INTEGER"):
+            connection.execute(f"ALTER TABLE messages ADD COLUMN {column}")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the standalone WhatsApp service uses launchd")
+def test_whatsapp_checkpoint_survives_a_schema_migrated_in_place(tmp_path: Path) -> None:
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    runner = _runner(runtime, calls)
+    _append_whatsapp(database, body="before the upgrade")
+    before = whatsapp.inspect_whatsapp(
+        store_root=store, runtime=runtime, runner=runner, observed_at=NOW
+    )
+    checkpoint = before.cursor()
+    assert checkpoint is not None
+
+    _migrate_whatsapp_in_place(database)
+    _append_whatsapp(database, body="after the upgrade", seconds=60)
+    after = whatsapp.inspect_whatsapp(
+        store_root=store, runtime=runtime, runner=runner, observed_at=NOW
+    )
+    assert after.schema != before.schema, "the fixture did not move the schema"
+    assert after.generation != before.generation
+
+    verified, _observed = whatsapp.verify_whatsapp_checkpoint(
+        cursor=checkpoint, store_root=store, runtime=runtime, runner=runner, observed_at=NOW
+    )
+    payload = json.loads(verified)
+    assert payload["schema"] == after.schema
+    assert payload["generation"] == after.generation
+    assert payload["rowid"] == 1
+
+    delta = whatsapp.read_whatsapp_delta(
+        cursor=checkpoint, store_root=store, runtime=runtime, runner=runner, observed_at=NOW
+    )
+    assert delta.store_reconciled
+    assert [message.body for message in delta.messages] == ["after the upgrade"]
+    assert json.loads(delta.cursor)["schema"] == after.schema
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the standalone WhatsApp service uses launchd")
+def test_whatsapp_replaced_store_with_the_new_schema_is_still_refused(tmp_path: Path) -> None:
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    runner = _runner(runtime, calls)
+    _append_whatsapp(database, body="before the upgrade")
+    checkpoint = whatsapp.inspect_whatsapp(
+        store_root=store, runtime=runtime, runner=runner, observed_at=NOW
+    ).cursor()
+    assert checkpoint is not None
+
+    replacement = _whatsapp_store(store / "replacement")
+    _append_whatsapp(replacement, body="before the upgrade")
+    _migrate_whatsapp_in_place(replacement)
+    os.replace(replacement, database)
+
+    with pytest.raises(ContinuityError, match="store changed; cursor preserved"):
+        whatsapp.verify_whatsapp_checkpoint(
+            cursor=checkpoint, store_root=store, runtime=runtime, runner=runner, observed_at=NOW
+        )
+    with pytest.raises(ContinuityError, match="cursor preserved"):
+        whatsapp.read_whatsapp_delta(
+            cursor=checkpoint, store_root=store, runtime=runtime, runner=runner, observed_at=NOW
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the standalone WhatsApp service uses launchd")
+def test_whatsapp_migrated_store_with_a_missing_prefix_is_refused(tmp_path: Path) -> None:
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    runner = _runner(runtime, calls)
+    _append_whatsapp(database, body="before the upgrade")
+    checkpoint = whatsapp.inspect_whatsapp(
+        store_root=store, runtime=runtime, runner=runner, observed_at=NOW
+    ).cursor()
+    assert checkpoint is not None
+
+    _migrate_whatsapp_in_place(database)
+    _append_whatsapp(database, body="after the upgrade", seconds=60)
+    with sqlite3.connect(database) as connection:
+        connection.execute("DELETE FROM messages WHERE rowid = 1")
+
+    with pytest.raises(ContinuityError, match="continuity could not be verified"):
+        whatsapp.verify_whatsapp_checkpoint(
+            cursor=checkpoint, store_root=store, runtime=runtime, runner=runner, observed_at=NOW
+        )
