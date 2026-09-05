@@ -893,3 +893,49 @@ def test_snapshot_publication_refuses_symlink_and_index_root_swaps(
         companion.refresh(timeout_seconds=5)
     assert swapped
     assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_fallback_ranks_exact_canonical_identifier_before_repetitive_document(
+    vault: Vault,
+    tmp_path: Path,
+) -> None:
+    task_file = vault.root / "tasks/reconcile-synthetic-plan-2026-09-05.md"
+    task_file.parent.mkdir(parents=True, exist_ok=True)
+    task_content = (
+        '<!-- gsv:{"active_thread_id":null,"created_at":"2026-09-05T00:00:00Z",'
+        '"id":"reconcile-synthetic-plan-2026-09-05","kind":"task",'
+        '"next_action_present":true,"next_actor":"agent","rank":null,"refs":[],'
+        '"status":"ready","updated_at":"2026-09-05T00:00:00Z","version":4,'
+        '"waiting_on_present":false} -->\n\n'
+        "# Reconcile Synthetic Plan\n\n"
+        "## Outcome\n"
+        "Synthetic reconciliation plan is verified and ready for execution.\n\n"
+        "## Next action\n"
+        "Execute the synthetic transition steps.\n"
+    )
+    task_file.write_text(task_content, encoding="utf-8")
+
+    journal_file = vault.root / "journal/synthetic-log.md"
+    journal_file.parent.mkdir(parents=True, exist_ok=True)
+    repeated_line = "reconcile synthetic plan 2026 09 05 audit log entry recorded.\n"
+    journal_content = "# Synthetic Log\n\n" + (repeated_line * 150)
+    journal_file.write_text(journal_content, encoding="utf-8")
+
+    os.utime(task_file, (1_700_000_000, 1_700_000_000))
+    os.utime(journal_file, (1_800_000_000, 1_800_000_000))
+
+    companion = RecallCompanion(
+        vault.root,
+        executable=tmp_path / "missing-qmd",
+        index_root=tmp_path / "qmd-index",
+    )
+
+    exact_result = companion.search("reconcile-synthetic-plan-2026-09-05", limit=2)
+    assert exact_result.backend == "markdown"
+    assert len(exact_result.hits) == 2
+    assert exact_result.hits[0].relative_path == "tasks/reconcile-synthetic-plan-2026-09-05.md"
+    assert exact_result.hits[0].title == "Reconcile Synthetic Plan"
+    assert "Synthetic reconciliation plan is verified" in exact_result.hits[0].snippet
+    assert "<!-- gsv:" not in exact_result.hits[0].snippet
+    assert "active_thread_id" not in exact_result.hits[0].snippet
+    assert exact_result.hits[1].relative_path == "journal/synthetic-log.md"
