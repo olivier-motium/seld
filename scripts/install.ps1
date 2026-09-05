@@ -13,10 +13,6 @@ $InstallDir = if ($env:GSV_BIN_DIR) {
 }
 $Target = Join-Path $InstallDir "gsv.exe"
 
-if (-not $env:GSV_BINARY) {
-    throw "Seld does not publish a Windows prebuilt yet. Windows support is coming."
-}
-
 $Architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
     "X64" { "x86_64" }
     # Windows ARM64 uses the x64 asset through emulation; hosted E2E must validate it.
