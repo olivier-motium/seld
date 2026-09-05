@@ -18,7 +18,7 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.7.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
       - run: uv sync --frozen --extra dev --extra release --extra browser-test
@@ -77,7 +77,7 @@ jobs:
           "$python_path" -c 'import sys; assert sys.version_info[:2] == (3, 12); print(sys.executable)'
           echo "UV_PYTHON=$python_path" >> "$GITHUB_ENV"
           echo "UV_PYTHON_DOWNLOADS=never" >> "$GITHUB_ENV"
-      - uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.7.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
       - run: uv sync --frozen --extra dev --extra release
