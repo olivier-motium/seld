@@ -262,9 +262,77 @@ def test_unpublished_linux_prebuilt_fails_before_network(tmp_path: Path) -> None
     assert not marker.exists()
 
 
-def test_unpublished_windows_prebuilt_fails_before_network() -> None:
-    powershell = (ROOT / "scripts/install.ps1").read_text(encoding="utf-8")
-    assert powershell.index("if (-not $env:GSV_BINARY)") < powershell.index("Invoke-WebRequest")
+def _powershell_download_command(tmp_path: Path) -> list[str]:
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if powershell is None:
+        pytest.skip("PowerShell is not installed on this runner")
+    wrapper = tmp_path / "download-install.ps1"
+    wrapper.write_text(
+        """$ErrorActionPreference = "Stop"
+$env:GSV_BINARY = $null
+$env:GSV_BINARY_SHA256 = $null
+$env:GSV_VERSION = $null
+$env:GSV_RELEASE_BASE_URL = $null
+function Invoke-WebRequest {
+    param([string]$Uri, [string]$OutFile)
+    Add-Content -LiteralPath $env:GSV_TEST_DOWNLOAD_LOG -Value $Uri
+    if ($Uri.EndsWith('.sha256')) {
+        Copy-Item -LiteralPath $env:GSV_TEST_CHECKSUM -Destination $OutFile
+    } else {
+        Copy-Item -LiteralPath $env:GSV_TEST_ARTIFACT -Destination $OutFile
+    }
+}
+& $env:GSV_TEST_INSTALLER --no-browser
+exit $LASTEXITCODE
+""",
+        encoding="utf-8",
+    )
+    return [powershell, "-NoProfile", "-File", str(wrapper)]
+
+
+def test_powershell_installer_download_rejects_checksum_before_install(tmp_path: Path) -> None:
+    artifact = tmp_path / "candidate.exe"
+    artifact.write_bytes(b"untrusted artifact must never execute")
+    checksum = tmp_path / "candidate.sha256"
+    checksum.write_text("0" * 64 + "  gsv-windows-x86_64.exe\n", encoding="ascii")
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+    target = install_dir / "gsv.exe"
+    target.write_bytes(b"previous executable")
+    download_log = tmp_path / "downloads.log"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GSV_BIN_DIR": str(install_dir),
+            "GSV_TEST_ARTIFACT": str(artifact),
+            "GSV_TEST_CHECKSUM": str(checksum),
+            "GSV_TEST_DOWNLOAD_LOG": str(download_log),
+            "GSV_TEST_INSTALLER": str(ROOT / "scripts/install.ps1"),
+            "TEMP": str(tmp_path),
+            "TMP": str(tmp_path),
+            "TMPDIR": str(tmp_path),
+        }
+    )
+
+    result = subprocess.run(
+        _powershell_download_command(tmp_path),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "Seld artifact checksum verification failed" in result.stderr
+    release = f"https://github.com/olivier-motium/seld/releases/download/v{__version__}"
+    assert download_log.read_text(encoding="utf-8-sig").splitlines() == [
+        f"{release}/gsv-windows-x86_64.exe",
+        f"{release}/gsv-windows-x86_64.exe.sha256",
+    ]
+    assert target.read_bytes() == b"previous executable"
+    assert list(install_dir.iterdir()) == [target]
+    assert not list(tmp_path.glob("gsv-install-*"))
 
 
 def test_release_claims_match_the_no_generated_visual_artifact_policy() -> None:
@@ -1019,7 +1087,7 @@ def test_uninstallers_do_not_depend_on_jq_for_cleanup_decisions() -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell executable rollback needs Windows")
-@pytest.mark.parametrize("setup_exit", (4, 42))
+@pytest.mark.parametrize("setup_exit", (0, 4, 42))
 def test_powershell_distinguishes_post_commit_repair_from_rollback(
     tmp_path: Path, setup_exit: int
 ) -> None:
@@ -1114,7 +1182,12 @@ public static class Candidate {
     candidate = publish / "candidate.exe"
     assert candidate.is_file()
     old = candidate.read_bytes()
-    target.write_bytes(old)
+    if setup_exit != 0:
+        target.write_bytes(old)
+    checksum = tmp_path / "candidate.sha256"
+    checksum.write_text(
+        hashlib.sha256(old).hexdigest() + "  gsv-windows-x86_64.exe\n", encoding="ascii"
+    )
     compatibility_log = tmp_path / "compatibility.log"
     fake_tools = tmp_path / "tools"
     fake_tools.mkdir()
@@ -1122,8 +1195,10 @@ public static class Candidate {
     environment = os.environ.copy()
     environment.update(
         {
-            "GSV_BINARY": str(candidate),
-            "GSV_BINARY_SHA256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            "GSV_TEST_ARTIFACT": str(candidate),
+            "GSV_TEST_CHECKSUM": str(checksum),
+            "GSV_TEST_DOWNLOAD_LOG": str(tmp_path / "downloads.log"),
+            "GSV_TEST_INSTALLER": str(ROOT / "scripts/install.ps1"),
             "GSV_BIN_DIR": str(install_dir),
             "GSV_TEST_COMPAT": str(compatibility_log),
             "GSV_TEST_SETUP_EXIT": str(setup_exit),
@@ -1132,7 +1207,7 @@ public static class Candidate {
     )
 
     result = subprocess.run(
-        [powershell, "-NoProfile", "-File", str(ROOT / "scripts/install.ps1")],
+        _powershell_download_command(tmp_path),
         check=False,
         capture_output=True,
         text=True,
@@ -1142,7 +1217,10 @@ public static class Candidate {
 
     assert result.returncode == setup_exit
     assert target.read_bytes() == old, result.stderr
-    if setup_exit == 4:
+    if setup_exit == 0:
+        assert not compatibility_log.exists()
+        assert not list(install_dir.glob(".gsv.*"))
+    elif setup_exit == 4:
         assert not compatibility_log.exists()
         assert len(list(install_dir.glob(".gsv.previous.*"))) == 1
         assert "Bridge needs repair" in result.stderr
