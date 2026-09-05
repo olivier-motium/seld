@@ -41,9 +41,24 @@ def test_artifact_readiness_parity_allows_local_missing_but_release_requires_rea
     }
 
     assert build_standalone._require_connector_readiness_parity(missing, missing) == missing
-    assert e2e_clean_install._connector_readiness_receipt(missing, required=False) == missing
+    with pytest.raises(RuntimeError, match="missing one or more"):
+        e2e_clean_install._connector_readiness_receipt(missing, required=False)
     with pytest.raises(RuntimeError, match="missing one or more"):
         e2e_clean_install._connector_readiness_receipt(missing, required=True)
+
+
+def test_clean_install_preserves_pending_provider_setup() -> None:
+    pending = {
+        "oauth_registration_ready": False,
+        "registration_readiness": {
+            "google": {"sign_in": "setup_required", "status": "setup_required"},
+            "microsoft": {"sign_in": "available", "status": "ready"},
+            "slack": {"sign_in": "available", "status": "ready"},
+        },
+    }
+    assert e2e_clean_install._connector_readiness_receipt(pending, required=False) == pending
+    with pytest.raises(RuntimeError, match="provider setup is not ready"):
+        e2e_clean_install._connector_readiness_receipt(pending, required=True)
 
 
 def test_artifact_readiness_parity_rejects_source_and_frozen_drift() -> None:
