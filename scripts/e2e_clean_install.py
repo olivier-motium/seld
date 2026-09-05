@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -368,7 +369,7 @@ def run_e2e(
         or restored.get("configuration_matches_target") != "unknown"
         or restored.get("activation_required") is not True
         or restored.get("activation_commands")
-        != ["gsv bridge stop", f"gsv --vault {restore} setup"]
+        != ["gsv bridge stop", f"gsv --vault {shlex.quote(str(restore))} setup"]
     ):
         raise RuntimeError("restore did not report the deliberate activation contract")
     config_path.write_bytes(source_config)

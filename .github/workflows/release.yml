@@ -70,8 +70,12 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          brew list --versions python@3.12 >/dev/null || brew install python@3.12
-          echo "UV_PYTHON=$(brew --prefix python@3.12)/bin/python3.12" >> "$GITHUB_ENV"
+          python_path="$(brew --prefix python@3.12)/bin/python3.12"
+          if ! brew list --versions python@3.12 >/dev/null; then
+            brew install python@3.12 || test -x "$python_path"
+          fi
+          "$python_path" -c 'import sys; assert sys.version_info[:2] == (3, 12); print(sys.executable)'
+          echo "UV_PYTHON=$python_path" >> "$GITHUB_ENV"
           echo "UV_PYTHON_DOWNLOADS=never" >> "$GITHUB_ENV"
       - uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.7.0
         with:
