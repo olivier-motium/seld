@@ -62,6 +62,7 @@ _HTML_MIMES: Final = frozenset({"application/xhtml+xml", "text/html"})
 _JSON_MIMES: Final = frozenset({"application/json", "application/ld+json"})
 _CSV_MIMES: Final = frozenset({"application/csv", "text/csv", "text/tab-separated-values"})
 _DOCX_MIME: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_XLSX_MIME: Final = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _PDF_MIME: Final = "application/pdf"
 _IMAGE_MIMES: Final = frozenset(
     {"image/bmp", "image/gif", "image/jpeg", "image/png", "image/tiff", "image/webp"}
@@ -85,6 +86,7 @@ _EXTENSION_KINDS: Final = {
     ".tsv": "csv",
     ".txt": "text",
     ".webp": "image",
+    ".xlsx": "xlsx",
     ".xml": "text",
 }
 _BLOCK_TAGS: Final = frozenset(
@@ -196,6 +198,8 @@ def extract_text(path: Path | str, mime: str | None = None) -> ExtractionResult:
             result = _csv_text(descriptor)
         elif kind == "docx":
             result = _docx_text(descriptor)
+        elif kind == "xlsx":
+            result = _xlsx_text(descriptor)
         elif kind == "pdf":
             result = _external_text(descriptor, candidate.suffix, "pdf")
         else:
@@ -237,6 +241,8 @@ def _kind(path: Path, mime: str | None) -> str | None:
         return "csv"
     if clean_mime == _DOCX_MIME:
         return "docx"
+    if clean_mime == _XLSX_MIME:
+        return "xlsx"
     if clean_mime == _PDF_MIME:
         return "pdf"
     if clean_mime in _IMAGE_MIMES:
@@ -395,6 +401,255 @@ def _docx_text(descriptor: int) -> ExtractionResult:
     ]
     text, limited = _trim_text("\n".join(value for value in paragraphs if value))
     return _result_from_text(text, limited=limited)
+
+
+def _xlsx_text(descriptor: int) -> ExtractionResult:
+    duplicate = os.dup(descriptor)
+    try:
+        with os.fdopen(duplicate, "rb", closefd=True) as handle:
+            duplicate = -1
+            with zipfile.ZipFile(handle) as archive:
+                infos = archive.infolist()
+                if len(infos) > MAX_DOCX_MEMBERS:
+                    return _gap("XLSX archive has too many members", "document_structure_limit")
+                if any(info.flag_bits & 0x1 for info in infos) or any(
+                    info.filename == "EncryptedPackage" for info in infos
+                ):
+                    return _gap("XLSX document is encrypted", "encrypted_document")
+                indexed = {info.filename: info for info in infos}
+                if len(indexed) != len(infos):
+                    return _gap("XLSX archive has duplicate members", "invalid_xlsx")
+                workbook = _xlsx_xml(
+                    archive, indexed.get("xl/workbook.xml"), maximum=MAX_TEXT_BYTES
+                )
+                relationships = _xlsx_xml(
+                    archive, indexed.get("xl/_rels/workbook.xml.rels"), maximum=MAX_TEXT_BYTES
+                )
+                if workbook is None or relationships is None:
+                    return _gap(
+                        "XLSX workbook structure is unavailable",
+                        "missing_workbook_structure",
+                    )
+                sheet_members = _xlsx_sheet_members(workbook, relationships, indexed)
+                if sheet_members is None:
+                    return _gap("XLSX workbook structure is invalid", "invalid_xlsx")
+                shared_info = indexed.get("xl/sharedStrings.xml")
+                selected = [
+                    info
+                    for info in (
+                        indexed["xl/workbook.xml"],
+                        indexed["xl/_rels/workbook.xml.rels"],
+                        shared_info,
+                        *(member for _name, member in sheet_members),
+                    )
+                    if info is not None
+                ]
+                if sum(info.file_size for info in selected) > MAX_INPUT_BYTES:
+                    return _gap("XLSX XML exceeds the input limit", "document_structure_limit")
+                shared_strings = _xlsx_shared_strings(archive, shared_info)
+                if shared_strings is None:
+                    return _gap("XLSX shared strings are invalid", "invalid_xlsx")
+                output = _BoundedText()
+                output.line(
+                    "Cell values are stored values; number and date display formats are not applied."
+                )
+                for sheet_name, info in sheet_members:
+                    root = _xlsx_xml(archive, info)
+                    if root is None:
+                        return _gap("XLSX worksheet XML is invalid", "invalid_xlsx")
+                    if not output.line(f"Worksheet: {sheet_name}"):
+                        break
+                    if not _xlsx_write_sheet(root, shared_strings, output):
+                        break
+    except (
+        ElementTree.ParseError,
+        NotImplementedError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ):
+        return _gap("XLSX document is invalid", "invalid_xlsx")
+    finally:
+        if duplicate >= 0:
+            os.close(duplicate)
+    return _result_from_text(output.text, limited=output.limited)
+
+
+def _xlsx_xml(
+    archive: zipfile.ZipFile, info: zipfile.ZipInfo | None, *, maximum: int = MAX_INPUT_BYTES
+) -> ElementTree.Element[str] | None:
+    if info is None or info.file_size > maximum:
+        return None
+    with archive.open(info) as entry:
+        source = _read_stream(entry, maximum + 1)
+    if len(source) > maximum:
+        return None
+    return ElementTree.fromstring(source)
+
+
+def _xlsx_sheet_members(
+    workbook: ElementTree.Element[str],
+    relationships: ElementTree.Element[str],
+    indexed: dict[str, zipfile.ZipInfo],
+) -> list[tuple[str, zipfile.ZipInfo]] | None:
+    targets: dict[str, str] = {}
+    for relationship in relationships:
+        if _local_name(relationship.tag) != "Relationship":
+            continue
+        relation_id = relationship.attrib.get("Id")
+        target = relationship.attrib.get("Target")
+        relation_type = relationship.attrib.get("Type")
+        if (
+            isinstance(relation_id, str)
+            and isinstance(target, str)
+            and isinstance(relation_type, str)
+            and relation_type.endswith("/worksheet")
+            and relationship.attrib.get("TargetMode") != "External"
+        ):
+            member = _xlsx_member_path(target)
+            if member is not None:
+                targets[relation_id] = member
+    sheets: list[tuple[str, zipfile.ZipInfo]] = []
+    for sheet in workbook.iter():
+        if _local_name(sheet.tag) != "sheet":
+            continue
+        name = sheet.attrib.get("name")
+        relation_id = _xlsx_attribute(sheet, "id")
+        if not isinstance(name, str) or not name or not isinstance(relation_id, str):
+            return None
+        member_name = targets.get(relation_id)
+        info = indexed.get(member_name) if member_name is not None else None
+        if info is None:
+            return None
+        sheets.append((name, info))
+    return sheets or None
+
+
+def _xlsx_member_path(target: str) -> str | None:
+    if not target or "\x00" in target:
+        return None
+    parts = (
+        target.lstrip("/").split("/")
+        if target.startswith("/")
+        else ["xl", *target.split("/")]
+    )
+    if not all(part and part not in {".", ".."} for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _xlsx_shared_strings(
+    archive: zipfile.ZipFile, info: zipfile.ZipInfo | None
+) -> list[str] | None:
+    if info is None:
+        return []
+    root = _xlsx_xml(archive, info)
+    if root is None:
+        return None
+    return [_xlsx_node_text(item) for item in root if _local_name(item.tag) == "si"]
+
+
+class _BoundedText:
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+        self._bytes = 0
+        self.limited = False
+
+    @property
+    def text(self) -> str:
+        return "".join(self._parts)
+
+    def line(self, value: str) -> bool:
+        if self._parts and not self.write("\n"):
+            return False
+        return self.write(value)
+
+    def write(self, value: str) -> bool:
+        encoded = value.encode("utf-8")
+        remaining = MAX_TEXT_BYTES - self._bytes
+        if len(encoded) <= remaining:
+            self._parts.append(value)
+            self._bytes += len(encoded)
+            return True
+        if remaining > 0:
+            self._parts.append(encoded[:remaining].decode("utf-8", errors="ignore"))
+            self._bytes = MAX_TEXT_BYTES
+        self.limited = True
+        return False
+
+
+def _xlsx_write_sheet(
+    root: ElementTree.Element[str], shared_strings: list[str], output: _BoundedText
+) -> bool:
+    for row in root.iter():
+        if _local_name(row.tag) != "row":
+            continue
+        row_started = False
+        for position, cell in enumerate(row, start=1):
+            if _local_name(cell.tag) != "c":
+                continue
+            value = _xlsx_cell_value(cell, shared_strings)
+            if value is None:
+                continue
+            if row_started:
+                if not output.write(" | "):
+                    return False
+            elif not output.line(""):
+                return False
+            row_started = True
+            reference = cell.attrib.get("r") or f"cell {position}"
+            if not output.write(reference) or not output.write(": ") or not output.write(value):
+                return False
+    return True
+
+
+def _xlsx_cell_value(cell: ElementTree.Element[str], shared_strings: list[str]) -> str | None:
+    formula = _xlsx_child(cell, "f")
+    cached = _xlsx_cached_value(cell, shared_strings)
+    if formula is None:
+        return cached
+    expression = (formula.text or "").strip()
+    label = f"={expression}" if expression else "shared formula"
+    if cached is None:
+        return f"formula {label}; cached result unavailable"
+    return f"formula {label}; cached result: {cached}"
+
+
+def _xlsx_cached_value(cell: ElementTree.Element[str], shared_strings: list[str]) -> str | None:
+    cell_type = cell.attrib.get("t")
+    if cell_type == "inlineStr":
+        inline = _xlsx_child(cell, "is")
+        return "" if inline is None else _xlsx_node_text(inline)
+    value = _xlsx_child(cell, "v")
+    if value is None:
+        return None
+    raw = value.text or ""
+    if cell_type == "s":
+        index = int(raw)
+        if index < 0 or index >= len(shared_strings):
+            raise ValueError("XLSX shared string index is invalid")
+        return shared_strings[index]
+    if cell_type == "b":
+        return {"0": "FALSE", "1": "TRUE"}.get(raw, raw)
+    if cell_type == "d":
+        return f"stored ISO date: {raw}"
+    return raw
+
+
+def _xlsx_child(
+    element: ElementTree.Element[str], name: str
+) -> ElementTree.Element[str] | None:
+    return next((child for child in element if _local_name(child.tag) == name), None)
+
+
+def _xlsx_attribute(element: ElementTree.Element[str], name: str) -> str | None:
+    return next((value for key, value in element.attrib.items() if _local_name(key) == name), None)
+
+
+def _xlsx_node_text(element: ElementTree.Element[str]) -> str:
+    return "".join(node.text or "" for node in element.iter() if _local_name(node.tag) == "t")
 
 
 def _docx_paragraph(paragraph: ElementTree.Element[str]) -> str:
