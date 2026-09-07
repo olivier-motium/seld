@@ -855,7 +855,7 @@ def test_microsoft_sync_gets_full_message_body_then_calendar_events() -> None:
 def test_microsoft_primary_calendar_delta_confirms_permanent_removals() -> None:
     runtime = _Runtime(
         [
-            _response({"value": [{"id": "primary-id", "isDefaultCalendar": True}]}),
+            _response({"value": [{"id": "primary-id"}]}),
             _response(
                 {
                     "value": [
@@ -867,6 +867,7 @@ def test_microsoft_primary_calendar_delta_confirms_permanent_removals() -> None:
                     ]
                 }
             ),
+            _response({"id": "primary-id"}),
             _response(
                 {
                     "@odata.deltaLink": (
@@ -899,13 +900,15 @@ def test_microsoft_primary_calendar_delta_confirms_permanent_removals() -> None:
     assert [(item.object_id, item.deleted) for item in result.documents] == [
         ("outlook-calendar:primary-id:event-deleted", True)
     ]
-    assert runtime.calls[2][1]["operation"] == "events.delta"
-    assert runtime.calls[2][1]["input"] == {
+    assert runtime.calls[2][1]["operation"] == "calendars.get"
+    assert runtime.calls[2][1]["input"] == {"calendar_id": "primary"}
+    assert runtime.calls[3][1]["operation"] == "events.delta"
+    assert runtime.calls[3][1]["input"] == {
         "end": "2028-09-07T00:00:00Z",
         "page_size": 5,
         "start": "2025-09-07T00:00:00Z",
     }
-    assert runtime.calls[3][1]["input"] == {
+    assert runtime.calls[4][1]["input"] == {
         "calendar_id": "primary",
         "event_id": "event-deleted",
     }

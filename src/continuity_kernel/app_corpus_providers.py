@@ -1227,6 +1227,20 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                 calendar_ids = _string_list(calendar.get("calendar_ids"), maximum=_MAX_CALENDARS)
                 index = _nonnegative_int(calendar.get("index"))
                 primary_calendar_id = _optional_text(calendar.get("primary_calendar_id"))
+                if (
+                    index >= len(calendar_ids)
+                    and self._calendar_delta_window is not None
+                    and primary_calendar_id is None
+                ):
+                    primary = self._call(
+                        "gsv_outlook_calendar_read",
+                        connection_id,
+                        "calendars.get",
+                        {"calendar_id": "primary"},
+                    ).payload
+                    primary_calendar_id = _optional_text(primary.get("id"))
+                    if primary_calendar_id is not None:
+                        calendar["primary_calendar_id"] = primary_calendar_id
                 if index < len(calendar_ids):
                     calendar_id = calendar_ids[index]
                     page = self._call(

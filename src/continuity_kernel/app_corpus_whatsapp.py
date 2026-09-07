@@ -834,6 +834,10 @@ def _document(
     }
     if media_type is not None:
         metadata["media_type"] = media_type
+    filename = _label(row["filename"]) if "filename" in row.keys() else None
+    if filename and not deleted:
+        metadata["attachment_name"] = filename
+        text = "\n\n".join(value for value in (text, f"Attachment: {filename}") if value)
     if not deleted and _is_voice_media_type(media_type):
         if voice_transcript is not None:
             metadata["media_extraction_status"] = "local_transcript"
