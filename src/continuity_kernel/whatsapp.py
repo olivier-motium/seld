@@ -388,7 +388,7 @@ def read_whatsapp_delta(
     drift = _cursor_drift(previous, status)
     database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
     store_reconciled = False
-    if reconcile_store_replacement:
+    if reconcile_store_replacement or _schema_migrated_in_place(previous, status, database):
         previous, store_reconciled = _reconcile_cursor(previous, status, database)
     else:
         _validate_cursor(previous, status)
@@ -458,18 +458,14 @@ def replay_whatsapp_delta(
     if not status.available:
         raise ContinuityError(status.error or "standalone WhatsApp source is unavailable")
     assert status.account_fingerprint is not None
-    _validate_cursor(previous, status)
+    database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
+    previous, previous_reconciled = _reconcile_cursor(previous, status, database)
+    target, target_reconciled = _reconcile_cursor(target, status, database)
     assert status.schema is not None and status.generation is not None
     assert status.max_rowid is not None
-    if (
-        target.schema != status.schema
-        or target.generation != status.generation
-        or target.rowid < previous.rowid
-        or target.rowid > status.max_rowid
-    ):
+    if target.rowid < previous.rowid or target.rowid > status.max_rowid:
         raise ContinuityError("standalone WhatsApp prepared delivery prefix is unavailable")
 
-    database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
     prefix_messages, prefix_rowid, prefix_newest = _prefix_aggregates(
         database,
         through_rowid=target.rowid,
@@ -499,9 +495,13 @@ def replay_whatsapp_delta(
         observed_at=status.observed_at,
         covered_through=target.newest or status.observed_at,
         complete=complete,
+        # The persisted prepared token remains authoritative until acknowledgement.
+        # Queries use the reconciled cursor above, but returning its original form
+        # lets the caller compare the replay with that durable token exactly.
         cursor=target_cursor,
         messages=messages,
         account_fingerprint=status.account_fingerprint,
+        store_reconciled=previous_reconciled or target_reconciled,
         drift=_cursor_drift(previous, status),
     )
 
@@ -574,16 +574,6 @@ def verify_whatsapp_ack_token(
         )
     if acknowledgement.from_rowid != current.rowid or target.rowid <= current.rowid:
         raise ContinuityError("standalone WhatsApp delivery checkpoint is stale")
-    same_store = target.schema == current.schema and target.generation == current.generation
-    legacy_rebase = (
-        acknowledgement.store_reconciled
-        and current.version == 1
-        and target.version == CURSOR_VERSION
-        and target.schema == current.schema
-    )
-    if not same_store and not legacy_rebase:
-        raise ContinuityError("standalone WhatsApp delivery store changed before acknowledgement")
-
     status = inspect_whatsapp(
         store_root=store_root,
         runtime=runtime,
@@ -593,10 +583,10 @@ def verify_whatsapp_ack_token(
     )
     if not status.available:
         raise ContinuityError(status.error or "standalone WhatsApp source is unavailable")
-    if target.schema != status.schema or target.generation != status.generation:
-        raise ContinuityError("standalone WhatsApp delivery store changed before acknowledgement")
     database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
-    if legacy_rebase:
+    current, current_reconciled = _reconcile_cursor(current, status, database)
+    target, target_reconciled = _reconcile_cursor(target, status, database)
+    if current_reconciled or target_reconciled:
         prior_messages, prior_rowid, prior_newest = _prefix_aggregates(
             database,
             through_rowid=current.rowid,
@@ -1112,6 +1102,10 @@ def _validate_cursor(cursor: _Cursor, status: WhatsAppStatus) -> None:
 def _validate_cursor_aggregates(cursor: _Cursor, status: WhatsAppStatus) -> None:
     if cursor.schema != status.schema:
         raise ContinuityError("standalone WhatsApp schema changed; cursor preserved")
+    _validate_row_high_water(cursor, status)
+
+
+def _validate_row_high_water(cursor: _Cursor, status: WhatsAppStatus) -> None:
     assert status.messages is not None and status.chats is not None and status.max_rowid is not None
     # Counts and timestamps describe mutable inventory, not delivery order.
     # Deletion, expiry, revocation, or correction may legitimately move them
@@ -1136,17 +1130,76 @@ def _cursor_drift(cursor: _Cursor, status: WhatsAppStatus) -> tuple[str, ...]:
     return tuple(drift)
 
 
+def _same_store_under_prior_schema(
+    cursor: _Cursor,
+    database: Path,
+    *,
+    target_schema: str,
+    target_generation: str,
+) -> bool:
+    """Whether the live file is the one the cursor was taken from, schema aside.
+
+    A generation binds the file identity and the schema fingerprint together, so a
+    schema that moved makes the generation move with it. One pinned snapshot must
+    prove both the cursor's old generation and the inspected target generation.
+    That binds the old and new schemas to the same file identity, so a replacement
+    between inspection and reconciliation cannot be mistaken for a migration.
+    """
+
+    with _connect(database) as (_connection, identity):
+        return (
+            _generation(identity, cursor.schema) == cursor.generation
+            and _generation(identity, target_schema) == target_generation
+        )
+
+
+def _schema_migrated_in_place(cursor: _Cursor, status: WhatsAppStatus, database: Path) -> bool:
+    """A current cursor whose schema moved while its store file did not."""
+
+    return (
+        cursor.version == CURSOR_VERSION
+        and status.schema is not None
+        and cursor.schema != status.schema
+        and status.generation is not None
+        and _same_store_under_prior_schema(
+            cursor,
+            database,
+            target_schema=status.schema,
+            target_generation=status.generation,
+        )
+    )
+
+
 def _reconcile_cursor(
     cursor: _Cursor, status: WhatsAppStatus, database: Path
 ) -> tuple[_Cursor, bool]:
-    """Rebase a cursor only when the old aggregate prefix still exists exactly."""
+    """Rebase a cursor only when the old aggregate prefix still exists exactly.
 
-    _validate_cursor_aggregates(cursor, status)
-    if cursor.version == CURSOR_VERSION:
-        if cursor.generation != status.generation:
-            raise ContinuityError("standalone WhatsApp store changed; cursor preserved")
-        return cursor, False
+    Two cursors qualify: a legacy version-1 cursor, and a current cursor whose schema
+    fingerprint moved while the store file stayed the same, which is what an in-place
+    column migration by a newer wacli leaves behind (29 August 2026: three columns
+    were added to ``messages`` and every read refused as "schema changed" until this
+    path existed). A current cursor whose file identity moved is a replaced store and
+    is refused here exactly as before.
+    """
+
     assert status.schema is not None and status.generation is not None
+    if cursor.version == CURSOR_VERSION:
+        if cursor.schema == status.schema:
+            _validate_cursor_aggregates(cursor, status)
+            if cursor.generation != status.generation:
+                raise ContinuityError("standalone WhatsApp store changed; cursor preserved")
+            return cursor, False
+        if not _same_store_under_prior_schema(
+            cursor,
+            database,
+            target_schema=status.schema,
+            target_generation=status.generation,
+        ):
+            raise ContinuityError("standalone WhatsApp store changed; cursor preserved")
+        _validate_row_high_water(cursor, status)
+    else:
+        _validate_cursor_aggregates(cursor, status)
     prefix_messages, prefix_rowid, prefix_newest = _prefix_aggregates(
         database,
         through_rowid=cursor.rowid,
