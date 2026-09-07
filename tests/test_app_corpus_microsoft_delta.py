@@ -10,6 +10,7 @@ from continuity_kernel.app_corpus_microsoft_delta import (
     MAX_FOLDERS,
     MicrosoftMailDeltaSync,
     clear_continuations,
+    rewind_message_page_for_materialization_retry,
 )
 from continuity_kernel.vault import Vault
 
@@ -175,6 +176,35 @@ def test_continuation_reset_preserves_completed_delta_links() -> None:
     assert "continuation" not in saved["folders"]["folder-a"]
     assert saved["folder_delta_link"].endswith("folders")
     assert saved["folders"]["folder-a"]["delta_link"].endswith("a")
+
+
+def test_materialization_retry_rewinds_the_current_and_previous_message_folders() -> None:
+    checkpoint = json.dumps(
+        {
+            "candidates": {"deleted": {"folder_id": "folder-b", "revision": "r1"}},
+            "coverage_gaps": ["A retained coverage gap"],
+            "folder_delta_link": "folders-delta",
+            "folder_index": 2,
+            "folder_order": ["folder-a", "folder-b", "folder-c"],
+            "folders": {
+                "folder-a": {"delta_link": "messages-a"},
+                "folder-b": {"continuation": {"path": "page-b"}, "delta_link": "messages-b"},
+                "folder-c": {"continuation": {"path": "page-c"}, "delta_link": "messages-c"},
+            },
+            "phase": "messages",
+            "v": 1,
+        }
+    )
+
+    saved = json.loads(rewind_message_page_for_materialization_retry(checkpoint))
+
+    assert saved["phase"] == "messages"
+    assert saved["folder_index"] == 1
+    assert saved["folders"]["folder-a"]["delta_link"] == "messages-a"
+    assert saved["folders"]["folder-b"] == {}
+    assert saved["folders"]["folder-c"] == {}
+    assert saved["candidates"] == {"deleted": {"folder_id": "folder-b", "revision": "r1"}}
+    assert saved["coverage_gaps"] == ["A retained coverage gap"]
 
 
 def test_folder_cap_is_visible_and_never_truncates_the_checkpoint() -> None:

@@ -42,6 +42,7 @@ _MAX_METADATA_TEXT_CHARS: Final = 2_000
 _MAX_PAGE_ITEMS: Final = 50
 _MAX_CALENDARS: Final = 128
 _MAX_SLACK_CHANNELS: Final = 128
+_MAX_SLACK_SEARCH_PAGES: Final = 100
 _MAX_ATTACHMENT_BYTES: Final = 16 * 1024 * 1024
 _INLINE_ATTACHMENT_BYTES: Final = 1 * 1024 * 1024
 _GOOGLE_DOCUMENT_MIME: Final = "application/vnd.google-apps.document"
@@ -1066,24 +1067,32 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                 checkpoint=_optional_text(mail.get("delta_checkpoint")),
                 limit=page_size,
             )
-            mail["delta_checkpoint"] = delta.checkpoint
             scanned += delta.scanned
-            _clear_coverage_gaps(
-                mail,
-                prefix=(
-                    "Outlook Mail permanent deletions are not observable without a Graph delta "
-                    "read"
-                ),
-            )
-            for detail in delta.coverage_gaps:
-                _record_coverage_gap(mail, detail)
             for change in delta.changes:
-                detail = self._call(
-                    "gsv_outlook_mail_read",
-                    connection_id,
-                    "messages.get",
-                    {"body_format": "html", "message_id": change.message_id},
-                ).payload
+                try:
+                    detail = self._call(
+                        "gsv_outlook_mail_read",
+                        connection_id,
+                        "messages.get",
+                        {"body_format": "html", "message_id": change.message_id},
+                    ).payload
+                except ConnectorProviderError as exc:
+                    if exc.status != 404:
+                        raise
+                    documents.append(
+                        _outlook_delta_deleted_document(
+                            connection_id,
+                            change.message_id,
+                            _revision(
+                                change.value,
+                                "changeKey",
+                                "lastModifiedDateTime",
+                                fallback=change.message_id,
+                            ),
+                            fetched_at,
+                        )
+                    )
+                    continue
                 documents.extend(
                     self._outlook_documents(
                         connection_id,
@@ -1127,6 +1136,16 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                         immutable_ids=True,
                     )
                 )
+            mail["delta_checkpoint"] = delta.checkpoint
+            _clear_coverage_gaps(
+                mail,
+                prefix=(
+                    "Outlook Mail permanent deletions are not observable without a Graph delta "
+                    "read"
+                ),
+            )
+            for detail in delta.coverage_gaps:
+                _record_coverage_gap(mail, detail)
             mail["done"] = delta.complete
 
         if "outlook_calendar" not in self._sources:
@@ -1405,10 +1424,17 @@ class SlackAppCorpusAdapter(_CorpusProviderAdapter):
                         )
                     channels.append(channel_id)
             history["channels"] = channels
-            pages = _slack_page_count(page.payload)
+            reported_pages = _slack_page_count(page.payload)
+            pages = min(reported_pages, _MAX_SLACK_SEARCH_PAGES)
             if page_number >= pages:
                 search["done"] = True
                 search.pop("page", None)
+                if reported_pages > pages:
+                    _record_coverage_gap(
+                        history,
+                        "Slack search reached the local page bound; "
+                        "older matching messages were not indexed",
+                    )
             else:
                 search["page"] = page_number + 1
         else:
@@ -1934,8 +1960,6 @@ def _slack_page_count(value: Mapping[str, Any]) -> int:
     pages = paging.get("pages")
     if type(pages) is not int or pages < 1:
         return 1
-    if pages > 100:
-        raise ValidationError("Slack search exceeds its provider page bound")
     return pages
 
 

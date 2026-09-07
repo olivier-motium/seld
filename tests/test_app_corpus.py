@@ -1027,6 +1027,70 @@ def test_legacy_gmail_message_gap_recovery_starts_once_per_connection(tmp_path: 
     )
 
 
+def test_outlook_detail_failure_recovery_rewinds_once_per_connection(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Corpus")
+    companion = AppCorpusCompanion(
+        vault.root,
+        executable=tmp_path / "missing-qmd",
+        index_root=tmp_path / "corpus",
+    )
+    delta_checkpoint = json.dumps(
+        {
+            "candidates": {},
+            "coverage_gaps": [],
+            "folder_delta_link": "folders-delta",
+            "folder_index": 2,
+            "folder_order": ["folder-a", "folder-b", "folder-c"],
+            "folders": {
+                "folder-a": {"delta_link": "messages-a"},
+                "folder-b": {"delta_link": "messages-b"},
+                "folder-c": {"continuation": {"path": "page-c"}, "delta_link": "messages-c"},
+            },
+            "phase": "messages",
+            "v": 1,
+        }
+    )
+    failed_checkpoint = json.dumps(
+        {
+            "calendar": {"calendar_ids": [], "index": 0, "listed": False},
+            "mail": {"delta_checkpoint": delta_checkpoint},
+            "provider": "microsoft",
+            "round": "running",
+            "v": 1,
+        }
+    )
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+
+        def sync(self, connection_id, *, checkpoint=None, limit=100):
+            del connection_id, limit
+            self.calls.append(checkpoint)
+            return AppCorpusSyncResult(
+                documents=(),
+                checkpoint=failed_checkpoint if checkpoint is None else checkpoint,
+                scanned=0,
+                complete=False,
+                freshness={"status": "error", "detail": "connector provider read failed"},
+            )
+
+    adapter = Adapter()
+    for _ in range(3):
+        companion.sync(adapter, "outlook-connection")
+
+    recovered = json.loads(adapter.calls[1] or "{}")
+    recovered_delta = json.loads(recovered["mail"]["delta_checkpoint"])
+    assert recovered["outlook_delta_materialization_recovery_epoch"] == 1
+    assert recovered_delta["phase"] == "messages"
+    assert recovered_delta["folder_index"] == 1
+    assert recovered_delta["folders"]["folder-a"]["delta_link"] == "messages-a"
+    assert recovered_delta["folders"]["folder-b"] == {}
+    assert recovered_delta["folders"]["folder-c"] == {}
+    assert adapter.calls[2] == adapter.calls[1]
+
+
 def test_whatsapp_status_derives_legacy_media_coverage_from_metadata(tmp_path: Path) -> None:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Corpus")

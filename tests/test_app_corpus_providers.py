@@ -968,6 +968,113 @@ def test_microsoft_delta_tombstones_only_the_typed_immutable_record_after_404() 
     assert "separately indexed attachments" not in result.freshness.get("detail", "")
 
 
+def test_microsoft_delta_change_404_tombstones_and_advances_the_cursor() -> None:
+    first_runtime = _Runtime(
+        [
+            _response(
+                {
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=folders",
+                    "value": [{"id": "folder-1"}],
+                }
+            )
+        ]
+    )
+    first = MicrosoftAppCorpusAdapter(
+        first_runtime, sources=frozenset({"outlook_mail"})
+    ).sync("connection-2", limit=4)  # type: ignore[arg-type]
+    runtime = _Runtime(
+        [
+            _response(
+                {
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$deltatoken=messages",
+                    "value": [{"changeKey": "delta-v1", "id": "immutable-deleted"}],
+                }
+            ),
+            ConnectorProviderError(
+                origin=ConnectorOrigin.MICROSOFT_GRAPH,
+                status=404,
+                code="not_found",
+            ),
+        ]
+    )
+
+    result = MicrosoftAppCorpusAdapter(
+        runtime, sources=frozenset({"outlook_mail"})
+    ).sync("connection-2", checkpoint=first.checkpoint, limit=4)  # type: ignore[arg-type]
+
+    assert result.complete is True
+    assert [
+        (document.object_id, document.revision, document.deleted) for document in result.documents
+    ] == [("outlook-immutable:immutable-deleted", "delta-v1", True)]
+
+
+def test_microsoft_detail_failure_keeps_the_prior_delta_checkpoint_for_retry() -> None:
+    first_runtime = _Runtime(
+        [
+            _response(
+                {
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=folders",
+                    "value": [{"id": "folder-1"}],
+                }
+            )
+        ]
+    )
+    first = MicrosoftAppCorpusAdapter(
+        first_runtime, sources=frozenset({"outlook_mail"})
+    ).sync("connection-2", limit=4)  # type: ignore[arg-type]
+    prior_delta_checkpoint = json.loads(first.checkpoint)["mail"]["delta_checkpoint"]
+    failed_runtime = _Runtime(
+        [
+            _response(
+                {
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$deltatoken=messages",
+                    "value": [{"id": "mail-1"}],
+                }
+            ),
+            ConnectorProviderError(
+                origin=ConnectorOrigin.MICROSOFT_GRAPH,
+                status=503,
+                code="temporarily_unavailable",
+            ),
+        ]
+    )
+
+    failed = MicrosoftAppCorpusAdapter(
+        failed_runtime, sources=frozenset({"outlook_mail"})
+    ).sync("connection-2", checkpoint=first.checkpoint, limit=4)  # type: ignore[arg-type]
+
+    assert failed.documents == ()
+    assert failed.complete is False
+    assert failed.freshness["status"] == "error"
+    assert json.loads(failed.checkpoint)["mail"]["delta_checkpoint"] == prior_delta_checkpoint
+
+    retry_runtime = _Runtime(
+        [
+            _response(
+                {
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$deltatoken=messages",
+                    "value": [{"id": "mail-1"}],
+                }
+            ),
+            _response(
+                {
+                    "body": {"content": "Recovered mail body", "contentType": "text"},
+                    "changeKey": "mail-v1",
+                    "id": "mail-1",
+                    "subject": "Recovered mail",
+                }
+            ),
+        ]
+    )
+    retried = MicrosoftAppCorpusAdapter(
+        retry_runtime, sources=frozenset({"outlook_mail"})
+    ).sync("connection-2", checkpoint=failed.checkpoint, limit=4)  # type: ignore[arg-type]
+
+    assert retried.complete is True
+    assert retried.documents[0].object_id == "outlook-immutable:mail-1"
+    assert retried.documents[0].text == "Recovered mail body"
+
+
 def test_microsoft_sync_extracts_bounded_attachment_artifact(tmp_path: object) -> None:
     path = tmp_path / "notes.txt"  # type: ignore[operator]
     path.write_text("Attachment content", encoding="utf-8")  # type: ignore[union-attr]
@@ -1070,6 +1177,40 @@ def test_slack_sync_uses_search_then_authenticated_channel_history() -> None:
     assert "edits and deletions" in second.freshness["detail"]
     assert [name for name, _values in runtime.calls] == ["gsv_slack_read", "gsv_slack_read"]
     assert runtime.calls[1][1]["operation"] == "messages.list"
+
+
+def test_slack_search_keeps_current_documents_when_the_provider_exceeds_local_page_bound() -> None:
+    page = _response(
+        {
+            "messages": {
+                "matches": [
+                    {
+                        "channel": {"id": "C1"},
+                        "text": "Search result text",
+                        "ts": "1712345678.000001",
+                    }
+                ],
+                "paging": {"pages": 101},
+            }
+        }
+    )
+    runtime = _Runtime([page, page])
+    adapter = SlackAppCorpusAdapter(runtime)  # type: ignore[arg-type]
+
+    first = adapter.sync("connection-3", limit=50)
+    first_checkpoint = json.loads(first.checkpoint)
+    assert first.documents[0].source_ref == "slack:message:C1:1712345678.000001"
+    assert first.freshness["status"] == "partial"
+    assert first_checkpoint["search"]["page"] == 2
+
+    first_checkpoint["search"]["page"] = 100
+    bounded = adapter.sync("connection-3", checkpoint=json.dumps(first_checkpoint), limit=50)
+    bounded_checkpoint = json.loads(bounded.checkpoint)
+
+    assert bounded.documents[0].source_ref == "slack:message:C1:1712345678.000001"
+    assert bounded_checkpoint["search"]["done"] is True
+    assert "page" not in bounded_checkpoint["search"]
+    assert "local page bound" in bounded.freshness["detail"]
 
 
 def test_refused_connector_read_is_visible_and_never_claims_completion() -> None:

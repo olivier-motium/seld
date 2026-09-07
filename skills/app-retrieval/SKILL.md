@@ -15,6 +15,11 @@ live operations. `gsv apps status` reports selected sources, coverage, and index
 readiness. A listed account or a successful authorization is not proof that its
 content was indexed.
 
+Use the installed `gsv` executable for live provider access. Do not run live
+credential reads through a worktree's `uv run`, `.venv`, or `PYTHONPATH=src`;
+another Python identity can trigger repeated macOS Keychain permission prompts.
+Worktree environments remain suitable for offline tests.
+
 ```bash
 gsv apps search "question or exact phrase" --connection-id CONNECTION --limit 8
 gsv apps read --connection-id CONNECTION --object-id OBJECT
@@ -30,6 +35,15 @@ For Slack, read the parent message and relevant replies in the same workspace
 and channel or DM before resolving a discussion. For Notion, follow relevant
 linked pages, database rows, and newer project versions. A successful demo or
 an older blueprint does not close a later unresolved acceptance issue.
+
+When Slack's local backfill is incomplete, use the live scoped commands:
+
+```bash
+gsv slack-search --connection-id CONNECTION --query 'QUERY' --max-pages 1 --max-results 8
+gsv slack-context --connection-id CONNECTION --ref RETURNED_REF --include-thread
+```
+
+The returned Slack reference is short-lived. Expand it during the same task.
 
 Distinguish source dates from fetch dates. Prefer a later explicit correction
 over the earlier statement it corrects. State material scope, coverage, freshness,

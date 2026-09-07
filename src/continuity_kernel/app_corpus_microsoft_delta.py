@@ -190,6 +190,33 @@ def clear_continuations(checkpoint: str) -> str:
     return _encode(state)
 
 
+def rewind_message_page_for_materialization_retry(checkpoint: str) -> str:
+    """Replay the affected Graph message page after a failed detail read.
+
+    Delta pages carry only identifiers.  If materializing one of those identifiers
+    fails after the delta checkpoint is produced, replaying the current folder and
+    its predecessor protects both a continued page and a page that ended a folder.
+    """
+
+    state = _decode(checkpoint)
+    order = _folder_order(state, _folders(state))
+    if state["phase"] not in {"messages", "complete"} or not order:
+        return _encode(state)
+    if state["phase"] == "complete":
+        current_index = len(order) - 1
+    else:
+        current_index = min(_nonnegative(state.get("folder_index")), len(order) - 1)
+    restart_index = max(current_index - 1, 0)
+    folders = _folders(state)
+    for folder_id in order[restart_index : current_index + 1]:
+        folder = folders[folder_id]
+        folder.pop("continuation", None)
+        folder.pop("delta_link", None)
+    state["folder_index"] = restart_index
+    state["phase"] = "messages"
+    return _encode(state)
+
+
 @dataclass(frozen=True)
 class _Page:
     payload: Mapping[str, Any]

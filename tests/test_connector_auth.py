@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from ctypes import string_at
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -213,7 +214,7 @@ def test_keyring_backend_encodes_binary_secret(monkeypatch: pytest.MonkeyPatch) 
     class SecureBackend:
         priority = 5.0
 
-    SecureBackend.__module__ = "keyring.backends.macOS"
+    SecureBackend.__module__ = "keyring.backends.SecretService"
 
     class FakeModule:
         def __init__(self) -> None:
@@ -244,6 +245,156 @@ def test_keyring_backend_encodes_binary_secret(monkeypatch: pytest.MonkeyPatch) 
 
     assert store.get_secret(connection_id, name) == b"\x00binary\xff"
     assert all(value != "\x00binary\xff" for value in module.values.values())
+
+
+def test_macos_keyring_write_updates_in_place_and_only_adds_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SecureBackend:
+        priority = 5.0
+
+    SecureBackend.__module__ = "keyring.backends.macOS"
+
+    class FakeModule:
+        def __init__(self) -> None:
+            self.password_writes: list[tuple[str, str, str]] = []
+            self.deletions: list[tuple[str, str]] = []
+
+        def get_keyring(self) -> SecureBackend:
+            return SecureBackend()
+
+        def get_password(self, service: str, username: str) -> str | None:
+            raise AssertionError((service, username))
+
+        def set_password(self, service: str, username: str, password: str) -> None:
+            self.password_writes.append((service, username, password))
+
+        def delete_password(self, service: str, username: str) -> None:
+            self.deletions.append((service, username))
+
+    class FakeCall:
+        def __init__(self, status: int) -> None:
+            self.status = status
+            self.calls: list[tuple[dict[str, object], dict[str, object] | None]] = []
+
+        def __call__(
+            self, query: dict[str, object], attributes: dict[str, object] | None
+        ) -> int:
+            self.calls.append((query, attributes))
+            return self.status
+
+    class FakeDataCreate:
+        def __init__(self) -> None:
+            self.calls: list[bytes] = []
+
+        def __call__(self, _allocator: object, value: object, length: int) -> int:
+            data = string_at(value, length)
+            self.calls.append(data)
+            return 42
+
+    class FakeRelease:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def __call__(self, value: object) -> None:
+            self.calls.append(value)
+
+    class FakeMacOSAPI:
+        class error:
+            item_not_found = -25300
+
+        class Error:
+            @staticmethod
+            def raise_for_status(status: int) -> None:
+                if status != 0:
+                    raise RuntimeError(status)
+
+        def __init__(self, update_status: int, add_status: int = 0) -> None:
+            self.update = FakeCall(update_status)
+            self.add = FakeCall(add_status)
+            self.data_create = FakeDataCreate()
+            self.release = FakeRelease()
+            self.value_data = None
+            self._sec = type("Security", (), {"SecItemUpdate": self.update})()
+            self._found = type(
+                "Foundation",
+                (),
+                {"CFDataCreate": self.data_create, "CFRelease": self.release},
+            )()
+            self.SecItemAdd = self.add
+
+        @staticmethod
+        def k_(name: str) -> str:
+            return name
+
+        def create_query(self, **kwargs: object) -> dict[str, object]:
+            value_data = kwargs.get("kSecValueData")
+            if value_data is not None:
+                self.value_data = value_data
+            return dict(kwargs)
+
+    module = FakeModule()
+    api_box: dict[str, FakeMacOSAPI] = {"value": FakeMacOSAPI(0)}
+
+    def import_module(name: str) -> object:
+        if name == "keyring":
+            return module
+        if name == "keyring.backends.macOS.api":
+            return api_box["value"]
+        raise AssertionError(name)
+
+    monkeypatch.setattr(
+        "continuity_kernel.connector_secrets.importlib.import_module", import_module
+    )
+    connection_id = parse_connection_id(_connection_id())
+    name = parse_secret_name("access-token")
+    username = f"{connection_id}/{name}"
+    encoded = "v1:dXBkYXRlZA=="
+
+    KeyringSecretStore().set_secret(connection_id, name, b"updated")
+    success = api_box["value"]
+
+    assert success.update.calls == [
+        (
+            {
+                "kSecClass": "kSecClassGenericPassword",
+                "kSecAttrService": "seld.connector-auth",
+                "kSecAttrAccount": username,
+            },
+            {"kSecValueData": success.value_data},
+        )
+    ]
+    assert success.value_data.value == 42
+    assert success.data_create.calls == [encoded.encode("utf-8")]
+    assert success.add.calls == []
+    assert success.release.calls[-1] is success.value_data
+
+    failed = FakeMacOSAPI(-25293)
+    api_box["value"] = failed
+    with pytest.raises(SetupError, match="secret write failed"):
+        KeyringSecretStore().set_secret(connection_id, name, b"updated")
+    assert failed.add.calls == []
+    assert failed.value_data.value == 42
+    assert failed.release.calls[-1] is failed.value_data
+
+    missing = FakeMacOSAPI(-25300)
+    api_box["value"] = missing
+    KeyringSecretStore().set_secret(connection_id, name, b"updated")
+    assert missing.add.calls == [
+        (
+            {
+                "kSecClass": "kSecClassGenericPassword",
+                "kSecAttrService": "seld.connector-auth",
+                "kSecAttrAccount": username,
+                "kSecValueData": missing.value_data,
+            },
+            None,
+        )
+    ]
+    assert missing.value_data.value == 42
+    assert missing.release.calls[-1] is missing.value_data
+    assert module.password_writes == []
+    assert module.deletions == []
 
 
 def test_atomic_token_update_persists_only_a_secret_reference(tmp_path: Path) -> None:

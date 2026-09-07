@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from continuity_kernel import recall as recall_module
+from continuity_kernel.app_corpus_microsoft_delta import (
+    rewind_message_page_for_materialization_retry,
+)
 from continuity_kernel.atomic import PinnedPathRoot
 from continuity_kernel.config import data_dir
 from continuity_kernel.errors import ValidationError
@@ -37,6 +40,9 @@ _STATE_VERSION = 1
 _OBJECT_ID = re.compile(r"^.{1,1024}$", re.DOTALL)
 _GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_CHECKPOINT = "gmail_legacy_message_gap_recovery_epoch"
 _GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_EPOCH = "legacy_message_gap_recovery_epoch"
+_OUTLOOK_DELTA_MATERIALIZATION_RECOVERY_CHECKPOINT = (
+    "outlook_delta_materialization_recovery_epoch"
+)
 
 
 @dataclass(frozen=True)
@@ -281,6 +287,9 @@ class AppCorpusCompanion:
             recovery_epoch = _gmail_legacy_message_gap_recovery_epoch(prior)
             if recovery_epoch is not None:
                 entry[_GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_CHECKPOINT] = recovery_epoch
+            outlook_recovery_epoch = _outlook_delta_materialization_recovery_epoch(prior)
+            if outlook_recovery_epoch is not None:
+                entry[_OUTLOOK_DELTA_MATERIALIZATION_RECOVERY_CHECKPOINT] = outlook_recovery_epoch
             connections[connection_id] = entry
             state["connections"] = connections
             _write_state(store, state)
@@ -347,8 +356,13 @@ class AppCorpusCompanion:
                     state = _load_state(store)
                     prior = _connections(state).get(connection_id, {})
                     checkpoint = _resume_checkpoint(prior) or _complete_checkpoint(prior)
-                    checkpoint, recovery_epoch = _gmail_legacy_message_gap_recovery_checkpoint(
-                        _documents(state), connection_id, prior, checkpoint
+                    checkpoint, gmail_recovery_epoch = (
+                        _gmail_legacy_message_gap_recovery_checkpoint(
+                            _documents(state), connection_id, prior, checkpoint
+                        )
+                    )
+                    checkpoint, outlook_recovery_epoch = (
+                        _outlook_delta_materialization_recovery_checkpoint(prior, checkpoint)
                     )
                     expected = _sync_snapshot_token(state, connection_id)
                 # Provider reads can take minutes.  The connection lock serializes their
@@ -365,7 +379,14 @@ class AppCorpusCompanion:
                             "app corpus connection changed during provider read; retry the sync"
                         )
                     committed = self._commit_sync_unlocked(
-                        store, state, connection_id, prior, result, deadline, recovery_epoch
+                        store,
+                        state,
+                        connection_id,
+                        prior,
+                        result,
+                        deadline,
+                        gmail_recovery_epoch,
+                        outlook_recovery_epoch,
                     )
             if not refresh:
                 return committed
@@ -380,7 +401,8 @@ class AppCorpusCompanion:
         prior: Mapping[str, Any],
         result: AppCorpusSyncResult,
         deadline: float,
-        recovery_epoch: int | None,
+        gmail_recovery_epoch: int | None,
+        outlook_recovery_epoch: int | None,
     ) -> AppCorpusSync:
         documents = _documents(state)
         connections = _connections(state)
@@ -466,8 +488,10 @@ class AppCorpusCompanion:
         else:
             entry["complete_checkpoint"] = _complete_checkpoint(prior)
             entry["resume_checkpoint"] = result.checkpoint or _resume_checkpoint(prior)
-        if recovery_epoch is not None:
-            entry[_GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_CHECKPOINT] = recovery_epoch
+        if gmail_recovery_epoch is not None:
+            entry[_GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_CHECKPOINT] = gmail_recovery_epoch
+        if outlook_recovery_epoch is not None:
+            entry[_OUTLOOK_DELTA_MATERIALIZATION_RECOVERY_CHECKPOINT] = outlook_recovery_epoch
         for path, encoded in writes:
             _check_deadline(deadline)
             store.atomic_write(path, encoded)
@@ -951,6 +975,9 @@ def _sync_snapshot_token(state: Mapping[str, Any], connection_id: str) -> str:
         _GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_CHECKPOINT: _gmail_legacy_message_gap_recovery_epoch(
             connection
         ),
+        _OUTLOOK_DELTA_MATERIALIZATION_RECOVERY_CHECKPOINT: (
+            _outlook_delta_materialization_recovery_epoch(connection)
+        ),
         "resume_checkpoint": _resume_checkpoint(connection),
         "scope": scope,
     }
@@ -1205,6 +1232,46 @@ def _gmail_legacy_message_gap_recovery_checkpoint(
 
 def _gmail_legacy_message_gap_recovery_epoch(value: Mapping[str, Any]) -> int | None:
     return _positive_int(value.get(_GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_CHECKPOINT))
+
+
+def _outlook_delta_materialization_recovery_checkpoint(
+    prior: Mapping[str, Any], checkpoint: str | None
+) -> tuple[str | None, int | None]:
+    """Rewind one legacy Microsoft detail-read failure only once."""
+
+    recovery_epoch = _outlook_delta_materialization_recovery_epoch(prior)
+    if recovery_epoch is not None:
+        return checkpoint, recovery_epoch
+    freshness = prior.get("freshness")
+    if not isinstance(freshness, Mapping) or freshness.get("status") != "error":
+        return checkpoint, None
+    if checkpoint is None:
+        return checkpoint, None
+    try:
+        decoded = json.loads(checkpoint)
+    except json.JSONDecodeError:
+        return checkpoint, None
+    if not isinstance(decoded, dict) or decoded.get("provider") != "microsoft":
+        return checkpoint, None
+    mail = decoded.get("mail")
+    if not isinstance(mail, dict):
+        return checkpoint, None
+    delta_checkpoint = mail.get("delta_checkpoint")
+    if not isinstance(delta_checkpoint, str):
+        return checkpoint, None
+    try:
+        mail["delta_checkpoint"] = rewind_message_page_for_materialization_retry(delta_checkpoint)
+    except ValidationError:
+        return checkpoint, None
+    decoded[_OUTLOOK_DELTA_MATERIALIZATION_RECOVERY_CHECKPOINT] = 1
+    encoded = json.dumps(decoded, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    if len(encoded.encode("utf-8")) > MAX_CHECKPOINT_BYTES:
+        return checkpoint, None
+    return encoded, 1
+
+
+def _outlook_delta_materialization_recovery_epoch(value: Mapping[str, Any]) -> int | None:
+    return _positive_int(value.get(_OUTLOOK_DELTA_MATERIALIZATION_RECOVERY_CHECKPOINT))
 
 
 def _is_legacy_gmail_message_gap(record: Mapping[str, Any], connection_id: str) -> bool:
