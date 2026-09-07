@@ -31,6 +31,10 @@ making a substantive claim; a ranked snippet alone can omit a correction or
 qualification. For a cross-source question, search the relevant connections and
 compare the dated evidence.
 
+If the result reports the `local` backend, semantic indexing is unavailable or
+catching up. Retry with a few distinctive words in the source language instead
+of a full natural-language question, then read the relevant returned objects.
+
 For Slack, read the parent message and relevant replies in the same workspace
 and channel or DM before resolving a discussion. For Notion, follow relevant
 linked pages, database rows, and newer project versions. A successful demo or
