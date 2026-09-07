@@ -1276,7 +1276,19 @@ class LocalSourceDelivery:
             raise ConflictError("local source account binding changed after polling")
         if delta.cursor != prepared.target_cursor or len(delta.messages) != prepared.items_observed:
             raise ContinuityError("local source content changed after polling")
+        if not delta.messages:
+            # An empty store uses observation time as its coverage boundary.
+            # Replay must retain the prepared boundary, not the later clock.
+            delta = replace(delta, covered_through=prepared.covered_through)
         if prepared.adapter_token is None and _delta_digest(delta) != prepared.delivery_digest:
+            # Older empty WhatsApp deliveries included this store-only flag.
+            # Accept either historical value without relaxing content identity.
+            if isinstance(delta, whatsapp.WhatsAppDelta) and not delta.messages:
+                if prepared.delivery_digest in {
+                    _delta_digest(delta, legacy_store_reconciled=False),
+                    _delta_digest(delta, legacy_store_reconciled=True),
+                }:
+                    return
             raise ContinuityError("local source content changed after polling")
 
     def _verify_prepared_delivery(
@@ -1780,11 +1792,17 @@ def _evidence_refs(
 
 def _delta_digest(
     delta: apple_messages.AppleMessagesDelta | whatsapp.WhatsAppDelta,
+    *,
+    legacy_store_reconciled: bool | None = None,
 ) -> str:
     payload = delta.to_dict()
     # Observation time changes on a replay; delivery identity does not. The
     # prepared token separately preserves the original bounded coverage time.
     payload.pop("observed_at", None)
+    # Store reconciliation can change during replay without changing content.
+    payload.pop("store_reconciled", None)
+    if legacy_store_reconciled is not None:
+        payload["store_reconciled"] = legacy_store_reconciled
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
         "ascii"
     )
