@@ -1204,6 +1204,22 @@ def test_lexical_search_keeps_scoped_indexes_and_updates_changed_bodies(tmp_path
     assert companion.search("launch", connection_id="con_a").hits
     assert len(reads) == 2
 
+    class Refetched:
+        def sync(self, connection_id, *, checkpoint=None, limit=100):
+            document = adapter.sync(connection_id).documents[0]
+            return AppCorpusSyncResult(
+                documents=(replace(document, fetched_at="2026-09-07T12:00:00Z"),),
+                checkpoint="refetched",
+                scanned=1,
+                complete=True,
+                freshness={"status": "complete"},
+            )
+
+    companion.sync(Refetched(), "con_a")
+    hit = companion.search("launch", connection_id="con_a").hits[0]
+    assert hit.fetched_at == "2026-09-07T12:00:00Z"
+    assert len(reads) == 2
+
     class Updated:
         def sync(self, connection_id, *, checkpoint=None, limit=100):
             document = adapter.sync(connection_id).documents[0]

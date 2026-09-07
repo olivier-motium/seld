@@ -143,7 +143,8 @@ def _fingerprint(documents: Mapping[str, Mapping[str, Any]], *, deadline: float)
             key,
             record.get("connection_id"),
             record.get("provider"),
-            record.get("fetched_at"),
+            # A read timestamp does not change searchable content. Hits use the
+            # current corpus record, so a rescan must not reindex unchanged text.
             record.get("object_id"),
             record.get("revision"),
             record.get("source_ref"),
