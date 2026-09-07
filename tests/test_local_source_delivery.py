@@ -1474,6 +1474,36 @@ def test_whatsapp_pending_replay_excludes_messages_that_arrive_later(tmp_path: P
 
 
 @_POSIX_STORAGE
+def test_whatsapp_delivery_survives_an_in_place_schema_migration(tmp_path: Path) -> None:
+    vault, _selected = _selected_vault(tmp_path, "whatsapp")
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    delivery = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=_runner(runtime),
+    )
+    delivery.baseline("whatsapp")
+    with sqlite3.connect(database) as connection:
+        for column in ("deleted_at INTEGER", "deletion_reason TEXT", "payload_purged_at INTEGER"):
+            connection.execute(f"ALTER TABLE messages ADD COLUMN {column}")
+    _append_whatsapp(database, "after the schema migration")
+
+    prepared = delivery.poll("whatsapp")
+    assert [message["body"] for message in prepared["messages"]] == [
+        "after the schema migration"
+    ]
+    assert delivery.poll("whatsapp") == prepared
+
+    acknowledged = _ack(delivery, prepared)
+    assert acknowledged["sequence"] == 1
+    following = delivery.poll("whatsapp")
+    assert following["messages"] == []
+
+
+@_POSIX_STORAGE
 def test_empty_pending_replay_leaves_a_later_message_for_the_next_poll(tmp_path: Path) -> None:
     vault, _selected = _selected_vault(tmp_path, "apple_messages")
     store = tmp_path / "Messages"

@@ -458,7 +458,8 @@ def replay_whatsapp_delta(
     if not status.available:
         raise ContinuityError(status.error or "standalone WhatsApp source is unavailable")
     assert status.account_fingerprint is not None
-    _validate_cursor(previous, status)
+    database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
+    previous, _store_reconciled = _reconcile_cursor(previous, status, database)
     assert status.schema is not None and status.generation is not None
     assert status.max_rowid is not None
     if (
@@ -469,7 +470,6 @@ def replay_whatsapp_delta(
     ):
         raise ContinuityError("standalone WhatsApp prepared delivery prefix is unavailable")
 
-    database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
     prefix_messages, prefix_rowid, prefix_newest = _prefix_aggregates(
         database,
         through_rowid=target.rowid,
@@ -574,6 +574,7 @@ def verify_whatsapp_ack_token(
         )
     if acknowledgement.from_rowid != current.rowid or target.rowid <= current.rowid:
         raise ContinuityError("standalone WhatsApp delivery checkpoint is stale")
+    database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
     same_store = target.schema == current.schema and target.generation == current.generation
     legacy_rebase = (
         acknowledgement.store_reconciled
@@ -581,7 +582,15 @@ def verify_whatsapp_ack_token(
         and target.version == CURSOR_VERSION
         and target.schema == current.schema
     )
-    if not same_store and not legacy_rebase:
+    migrated_rebase = (
+        acknowledgement.store_reconciled
+        and current.version == CURSOR_VERSION
+        and target.version == CURSOR_VERSION
+        and current.schema != target.schema
+        and _same_store_under_prior_schema(current, database)
+    )
+    prefix_rebase = legacy_rebase or migrated_rebase
+    if not same_store and not prefix_rebase:
         raise ContinuityError("standalone WhatsApp delivery store changed before acknowledgement")
 
     status = inspect_whatsapp(
@@ -595,8 +604,7 @@ def verify_whatsapp_ack_token(
         raise ContinuityError(status.error or "standalone WhatsApp source is unavailable")
     if target.schema != status.schema or target.generation != status.generation:
         raise ContinuityError("standalone WhatsApp delivery store changed before acknowledgement")
-    database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
-    if legacy_rebase:
+    if prefix_rebase:
         prior_messages, prior_rowid, prior_newest = _prefix_aggregates(
             database,
             through_rowid=current.rowid,
