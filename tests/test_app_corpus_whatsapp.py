@@ -18,6 +18,41 @@ ACCOUNT = "sha256:" + "a" * 64
 AT = int(datetime(2026, 9, 7, 10, 0, tzinfo=UTC).timestamp())
 
 
+def test_downloaded_attachment_requires_matching_bytes_and_respects_deletion(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "store"
+    database = _store(root)
+    attachment = tmp_path / "download.txt"
+    attachment.write_text("The document contains the approved agenda.")
+    _append(database, message_id="attachment", text="Agenda", timestamp=AT)
+    with closing(sqlite3.connect(database)) as connection:
+        for column, kind in (
+            ("local_path", "TEXT"), ("file_sha256", "BLOB"),
+            ("filename", "TEXT"), ("mime_type", "TEXT"),
+        ):
+            connection.execute(f"ALTER TABLE messages ADD COLUMN {column} {kind}")
+        connection.execute(
+            "UPDATE messages SET local_path=?, file_sha256=?, filename=?, mime_type=?",
+            (str(attachment), hashlib.sha256(attachment.read_bytes()).digest(),
+             "download.txt", "text/plain; charset=utf-8"),
+        )
+        connection.commit()
+    adapter = WhatsAppAppCorpusAdapter(account_fingerprint=ACCOUNT, store_root=root)
+    document = adapter.sync("wa-test").documents[0]
+    assert "approved agenda" in document.text
+    assert document.metadata["media_extraction_status"] == "local_text"
+    attachment.write_text("Replacement bytes must not be indexed.")
+    document = adapter.sync("wa-test").documents[0]
+    assert "Replacement" not in document.text
+    assert document.metadata["extraction_reason"] == "attachment digest mismatch"
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("UPDATE messages SET deleted_at=?", (AT + 1,))
+        connection.commit()
+    document = adapter.sync("wa-test").documents[0]
+    assert document.deleted and not document.text
+
+
 def _store(root: Path) -> Path:
     root.mkdir(parents=True)
     database = root / "wacli.db"

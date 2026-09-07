@@ -1363,6 +1363,8 @@ def _media_coverage_counts(
                 counts["local_relay_transcripts"] = counts.get("local_relay_transcripts", 0) + 1
             elif status == "transcript_unavailable" or status is None:
                 counts["transcript_unavailable"] = counts.get("transcript_unavailable", 0) + 1
+        elif status in {"local_text", "partial_text"}:
+            counts[str(status)] = counts.get(str(status), 0) + 1
         elif status == "not_extracted" or status is None:
             counts["not_extracted"] = counts.get("not_extracted", 0) + 1
     return {media_type: coverage[media_type] for media_type in sorted(coverage)}

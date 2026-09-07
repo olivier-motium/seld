@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import stat
+import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -23,6 +24,7 @@ from typing import Final
 from urllib.parse import quote
 
 from continuity_kernel.app_corpus import AppCorpusDocument, AppCorpusSyncResult
+from continuity_kernel.app_corpus_text import MAX_INPUT_BYTES, ExtractionResult, extract_text
 from continuity_kernel.errors import ContinuityError, ValidationError
 from continuity_kernel.sqlite_snapshot import SQLiteFileIdentity, pinned_sqlite_snapshot
 from continuity_kernel.whatsapp import DEFAULT_RUNTIME, default_store_root
@@ -847,9 +849,22 @@ def _document(
         # complete media content.
         metadata["extraction_status"] = "partial" if text else "gap"
         metadata["media_extraction_status"] = "not_extracted"
+        extracted = _local_attachment_text(row)
+        if extracted is not None:
+            metadata["extraction_status"] = extracted.status
+            metadata["media_extraction_status"] = (
+                "local_text" if extracted.status == "ok" else "partial_text"
+                if extracted.text else "not_extracted"
+            )
+            if extracted.reason:
+                metadata["extraction_reason"] = extracted.reason
+            if extracted.text:
+                text = "\n\n".join(value for value in (text, extracted.text) if value)
     revision = f"whatsapp-message:{revision_at}"
     if voice_transcript is not None and not deleted:
         revision += f":relay-transcript:{voice_transcript.event_digest}"
+    if metadata.get("media_extraction_status") in {"local_text", "partial_text"}:
+        revision += ":attachment-text:" + hashlib.sha256(text.encode()).hexdigest()
     return AppCorpusDocument(
         connection_id=connection_id,
         provider=PROVIDER,
@@ -878,6 +893,40 @@ def _message_text(row: sqlite3.Row) -> str:
     return "\n\n".join(values)
 
 
+def _local_attachment_text(row: sqlite3.Row) -> ExtractionResult | None:
+    """Extract only a bounded snapshot matching the provider's plaintext digest.
+
+    wacli may record downloads outside its store. A path alone is insufficient:
+    authenticate the bytes against the message before passing them to a parser.
+    Never download, open the paired session database, or follow a file symlink.
+    """
+    keys = row.keys()
+    path = row["local_path"] if "local_path" in keys else None
+    digest = row["file_sha256"] if "file_sha256" in keys else None
+    if not isinstance(path, str) or not path:
+        return None
+    if not isinstance(digest, bytes) or len(digest) != 32:
+        return ExtractionResult("", "gap", "attachment digest unavailable", ())
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_INPUT_BYTES:
+                return ExtractionResult("", "gap", "attachment is not a bounded regular file", ())
+            data = source.read(MAX_INPUT_BYTES + 1)
+        if len(data) > MAX_INPUT_BYTES or hashlib.sha256(data).digest() != digest:
+            return ExtractionResult("", "gap", "attachment digest mismatch", ())
+        filename = row["filename"] if "filename" in keys else None
+        suffix = Path(filename or path).suffix[:16]
+        mime = row["mime_type"] if "mime_type" in keys else None
+        with tempfile.TemporaryDirectory(prefix="gsv-wa-text-") as temporary:
+            snapshot = Path(temporary) / ("attachment" + suffix)
+            snapshot.write_bytes(data)
+            return extract_text(snapshot, mime=mime.split(";", 1)[0] if mime else None)
+    except (OSError, ValueError):
+        return ExtractionResult("", "gap", "local attachment unavailable", ())
+
+
 def _rows_after(
     connection: sqlite3.Connection,
     *,
@@ -897,6 +946,10 @@ def _rows_after(
             "media_caption",
             "media_type",
             "edited_ts",
+            "local_path",
+            "file_sha256",
+            "filename",
+            "mime_type",
         )
     }
     deleted_terms = [
