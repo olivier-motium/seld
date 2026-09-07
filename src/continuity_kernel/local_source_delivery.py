@@ -1283,12 +1283,11 @@ class LocalSourceDelivery:
         if prepared.adapter_token is None and _delta_digest(delta) != prepared.delivery_digest:
             # Older empty deliveries included this store-only flag.
             # Accept either historical value without relaxing content identity.
-            if not delta.messages:
-                if prepared.delivery_digest in {
-                    _delta_digest(delta, legacy_store_reconciled=False),
-                    _delta_digest(delta, legacy_store_reconciled=True),
-                }:
-                    return
+            if not delta.messages and prepared.delivery_digest in {
+                _delta_digest(delta, legacy_store_reconciled=False),
+                _delta_digest(delta, legacy_store_reconciled=True),
+            }:
+                return
             raise ContinuityError("local source content changed after polling")
 
     def _verify_prepared_delivery(

@@ -1476,7 +1476,9 @@ def test_whatsapp_pending_replay_excludes_messages_that_arrive_later(tmp_path: P
 @_POSIX_STORAGE
 @pytest.mark.parametrize("pending_kind", ["message", "empty", "legacy_empty"])
 def test_whatsapp_delivery_survives_an_in_place_schema_migration(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pending_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_kind: str,
 ) -> None:
     vault, _selected = _selected_vault(tmp_path, "whatsapp")
     store = tmp_path / "wacli-store"
@@ -1495,7 +1497,8 @@ def test_whatsapp_delivery_survives_an_in_place_schema_migration(
         if pending_kind == "legacy_empty":
             digest = local_source_delivery._delta_digest
             legacy.setattr(
-                local_source_delivery, "_delta_digest",
+                local_source_delivery,
+                "_delta_digest",
                 lambda delta: digest(delta, legacy_store_reconciled=False),
             )
         prepared = delivery.poll("whatsapp")
@@ -1519,7 +1522,9 @@ def test_whatsapp_delivery_survives_an_in_place_schema_migration(
 @_POSIX_STORAGE
 @pytest.mark.parametrize("legacy_digest", [False, True])
 def test_empty_pending_replay_leaves_a_later_message_for_the_next_poll(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_digest: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_digest: bool,
 ) -> None:
     vault, _selected = _selected_vault(tmp_path, "apple_messages")
     store = tmp_path / "Messages"
@@ -1531,7 +1536,8 @@ def test_empty_pending_replay_leaves_a_later_message_for_the_next_poll(
         if legacy_digest:
             digest = local_source_delivery._delta_digest
             legacy.setattr(
-                local_source_delivery, "_delta_digest",
+                local_source_delivery,
+                "_delta_digest",
                 lambda delta: digest(delta, legacy_store_reconciled=False),
             )
         empty = delivery.poll("apple_messages", limit=2)
