@@ -1183,6 +1183,7 @@ def _reconcile_cursor(
     is refused here exactly as before.
     """
 
+    assert status.schema is not None and status.generation is not None
     if cursor.version == CURSOR_VERSION:
         if cursor.schema == status.schema:
             _validate_cursor_aggregates(cursor, status)
@@ -1199,7 +1200,6 @@ def _reconcile_cursor(
         _validate_row_high_water(cursor, status)
     else:
         _validate_cursor_aggregates(cursor, status)
-    assert status.schema is not None and status.generation is not None
     prefix_messages, prefix_rowid, prefix_newest = _prefix_aggregates(
         database,
         through_rowid=cursor.rowid,
