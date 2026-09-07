@@ -522,3 +522,25 @@ def test_whatsapp_native_capabilities_are_explicit_and_not_apps_call(
     assert all(item["executor"] == "native_wacli_cli" for item in capabilities.values())
     assert all(item["apps_call_supported"] is False for item in capabilities.values())
     assert all(item["approval_required"] is True for item in (create, update, delete, purge))
+
+
+def test_whatsapp_retention_replays_same_store_without_inferred_deletions(tmp_path: Path) -> None:
+    database = _store(tmp_path / "wacli")
+    _append(database, message_id="kept", text="kept", timestamp=AT)
+    _append(database, message_id="removed", text="removed", timestamp=AT + 1)
+    adapter = WhatsAppAppCorpusAdapter(account_fingerprint=ACCOUNT, store_root=database.parent)
+    initial = adapter.sync("local-whatsapp", limit=10)
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("DELETE FROM messages WHERE rowid = 2")
+        connection.commit()
+    _append(database, message_id="new", text="new", timestamp=AT + 2)
+    page = adapter.sync("local-whatsapp", checkpoint=initial.checkpoint, limit=1)
+    assert [doc.text for doc in page.documents] == ["kept"]
+    assert page.freshness["status"] == "partial"
+    assert not page.complete
+    next_page = adapter.sync("local-whatsapp", checkpoint=page.checkpoint, limit=10)
+    assert [doc.text for doc in next_page.documents] == ["new"]
+    assert next_page.complete
+    assert next_page.freshness["status"] == "partial"
+    assert all(not doc.deleted for doc in (*page.documents, *next_page.documents))
+    assert json.loads(next_page.checkpoint)["continuity_gap"] is True

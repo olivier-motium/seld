@@ -70,6 +70,7 @@ from continuity_kernel.connector_runtime import (
     ConnectorRuntime,
     default_connector_adapters,
 )
+from continuity_kernel.connector_sources import SUPPORTED_SOURCE_IDS, read_connector_source
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
 from continuity_kernel.direction import direction_aim, direction_dict
@@ -500,6 +501,13 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "source":
         if args.source_command == "list":
             return {"catalog": list_recipes(), "state": vault.source_status()}
+        if args.source_command == "read":
+            return read_connector_source(
+                vault,
+                connection_id=args.connection_id,
+                source_id=args.source,
+                limit=args.limit,
+            )
         if args.source_command == "select":
             return vault.select_sources(
                 expected_revision=args.expected_revision,
@@ -560,6 +568,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         )
         if args.local_source_command == "status":
             return delivery.status(args.source)
+        if args.local_source_command == "recent":
+            return delivery.recent(args.source, limit=args.limit)
         if args.local_source_command == "baseline":
             return delivery.baseline(args.source)
         if args.local_source_command == "staged-status":
@@ -999,9 +1009,7 @@ def _apps(vault: Vault, args: argparse.Namespace) -> Any:
                         adapter=args.adapter,
                         settings=_outlook_calendar_delta_settings(args),
                     )
-                adapters = _app_corpus_adapters(
-                    runtime, corpus, recheck_existing=recheck_existing
-                )
+                adapters = _app_corpus_adapters(runtime, corpus, recheck_existing=recheck_existing)
                 adapter = adapters.get(args.adapter)
                 if adapter is None:
                     raise ValidationError("configured app corpus adapter is unavailable")
@@ -1520,8 +1528,21 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
 
 
 def _pulse_status(vault: Vault) -> dict[str, object]:
+    heartbeat = heartbeat_status(vault.root)
     return {
-        "heartbeat": heartbeat_status(vault.root),
+        # Keep the original field for existing callers.  It is intentionally
+        # paired with an explicit scope below so a healthy sensor is never read
+        # as proof that the resident AI completed a wake.
+        "heartbeat": heartbeat,
+        "mechanical_sweep": {
+            "failure": heartbeat["failure"] if heartbeat is not None else None,
+            "observed_at": heartbeat["observed_at"] if heartbeat is not None else None,
+            "state": heartbeat["status"] if heartbeat is not None else "unobserved",
+        },
+        "ai_wake": {
+            "reason": "Mechanical sweep status does not record AI Pulse wake completion.",
+            "state": "unobserved",
+        },
         "signals": vault.resident_signal_status(),
     }
 
@@ -2504,6 +2525,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     source_commands = source.add_subparsers(dest="source_command", required=True)
     source_commands.add_parser("list")
+    source_read = source_commands.add_parser(
+        "read",
+        help="Read one selected OAuth source without recording its transient result.",
+    )
+    source_read.add_argument("--source", choices=sorted(SUPPORTED_SOURCE_IDS), required=True)
+    source_read.add_argument("--connection-id", required=True)
+    source_read.add_argument("--limit", type=int, default=5)
     source_select = source_commands.add_parser(
         "select",
         help="CAS-replace the user-approved source set; deselection purges its coverage.",
@@ -2586,6 +2614,10 @@ def _parser() -> argparse.ArgumentParser:
     local_source_baseline = local_source_commands.add_parser(
         "baseline", help="Start forward-only delivery at the current aggregate cursor."
     )
+    local_source_recent = local_source_commands.add_parser(
+        "recent",
+        help="Read bounded newest-first WhatsApp context without advancing its delivery cursor.",
+    )
     local_source_poll = local_source_commands.add_parser(
         "poll", help="Read or replay one bounded transient delta without advancing."
     )
@@ -2613,6 +2645,7 @@ def _parser() -> argparse.ArgumentParser:
         local_source_adopt_staged,
     ):
         command.add_argument("--source", choices=SUPPORTED_LOCAL_SOURCES, required=True)
+    local_source_recent.add_argument("--source", choices=("whatsapp",), required=True)
     for command in (
         local_source_baseline,
         local_source_poll,
@@ -2630,6 +2663,7 @@ def _parser() -> argparse.ArgumentParser:
         )
         command.add_argument("--runtime", default=str(whatsapp.DEFAULT_RUNTIME))
         command.add_argument("--service-label")
+    local_source_recent.add_argument("--limit", type=int, default=25)
     local_source_poll.add_argument("--limit", type=int, default=100)
     local_source_ack.add_argument("--token", required=True)
     local_source_ack.add_argument("--expected-source-revision", required=True)
@@ -2714,7 +2748,10 @@ def _parser() -> argparse.ArgumentParser:
         help="Inspect or run one bounded mechanical resident sweep.",
     )
     pulse_commands = pulse.add_subparsers(dest="pulse_command", required=True)
-    pulse_commands.add_parser("status", help="Read the latest content-free sweep heartbeat.")
+    pulse_commands.add_parser(
+        "status",
+        help="Read mechanical sweep health; it does not prove an AI Pulse wake completed.",
+    )
     pulse_commands.add_parser(
         "sweep",
         help="Run one provider-free mechanical sweep and publish its heartbeat.",

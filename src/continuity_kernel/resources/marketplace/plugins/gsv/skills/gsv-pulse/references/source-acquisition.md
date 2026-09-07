@@ -28,7 +28,15 @@ When acquiring due sources on a Pulse wake:
    changes.
 
 WhatsApp is the always-on local sense. When selected, check it on every Pulse
-wake even when its stored proof remains fresh. Treat each returned batch as one
+wake even when its stored proof remains fresh. If the unread backlog predates
+the current day, first inspect the native local-source recent view, or the
+installed `gsv local-source recent --source whatsapp --limit 25` command when
+this task lacks the tool. It returns partial current context while preserving
+the unread backlog. It does not acknowledge a delivery or advance its coverage.
+Do not record its newest timestamp as the unread queue's coverage horizon.
+Keep its bodies transient and deduplicate derived changes when messages replay.
+
+Treat each returned delivery batch as one
 ordered crash-safe replay unit. After its meaning is durably readable,
 acknowledge it and poll again when it is partial. Drain in that order until the
 adapter reports complete coverage or the existing seven-minute acquisition
@@ -52,6 +60,14 @@ the six-hour Slack proof expires. Slack rotates public-client credentials every
 12 hours, so substituting a host-owned Slack app would refresh source coverage
 without preserving the portable connection's next refresh token. Treat a
 missed reproof or refresh failure as an authentication incident.
+
+An existing Codex task can retain an older connector process after a local
+Seld update. When a native tool is missing or demonstrably stale, use the
+installed `gsv source read --source slack --connection-id <exact-id> --limit 5`
+command for the selected connection. The same command supports the other
+portable sources. It returns a transient read and content-free receipt; judge
+the content, then record that receipt through the ordinary source CAS flow.
+Do not substitute another account or report tool absence as an OAuth failure.
 
 ## Read enough, not an arbitrary amount
 

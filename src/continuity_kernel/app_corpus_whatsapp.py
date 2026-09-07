@@ -64,6 +64,7 @@ class _Checkpoint:
     columns: tuple[tuple[str, str], ...] | None = None
     prefix_messages: int | None = None
     prefix_newest: str | None = None
+    continuity_gap: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,7 +154,7 @@ class WhatsAppAppCorpusAdapter:
                         status="refused",
                         detail="WhatsApp local store changed; reconnect before retrieval continues",
                     )
-                return self._sync_snapshot(
+                result = self._sync_snapshot(
                     connection,
                     connection_id=connection_id,
                     current=current,
@@ -161,6 +162,17 @@ class WhatsAppAppCorpusAdapter:
                     limit=limit,
                     observed_at=observed_at,
                 )
+                if current.continuity_gap:
+                    result = replace(
+                        result,
+                        freshness=_freshness(
+                            "partial",
+                            observed_at,
+                            "Local WhatsApp rows were removed; retrieval continues from the local store. "
+                            "Previously indexed messages are retained without inferred deletions",
+                        ),
+                    )
+                return result
         except (ContinuityError, ValidationError, sqlite3.Error):
             return _result(
                 checkpoint=checkpoint,
@@ -857,8 +869,11 @@ def _document(
         if extracted is not None:
             metadata["extraction_status"] = extracted.status
             metadata["media_extraction_status"] = (
-                "local_text" if extracted.status == "ok" else "partial_text"
-                if extracted.text else "not_extracted"
+                "local_text"
+                if extracted.status == "ok"
+                else "partial_text"
+                if extracted.text
+                else "not_extracted"
             )
             if extracted.reason:
                 metadata["extraction_reason"] = extracted.reason
@@ -1073,6 +1088,23 @@ def _reconcile_checkpoint(
             raise ContinuityError("WhatsApp local store changed")
         if checkpoint.columns is not None and checkpoint.columns != current_columns:
             raise ContinuityError("WhatsApp local store changed")
+        # Local retention may remove the high-water row without replacing the
+        # pinned database. Replay remaining rows, but do not infer tombstones.
+        if (
+            checkpoint.rowid
+            and connection.execute(
+                "SELECT 1 FROM messages WHERE rowid = ?", (checkpoint.rowid,)
+            ).fetchone()
+            is None
+        ):
+            checkpoint = replace(
+                checkpoint,
+                rowid=0,
+                phase="initial",
+                rescan_rowid=0,
+                rescan_due_at=None,
+                continuity_gap=True,
+            )
         return _with_prefix(replace(checkpoint, columns=current_columns), connection=connection)
 
     if not _same_store_under_prior_schema(checkpoint, identity):
@@ -1175,6 +1207,7 @@ def _encode_checkpoint(value: _Checkpoint) -> str:
             "rowid": value.rowid,
             "schema": value.schema,
             "version": CHECKPOINT_VERSION,
+            **({"continuity_gap": True} if value.continuity_gap else {}),
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -1209,7 +1242,10 @@ def _decode_checkpoint(value: str | None, *, account: str) -> _Checkpoint | None
         columns: tuple[tuple[str, str], ...] | None = None
         prefix_messages: int | None = None
         prefix_newest: str | None = None
-    elif version == CHECKPOINT_VERSION and set(payload) == required:
+    elif version == CHECKPOINT_VERSION and set(payload) in (
+        required,
+        required | {"continuity_gap"},
+    ):
         columns = _decode_schema_columns(payload.get("columns"))
         prefix_messages = payload.get("prefix_messages")
         if (
@@ -1222,6 +1258,8 @@ def _decode_checkpoint(value: str | None, *, account: str) -> _Checkpoint | None
         if prefix_newest is not None:
             _parse_iso(prefix_newest)
     else:
+        raise ValidationError("WhatsApp retrieval checkpoint is invalid")
+    if not isinstance(payload.get("continuity_gap", False), bool):
         raise ValidationError("WhatsApp retrieval checkpoint is invalid")
     if payload.get("account") != account:
         raise ValidationError("WhatsApp retrieval checkpoint belongs to another account")
@@ -1254,6 +1292,7 @@ def _decode_checkpoint(value: str | None, *, account: str) -> _Checkpoint | None
         columns=columns,
         prefix_messages=prefix_messages,
         prefix_newest=prefix_newest,
+        continuity_gap=payload.get("continuity_gap", False),
     )
 
 

@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
 from continuity_kernel.app_corpus import AppCorpusCompanion
 from continuity_kernel.app_corpus_microsoft_calendar_delta import validate_calendar_delta_window
 from continuity_kernel.app_corpus_providers import (
@@ -14,6 +16,7 @@ from continuity_kernel.app_corpus_providers import (
     SlackAppCorpusAdapter,
     default_app_corpus_adapters,
 )
+from continuity_kernel.connector_contract import canonicalize_json
 from continuity_kernel.connector_transport import ConnectorOrigin, ConnectorProviderError
 from continuity_kernel.errors import ValidationError
 from continuity_kernel.vault import Vault
@@ -351,6 +354,53 @@ def test_gmail_detail_failure_keeps_prior_body_and_retries_its_provider_page(
     assert updated.text == "new"
     assert retry_runtime.calls[0][1]["operation"] == "history.list"
     assert retry_runtime.calls[0][1]["input"]["start_history_id"] == "41"
+
+
+def test_gmail_detail_not_found_does_not_block_a_backfill_page() -> None:
+    runtime = _Runtime(
+        [
+            _response({"historyId": "41"}),
+            _response({"messages": [{"id": "m-gone"}]}),
+            ConnectorProviderError(
+                origin=ConnectorOrigin.GMAIL,
+                status=404,
+                code="not_found",
+            ),
+        ]
+    )
+
+    result = GoogleAppCorpusAdapter(runtime, sources=frozenset({"gmail"})).sync(
+        "gmail-connection", limit=10
+    )  # type: ignore[arg-type]
+
+    assert result.complete is True
+    assert result.documents == ()
+    assert result.freshness["status"] == "partial"
+    assert "could not be read" in result.freshness["detail"]
+    assert "unavailable objects" in result.freshness["detail"]
+    assert json.loads(result.checkpoint)["gmail_history_id"] == "41"
+
+
+def test_gmail_detail_provider_failure_surfaces_its_http_status() -> None:
+    runtime = _Runtime(
+        [
+            _response({"historyId": "41"}),
+            _response({"messages": [{"id": "m-retry"}]}),
+            ConnectorProviderError(
+                origin=ConnectorOrigin.GMAIL,
+                status=503,
+                code="temporarily_unavailable",
+            ),
+        ]
+    )
+
+    result = GoogleAppCorpusAdapter(runtime, sources=frozenset({"gmail"})).sync(
+        "gmail-connection", limit=10
+    )  # type: ignore[arg-type]
+
+    assert result.complete is False
+    assert result.freshness["status"] == "partial"
+    assert "provider HTTP 503" in result.freshness["detail"]
 
 
 def test_gmail_legacy_message_gap_recovery_restarts_one_baseline_without_rewinding_retry(
@@ -792,6 +842,101 @@ def test_google_sync_indexes_bounded_readable_gmail_attachments_separately() -> 
     )
     assert message.metadata["received_at"] == "2024-04-05T19:34:38.001Z"
     assert runtime.calls[3][1]["operation"] == "attachments.get"
+
+
+def test_gmail_large_json_body_uses_bounded_raw_mime_artifact(tmp_path: Path) -> None:
+    raw_path = tmp_path / "large-message.eml"
+    attachments = b"".join(
+        b"\r\n--boundary\r\n"
+        b"Content-Type: text/plain; name=notes-"
+        + str(index).encode()
+        + b".txt\r\n"
+        b"Content-Disposition: attachment; filename=notes-"
+        + str(index).encode()
+        + b".txt\r\n"
+        b"Content-Transfer-Encoding: base64\r\n"
+        b"\r\n"
+        + base64.b64encode(b"Attachment text")
+        for index in range(25)
+    )
+    raw_path.write_bytes(
+        b"From: sender@example.test\r\n"
+        b"Subject: Large message\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b"Content-Type: multipart/mixed; boundary=boundary\r\n"
+        b"\r\n"
+        b"--boundary\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"\r\n"
+        + b"<style>"
+        + b"x" * 256_001
+        + b"</style><p>Late visible body</p><p>"
+        + b"v" * 240_001
+        + b"</p>"
+        + attachments
+        + b"\r\n--boundary--\r\n"
+    )
+    runtime = _Runtime(
+        [
+            _response({"historyId": "41"}),
+            _response({"messages": [{"id": "m-large"}]}),
+            ValidationError("JSON string is invalid or too large"),
+            _response(
+                {
+                    "historyId": "h-large",
+                    "id": "m-large",
+                    "internalDate": "1712345678001",
+                    "labelIds": ["INBOX"],
+                    "threadId": "t-large",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "sender@example.test"},
+                            {"name": "Subject", "value": "Large message"},
+                        ]
+                    },
+                }
+            ),
+            {
+                "artifact": {"path": str(raw_path)},
+                "result": {"bytes": raw_path.stat().st_size, "delivery": "artifact"},
+                "status": "ok",
+            },
+            _response({"items": []}),
+            _response({"startPageToken": "drive-start"}),
+            _response({"files": []}),
+        ]
+    )
+
+    result = GoogleAppCorpusAdapter(runtime).sync("connection-1", limit=3)  # type: ignore[arg-type]
+
+    message = next(
+        document for document in result.documents if document.object_id == "gmail:m-large"
+    )
+    attachments = [
+        document
+        for document in result.documents
+        if document.object_id.startswith("gmail-attachment:m-large:raw-")
+    ]
+    assert len(message.text) == 240_000
+    assert message.text.startswith("Late visible body")
+    assert message.metadata["attachment_count"] == 25
+    assert message.metadata["extraction_status"] == "partial"
+    assert "visible message text was truncated" in message.metadata["extraction_omissions"]
+    assert "only the first 24 named attachments" in message.metadata["extraction_omissions"]
+    assert message.metadata["thread_id"] == "t-large"
+    assert message.freshness["status"] == "partial"
+    assert len(attachments) == 24
+    assert attachments[0].text == "Attachment text"
+    assert attachments[0].metadata["parent_message_id"] == "m-large"
+    assert runtime.calls[2][1]["input"] == {"format": "full", "message_id": "m-large"}
+    assert runtime.calls[3][1]["input"] == {
+        "format": "metadata",
+        "message_id": "m-large",
+        "metadata_header_names": ["From", "Subject"],
+    }
+    assert runtime.calls[4][1]["input"] == {"format": "raw", "message_id": "m-large"}
+    with pytest.raises(ValidationError, match="JSON string is invalid or too large"):
+        canonicalize_json({"payload": "x" * 256_001})
 
 
 def test_microsoft_sync_gets_full_message_body_then_calendar_events() -> None:

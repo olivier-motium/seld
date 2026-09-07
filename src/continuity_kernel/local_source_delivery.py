@@ -255,6 +255,74 @@ class LocalSourceDelivery:
                 result["error_code"] = error_code
         return result
 
+    def recent(self, source: str, *, limit: int = whatsapp.MAX_RECENT) -> dict[str, Any]:
+        """Read bounded newest-first WhatsApp context without touching delivery state."""
+
+        source = _source(source)
+        if source != "whatsapp":
+            raise ValidationError("recent local context is supported only for WhatsApp")
+        if not 1 <= limit <= whatsapp.MAX_RECENT:
+            raise ValidationError(
+                f"local source recent limit must be between 1 and {whatsapp.MAX_RECENT}"
+            )
+        snapshot = self._selected_snapshot(source)
+        binding = self._binding(source, create_host=False)
+        if binding is None:
+            raise ConflictError("local source host identity is unavailable")
+        with self._locked_storage(binding, create=False) as store:
+            if store is None:
+                raise ConflictError("local source is not baselined")
+            store_root, pending_binding = self._adapter_root(store, binding)
+            if pending_binding is not None:
+                raise ConflictError("local source adapter binding is not established")
+            state, state_bytes = self._read_state(store, binding, required=True)
+            assert state is not None and state_bytes is not None
+            identity_error = self._checkpoint_identity_error(
+                source,
+                state,
+                binding=binding,
+                store_root=store_root,
+            )
+            if identity_error is not None:
+                raise ConflictError(f"local source account identity is {identity_error}")
+            expected_account = state.last_receipt.account_digest if state.last_receipt else None
+            if state.pending_token is not None:
+                prepared = _decode_token(state.pending_token, binding)
+                expected_account = prepared.account_digest or expected_account
+            if expected_account is None:
+                raise ConflictError("local source account identity is unverified")
+            recent = whatsapp.read_whatsapp_recent(
+                store_root=store_root,
+                runtime=self.whatsapp_runtime,
+                service_label=self.whatsapp_service_label,
+                runner=self.whatsapp_runner,
+                limit=limit,
+            )
+            if recent.account_fingerprint != expected_account:
+                raise ConflictError(
+                    "local source account identity changed during recent context read"
+                )
+            current_state, current_bytes = self._read_state(store, binding, required=True)
+            assert current_state is not None
+            if current_bytes != state_bytes:
+                raise ConflictError("local source checkpoint changed during recent context read")
+        current = self._selected_snapshot(source)
+        if current.revision != snapshot.revision:
+            raise ConflictError("source state changed during recent context read")
+        return {
+            "source": source,
+            "observed_at": recent.observed_at,
+            "covered_through": recent.covered_through,
+            "completeness": "partial",
+            "complete": False,
+            "messages": recent.to_dict()["messages"],
+            "untrusted_evidence": True,
+            "persisted": False,
+            "recent_context": "partial",
+            "unread_backlog_preserved": True,
+            "source_revision": snapshot.revision,
+        }
+
     def baseline(self, source: str) -> dict[str, Any]:
         """Store the current aggregate cursor as a forward-only baseline."""
 

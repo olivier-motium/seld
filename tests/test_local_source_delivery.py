@@ -122,7 +122,7 @@ def _whatsapp_store(root: Path) -> Path:
     return database
 
 
-def _append_whatsapp(database: Path, body: str) -> None:
+def _append_whatsapp(database: Path, body: str, *, timestamp: int | None = None) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(
             "INSERT INTO messages ("
@@ -133,7 +133,7 @@ def _append_whatsapp(database: Path, body: str) -> None:
                 "private-route@s.whatsapp.net",
                 "provider-message-id",
                 "private-sender@s.whatsapp.net",
-                int(datetime.now(UTC).timestamp()),
+                timestamp if timestamp is not None else int(datetime.now(UTC).timestamp()),
                 body,
                 body,
                 "/private/provider/media",
@@ -1447,6 +1447,81 @@ def test_whatsapp_recipe_limit_is_one_replay_unit_not_a_wake_cap(tmp_path: Path)
 
 
 @_POSIX_STORAGE
+def test_whatsapp_recent_context_is_newest_first_and_preserves_pending_delivery(
+    tmp_path: Path,
+) -> None:
+    vault, _selected = _selected_vault(tmp_path, "whatsapp")
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    delivery = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=_runner(runtime),
+    )
+    delivery.baseline("whatsapp")
+    _append_whatsapp(database, "acknowledged", timestamp=1_700_000_000)
+    _ack(delivery, delivery.poll("whatsapp"))
+    _append_whatsapp(database, "old delivery", timestamp=1_700_000_100)
+    pending = delivery.poll("whatsapp", limit=1)
+    _append_whatsapp(database, "middle context", timestamp=1_700_000_200)
+    _append_whatsapp(database, "newest context", timestamp=1_700_000_300)
+
+    state_before = _state_path().read_bytes()
+    source_before = vault.get_source_snapshot().revision
+    status_before = delivery.status("whatsapp")
+    recent = delivery.recent("whatsapp", limit=2)
+
+    assert [message["body"] for message in recent["messages"]] == [
+        "newest context",
+        "middle context",
+    ]
+    assert recent["completeness"] == "partial"
+    assert recent["complete"] is False
+    assert recent["recent_context"] == "partial"
+    assert recent["unread_backlog_preserved"] is True
+    assert recent["persisted"] is False
+    assert recent["source_revision"] == source_before
+    assert "delivery" not in recent
+    assert _state_path().read_bytes() == state_before
+    assert vault.get_source_snapshot().revision == source_before
+    assert delivery.status("whatsapp") == status_before
+    assert delivery.poll("whatsapp") == pending
+
+
+@_POSIX_STORAGE
+def test_whatsapp_recent_context_rejects_an_identity_mismatch_without_state_change(
+    tmp_path: Path,
+) -> None:
+    vault, _selected = _selected_vault(tmp_path, "whatsapp")
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    delivery = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=_runner(runtime),
+    )
+    delivery.baseline("whatsapp")
+    _append_whatsapp(database, "bound account", timestamp=1_700_000_000)
+    _ack(delivery, delivery.poll("whatsapp"))
+    state_before = _state_path().read_bytes()
+
+    mismatched = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=_runner(runtime, linked_jid="19995550123:1@s.whatsapp.net"),
+    )
+    with pytest.raises(ConflictError, match="identity_mismatch"):
+        mismatched.recent("whatsapp")
+
+    assert _state_path().read_bytes() == state_before
+
+
+@_POSIX_STORAGE
 def test_whatsapp_pending_replay_excludes_messages_that_arrive_later(tmp_path: Path) -> None:
     vault, _selected = _selected_vault(tmp_path, "whatsapp")
     store = tmp_path / "wacli-store"
@@ -1845,6 +1920,7 @@ def test_fresh_cli_rebaseline_requires_exact_replacement_disposition(tmp_path: P
 def test_mcp_local_source_contract_marks_poll_and_ack_as_mutating() -> None:
     tools = {tool["name"]: tool for tool in mcp_server.TOOLS}
     assert tools["gsv_local_source_status"]["annotations"]["readOnlyHint"] is True
+    assert tools["gsv_local_source_recent"]["annotations"]["readOnlyHint"] is True
     assert tools["gsv_local_source_poll"]["annotations"]["readOnlyHint"] is False
     assert tools["gsv_local_source_baseline"]["annotations"]["readOnlyHint"] is False
     assert tools["gsv_local_source_staged_status"]["annotations"]["readOnlyHint"] is True
@@ -1855,6 +1931,7 @@ def test_mcp_local_source_contract_marks_poll_and_ack_as_mutating() -> None:
         "account_binding" not in tools["gsv_local_source_acknowledge"]["inputSchema"]["properties"]
     )
     assert "untrusted evidence" in tools["gsv_local_source_poll"]["description"]
+    assert "unread delivery backlog" in tools["gsv_local_source_recent"]["description"]
     assert "host-local pending token" in tools["gsv_local_source_poll"]["description"]
     assert "sends" in tools["gsv_local_source_poll"]["description"]
     assert "vault-staged" in tools["gsv_local_source_adopt_staged"]["description"]

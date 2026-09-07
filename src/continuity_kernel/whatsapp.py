@@ -41,18 +41,21 @@ __all__ = [
     "WhatsAppAck",
     "WhatsAppDelta",
     "WhatsAppMessage",
+    "WhatsAppRecent",
     "WhatsAppStatus",
     "account_fingerprint",
     "create_whatsapp_ack_token",
     "default_store_root",
     "inspect_whatsapp",
     "read_whatsapp_delta",
+    "read_whatsapp_recent",
     "resolve_service_label",
     "verify_whatsapp_ack_token",
     "verify_whatsapp_checkpoint",
 ]
 
 MAX_DELTA = 100
+MAX_RECENT = 25
 MAX_BODY_CHARS = 4_000
 MAX_DELTA_BODY_CHARS = 48_000
 MAX_LABEL_CHARS = 240
@@ -152,6 +155,23 @@ class WhatsAppDelta:
         payload = asdict(self)
         payload.pop("account_fingerprint")
         return {**payload, "messages": [asdict(message) for message in self.messages]}
+
+
+@dataclass(frozen=True)
+class WhatsAppRecent:
+    """A bounded newest-first context view that cannot advance a delivery cursor."""
+
+    observed_at: str
+    covered_through: str
+    messages: tuple[WhatsAppMessage, ...]
+    account_fingerprint: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "observed_at": self.observed_at,
+            "covered_through": self.covered_through,
+            "messages": [asdict(message) for message in self.messages],
+        }
 
 
 @dataclass(frozen=True)
@@ -427,6 +447,45 @@ def read_whatsapp_delta(
         account_fingerprint=status.account_fingerprint,
         store_reconciled=store_reconciled,
         drift=drift,
+    )
+
+
+def read_whatsapp_recent(
+    *,
+    store_root: Path | None = None,
+    limit: int = MAX_RECENT,
+    observed_at: datetime | None = None,
+    runtime: Path = DEFAULT_RUNTIME,
+    service_label: str = DEFAULT_SERVICE_LABEL,
+    runner: Runner | None = None,
+) -> WhatsAppRecent:
+    """Read at most 25 newest messages without deriving or moving a delivery cursor."""
+
+    if not 1 <= limit <= MAX_RECENT:
+        raise ValidationError(f"WhatsApp recent limit must be between 1 and {MAX_RECENT}")
+    status = inspect_whatsapp(
+        store_root=store_root,
+        runtime=runtime,
+        service_label=service_label,
+        observed_at=observed_at,
+        runner=runner,
+    )
+    if not status.available:
+        raise ContinuityError(status.error or "standalone WhatsApp source is unavailable")
+    assert status.account_fingerprint is not None
+    assert status.schema is not None and status.generation is not None
+    database = (store_root or default_store_root()).expanduser().resolve() / "wacli.db"
+    rows = _recent_rows(
+        database,
+        limit=limit,
+        expected_schema=status.schema,
+        expected_generation=status.generation,
+    )
+    return WhatsAppRecent(
+        observed_at=status.observed_at,
+        covered_through=status.newest_message_at or status.observed_at,
+        messages=_bounded_recent_messages(rows),
+        account_fingerprint=status.account_fingerprint,
     )
 
 
@@ -732,6 +791,64 @@ def _delta_rows(
             rows = connection.execute(query, parameters).fetchall()
         except sqlite3.Error as exc:
             raise ContinuityError("standalone WhatsApp delta query failed") from exc
+    return rows
+
+
+def _recent_rows(
+    database: Path,
+    *,
+    limit: int,
+    expected_schema: str,
+    expected_generation: str,
+) -> list[sqlite3.Row]:
+    with _connect(database) as (connection, before):
+        try:
+            connection.execute("BEGIN")
+            columns = _columns(connection, "messages")
+            chat_columns = _columns(connection, "chats")
+            required = {"rowid", "ts", "from_me", "text", "display_text"}
+            if not required <= columns.keys():
+                raise ContinuityError(
+                    "standalone WhatsApp schema is missing required recent fields"
+                )
+            schema = _schema_fingerprint(columns, chat_columns)
+            generation = _generation(before, schema)
+            if schema != expected_schema or generation != expected_generation:
+                raise ContinuityError(
+                    "standalone WhatsApp store changed during recent context read"
+                )
+            visible_filters = [
+                f"COALESCE({name}, 0) = 0"
+                for name in ("revoked", "deleted_for_me")
+                if name in columns
+            ]
+            visible = " AND ".join(visible_filters) if visible_filters else "1"
+            content = {
+                name: (
+                    f"CASE WHEN {visible} THEN substr({name}, 1, {MAX_BODY_CHARS + 1}) "
+                    f"ELSE NULL END AS {name}"
+                )
+                for name in ("text", "display_text")
+            }
+            optionals = {
+                name: (
+                    f"CASE WHEN {visible} THEN substr({name}, 1, "
+                    f"{(MAX_BODY_CHARS if name == 'media_caption' else MAX_LABEL_CHARS) + 1}) "
+                    f"ELSE NULL END AS {name}"
+                    if name in columns
+                    else f"NULL AS {name}"
+                )
+                for name in ("chat_name", "sender_name", "media_caption", "media_type")
+            }
+            query = (
+                "SELECT rowid, ts, from_me, "
+                + ", ".join((*content.values(), *optionals.values()))
+                + f", CASE WHEN {visible} THEN 1 ELSE 0 END AS visible"
+                + " FROM messages ORDER BY ts DESC, rowid DESC LIMIT ?"
+            )
+            rows = connection.execute(query, (limit,)).fetchall()
+        except sqlite3.Error as exc:
+            raise ContinuityError("standalone WhatsApp recent query failed") from exc
     return rows
 
 
@@ -1323,6 +1440,22 @@ def _bounded_messages(
         remaining -= len(message.body or "")
         last_rowid = message.rowid
     return tuple(messages), last_rowid, True
+
+
+def _bounded_recent_messages(rows: list[sqlite3.Row]) -> tuple[WhatsAppMessage, ...]:
+    messages: list[WhatsAppMessage] = []
+    remaining = MAX_DELTA_BODY_CHARS
+    for row in rows:
+        if not bool(row["visible"]):
+            continue
+        raw_body = _body(row)
+        if raw_body and remaining <= 0:
+            break
+        allowance = min(MAX_BODY_CHARS, remaining)
+        message = _message(row, body=raw_body, body_allowance=allowance)
+        messages.append(message)
+        remaining -= len(message.body or "")
+    return tuple(messages)
 
 
 def _body(row: sqlite3.Row) -> str | None:

@@ -210,3 +210,72 @@ def test_qmd_failure_never_returns_a_scope_binding(tmp_path: Path) -> None:
         assert not next((root / "qmd-scopes").rglob("manifest.json"), None)
     finally:
         store.close()
+
+
+def test_scope_binding_check_requires_the_exact_qmd_collection_target(tmp_path: Path) -> None:
+    root = tmp_path / "corpus"
+    root.mkdir(mode=0o700)
+    store = PinnedPathRoot(root)
+    try:
+        record, content = _record("con_a", "trusted content", seed="a")
+        _write_source(store, record, content)
+        calls: list[tuple[str, ...]] = []
+        manager = ScopedQMDIndexManager(
+            store,
+            root,
+            executable="qmd",
+            environment={},
+            index="seld-apps",
+            run_command=_runner(store, calls),
+        )
+        binding = manager.refresh(_snapshot("a" * 64, record), deadline=time.monotonic() + 10)[0]
+
+        def bound(command, **_kwargs):
+            if command[3:5] == ("collection", "show"):
+                return recall_module._CommandResult(
+                    0,
+                    (
+                        f"Collection: {binding.collection}\n"
+                        f"  Path:     {binding.documents_root}\n"
+                        "  Pattern:  **/*.md\n"
+                    ).encode(),
+                    b"",
+                )
+            return recall_module._CommandResult(0, b"", b"")
+
+        assert (
+            binding.collection_binding_problem(
+                "qmd",
+                cwd=root,
+                environment={},
+                deadline=time.monotonic() + 10,
+                run_command=bound,
+            )
+            is None
+        )
+
+        def rebound(command, **_kwargs):
+            if command[3:5] == ("collection", "show"):
+                return recall_module._CommandResult(
+                    0,
+                    (
+                        f"Collection: {binding.collection}\n"
+                        f"  Path:     {root / 'foreign'}\n"
+                        "  Pattern:  **/*.md\n"
+                    ).encode(),
+                    b"",
+                )
+            return recall_module._CommandResult(0, b"", b"")
+
+        assert (
+            binding.collection_binding_problem(
+                "qmd",
+                cwd=root,
+                environment={},
+                deadline=time.monotonic() + 10,
+                run_command=rebound,
+            )
+            == "QMD scoped app corpus collection binding is unverified"
+        )
+    finally:
+        store.close()

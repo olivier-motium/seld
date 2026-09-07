@@ -20,7 +20,7 @@ from typing import Final
 
 from continuity_kernel.atomic import atomic_write, exclusive_lock, read_regular_file, sha256_bytes
 from continuity_kernel.config import data_dir, local_host_id
-from continuity_kernel.errors import ContinuityError, ValidationError
+from continuity_kernel.errors import ConflictError, ContinuityError, ValidationError
 from continuity_kernel.records import TERMINAL_THREAD_STATUSES, format_time, parse_time
 from continuity_kernel.resident_signals import ResidentSignalStore, SignalAppendRequest
 from continuity_kernel.source_recipes import get_recipe
@@ -99,9 +99,10 @@ def sense_sweep(
 ) -> SenseSweepResult:
     """Run one current sweep; missed intervals are never enumerated or replayed.
 
-    The mechanical scan stays within its five-second budget. A scheduled caller
-    may add one host-admitted recall refresh after that scan while the sweep lock
-    still prevents overlap.
+    The mechanical scan stays within its five-second budget and publishes its
+    heartbeat before optional recall maintenance begins.  Maintenance is
+    serialized separately, so a slow or failed QMD refresh cannot make the
+    sensor appear unavailable or block a later sweep.
     """
 
     if (
@@ -218,9 +219,6 @@ def sense_sweep(
                 counts["signals"] = sum(int(created) for _signal, created in results)
                 _within_budget(monotonic, deadline)
 
-                if recall_refresh is not None:
-                    recall_status = recall_refresh()
-
             except _BudgetExceeded:
                 status = "timed_out"
                 failure = "budget_exceeded"
@@ -244,6 +242,13 @@ def sense_sweep(
             )
     except (ContinuityError, OSError):
         raise
+
+    # Recall is cache maintenance, not part of the mechanical sweep.  The
+    # heartbeat above is the durable result of this sweep, so later QMD delay
+    # or failure cannot hide a healthy sensor run.  Use a distinct nonblocking
+    # lock to avoid stacking maintenance attempts on each scheduled invocation.
+    if status == "complete" and recall_refresh is not None:
+        recall_status = _run_recall_refresh(host_root, recall_refresh)
 
     return SenseSweepResult(
         observed_at=format_time(now),
@@ -506,6 +511,27 @@ def _source_signal_envelope(
 def _within_budget(monotonic: Callable[[], float], deadline: float) -> None:
     if monotonic() >= deadline:
         raise _BudgetExceeded
+
+
+def _run_recall_refresh(
+    host_root: Path,
+    recall_refresh: Callable[[], SweepRecallStatus],
+) -> SweepRecallStatus:
+    """Run one optional cache refresh without delaying or serializing sensing."""
+
+    try:
+        with exclusive_lock(host_root / "locks/recall-refresh.lock", timeout=0.0):
+            try:
+                result = recall_refresh()
+            except Exception:
+                return SweepRecallStatus(True, None, False, "refresh_failed")
+    except ConflictError:
+        return SweepRecallStatus(False, None, False, "deferred_budget")
+    except (ContinuityError, OSError):
+        return SweepRecallStatus(True, None, False, "refresh_failed")
+    if not isinstance(result, SweepRecallStatus):
+        return SweepRecallStatus(True, None, False, "refresh_failed")
+    return result
 
 
 def _host_root(vault_root: Path, *, vault_id: str, host_id: str) -> Path:

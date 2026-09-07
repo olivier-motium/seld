@@ -125,7 +125,7 @@ The resident Pulse uses the ordinary app-native ChatGPT task and skill surfaces,
 not the guided-review subprocess transport. Registration creates exactly one
 dedicated ChatGPT task, binds its real UUID to structural
 `task:resident-pulse` and, after a manual proof and fresh approval, targets that
-same task with one app `heartbeat` on the ten-minute target cadence.
+same task with one app `heartbeat` on a thirty-minute cadence.
 
 Each wake loads `$gsv-pulse`. The model freezes a bounded context and selected
 source window, makes semantic judgments, and writes through the existing `gsv`

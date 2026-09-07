@@ -393,6 +393,11 @@ def _call(
         )
     if name == "gsv_local_source_status":
         return LocalSourceDelivery(vault).status(_string(values, "source"))
+    if name == "gsv_local_source_recent":
+        return LocalSourceDelivery(vault).recent(
+            _string(values, "source"),
+            limit=_integer(values, "limit", 25),
+        )
     if name == "gsv_local_source_baseline":
         return LocalSourceDelivery(vault).baseline(_string(values, "source"))
     if name == "gsv_local_source_staged_status":
@@ -1563,6 +1568,20 @@ TOOLS: Final = [
             "disposition",
         ),
         read_only=False,
+    ),
+    _tool(
+        "gsv_local_source_recent",
+        (
+            "Read up to 25 newest WhatsApp messages as partial transient context. "
+            "It preserves the unread delivery backlog and never creates a pending token, "
+            "advances coverage, writes provider state, sends, reacts, or replies."
+        ),
+        {
+            "limit": {"maximum": 25, "minimum": 1, "type": "integer"},
+            "source": {"enum": ["whatsapp"], "type": "string"},
+        },
+        ("source",),
+        read_only=True,
     ),
     _tool(
         "gsv_local_source_poll",

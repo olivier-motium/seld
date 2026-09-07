@@ -410,11 +410,21 @@ def test_current_qmd_search_maps_hits_back_to_exact_source(tmp_path: Path, monke
     ).hexdigest()[:16]
     state = json.loads(companion.state_path.read_text(encoding="utf-8"))
     collection = state["qmd_bindings"]["con_abc"]["collection"]
-    monkeypatch.setattr(
-        recall_module,
-        "_run_command",
-        lambda command, **kwargs: (
-            recall_module._CommandResult(
+    documents_root = state["qmd_bindings"]["con_abc"]["documents_root"]
+
+    def query(command, **_kwargs):
+        if command[3:5] == ("collection", "show"):
+            return recall_module._CommandResult(
+                0,
+                (
+                    f"Collection: {collection}\n"
+                    f"  Path:     {documents_root}\n"
+                    "  Pattern:  **/*.md\n"
+                ).encode(),
+                b"",
+            )
+        if "query" in command:
+            return recall_module._CommandResult(
                 0,
                 (
                     '{"results":[{"file":"qmd://'
@@ -427,14 +437,63 @@ def test_current_qmd_search_maps_hits_back_to_exact_source(tmp_path: Path, monke
                 ).encode(),
                 b"",
             )
-            if "query" in command
-            else recall_module._CommandResult(0, b"", b"")
-        ),
+        return recall_module._CommandResult(0, b"", b"")
+
+    monkeypatch.setattr(
+        recall_module,
+        "_run_command",
+        query,
     )
 
     result = companion.search("launch decision", connection_id="con_abc")
 
     assert result.backend == "qmd"
+    assert result.hits[0].source_ref == "gmail:message-1"
+
+
+def test_rebound_scoped_qmd_collection_uses_local_lexical_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Corpus")
+    executable = tmp_path / "qmd"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    companion = AppCorpusCompanion(
+        vault.root,
+        executable=executable,
+        index_root=tmp_path / "corpus",
+    )
+    monkeypatch.setattr(
+        recall_module,
+        "_run_command",
+        lambda *_args, **_kwargs: recall_module._CommandResult(0, b"", b""),
+    )
+    companion.sync(_PagedAdapter([]), "con_abc", refresh=True)
+    state = json.loads(companion.state_path.read_text(encoding="utf-8"))
+    collection = state["qmd_bindings"]["con_abc"]["collection"]
+
+    def rebound(command, **_kwargs):
+        if command[3:5] == ("collection", "show"):
+            return recall_module._CommandResult(
+                0,
+                (
+                    f"Collection: {collection}\n"
+                    f"  Path:     {tmp_path / 'foreign'}\n"
+                    "  Pattern:  **/*.md\n"
+                ).encode(),
+                b"",
+            )
+        if "query" in command:
+            pytest.fail("a rebound scoped collection must not be queried")
+        return recall_module._CommandResult(0, b"", b"")
+
+    monkeypatch.setattr(recall_module, "_run_command", rebound)
+
+    result = companion.search("launch decision", connection_id="con_abc")
+
+    assert result.backend == "local"
+    assert result.reason == "QMD app search failed; local lexical app search was used"
     assert result.hits[0].source_ref == "gmail:message-1"
 
 

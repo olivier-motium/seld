@@ -1588,6 +1588,17 @@ def _scoped_qmd_hits(
             manifest_path=documents_root.parent / "manifest.json",
             record_names=record_names,
         )
+        if (
+            binding.collection_binding_problem(
+                companion.executable,
+                cwd=companion.index_root,
+                environment=companion._environment(),
+                deadline=deadline,
+                run_command=recall_module._run_command,
+            )
+            is not None
+        ):
+            return None
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None

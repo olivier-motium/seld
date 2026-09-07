@@ -1888,6 +1888,45 @@ def test_slack_read_tier_accepts_union_grant_within_profile_surface(tmp_path: Pa
     )
 
 
+def test_slack_implicit_identify_is_removed_from_persisted_and_resolved_scopes(
+    tmp_path: Path,
+) -> None:
+    profile = get_profile("slack")
+    manager = _slack_manager(tmp_path, scopes=profile.read_scopes)
+    raw = OAuthCredential(
+        access_token="slack-implicit-identity-access",
+        refresh_token="slack-implicit-identity-refresh",
+        token_type=OAuthTokenType.BEARER,
+        scopes=("identify", *profile.read_scopes),
+        issued_at=BASE_TIME,
+        expires_at=None,
+    )
+
+    stored = _import_oauth_credential(manager, raw)
+
+    assert stored.version == 1
+    assert (
+        OAuthCredential.from_bytes(manager.tokens.read(CONNECTION_ID).value).scopes
+        == profile.read_scopes
+    )
+
+    # A credential persisted by an older process is normalized when the current
+    # manager resolves it, so stale readers receive the same operational scope set.
+    manager.tokens.update(
+        CONNECTION_ID,
+        expected_version=stored.version,
+        value=raw.to_bytes(),
+        updated_at=BASE_TIME,
+    )
+    resolved = manager.resolve_oauth_access_token_state(CONNECTION_ID, observed_at=BASE_TIME)
+
+    assert resolved.scopes == profile.read_scopes
+    assert (
+        OAuthCredential.from_bytes(manager.tokens.read(CONNECTION_ID).value).scopes
+        == profile.read_scopes
+    )
+
+
 def test_slack_read_tier_refuses_grant_containing_scopes_outside_profile_surface(
     tmp_path: Path,
 ) -> None:

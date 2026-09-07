@@ -41,6 +41,24 @@ def test_scheduled_recall_refresh_defers_without_load_average(
     )
 
 
+def test_pulse_status_separates_mechanical_and_ai_wake_health(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "pulse-status-vault")
+    vault.initialize(name="Pulse status scope")
+
+    status = cli._pulse_status(vault)
+
+    assert status["heartbeat"] is None
+    assert status["mechanical_sweep"] == {
+        "failure": None,
+        "observed_at": None,
+        "state": "unobserved",
+    }
+    assert status["ai_wake"] == {
+        "reason": "Mechanical sweep status does not record AI Pulse wake completion.",
+        "state": "unobserved",
+    }
+
+
 def test_cli_resident_activation_survives_a_fresh_process(tmp_path: Path) -> None:
     vault_path = tmp_path / "resident-activation-vault"
     vault = Vault(vault_path)
@@ -167,6 +185,21 @@ def test_cli_pulse_sweep_is_visible_from_a_fresh_process(
     }
     assert restarted["heartbeat"]["observed_at"] == swept["observed_at"]
     assert restarted["heartbeat"]["sequence"] == 1
+    assert restarted["heartbeat"]["recall"] == {
+        "attempted": False,
+        "changed": None,
+        "failure": None,
+        "updated": False,
+    }
+    assert restarted["mechanical_sweep"] == {
+        "failure": None,
+        "observed_at": swept["observed_at"],
+        "state": "complete",
+    }
+    assert restarted["ai_wake"] == {
+        "reason": "Mechanical sweep status does not record AI Pulse wake completion.",
+        "state": "unobserved",
+    }
     assert restarted["signals"]["pending"] == 0
 
 
@@ -496,6 +529,67 @@ def test_cli_source_selection_read_and_fresh_process_visibility(
     assert restarted["state"]["revision"] == recorded["revision"]
     assert restarted["state"]["sources"][0]["observation"]["result"] == "explicit_empty"
     assert any(item["source"] == "gmail" for item in restarted["catalog"])
+
+
+def test_cli_source_read_returns_the_transient_connector_result_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vault_path = tmp_path / "source-read-vault"
+    Vault(vault_path).initialize(name="Source read")
+    received: dict[str, object] = {}
+    transient = {
+        "result": "success",
+        "items": [{"text": "transient"}],
+        "record": {"completeness": "partial"},
+    }
+
+    def read(
+        vault: Vault,
+        *,
+        connection_id: str,
+        source_id: str,
+        limit: int,
+    ) -> dict[str, object]:
+        received.update(
+            vault_root=vault.root,
+            connection_id=connection_id,
+            source_id=source_id,
+            limit=limit,
+        )
+        return transient
+
+    monkeypatch.setattr(cli, "read_connector_source", read)
+    before = Vault(vault_path).logical_digest()
+
+    assert (
+        cli.main(
+            [
+                "--json",
+                "--vault",
+                str(vault_path),
+                "source",
+                "read",
+                "--source",
+                "slack",
+                "--connection-id",
+                "con_test",
+                "--limit",
+                "7",
+            ]
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out)["result"] == transient
+    assert received == {
+        "vault_root": vault_path.resolve(),
+        "connection_id": "con_test",
+        "source_id": "slack",
+        "limit": 7,
+    }
+    assert Vault(vault_path).logical_digest() == before
 
 
 @pytest.mark.skipif(os.name == "nt", reason="secure descriptor-pinned reads are POSIX-only")

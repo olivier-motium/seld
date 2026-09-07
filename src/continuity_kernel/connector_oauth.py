@@ -8,7 +8,7 @@ import hmac
 import json
 import math
 import secrets
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final, Protocol, cast
 from urllib.error import HTTPError, URLError
@@ -22,7 +22,6 @@ _PKCE_ALLOWED: Final = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 )
 _MAX_RESPONSE_BYTES: Final = 1_048_576
-_SLACK_REFRESH_ENDPOINT: Final = "https://slack.com/api/oauth.v2.access"
 _RESERVED_AUTH_PARAMETERS: Final = frozenset(
     "client_id code_challenge code_challenge_method redirect_uri response_type scope state".split()  # noqa: SIM905
 )
@@ -291,18 +290,16 @@ def refresh_access_token(
         _validate_scopes(scopes)
         if scopes:
             fields["scope"] = " ".join(scopes)
-    request_config = config
     preserved_refresh_token: str | None = refresh_token
     if config.dialect is OAuthDialect.SLACK_USER:
-        request_config = replace(config, token_endpoint=_SLACK_REFRESH_ENDPOINT)
         preserved_refresh_token = None
     token_set = _request_token(
-        request_config,
+        config,
         fields,
         timeout_seconds=timeout_seconds,
         post_form=post_form,
         preserved_refresh_token=preserved_refresh_token,
-        allow_slack_authed_user_scope=False,
+        allow_slack_authed_user_scope=config.dialect is OAuthDialect.SLACK_USER,
     )
     if config.dialect is OAuthDialect.SLACK_USER:
         if token_set.refresh_token is None or token_set.refresh_token == refresh_token:

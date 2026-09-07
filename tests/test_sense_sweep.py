@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -74,22 +75,101 @@ def test_empty_sweep_records_only_host_local_heartbeat(vault: Vault) -> None:
     assert vault.logical_digest() == before
 
 
-def test_scheduled_recall_result_is_published_in_same_heartbeat(vault: Vault) -> None:
+def test_scheduled_recall_runs_after_the_mechanical_heartbeat(vault: Vault) -> None:
+    observed_heartbeats: list[dict[str, object] | None] = []
+
+    def refresh() -> SweepRecallStatus:
+        observed_heartbeats.append(heartbeat_status(vault.root))
+        return SweepRecallStatus(True, True, True, None)
+
     result = sense_sweep(
         vault,
         observed_at=datetime(2026, 7, 29, 8, tzinfo=UTC),
-        recall_refresh=lambda: SweepRecallStatus(True, True, True, None),
+        recall_refresh=refresh,
     )
 
     assert result.recall == SweepRecallStatus(True, True, True, None)
+    assert len(observed_heartbeats) == 1
+    published = observed_heartbeats[0]
+    assert published is not None
+    assert published["status"] == "complete"
+    assert published["sequence"] == 1
+    assert published["recall"] == {
+        "attempted": False,
+        "changed": None,
+        "failure": None,
+        "updated": False,
+    }
     status = heartbeat_status(vault.root)
     assert status is not None
     assert status["recall"] == {
-        "attempted": True,
-        "changed": True,
+        "attempted": False,
+        "changed": None,
         "failure": None,
-        "updated": True,
+        "updated": False,
     }
+
+
+def test_recall_failure_does_not_replace_a_complete_sweep_heartbeat(vault: Vault) -> None:
+    def refresh() -> SweepRecallStatus:
+        raise RuntimeError("QMD stopped")
+
+    result = sense_sweep(
+        vault,
+        observed_at=datetime(2026, 7, 29, 8, tzinfo=UTC),
+        recall_refresh=refresh,
+    )
+
+    assert result.status == "complete"
+    assert result.recall == SweepRecallStatus(True, None, False, "refresh_failed")
+    heartbeat = heartbeat_status(vault.root)
+    assert heartbeat is not None
+    assert heartbeat["status"] == "complete"
+    assert heartbeat["recall"] == {
+        "attempted": False,
+        "changed": None,
+        "failure": None,
+        "updated": False,
+    }
+
+
+def test_slow_recall_does_not_hold_the_sweep_lock(vault: Vault) -> None:
+    refresh_started = threading.Event()
+    allow_refresh_finish = threading.Event()
+    failures: list[BaseException] = []
+
+    def refresh() -> SweepRecallStatus:
+        refresh_started.set()
+        assert allow_refresh_finish.wait(timeout=2)
+        return SweepRecallStatus(True, False, False, None)
+
+    def first_sweep() -> None:
+        try:
+            sense_sweep(
+                vault,
+                observed_at=datetime(2026, 7, 29, 8, tzinfo=UTC),
+                recall_refresh=refresh,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=first_sweep)
+    worker.start()
+    try:
+        assert refresh_started.wait(timeout=2)
+        second = sense_sweep(
+            vault,
+            observed_at=datetime(2026, 7, 29, 8, 1, tzinfo=UTC),
+            budget_seconds=0.1,
+        )
+        assert second.status == "complete"
+    finally:
+        allow_refresh_finish.set()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert heartbeat_status(vault.root)["sequence"] == 2  # type: ignore[index]
 
 
 def test_fresh_source_is_not_due_and_never_read_source_is_due(vault: Vault) -> None:

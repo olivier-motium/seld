@@ -85,6 +85,40 @@ class QMDScopedBinding:
             return None
         return self.record_names.get(relative)
 
+    def collection_binding_problem(
+        self,
+        executable: str,
+        *,
+        cwd: Path,
+        environment: Mapping[str, str],
+        deadline: float,
+        run_command: _CommandRunner,
+    ) -> str | None:
+        """Return a safe problem when QMD no longer addresses this physical scope."""
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "QMD scoped app corpus binding check timed out"
+        result = run_command(
+            self.command(executable, "collection", "show", self.collection),
+            cwd=cwd,
+            env=dict(environment),
+            timeout_seconds=remaining,
+            output_limit=128 * 1024,
+        )
+        if result.problem == "timeout":
+            return "QMD scoped app corpus binding check timed out"
+        if result.problem == "output_limit":
+            return "QMD scoped app corpus binding check exceeded its output bound"
+        if result.problem is not None:
+            return "QMD scoped app corpus binding check is unavailable"
+        if result.returncode:
+            return f"QMD scoped app corpus binding check failed with exit code {result.returncode}"
+        target = recall_module._qmd_collection_target(result.stdout, collection=self.collection)
+        if target != self.documents_root:
+            return "QMD scoped app corpus collection binding is unverified"
+        return None
+
 
 _CommandRunner = Callable[..., recall_module._CommandResult]
 

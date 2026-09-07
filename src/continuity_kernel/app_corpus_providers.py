@@ -15,6 +15,9 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email import policy
+from email.message import Message
+from email.parser import BytesParser
 from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -41,7 +44,7 @@ from continuity_kernel.app_corpus_microsoft_delta import (
 )
 from continuity_kernel.app_corpus_text import ExtractionResult, extract_text
 from continuity_kernel.connector_runtime import ConnectorRuntime
-from continuity_kernel.connector_transport import ConnectorProviderError
+from continuity_kernel.connector_transport import ConnectorOrigin, ConnectorProviderError
 from continuity_kernel.errors import ContinuityError, ValidationError
 
 _CHECKPOINT_VERSION: Final = 1
@@ -54,6 +57,7 @@ _MAX_SLACK_CHANNELS: Final = 128
 _MAX_SLACK_SEARCH_PAGES: Final = 100
 _MAX_ATTACHMENT_BYTES: Final = 16 * 1024 * 1024
 _INLINE_ATTACHMENT_BYTES: Final = 1 * 1024 * 1024
+_MAX_GMAIL_RAW_MESSAGE_BYTES: Final = 16 * 1024 * 1024
 _GOOGLE_DOCUMENT_MIME: Final = "application/vnd.google-apps.document"
 _DOCX_MIME: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _PDF_MIME: Final = "application/pdf"
@@ -69,22 +73,35 @@ class _PlainText(HTMLParser):
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
+        self.hidden_depth = 0
         self.parts: list[str] = []
 
     def handle_data(self, data: str) -> None:
-        self.parts.append(data)
+        if self.hidden_depth == 0:
+            self.parts.append(data)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         del attrs
+        if tag in {"head", "script", "style", "template", "title"}:
+            self.hidden_depth += 1
+            return
+        if self.hidden_depth:
+            return
         if tag in {"br", "div", "li", "p", "tr"}:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
+        if tag in {"head", "script", "style", "template", "title"} and self.hidden_depth:
+            self.hidden_depth -= 1
+            return
+        if self.hidden_depth:
+            return
         if tag in {"div", "li", "p", "tr"}:
             self.parts.append("\n")
 
-    def text(self) -> str:
-        return _bounded_text("".join(self.parts))
+    def text(self, *, bounded: bool = True) -> str:
+        value = "".join(self.parts)
+        return _bounded_text(value) if bounded else value
 
 
 @dataclass(frozen=True)
@@ -100,6 +117,25 @@ class _Attachment:
     filename: str
     mime_type: str | None
     size: int | None
+
+
+@dataclass(frozen=True)
+class _RawGmailAttachment:
+    content: bytes
+    filename: str
+    mime_type: str
+    part_index: int
+
+
+@dataclass(frozen=True)
+class _RawGmailMessage:
+    attachment_count: int
+    attachments: tuple[_RawGmailAttachment, ...]
+    attachments_truncated: bool
+    body: str
+    body_truncated: bool
+    sender: str | None
+    subject: str | None
 
 
 class _CorpusProviderAdapter:
@@ -384,6 +420,7 @@ class GoogleAppCorpusAdapter(_CorpusProviderAdapter):
             if incremental_since is not None and history_anchor_id is not None:
                 try:
                     gmail["retry_current_page"] = False
+                    gmail.pop("retry_category", None)
                     page = self._call(
                         "gsv_gmail_read",
                         connection_id,
@@ -415,7 +452,8 @@ class GoogleAppCorpusAdapter(_CorpusProviderAdapter):
                 if gmail.pop("retry_current_page", False):
                     _record_coverage_gap(
                         gmail,
-                        "Gmail message details are retrying after a provider read failure",
+                        "Gmail message details are retrying after "
+                        f"{_gmail_detail_retry_reason(gmail)}",
                     )
                 elif page.continuation is None:
                     final_history_id = _gmail_history_id(page.payload.get("historyId"))
@@ -455,6 +493,7 @@ class GoogleAppCorpusAdapter(_CorpusProviderAdapter):
                 if incremental_since is not None:
                     query["query"] = f"after:{_gmail_overlap_date(incremental_since)}"
                 gmail["retry_current_page"] = False
+                gmail.pop("retry_category", None)
                 page = self._call(
                     "gsv_gmail_read",
                     connection_id,
@@ -476,7 +515,8 @@ class GoogleAppCorpusAdapter(_CorpusProviderAdapter):
                 if gmail.pop("retry_current_page", False):
                     _record_coverage_gap(
                         gmail,
-                        "Gmail message details are retrying after a provider read failure",
+                        "Gmail message details are retrying after "
+                        f"{_gmail_detail_retry_reason(gmail)}",
                     )
                 else:
                     _finish_page(gmail, page.continuation)
@@ -834,19 +874,64 @@ class GoogleAppCorpusAdapter(_CorpusProviderAdapter):
         for summary in messages:
             message_id = _required_identifier(summary, "id", "Gmail message")
             try:
-                detail = self._call(
-                    "gsv_gmail_read",
-                    connection_id,
-                    "messages.get",
-                    {"format": "full", "message_id": message_id},
-                ).payload
-                documents.extend(
-                    self._gmail_documents(connection_id, detail, fetched_at, fallback_id=message_id)
-                )
-            except Exception:
+                try:
+                    detail = self._call(
+                        "gsv_gmail_read",
+                        connection_id,
+                        "messages.get",
+                        {"format": "full", "message_id": message_id},
+                    ).payload
+                except ValidationError as exc:
+                    if not _gmail_full_message_exceeds_json_bound(exc):
+                        raise
+                    metadata = self._call(
+                        "gsv_gmail_read",
+                        connection_id,
+                        "messages.get",
+                        {
+                            "format": "metadata",
+                            "message_id": message_id,
+                            "metadata_header_names": ["From", "Subject"],
+                        },
+                    ).payload
+                    raw = self._call(
+                        "gsv_gmail_read",
+                        connection_id,
+                        "messages.get",
+                        {"format": "raw", "message_id": message_id},
+                    )
+                    documents.extend(
+                        self._gmail_raw_documents(
+                            connection_id,
+                            metadata,
+                            raw.artifact,
+                            fetched_at,
+                            fallback_id=message_id,
+                        )
+                    )
+                else:
+                    documents.extend(
+                        self._gmail_documents(
+                            connection_id, detail, fetched_at, fallback_id=message_id
+                        )
+                    )
+            except ConnectorProviderError as exc:
+                if exc.origin is ConnectorOrigin.GMAIL and exc.status == 404:
+                    # A message may disappear between a list and its detail read.
+                    # Do not infer a corpus deletion from that race, but let the
+                    # bounded scan advance instead of retrying this page forever.
+                    _record_omission(gmail)
+                    _record_coverage_gap(
+                        gmail,
+                        "Gmail listed message could not be read; "
+                        "any prior corpus content was retained",
+                    )
+                    continue
+                _record_gmail_detail_retry(gmail, exc)
+            except Exception as exc:
                 # A summary page cannot replace a previously indexed message body.
                 # Keep its provider cursor fixed and retry this same page on the next sync.
-                gmail["retry_current_page"] = True
+                _record_gmail_detail_retry(gmail, exc)
         return documents
 
     def _gmail_history_documents(
@@ -872,6 +957,73 @@ class GoogleAppCorpusAdapter(_CorpusProviderAdapter):
                     additions.append({"id": message_id})
             documents.extend(
                 self._gmail_message_documents(connection_id, additions, fetched_at, gmail)
+            )
+        return documents
+
+    def _gmail_raw_documents(
+        self,
+        connection_id: str,
+        metadata: Mapping[str, Any],
+        artifact: Mapping[str, Any] | None,
+        fetched_at: str,
+        *,
+        fallback_id: str,
+    ) -> list[AppCorpusDocument]:
+        path = _optional_text((artifact or {}).get("path"))
+        if path is None:
+            raise ValidationError("Gmail raw message artifact is unavailable")
+        parsed = _parse_gmail_raw_message(Path(path))
+        message_id = _optional_text(metadata.get("id")) or fallback_id
+        revision = _revision(metadata, "historyId", "internalDate", fallback=message_id)
+        received_at = _gmail_internal_date(metadata.get("internalDate"))
+        attachment_names = tuple(attachment.filename for attachment in parsed.attachments)
+        body = parsed.body
+        if attachment_names:
+            body = _bounded_text(body + "\n\nAttachments: " + ", ".join(attachment_names))
+        metadata_payload = metadata.get("payload")
+        document_metadata = _metadata(
+            attachment_count=parsed.attachment_count,
+            labels=_joined_strings(metadata.get("labelIds")),
+            received_at=received_at,
+            sender=parsed.sender or _gmail_header(metadata_payload, "from"),
+            thread_id=_optional_text(metadata.get("threadId")),
+        )
+        omissions = _gmail_raw_extraction_omissions(parsed)
+        if omissions:
+            document_metadata = {
+                **document_metadata,
+                "extraction_omissions": ",".join(omissions),
+                "extraction_status": "partial",
+            }
+        documents = [
+            AppCorpusDocument(
+                connection_id=connection_id,
+                provider="gmail",
+                object_id=f"gmail:{message_id}",
+                revision=revision,
+                fetched_at=fetched_at,
+                source_ref=f"gmail:message:{message_id}",
+                title=_title(
+                    parsed.subject or _gmail_header(metadata_payload, "subject"), "Gmail message"
+                ),
+                text=body,
+                metadata=document_metadata,
+                freshness=_freshness(
+                    "partial" if omissions else "complete",
+                    "; ".join(omissions) if omissions else "provider object was read",
+                ),
+            )
+        ]
+        for attachment in parsed.attachments:
+            documents.append(
+                _gmail_raw_attachment_document(
+                    connection_id,
+                    message_id,
+                    revision,
+                    attachment,
+                    fetched_at,
+                    received_at=received_at,
+                )
             )
         return documents
 
@@ -1677,6 +1829,83 @@ def _gmail_document(
     )
 
 
+def _gmail_raw_attachment_document(
+    connection_id: str,
+    message_id: str,
+    revision: str,
+    attachment: _RawGmailAttachment,
+    fetched_at: str,
+    *,
+    received_at: str | None,
+) -> AppCorpusDocument:
+    attachment_id = f"raw-{attachment.part_index}"
+    source_ref = f"gmail:attachment:{message_id}:{attachment_id}"
+    base_metadata = _metadata(
+        filename=attachment.filename,
+        mime_type=attachment.mime_type,
+        parent_message_id=message_id,
+        received_at=received_at,
+        size=len(attachment.content),
+    )
+    common = {
+        "connection_id": connection_id,
+        "provider": "gmail",
+        "object_id": f"gmail-attachment:{message_id}:{attachment_id}",
+        "revision": revision,
+        "fetched_at": fetched_at,
+        "source_ref": source_ref,
+        "title": attachment.filename,
+    }
+    if len(attachment.content) > _INLINE_ATTACHMENT_BYTES:
+        return _attachment_gap_document(
+            **common,
+            metadata=base_metadata,
+            reason="attachment was not read because it exceeds the inline read bound",
+        )
+    if attachment.mime_type not in _artifact_extractable_mimes():
+        return _attachment_gap_document(
+            **common,
+            metadata=base_metadata,
+            reason="attachment type needs a local artifact extraction route",
+        )
+    try:
+        if attachment.mime_type in _inline_text_mimes():
+            text = _bounded_text(_decode_mime_text(attachment.content, charset=None))
+            if attachment.mime_type == "text/html":
+                text = _html_to_text(text)
+            return _document(**common, text=text, metadata=base_metadata)
+        extraction = _extract_inline_attachment(
+            attachment.content,
+            _Attachment(
+                attachment_id=attachment_id,
+                filename=attachment.filename,
+                mime_type=attachment.mime_type,
+                size=len(attachment.content),
+            ),
+        )
+        if extraction.status == "ok":
+            return _document(
+                **common,
+                text=extraction.text,
+                metadata={**base_metadata, "extraction_status": extraction.status},
+            )
+        return _attachment_gap_document(
+            **common,
+            metadata={
+                **base_metadata,
+                "extraction_omissions": ",".join(extraction.omissions[:12]),
+                "extraction_status": extraction.status,
+            },
+            reason=extraction.reason or "attachment text extraction was incomplete",
+        )
+    except Exception as exc:
+        return _attachment_gap_document(
+            **common,
+            metadata=base_metadata,
+            reason=_failure_detail(exc),
+        )
+
+
 def _gmail_deleted_document(
     connection_id: str, message_id: str, revision: str, fetched_at: str
 ) -> AppCorpusDocument:
@@ -1914,6 +2143,109 @@ def _gmail_body(value: object) -> tuple[str, list[str]]:
     visit(value)
     body = "\n\n".join(plain) if plain else "\n\n".join(_html_to_text(item) for item in html)
     return _bounded_text(body), _unique_limited(attachments, maximum=24)
+
+
+def _parse_gmail_raw_message(path: Path) -> _RawGmailMessage:
+    try:
+        if not path.is_file() or path.stat().st_size > _MAX_GMAIL_RAW_MESSAGE_BYTES:
+            raise ValidationError("Gmail raw message exceeds the corpus artifact read bound")
+        with path.open("rb") as stream:
+            message = BytesParser(policy=policy.default).parse(stream)
+    except OSError as exc:
+        raise ValidationError("Gmail raw message artifact cannot be read") from exc
+    plain: list[str] = []
+    html: list[str] = []
+    attachments: list[_RawGmailAttachment] = []
+    attachment_count = 0
+    for part_index, part in enumerate(message.walk()):
+        if part.is_multipart():
+            continue
+        mime_type = part.get_content_type().casefold()
+        filename = _mime_filename(part)
+        if filename is not None:
+            attachment_count += 1
+            if len(attachments) < 24:
+                attachments.append(
+                    _RawGmailAttachment(
+                        content=_mime_part_bytes(part),
+                        filename=filename,
+                        mime_type=mime_type,
+                        part_index=part_index,
+                    )
+                )
+            continue
+        if mime_type == "text/plain":
+            plain.append(
+                _decode_mime_text(
+                    _mime_part_bytes(part), charset=part.get_content_charset(), bounded=False
+                )
+            )
+        elif mime_type == "text/html":
+            html.append(
+                _decode_mime_text(
+                    _mime_part_bytes(part), charset=part.get_content_charset(), bounded=False
+                )
+            )
+    visible_body = (
+        "\n\n".join(plain)
+        if plain
+        else "\n\n".join(_visible_html_to_text(item) for item in html)
+    )
+    body, body_truncated = _bounded_document_text(visible_body)
+    return _RawGmailMessage(
+        attachment_count=attachment_count,
+        attachments=tuple(attachments),
+        attachments_truncated=attachment_count > len(attachments),
+        body=body,
+        body_truncated=body_truncated,
+        sender=_mime_header(message, "from"),
+        subject=_mime_header(message, "subject"),
+    )
+
+
+def _mime_filename(part: Message) -> str | None:
+    value = part.get_filename()
+    if not isinstance(value, str):
+        return None
+    clean = _bounded_text(value)
+    return clean or None
+
+
+def _mime_part_bytes(part: Message) -> bytes:
+    try:
+        payload = part.get_payload(decode=True)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("Gmail raw message part cannot be decoded") from exc
+    if payload is None:
+        return b""
+    if not isinstance(payload, bytes):
+        raise ValidationError("Gmail raw message part is invalid")
+    return payload
+
+
+def _decode_mime_text(content: bytes, *, charset: str | None, bounded: bool = True) -> str:
+    try:
+        decoded = content.decode(charset or "utf-8", errors="replace")
+    except (LookupError, UnicodeError):
+        decoded = content.decode("utf-8", errors="replace")
+    return _bounded_text(decoded) if bounded else decoded
+
+
+def _mime_header(message: Message, name: str) -> str | None:
+    value = message.get(name)
+    if value is None:
+        return None
+    clean = _bounded_text(str(value))
+    return clean or None
+
+
+def _gmail_raw_extraction_omissions(message: _RawGmailMessage) -> tuple[str, ...]:
+    omissions: list[str] = []
+    if message.body_truncated:
+        omissions.append("visible message text was truncated at the corpus text bound")
+    if message.attachments_truncated:
+        omissions.append("only the first 24 named attachments were materialized")
+    return tuple(omissions)
 
 
 def _gmail_attachments(value: object) -> list[_Attachment]:
@@ -2303,6 +2635,33 @@ def _gmail_history_expired(error: Exception) -> bool:
     return getattr(error, "code", None) == "full_sync_required"
 
 
+def _record_gmail_detail_retry(gmail: dict[str, Any], error: Exception) -> None:
+    """Retain the page cursor and one content-free reason for its retry."""
+
+    gmail["retry_current_page"] = True
+    gmail["retry_category"] = _gmail_detail_retry_category(error)
+
+
+def _gmail_full_message_exceeds_json_bound(error: ValidationError) -> bool:
+    """Use raw MIME only for the connector's exact bounded-result failure."""
+
+    return str(error) == "JSON string is invalid or too large"
+
+
+def _gmail_detail_retry_reason(gmail: dict[str, Any]) -> str:
+    return _optional_text(gmail.pop("retry_category", None)) or "a provider read failure"
+
+
+def _gmail_detail_retry_category(value: object) -> str:
+    if isinstance(value, ConnectorProviderError):
+        return f"provider HTTP {value.status}"
+    if isinstance(value, ValidationError):
+        return "invalid provider result"
+    if isinstance(value, ContinuityError):
+        return "connector failure"
+    return "unexpected local failure"
+
+
 def _refused(error: Exception) -> bool:
     if not isinstance(error, (ContinuityError, ValidationError)):
         return False
@@ -2466,6 +2825,21 @@ def _html_to_text(value: str) -> str:
     except Exception:
         return _bounded_text(value)
     return parser.text()
+
+
+def _visible_html_to_text(value: str) -> str:
+    parser = _PlainText()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        return value
+    return parser.text(bounded=False)
+
+
+def _bounded_document_text(value: str) -> tuple[str, bool]:
+    clean = value.replace("\x00", "").strip()
+    return clean[:_MAX_DOCUMENT_TEXT_CHARS], len(clean) > _MAX_DOCUMENT_TEXT_CHARS
 
 
 def _decode_base64_text(value: str) -> str:

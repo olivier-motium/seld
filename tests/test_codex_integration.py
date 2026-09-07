@@ -31,8 +31,23 @@ from continuity_kernel.vault import Vault
 class FakeCodex:
     marketplaces: dict[str, str] = field(default_factory=dict)
     plugins: set[str] = field(default_factory=set)
+    plugin_versions: dict[str, str] = field(default_factory=dict)
     calls: list[tuple[str, ...]] = field(default_factory=list)
     required_manifest: Path | None = None
+
+    def plugin_version(self, plugin: str) -> str:
+        version = self.plugin_versions.get(plugin)
+        if version is not None:
+            return version
+        return integration._plugin_version_from_marketplace_contents(
+            integration._marketplace_contents(Path.cwd(), runtime=("test-python", []))[0]
+        )
+
+    def refresh_plugin_version(self, plugin: str) -> None:
+        root = self.marketplaces.get(integration.MARKETPLACE_NAME)
+        if root is None:
+            raise AssertionError("plugin refresh needs the registered marketplace")
+        self.plugin_versions[plugin] = integration._plugin_version_from_marketplace_path(Path(root))
 
     def run(self, executable: str, arguments: list[str], home: Path) -> dict[str, Any]:
         del executable, home
@@ -74,14 +89,21 @@ class FakeCodex:
         if command == ("plugin", "list", "--json"):
             return {
                 "installed": [
-                    {"enabled": True, "pluginId": plugin} for plugin in sorted(self.plugins)
+                    {
+                        "enabled": True,
+                        "pluginId": plugin,
+                        "version": self.plugin_version(plugin),
+                    }
+                    for plugin in sorted(self.plugins)
                 ]
             }
         if command[:2] == ("plugin", "add"):
             self.plugins.add(command[2])
+            self.refresh_plugin_version(command[2])
             return {"ok": True}
         if command[:2] == ("plugin", "remove"):
             self.plugins.discard(command[2])
+            self.plugin_versions.pop(command[2], None)
             return {"ok": True}
         raise AssertionError(f"unexpected fake Codex command: {command}")
 
@@ -603,6 +625,62 @@ def test_codex_status_ready_requires_receipt_provider_root_and_exact_manifest(
     assert changed["plugin_installed"] is True
     assert changed["ready"] is False
     assert changed["manifest_verified"] is False
+
+
+def test_reinstall_refreshes_an_enabled_stale_plugin_cache(
+    tmp_path: Path, fake_codex: FakeCodex
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    vault = tmp_path / "vault"
+    integration.install_codex(vault=vault, codex_home=home)
+    expected_version = fake_codex.plugin_versions[integration.PLUGIN_ID]
+    fake_codex.plugin_versions[integration.PLUGIN_ID] = "0.0.0-stale"
+
+    stale = integration.codex_status(codex_home=home)
+    calls_before = len(fake_codex.calls)
+    refreshed = integration.install_codex(vault=vault, codex_home=home)
+
+    assert stale["plugin_installed"] is True
+    assert stale["plugin_version_verified"] is False
+    assert stale["ready"] is False
+    assert refreshed.plugin_installed is True
+    assert fake_codex.plugin_versions[integration.PLUGIN_ID] == expected_version
+    assert ("plugin", "add", integration.PLUGIN_ID, "--json") in fake_codex.calls[calls_before:]
+    assert integration.codex_status(codex_home=home)["ready"] is True
+
+
+def test_failed_stale_plugin_refresh_preserves_existing_registration(
+    tmp_path: Path,
+    fake_codex: FakeCodex,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    vault = tmp_path / "vault"
+    installed = integration.install_codex(vault=vault, codex_home=home)
+    fake_codex.plugin_versions[integration.PLUGIN_ID] = "0.0.0-stale"
+    manifest_before = integration._tree_manifest(Path(installed.marketplace_root))
+    real_run = fake_codex.run
+
+    def refresh_then_fail(
+        executable: str,
+        arguments: list[str],
+        codex_home: Path,
+    ) -> dict[str, Any]:
+        result = real_run(executable, arguments, codex_home)
+        if arguments[:2] == ["plugin", "add"]:
+            raise SetupError("injected stale-plugin refresh failure")
+        return result
+
+    monkeypatch.setattr(integration, "_run_json", refresh_then_fail)
+    with pytest.raises(SetupError, match="stale-plugin refresh failure"):
+        integration.install_codex(vault=vault, codex_home=home)
+
+    assert fake_codex.plugins == {integration.PLUGIN_ID}
+    assert not any(call[:2] == ("plugin", "remove") for call in fake_codex.calls)
+    assert integration._tree_manifest(Path(installed.marketplace_root)) == manifest_before
+    assert "install_transition" not in _receipt_payload(home)
 
 
 def test_identical_reinstall_is_a_true_noop_without_new_recovery_or_provider_mutation(

@@ -39,6 +39,7 @@ from continuity_kernel.resident_context import ResidentSkillFile, add_resident_s
 
 MARKETPLACE_NAME: Final = "gsv-local"
 PLUGIN_ID: Final = "gsv@gsv-local"
+PLUGIN_MANIFEST_PATH: Final = "plugins/gsv/.codex-plugin/plugin.json"
 BLOCK_START: Final = "<!-- gsv-managed:start -->"
 BLOCK_END: Final = "<!-- gsv-managed:end -->"
 RECEIPT_FORMAT_VERSION: Final = 2
@@ -390,6 +391,12 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
             "left it unchanged. Remove it explicitly before installing this copy."
         )
     prepared_marketplace = _marketplace_contents(vault, runtime=None)
+    expected_plugin_version = _plugin_version_from_marketplace_contents(prepared_marketplace[0])
+    plugin_version_verified = plugin_installed and _plugin_version_matches(
+        plugin_entry,
+        expected_plugin_version,
+        context="plugin list",
+    )
     planned_agents_before, planned_agents_after = _planned_instruction_install(home)
     if planned_agents_before != agents_before:
         raise ConflictError("Codex AGENTS.md changed during install preflight")
@@ -398,7 +405,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
         and prior_receipt.get("integration_active") is True
         and prior_marketplace_manifest == prepared_marketplace[1]
         and existing is not None
-        and plugin_installed
+        and plugin_version_verified
         and planned_agents_before == planned_agents_after
     )
     if idempotent_install:
@@ -420,6 +427,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
             expected_instructions=planned_agents_after,
             expected_receipt=prior_receipt_snapshot.encoded,
             cleanup_pending=prior_cleanup_pending,
+            expected_plugin_version=expected_plugin_version,
         )
         return
     # Reserve the worst-case immutable transition evidence plus the later
@@ -482,7 +490,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
                 home,
             )
 
-        if not plugin_installed:
+        if not plugin_version_verified:
             if transition_receipt is None:  # pragma: no cover - callback invariant
                 raise SetupError("install transition receipt was not persisted")
             transition_receipt = _mark_install_provider_attempt(
@@ -495,7 +503,11 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
 
         instruction_change = _install_instructions(home)
         status = codex_status(codex_home=home)
-        if not status["plugin_installed"] or not status["instructions_installed"]:
+        if (
+            not status["plugin_installed"]
+            or not status["plugin_version_verified"]
+            or not status["instructions_installed"]
+        ):
             raise SetupError("ChatGPT did not report the Seld integration as installed")
         result = CodexInstallResult(
             codex_home=str(home),
@@ -527,6 +539,7 @@ def _install_codex_transaction_locked(*, vault: Path, home: Path) -> Iterator[Co
             instruction_change=instruction_change,
             expected_receipt=transition_receipt,
             prior_cleanup_pending=prior_cleanup_pending,
+            expected_plugin_version=expected_plugin_version,
         )
         cleanup_pending = list(committed_prior_cleanup)
         if marketplace_change.previous_record is not None:
@@ -602,6 +615,18 @@ def codex_status(*, codex_home: Path | None = None) -> dict[str, Any]:
     )
     instructions_installed = _instructions_installed(home)
     plugin_installed = plugin is not None and plugin.get("enabled") is True
+    plugin_version_verified = False
+    if plugin_installed:
+        try:
+            expected_plugin_version = _plugin_version_from_marketplace_path(_marketplace_root(home))
+        except (ContinuityError, OSError, ValidationError):
+            pass
+        else:
+            plugin_version_verified = _plugin_version_matches(
+                plugin,
+                expected_plugin_version,
+                context="plugin list during status",
+            )
     receipt = _load_receipt(home)
     receipt_active = bool(
         receipt.get("format_version") == RECEIPT_FORMAT_VERSION
@@ -619,6 +644,7 @@ def codex_status(*, codex_home: Path | None = None) -> dict[str, Any]:
     ready = bool(
         marketplace_root_verified
         and plugin_installed
+        and plugin_version_verified
         and instructions_installed
         and receipt_active
         and manifest_verified
@@ -630,6 +656,7 @@ def codex_status(*, codex_home: Path | None = None) -> dict[str, Any]:
         "marketplace_registered": marketplace is not None,
         "marketplace_root_verified": marketplace_root_verified,
         "plugin_installed": plugin_installed,
+        "plugin_version_verified": plugin_version_verified,
         "ready": ready,
         "receipt_active": receipt_active,
     }
@@ -641,6 +668,7 @@ def _assert_provider_install_state(
     home: Path,
     marketplace_registered: bool,
     plugin_registered: bool,
+    expected_plugin_version: str | None = None,
     context: str,
 ) -> None:
     marketplaces = _run_json(executable, ["plugin", "marketplace", "list", "--json"], home)
@@ -666,6 +694,12 @@ def _assert_provider_install_state(
     if plugin_registered:
         if plugin is None or plugin.get("enabled") is not True:
             raise ConflictError(f"Codex plugin registration changed during {context}")
+        if expected_plugin_version is not None and not _plugin_version_matches(
+            plugin,
+            expected_plugin_version,
+            context=f"plugin list during {context}",
+        ):
+            raise ConflictError(f"Codex plugin version changed during {context}")
     elif plugin is not None:
         raise ConflictError(f"Codex plugin registration changed during {context}")
 
@@ -678,6 +712,7 @@ def _assert_install_commit_state(
     instruction_change: _InstructionChange | None,
     expected_receipt: bytes,
     prior_cleanup_pending: list[dict[str, Any]],
+    expected_plugin_version: str,
 ) -> list[dict[str, Any]]:
     if _tree_manifest(marketplace_change.path) != marketplace_change.installed_manifest:
         raise ConflictError(
@@ -717,6 +752,7 @@ def _assert_install_commit_state(
         home=home,
         marketplace_registered=True,
         plugin_registered=True,
+        expected_plugin_version=expected_plugin_version,
         context="install commit",
     )
     return committed_prior_cleanup
@@ -730,6 +766,7 @@ def _assert_idempotent_install_state(
     expected_instructions: bytes,
     expected_receipt: bytes | None,
     cleanup_pending: list[dict[str, Any]],
+    expected_plugin_version: str,
 ) -> None:
     if expected_receipt is None:  # pragma: no cover - guarded by idempotent receipt state
         raise SetupError("idempotent install has no stable ownership receipt")
@@ -758,6 +795,7 @@ def _assert_idempotent_install_state(
         home=home,
         marketplace_registered=True,
         plugin_registered=True,
+        expected_plugin_version=expected_plugin_version,
         context="idempotent setup",
     )
 
@@ -2012,6 +2050,52 @@ def _marketplace_contents(
     return contents, manifest
 
 
+def _plugin_version_from_marketplace_contents(
+    contents: dict[str, bytes | ResidentSkillFile | None],
+) -> str:
+    raw = contents.get(PLUGIN_MANIFEST_PATH)
+    if not isinstance(raw, bytes):
+        raise ValidationError(f"packaged marketplace is missing {PLUGIN_MANIFEST_PATH}")
+    return _plugin_version_from_manifest_bytes(raw, context="packaged marketplace")
+
+
+def _plugin_version_from_marketplace_path(root: Path) -> str:
+    raw = _read_regular_bytes(
+        root.joinpath(*PurePosixPath(PLUGIN_MANIFEST_PATH).parts),
+        label="Seld plugin manifest",
+    )
+    if raw is None:
+        raise ValidationError(f"installed marketplace is missing {PLUGIN_MANIFEST_PATH}")
+    return _plugin_version_from_manifest_bytes(raw, context="installed marketplace")
+
+
+def _plugin_version_from_manifest_bytes(raw: bytes, *, context: str) -> str:
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"{context} has an invalid Seld plugin manifest") from exc
+    if not isinstance(manifest, dict) or manifest.get("name") != "gsv":
+        raise ValidationError(f"{context} has an invalid Seld plugin manifest")
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version:
+        raise ValidationError(f"{context} has an invalid Seld plugin version")
+    return version
+
+
+def _plugin_version_matches(
+    plugin: dict[str, Any] | None,
+    expected_version: str,
+    *,
+    context: str,
+) -> bool:
+    if plugin is None:  # pragma: no cover - guarded by caller
+        return False
+    version = plugin.get("version")
+    if not isinstance(version, str) or not version:
+        raise SetupError(f"Codex returned a malformed {context}: `version` must be a string")
+    return version == expected_version
+
+
 def _marketplace_manifest_value(content: bytes | ResidentSkillFile | None) -> str:
     if content is None:
         return "directory"
@@ -2722,12 +2806,6 @@ def _validate_install_transition(
         or any(type(provider_attempts.get(key)) is not bool for key in ("marketplace", "plugin"))
     ):
         raise ValidationError(f"Codex receipt has invalid provider attempt state: {receipt_path}")
-    for provider in ("marketplace", "plugin"):
-        if provider_before[provider] and provider_attempts[provider]:
-            raise ValidationError(
-                f"Codex receipt cannot attempt an already-present provider registration: "
-                f"{receipt_path}"
-            )
     agents_digest = value.get("agents_before_sha256")
     if agents_digest is not None and (
         not isinstance(agents_digest, str) or not _is_sha256(agents_digest)
@@ -3000,8 +3078,6 @@ def _mark_install_provider_attempt(
     attempts = transition.get("provider_attempts")
     if not isinstance(provider_before, dict) or not isinstance(attempts, dict):
         raise ValidationError("install transition receipt has no provider state")
-    if provider_before.get(provider) is True:
-        raise ValidationError(f"provider registration already existed before install: {provider}")
     if attempts.get(provider) is True:
         return encoded
     updated_attempts = dict(attempts)

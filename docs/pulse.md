@@ -41,9 +41,9 @@ reminder, inbox, score, or dashboard system.
    Pulse task to its real Codex UUID.
 2. Exactly one `codex-chief-of-staff:<uuid>` ref identifies the foreground task.
 3. One app-native heartbeat targets the Pulse task every thirty minutes.
-4. `$gsv-pulse` freezes current Mind, Direction, complete Portfolio, ordinary
-   open Tasks, relevant WorkThreads and Entities, NOW, pending signals, and
-   useful selected-source windows.
+4. `$gsv-pulse` freezes Mind, NOW, one bounded page of pending signals, and
+   the selected-source windows needed for the current judgment. It reads exact
+   Tasks, WorkThreads, Entities, Direction, or Portfolio only when relevant.
 5. The model authors justified local changes through fresh compare-and-swap and
    exact readback, then acknowledges inputs and records honest content-free
    coverage.
@@ -54,7 +54,17 @@ reminder, inbox, score, or dashboard system.
 The structural Pulse task is excluded from life Portfolio and ordinary task
 counts.
 
+`gsv pulse status` reports the separate mechanical sweep. Its heartbeat does
+not prove that an AI wake read sources or updated NOW. The sweep publishes its
+heartbeat before optional QMD maintenance, which has a separate lock and may
+defer without making the sensor appear unavailable.
+
 ## Source use
+
+When WhatsApp's unread queue is historical, Pulse can inspect a bounded recent
+context view before processing the queue. The recent view does not acknowledge
+messages or advance the unread checkpoint. Pulse retains the backlog and uses
+the ordinary poll, judgment, and acknowledgement loop to process it.
 
 Pulse starts from the last honest coverage horizon, reads metadata or previews,
 and expands only evidence needed for the current judgment. There is no fixed

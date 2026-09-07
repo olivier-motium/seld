@@ -6,9 +6,21 @@ description: Run or repair Seld's resident Pulse in its dedicated Codex task. Ke
 # Seld resident Pulse
 
 Pulse is ambient executive function, not a task generator. In one short,
-serialized cognition episode it reads current Seld truth and useful new source
-evidence, updates only the canon that genuinely changed, and either helps
-through the foreground Chief of Staff task or stays silent.
+serialized cognition episode it reads the smallest current Seld truth and new
+source evidence needed for a decision, updates only the canon that genuinely
+changed, and either helps through the foreground Chief of Staff task or stays
+silent.
+
+In this exact bound Pulse task, an empty scheduled continuation is a request
+to run the next Pulse wake. It is not a request for a readiness reply. Keep
+this standing behavior in the task's conversation: an in-chat heartbeat
+resumes existing context and may arrive without a new user message. This rule
+does not authorize work in another task or bypass the identity guard below.
+
+A mechanical sweep is not a cognition episode. It queues current due evidence
+and publishes a content-free sensor heartbeat. `gsv pulse status` proves only
+that sweep. It does not prove that an AI wake ran, read sources, integrated
+meaning, or delivered a foreground message.
 
 Use [canonical terminology](../gsv/references/terminology.md) for system roles
 and unit lifecycles. Use [registration](references/registration.md) only for an
@@ -42,13 +54,15 @@ foreground route.
 
 ## Freeze one useful wake
 
-At the start, read once:
+At the start, freeze the smallest set of canon that can change this wake:
 
-- `gsv_context`, current Direction, and the complete authored Portfolio;
-- ordinary open Tasks plus only relevant WorkThreads and Entities;
-- `MIND.md` and `NOW.md` with exact revisions;
+- `MIND.md`, `NOW.md`, and one bounded page of pending resident signals;
 - selected source state and its exact revision; and
-- one bounded page of pending resident signals with its exact queue revision.
+- the Task, WorkThread, Entity, Direction, or Portfolio item named by a signal
+  or needed for the one decision at hand.
+
+Read the full Direction, Portfolio, or open-task set only when the current
+decision requires it. Do not load them as a routine context dump.
 
 Freeze the exact input IDs and source windows to inspect. New arrivals wait for
 the next wake. Re-read only an exact record immediately before its CAS mutation
@@ -65,6 +79,9 @@ source, recall, or execution unit inspection; at eight minutes stop acquiring
 and finish the smallest honest judgment and readback already acquired. Bounds
 protect reliability, but do not impose an arbitrary item count: inspect the
 incremental evidence needed to make the current judgment.
+
+Use QMD only for a concrete retrieval gap. QMD maintenance may defer or fail
+without changing the mechanical sweep result. Do not retry it inside the wake.
 
 ## Apply the task-creation gate
 
@@ -168,8 +185,16 @@ returned bodies transient. A crash or stale CAS replays the same delivery; it
 never skips evidence or silently advances a checkpoint.
 
 Selected WhatsApp is due on every Pulse wake, regardless of its proof TTL or
-current freshness label. Its small poll limit is one replay unit, not a
-per-wake throughput limit. Poll, judge, persist any justified meaning, read it
+current freshness label. When its unread backlog predates the current day,
+first use the native local-source recent view to inspect at most 25 newest
+messages. If this existing Codex task lacks that tool, use the installed
+`gsv local-source recent --source whatsapp --limit 25` command. This is partial
+current context, not delivery acknowledgement or proof that the backlog was
+read. Keep its bodies transient, preserve the backlog, and deduplicate any
+derived changes against existing records when those messages later replay.
+
+Then continue the ordered poll/acknowledge handshake. Its small poll limit is
+one replay unit, not a per-wake throughput limit. Poll, judge, persist any justified meaning, read it
 back, and acknowledge that exact batch. If the batch is partial, immediately
 poll the next batch and repeat. Continue until the adapter reports complete
 coverage or the seven-minute no-new-acquisition boundary arrives. Each next
