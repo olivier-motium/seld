@@ -1517,14 +1517,24 @@ def test_whatsapp_delivery_survives_an_in_place_schema_migration(
 
 
 @_POSIX_STORAGE
-def test_empty_pending_replay_leaves_a_later_message_for_the_next_poll(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy_digest", [False, True])
+def test_empty_pending_replay_leaves_a_later_message_for_the_next_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_digest: bool,
+) -> None:
     vault, _selected = _selected_vault(tmp_path, "apple_messages")
     store = tmp_path / "Messages"
     database = _apple_store(store)
     delivery = LocalSourceDelivery(vault, store_root=store)
     delivery.baseline("apple_messages")
 
-    empty = delivery.poll("apple_messages", limit=2)
+    with monkeypatch.context() as legacy:
+        if legacy_digest:
+            digest = local_source_delivery._delta_digest
+            legacy.setattr(
+                local_source_delivery, "_delta_digest",
+                lambda delta: digest(delta, legacy_store_reconciled=False),
+            )
+        empty = delivery.poll("apple_messages", limit=2)
     _append_apple(database, "arrived after the empty delivery")
     replay = delivery.poll("apple_messages", limit=99)
 

@@ -1281,9 +1281,9 @@ class LocalSourceDelivery:
             # Replay must retain the prepared boundary, not the later clock.
             delta = replace(delta, covered_through=prepared.covered_through)
         if prepared.adapter_token is None and _delta_digest(delta) != prepared.delivery_digest:
-            # Older empty WhatsApp deliveries included this store-only flag.
+            # Older empty deliveries included this store-only flag.
             # Accept either historical value without relaxing content identity.
-            if isinstance(delta, whatsapp.WhatsAppDelta) and not delta.messages:
+            if not delta.messages:
                 if prepared.delivery_digest in {
                     _delta_digest(delta, legacy_store_reconciled=False),
                     _delta_digest(delta, legacy_store_reconciled=True),
