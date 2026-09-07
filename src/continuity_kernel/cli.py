@@ -936,7 +936,13 @@ def _apps(vault: Vault, args: argparse.Namespace) -> Any:
         }
     if args.apps_command == "configure":
         _assert_connection_source(vault, args.connection_id, args.adapter)
-        return asdict(corpus.configure(args.connection_id, adapter=args.adapter))
+        return asdict(
+            corpus.configure(
+                args.connection_id,
+                adapter=args.adapter,
+                settings=_outlook_calendar_delta_settings(args),
+            )
+        )
     if args.apps_command == "configure-whatsapp":
         status = whatsapp.inspect_whatsapp(
             store_root=Path(args.store_root).expanduser() if args.store_root else None
@@ -983,13 +989,19 @@ def _apps(vault: Vault, args: argparse.Namespace) -> Any:
         runtime = ConnectorRuntime(vault, adapters=default_connector_adapters())
         try:
             recheck_existing = bool(getattr(args, "recheck_existing", False))
-            adapters = _app_corpus_adapters(runtime, corpus, recheck_existing=recheck_existing)
             if args.apps_command == "sync":
                 if recheck_existing and args.adapter != "whatsapp":
                     raise ValidationError("--recheck-existing is available only for WhatsApp sync")
                 if args.adapter not in {"notion", "whatsapp"}:
                     _assert_connection_source(vault, args.connection_id, args.adapter)
-                    corpus.configure(args.connection_id, adapter=args.adapter)
+                    corpus.configure(
+                        args.connection_id,
+                        adapter=args.adapter,
+                        settings=_outlook_calendar_delta_settings(args),
+                    )
+                adapters = _app_corpus_adapters(
+                    runtime, corpus, recheck_existing=recheck_existing
+                )
                 adapter = adapters.get(args.adapter)
                 if adapter is None:
                     raise ValidationError("configured app corpus adapter is unavailable")
@@ -1001,6 +1013,7 @@ def _apps(vault: Vault, args: argparse.Namespace) -> Any:
                         timeout_seconds=args.timeout,
                     )
                 )
+            adapters = _app_corpus_adapters(runtime, corpus, recheck_existing=recheck_existing)
             return list(corpus.sync_all(adapters, limit=args.limit, timeout_seconds=args.timeout))
         finally:
             runtime.close()
@@ -1081,6 +1094,27 @@ def _app_corpus_adapters(
         adapters = default_app_corpus_adapters(runtime)
     local_adapters: dict[str, dict[str, object]] = {}
     for scope in corpus.scopes():
+        if scope.adapter == "outlook_calendar":
+            start = scope.settings.get("calendar_delta_start")
+            end = scope.settings.get("calendar_delta_end")
+            if start is None and end is None:
+                calendar_adapter: object = adapters["outlook_calendar"]
+            elif isinstance(start, str) and isinstance(end, str):
+                from continuity_kernel.app_corpus_microsoft_calendar_delta import (
+                    validate_calendar_delta_window,
+                )
+                from continuity_kernel.app_corpus_providers import MicrosoftAppCorpusAdapter
+
+                calendar_adapter = MicrosoftAppCorpusAdapter(
+                    runtime,
+                    sources=frozenset({"outlook_calendar"}),
+                    calendar_delta_window=validate_calendar_delta_window(start, end),
+                )
+            else:
+                raise ValidationError("Outlook Calendar app corpus delta window is invalid")
+            local_adapters.setdefault("outlook_calendar", {})[scope.connection_id] = (
+                calendar_adapter
+            )
         if scope.adapter == "whatsapp":
             fingerprint = scope.settings.get("account_fingerprint")
             root = scope.settings.get("store_root")
@@ -1111,6 +1145,30 @@ def _app_corpus_adapters(
     if not isinstance(adapters, dict) or not all(isinstance(key, str) for key in adapters):
         raise ValidationError("app corpus adapter registry is invalid")
     return adapters
+
+
+def _outlook_calendar_delta_settings(args: argparse.Namespace) -> dict[str, str] | None:
+    """Return one explicitly selected primary-calendar delta window, if supplied."""
+
+    start = getattr(args, "calendar_delta_start", None)
+    end = getattr(args, "calendar_delta_end", None)
+    if start is None and end is None:
+        return None
+    if (
+        getattr(args, "adapter", None) != "outlook_calendar"
+        or not isinstance(start, str)
+        or not isinstance(end, str)
+    ):
+        raise ValidationError(
+            "Outlook Calendar delta configuration needs both --calendar-delta-start and "
+            "--calendar-delta-end"
+        )
+    from continuity_kernel.app_corpus_microsoft_calendar_delta import (
+        validate_calendar_delta_window,
+    )
+
+    window = validate_calendar_delta_window(start, end)
+    return {"calendar_delta_start": window.start, "calendar_delta_end": window.end}
 
 
 class _ConnectionScopedCorpusAdapter:
@@ -2303,6 +2361,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     apps_configure.add_argument("--connection-id", required=True)
     apps_configure.add_argument("--adapter", required=True)
+    apps_configure.add_argument(
+        "--calendar-delta-start",
+        help="Outlook Calendar only: retained primary-calendar delta window start (ISO 8601).",
+    )
+    apps_configure.add_argument(
+        "--calendar-delta-end",
+        help="Outlook Calendar only: retained primary-calendar delta window end (ISO 8601).",
+    )
     apps_configure_whatsapp = apps_commands.add_parser(
         "configure-whatsapp",
         help="Read the linked local WhatsApp account fingerprint and pin it for corpus indexing.",
@@ -2336,6 +2402,14 @@ def _parser() -> argparse.ArgumentParser:
     apps_sync.add_argument("--limit", type=int, default=100)
     apps_sync.add_argument("--timeout", type=int, default=120)
     apps_sync.add_argument("--executable", default="qmd")
+    apps_sync.add_argument(
+        "--calendar-delta-start",
+        help="Outlook Calendar only: retain this primary-calendar delta window start (ISO 8601).",
+    )
+    apps_sync.add_argument(
+        "--calendar-delta-end",
+        help="Outlook Calendar only: retain this primary-calendar delta window end (ISO 8601).",
+    )
     apps_sync.add_argument(
         "--recheck-existing",
         action="store_true",

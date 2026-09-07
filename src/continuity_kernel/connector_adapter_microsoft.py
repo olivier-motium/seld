@@ -711,7 +711,7 @@ class MicrosoftConnectorAdapter:
                     body_format=shape.body_format,
                     max_page_size=(
                         _integer(request_data["page_size"])
-                        if known.name in {"folders.delta", "messages.delta"}
+                        if known.name in {"folders.delta", "messages.delta", "events.delta"}
                         and "page_size" in request_data
                         else None
                     ),
@@ -1228,6 +1228,8 @@ def _calendar_shape(name: str, data: dict[str, object]) -> _RequestShape:
             query=_event_query(data),
             time_zone=_optional_text(data, "time_zone"),
         )
+    if name == "events.delta":
+        return _calendar_delta_shape(data)
     if name == "events.get":
         return _RequestShape(
             _event_path(_text(data, "calendar_id"), _text(data, "event_id")),
@@ -1584,6 +1586,23 @@ def _window_shape(
             ("startDateTime", start),
             ("endDateTime", end),
         ),
+    )
+
+
+def _calendar_delta_shape(data: dict[str, object]) -> _RequestShape:
+    """Build the documented fixed primary-calendar calendarView delta request."""
+
+    path = f"{_ROOT}/calendarView/delta"
+    if "delta_link" in data:
+        return _delta_link_shape(_text(data, "delta_link"), path=path)
+    return _RequestShape(
+        path,
+        ConnectorMethod.GET,
+        query=(
+            ("startDateTime", _text(data, "start")),
+            ("endDateTime", _text(data, "end")),
+        ),
+        delta=True,
     )
 
 

@@ -56,6 +56,12 @@ and no matches do not establish that an event or message does not exist. For a
 current-state question, use an available live read operation when the stored
 source is stale or incomplete.
 
+WhatsApp attachment text comes from local files whose bytes match the message's
+recorded digest. A caption is not attachment content. Missing downloads and
+unreadable images remain coverage gaps; a live WhatsApp sync may hold the store
+lock needed by the download command. Preserve its ownership when coordinating
+downloads. The retrieval adapter does not request phone re-uploads.
+
 The corpus supports retrieval. For provider actions, use only operations listed
 by `gsv apps capabilities` and inspect `gsv apps call --help`. Existing approval
 requirements apply to writes. Retrieval does not authorize sending, editing,

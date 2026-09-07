@@ -52,6 +52,7 @@ CALENDAR_NAMES = frozenset(
         "calendars.list",
         "calendars.get",
         "events.list",
+        "events.delta",
         "events.get",
         "events.window",
         "events.instances",
@@ -110,9 +111,9 @@ def test_microsoft_catalog_has_the_exact_mail_and_calendar_operation_sets() -> N
         operation for operation in MICROSOFT_OPERATIONS if operation.provider == "outlook_calendar"
     )
 
-    assert len(MICROSOFT_OPERATIONS) == 53
+    assert len(MICROSOFT_OPERATIONS) == 54
     assert len(mail) == 29
-    assert len(calendar) == 24
+    assert len(calendar) == 25
     assert {operation.name for operation in mail} == MAIL_NAMES
     assert {operation.name for operation in calendar} == CALENDAR_NAMES
     assert all(operation.endpoint == operation.name for operation in MICROSOFT_OPERATIONS)

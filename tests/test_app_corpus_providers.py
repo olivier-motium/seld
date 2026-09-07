@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from continuity_kernel.app_corpus import AppCorpusCompanion
+from continuity_kernel.app_corpus_microsoft_calendar_delta import validate_calendar_delta_window
 from continuity_kernel.app_corpus_providers import (
     GoogleAppCorpusAdapter,
     MicrosoftAppCorpusAdapter,
@@ -849,6 +850,66 @@ def test_microsoft_sync_gets_full_message_body_then_calendar_events() -> None:
     assert event.metadata["start_at"] == "2026-09-07T09:00:00Z"
     assert second.complete is True
     assert all(not name.endswith("_write") for name, _values in runtime.calls)
+
+
+def test_microsoft_primary_calendar_delta_confirms_permanent_removals() -> None:
+    runtime = _Runtime(
+        [
+            _response({"value": [{"id": "primary-id", "isDefaultCalendar": True}]}),
+            _response(
+                {
+                    "value": [
+                        {
+                            "changeKey": "event-v1",
+                            "id": "event-deleted",
+                            "subject": "Was here",
+                        }
+                    ]
+                }
+            ),
+            _response(
+                {
+                    "@odata.deltaLink": (
+                        "https://graph.microsoft.com/v1.0/me/calendarView/delta"
+                        "?$deltatoken=calendar-next"
+                    ),
+                    "value": [{"@removed": {"reason": "deleted"}, "id": "event-deleted"}],
+                }
+            ),
+            ConnectorProviderError(
+                origin=ConnectorOrigin.MICROSOFT_GRAPH,
+                status=404,
+                code="not_found",
+            ),
+        ]
+    )
+    adapter = MicrosoftAppCorpusAdapter(
+        runtime,  # type: ignore[arg-type]
+        sources=frozenset({"outlook_calendar"}),
+        calendar_delta_window=validate_calendar_delta_window(
+            "2025-09-07T00:00:00Z", "2028-09-07T00:00:00Z"
+        ),
+    )
+
+    listed = adapter.sync("connection-2", limit=10)
+    baseline = adapter.sync("connection-2", checkpoint=listed.checkpoint, limit=10)
+    result = adapter.sync("connection-2", checkpoint=baseline.checkpoint, limit=10)
+
+    assert result.complete is True
+    assert [(item.object_id, item.deleted) for item in result.documents] == [
+        ("outlook-calendar:primary-id:event-deleted", True)
+    ]
+    assert runtime.calls[2][1]["operation"] == "events.delta"
+    assert runtime.calls[2][1]["input"] == {
+        "end": "2028-09-07T00:00:00Z",
+        "page_size": 5,
+        "start": "2025-09-07T00:00:00Z",
+    }
+    assert runtime.calls[3][1]["input"] == {
+        "calendar_id": "primary",
+        "event_id": "event-deleted",
+    }
+    assert "secondary calendars" in result.freshness["detail"]
 
 
 def test_microsoft_completed_checkpoint_reuses_graph_delta_links() -> None:

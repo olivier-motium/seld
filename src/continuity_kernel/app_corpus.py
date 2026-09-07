@@ -233,17 +233,28 @@ class AppCorpusCompanion:
         ):
             state = _load_state(store)
             scopes = _scopes(state)
+            existing = scopes.get(connection_id)
+            if (
+                settings is None
+                and isinstance(existing, Mapping)
+                and existing.get("adapter") == adapter
+            ):
+                configured_settings = _json_mapping(
+                    existing.get("settings", {}), "app corpus scope settings"
+                )
+            else:
+                configured_settings = _json_mapping(settings or {}, "app corpus scope settings")
             scopes[connection_id] = {
                 "adapter": adapter,
                 "connection_id": connection_id,
-                "settings": _json_mapping(settings or {}, "app corpus scope settings"),
+                "settings": configured_settings,
             }
             state["scopes"] = scopes
             _write_state(store, state)
         return AppCorpusScope(
             adapter=adapter,
             connection_id=connection_id,
-            settings=_json_mapping(settings or {}, "app corpus scope settings"),
+            settings=configured_settings,
         )
 
     def scopes(self) -> tuple[AppCorpusScope, ...]:

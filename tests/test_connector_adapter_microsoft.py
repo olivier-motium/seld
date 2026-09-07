@@ -317,6 +317,11 @@ def _input_for(operation: OperationSpec) -> dict[str, object]:
         "calendars.list": {},
         "calendars.get": {"calendar_id": "calendar-1"},
         "events.list": {"calendar_id": "primary"},
+        "events.delta": {
+            "end": "2026-08-01T10:00:00Z",
+            "page_size": 100,
+            "start": "2026-08-01T09:00:00Z",
+        },
         "events.get": {"calendar_id": "primary", "event_id": "event-1"},
         "events.window": {
             "calendar_id": "primary",
@@ -435,6 +440,7 @@ _EXPECTED_REQUESTS = {
         "calendars.list": (ConnectorMethod.GET, f"{_ME}/calendars"),
         "calendars.get": (ConnectorMethod.GET, _CALENDAR),
         "events.list": (ConnectorMethod.GET, f"{_PRIMARY_CALENDAR}/events"),
+        "events.delta": (ConnectorMethod.GET, f"{_ME}/calendarView/delta"),
         "events.get": (ConnectorMethod.GET, _EVENT),
         "events.window": (ConnectorMethod.GET, f"{_PRIMARY_CALENDAR}/calendarView"),
         "events.instances": (ConnectorMethod.GET, f"{_EVENT}/instances"),
@@ -1199,6 +1205,15 @@ def test_every_microsoft_operation_uses_its_fixed_final_graph_route() -> None:
                 {
                     "@odata.deltaLink": (
                         "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta"
+                        "?$deltatoken=next"
+                    )
+                }
+            ).encode()
+        elif operation.name == "events.delta":
+            delta_response = json.dumps(
+                {
+                    "@odata.deltaLink": (
+                        "https://graph.microsoft.com/v1.0/me/calendarView/delta"
                         "?$deltatoken=next"
                     )
                 }

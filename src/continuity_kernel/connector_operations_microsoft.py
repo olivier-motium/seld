@@ -417,6 +417,28 @@ _EVENTS_LIST = _object(
     },
     required=("calendar_id",),
 )
+_EVENTS_DELTA = _object(
+    {
+        "delta_link": _DELTA_LINK,
+        "end": _DATE_TIME,
+        "page_size": _CALENDAR_WINDOW_PAGE_SIZE,
+        "start": _DATE_TIME,
+    }
+)
+_EVENTS_DELTA["oneOf"] = [
+    _object(
+        {
+            "end": _DATE_TIME,
+            "page_size": _CALENDAR_WINDOW_PAGE_SIZE,
+            "start": _DATE_TIME,
+        },
+        required=("start", "end"),
+    ),
+    _object(
+        {"delta_link": _DELTA_LINK, "page_size": _CALENDAR_WINDOW_PAGE_SIZE},
+        required=("delta_link",),
+    ),
+]
 _ONLINE_MEETING_PROVIDER = _enum("teams_for_business")
 _EVENT_CREATE_PROPERTIES = {
     "attendees": _ATTENDEES,
@@ -838,6 +860,14 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
         ConnectorEffect.READ,
         _CALENDAR_READ_SCOPES,
         _EVENTS_LIST,
+    ),
+    _operation(
+        "outlook_calendar",
+        ConnectorMode.READ,
+        "events.delta",
+        ConnectorEffect.READ,
+        _CALENDAR_READ_SCOPES,
+        _EVENTS_DELTA,
     ),
     _operation(
         "outlook_calendar",

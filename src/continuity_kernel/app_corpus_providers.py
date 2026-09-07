@@ -21,6 +21,15 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Final
 
 from continuity_kernel.app_corpus import AppCorpusDocument, AppCorpusSyncResult
+from continuity_kernel.app_corpus_microsoft_calendar_delta import (
+    MicrosoftCalendarDeltaSync,
+    MicrosoftCalendarDeltaWindow,
+    calendar_delta_checkpoint_matches_window,
+    validate_calendar_delta_window,
+)
+from continuity_kernel.app_corpus_microsoft_calendar_delta import (
+    clear_calendar_delta_continuation as _clear_microsoft_calendar_delta_continuation,
+)
 from continuity_kernel.app_corpus_microsoft_delta import (
     MAX_CHECKPOINT_CHARS as _MICROSOFT_DELTA_CHECKPOINT_CHARS,
 )
@@ -1015,12 +1024,20 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
         runtime: ConnectorRuntime,
         *,
         sources: frozenset[str] | None = None,
+        calendar_delta_window: MicrosoftCalendarDeltaWindow | None = None,
     ) -> None:
         super().__init__(runtime)
         selected = frozenset({"outlook_mail", "outlook_calendar"}) if sources is None else sources
         if not selected or not selected <= {"outlook_mail", "outlook_calendar"}:
             raise ValidationError("Microsoft app corpus sources are invalid")
         self._sources = selected
+        self._calendar_delta_window = (
+            None
+            if calendar_delta_window is None
+            else validate_calendar_delta_window(
+                calendar_delta_window.start, calendar_delta_window.end
+            )
+        )
 
     def _initial_state(self) -> dict[str, Any]:
         return {
@@ -1032,11 +1049,25 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
         }
 
     def _completion_checkpoint(self, state: Mapping[str, Any]) -> dict[str, object]:
-        if "outlook_mail" not in self._sources:
-            return {}
-        mail = _mapping(state.get("mail"))
-        checkpoint = _optional_text(mail.get("delta_checkpoint"))
-        return {} if checkpoint is None else {"mail_delta_checkpoint": checkpoint}
+        checkpoint: dict[str, object] = {}
+        if "outlook_mail" in self._sources:
+            mail = _mapping(state.get("mail"))
+            mail_checkpoint = _optional_text(mail.get("delta_checkpoint"))
+            if mail_checkpoint is not None:
+                checkpoint["mail_delta_checkpoint"] = mail_checkpoint
+        if "outlook_calendar" in self._sources and self._calendar_delta_window is not None:
+            calendar = _mapping(state.get("calendar"))
+            calendar_checkpoint = _optional_text(calendar.get("delta_checkpoint"))
+            primary_calendar_id = _optional_text(calendar.get("primary_calendar_id"))
+            if (
+                primary_calendar_id is not None
+                and calendar_delta_checkpoint_matches_window(
+                    calendar_checkpoint, self._calendar_delta_window
+                )
+            ):
+                checkpoint["calendar_delta_checkpoint"] = calendar_checkpoint
+                checkpoint["calendar_delta_primary_calendar_id"] = primary_calendar_id
+        return checkpoint
 
     def _restore_completion_checkpoint(
         self, state: dict[str, Any], checkpoint: Mapping[str, Any]
@@ -1044,6 +1075,19 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
         value = _optional_text(checkpoint.get("mail_delta_checkpoint"))
         if value is not None:
             _mapping_state(state, "mail")["delta_checkpoint"] = value
+        if self._calendar_delta_window is None:
+            return
+        calendar_checkpoint = _optional_text(checkpoint.get("calendar_delta_checkpoint"))
+        primary_calendar_id = _optional_text(checkpoint.get("calendar_delta_primary_calendar_id"))
+        if (
+            primary_calendar_id is not None
+            and calendar_delta_checkpoint_matches_window(
+                calendar_checkpoint, self._calendar_delta_window
+            )
+        ):
+            calendar = _mapping_state(state, "calendar")
+            calendar["delta_checkpoint"] = calendar_checkpoint
+            calendar["primary_calendar_id"] = primary_calendar_id
 
     def _sync_round(
         self,
@@ -1151,11 +1195,7 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
         if "outlook_calendar" not in self._sources:
             calendar["done"] = True
         elif not calendar.get("done"):
-            _record_coverage_gap(
-                calendar,
-                "Outlook Calendar permanent deletions are not observable; "
-                "cancellations are preserved",
-            )
+            self._record_calendar_delta_coverage(calendar)
             if not calendar.get("listed"):
                 page = self._call(
                     "gsv_outlook_calendar_read",
@@ -1175,6 +1215,8 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                                 "Outlook calendar list exceeds the local sync bound"
                             )
                         known.append(calendar_id)
+                    if item.get("isDefaultCalendar") is True and calendar_id is not None:
+                        calendar["primary_calendar_id"] = calendar_id
                 calendar["calendar_ids"] = known
                 if page.continuation is None:
                     calendar["listed"] = True
@@ -1184,9 +1226,8 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
             else:
                 calendar_ids = _string_list(calendar.get("calendar_ids"), maximum=_MAX_CALENDARS)
                 index = _nonnegative_int(calendar.get("index"))
-                if index >= len(calendar_ids):
-                    calendar["done"] = True
-                else:
+                primary_calendar_id = _optional_text(calendar.get("primary_calendar_id"))
+                if index < len(calendar_ids):
                     calendar_id = calendar_ids[index]
                     page = self._call(
                         "gsv_outlook_calendar_read",
@@ -1209,12 +1250,112 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                     if page.continuation is None:
                         calendar.pop("event_continuation", None)
                         calendar["index"] = index + 1
-                        if index + 1 >= len(calendar_ids):
+                        if (
+                            self._calendar_delta_window is None
+                            and index + 1 >= len(calendar_ids)
+                        ):
                             calendar["done"] = True
                     else:
                         calendar["event_continuation"] = page.continuation
+                elif self._calendar_delta_window is None:
+                    calendar["done"] = True
+                elif primary_calendar_id is None:
+                    _record_coverage_gap(
+                        calendar,
+                        "Outlook Calendar primary calendar was not identified; permanent "
+                        "deletions remain unobservable",
+                    )
+                    calendar["done"] = True
+                else:
+                    _record_coverage_gap(
+                        calendar,
+                        "Outlook Calendar permanent deletions in the configured primary-calendar "
+                        "window are not current until its Graph delta cursor finishes",
+                    )
+                    delta = MicrosoftCalendarDeltaSync(
+                        self._runtime, window=self._calendar_delta_window
+                    ).sync(
+                        connection_id,
+                        checkpoint=_optional_text(calendar.get("delta_checkpoint")),
+                        limit=page_size,
+                    )
+                    scanned += delta.scanned
+                    for change in delta.changes:
+                        if not change.removed:
+                            documents.append(
+                                _outlook_event_document(
+                                    connection_id,
+                                    primary_calendar_id,
+                                    change.value,
+                                    fetched_at,
+                                )
+                            )
+                            continue
+                        try:
+                            detail = self._call(
+                                "gsv_outlook_calendar_read",
+                                connection_id,
+                                "events.get",
+                                {"calendar_id": "primary", "event_id": change.event_id},
+                            ).payload
+                        except ConnectorProviderError as exc:
+                            if exc.status != 404:
+                                raise
+                            documents.append(
+                                _outlook_calendar_delta_deleted_document(
+                                    connection_id,
+                                    primary_calendar_id,
+                                    change.event_id,
+                                    _revision(
+                                        change.value,
+                                        "changeKey",
+                                        "lastModifiedDateTime",
+                                        fallback=change.event_id,
+                                    ),
+                                    fetched_at,
+                                )
+                            )
+                            continue
+                        documents.append(
+                            _outlook_event_document(
+                                connection_id,
+                                primary_calendar_id,
+                                detail,
+                                fetched_at,
+                            )
+                        )
+                    calendar["delta_checkpoint"] = delta.checkpoint
+                    calendar["done"] = delta.complete
+                    if delta.complete:
+                        _clear_coverage_gaps(
+                            calendar,
+                            prefix=(
+                                "Outlook Calendar permanent deletions in the configured "
+                                "primary-calendar window"
+                            ),
+                        )
 
         return documents, scanned, bool(mail.get("done")) and bool(calendar.get("done"))
+
+    def _record_calendar_delta_coverage(self, calendar: dict[str, Any]) -> None:
+        if self._calendar_delta_window is None:
+            _record_coverage_gap(
+                calendar,
+                "Outlook Calendar permanent deletions are not observable; "
+                "cancellations are preserved",
+            )
+            return
+        _clear_coverage_gaps(
+            calendar,
+            prefix="Outlook Calendar permanent deletions are not observable",
+        )
+        _record_coverage_gap(
+            calendar,
+            "Outlook Calendar permanent deletions are observed only for the primary "
+            f"calendar from {self._calendar_delta_window.start} through "
+            f"{self._calendar_delta_window.end}; secondary calendars and events outside "
+            "that window are retained",
+        )
 
     def _outlook_documents(
         self,
@@ -1655,6 +1796,27 @@ def _outlook_event_document(
             updated_at=_optional_text(value.get("lastModifiedDateTime")),
         ),
         deleted=value.get("isCancelled") is True,
+    )
+
+
+def _outlook_calendar_delta_deleted_document(
+    connection_id: str,
+    calendar_id: str,
+    event_id: str,
+    revision: str,
+    fetched_at: str,
+) -> AppCorpusDocument:
+    return _document(
+        connection_id=connection_id,
+        provider="outlook_calendar",
+        object_id=f"outlook-calendar:{calendar_id}:{event_id}",
+        revision=revision,
+        fetched_at=fetched_at,
+        source_ref=f"outlook-calendar:event:{calendar_id}:{event_id}",
+        title="Outlook calendar event",
+        text="",
+        metadata=_metadata(calendar_id=calendar_id, permanent_deletion=True),
+        deleted=True,
     )
 
 
@@ -2103,7 +2265,12 @@ def _clear_continuations(value: object) -> None:
         checkpoint = value.get("delta_checkpoint")
         if isinstance(checkpoint, str):
             try:
-                value["delta_checkpoint"] = _clear_microsoft_delta_continuations(checkpoint)
+                clear = (
+                    _clear_microsoft_calendar_delta_continuation
+                    if "primary_calendar_id" in value
+                    else _clear_microsoft_delta_continuations
+                )
+                value["delta_checkpoint"] = clear(checkpoint)
             except ValidationError:
                 value.pop("delta_checkpoint", None)
         for child in value.values():
