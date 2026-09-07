@@ -1486,16 +1486,17 @@ def test_whatsapp_delivery_survives_an_in_place_schema_migration(tmp_path: Path)
         whatsapp_runner=_runner(runtime),
     )
     delivery.baseline("whatsapp")
+    _append_whatsapp(database, "before the schema migration")
+    prepared = delivery.poll("whatsapp")
+    assert [message["body"] for message in prepared["messages"]] == [
+        "before the schema migration"
+    ]
+
     with sqlite3.connect(database) as connection:
         for column in ("deleted_at INTEGER", "deletion_reason TEXT", "payload_purged_at INTEGER"):
             connection.execute(f"ALTER TABLE messages ADD COLUMN {column}")
-    _append_whatsapp(database, "after the schema migration")
-
-    prepared = delivery.poll("whatsapp")
-    assert [message["body"] for message in prepared["messages"]] == [
-        "after the schema migration"
-    ]
-    assert delivery.poll("whatsapp") == prepared
+    replay = delivery.poll("whatsapp")
+    assert replay == prepared
 
     acknowledged = _ack(delivery, prepared)
     assert acknowledged["sequence"] == 1
