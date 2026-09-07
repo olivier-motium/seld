@@ -133,6 +133,13 @@ _DRIVE_LIFECYCLE_FIELDS: Final = (
     "capabilities(canAddChildren,canAddFolderFromAnotherDrive,canDelete,"
     "canMoveItemOutOfDrive,canMoveItemWithinDrive,canTrash,canUntrash)"
 )
+_DRIVE_FILE_LIST_FIELDS: Final = (
+    "nextPageToken,files(id,name,mimeType,description,modifiedTime,version,webViewLink,resourceKey,size,trashed)"
+)
+_DRIVE_CHANGE_LIST_FIELDS: Final = (
+    "nextPageToken,newStartPageToken,changes(fileId,removed,time,"
+    "file(id,name,mimeType,description,modifiedTime,version,webViewLink,resourceKey,size,trashed))"
+)
 _DRIVE_FOLDER_MIME_TYPE: Final = "application/vnd.google-apps.folder"
 _DRIVE_DOWNLOAD_ERROR_STATUS: Final = {
     1: (499, "cancelled"),
@@ -1858,6 +1865,25 @@ def _execute_drive(
             credential=credential,
             query=_drive_file_list_query(values, continuation),
         )
+    if name == "changes.get_start_page_token":
+        _reject_continuation(continuation)
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path=f"{base}/changes/startPageToken",
+            credential=credential,
+            query=(("fields", "startPageToken"),),
+        )
+    if name == "changes.list":
+        return _json_request(
+            transport,
+            origin=ConnectorOrigin.GOOGLE,
+            method=ConnectorMethod.GET,
+            path=f"{base}/changes",
+            credential=credential,
+            query=_drive_changes_query(values, continuation),
+        )
     if name in {"permissions.list", "revisions.list"}:
         resource = name.split(".", 1)[0]
         return _json_request(
@@ -2694,6 +2720,8 @@ def _drive_content_request(
     transfer: ConnectorTransferContext | None,
 ) -> ConnectorAdapterResult:
     delivery = _drive_delivery(values)
+    resource_key = _drive_input_resource_key(values)
+    resource_binding = _drive_resource_key_binding(values, resource_key)
     if delivery == "artifact":
         if transfer is None:
             raise ValidationError("Google Drive artifact delivery requires transfer context")
@@ -2709,6 +2737,7 @@ def _drive_content_request(
             credential=credential.credential,
             query=query,
             max_bytes=MAX_ARTIFACT_BYTES,
+            google_drive_resource_key=resource_binding,
         )
         if artifact_response.artifact is None:
             raise ValidationError("Google Drive artifact delivery produced no receipt")
@@ -2721,11 +2750,11 @@ def _drive_content_request(
     maximum = _integer(values.get("max_chunk_size", _MAX_CONTENT_BYTES))
     if maximum < 1:
         raise ValidationError("Google Drive content chunk bound is invalid")
-    headers: Mapping[str, str] | None = None
+    headers = _drive_resource_key_headers(values, resource_key) or {}
     expected_statuses = frozenset({200})
     if range_download:
         last_byte = byte_offset + maximum - 1
-        headers = {"Range": f"bytes={byte_offset}-{last_byte}"}
+        headers["Range"] = f"bytes={byte_offset}-{last_byte}"
         expected_statuses = frozenset({206})
     elif byte_offset != 0:
         raise ValidationError("Google Drive exports do not support byte offsets")
@@ -2735,7 +2764,7 @@ def _drive_content_request(
         path=path,
         credential=credential.credential,
         query=query,
-        headers=headers,
+        headers=headers or None,
         expected_statuses=expected_statuses,
         response_bound=min(maximum, _MAX_CONTENT_BYTES),
     )
@@ -3281,7 +3310,8 @@ def _drive_file_list_query(
         clauses.append(f"mimeType = '{_drive_query_literal(_text(values['mime_type']))}'")
     if values.get("include_trashed") is False:
         clauses.append("trashed = false")
-    query = list(
+    query = [("fields", _DRIVE_FILE_LIST_FIELDS)]
+    query.extend(
         _optional_query(
             values,
             {
@@ -3300,6 +3330,22 @@ def _drive_file_list_query(
     if "spaces" in values:
         query.append(("spaces", ",".join(_strings(values["spaces"]))))
     query.extend(_continuation_query(continuation))
+    return tuple(query)
+
+
+def _drive_changes_query(
+    values: dict[str, object], continuation: object | None
+) -> tuple[tuple[str, str], ...]:
+    query = [
+        ("fields", _DRIVE_CHANGE_LIST_FIELDS),
+        ("includeCorpusRemovals", "true"),
+        ("includeRemoved", "true"),
+    ]
+    query.extend(_optional_query(values, {"page_size": "pageSize"}))
+    if continuation is None:
+        query.append(("pageToken", _required(values, "start_change_id")))
+    else:
+        query.extend(_continuation_query(continuation))
     return tuple(query)
 
 

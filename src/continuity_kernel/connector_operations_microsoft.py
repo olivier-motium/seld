@@ -326,9 +326,20 @@ _MESSAGES_LIST_COMMON_PROPERTIES = {
     "folder_id": _ID,
     "page_size": _MESSAGES_PAGE_SIZE,
 }
+_MESSAGES_LIST_INCREMENTAL_PROPERTIES = {
+    **_MESSAGES_LIST_COMMON_PROPERTIES,
+    "last_modified_since": _string(
+        128,
+        min_length=20,
+        pattern=r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$",
+    ),
+    "order_by": _enum("received_at", "sent_at", "subject", "last_modified_at"),
+    "sort_direction": _enum("ascending", "descending"),
+}
 _MESSAGES_LIST = _object(
     {
         **_MESSAGES_LIST_COMMON_PROPERTIES,
+        "last_modified_since": _MESSAGES_LIST_INCREMENTAL_PROPERTIES["last_modified_since"],
         "is_read": {"type": "boolean"},
         "order_by": _enum("received_at", "sent_at", "subject", "last_modified_at"),
         "search": _string(4_096),
@@ -350,6 +361,36 @@ _MESSAGES_LIST["oneOf"] = [
             "sort_direction": _enum("ascending", "descending"),
         },
         required=("order_by",),
+    ),
+    _object(_MESSAGES_LIST_INCREMENTAL_PROPERTIES, required=("last_modified_since",)),
+]
+_DELTA_LINK = _string(16_384, min_length=1)
+_FOLDERS_DELTA = _object(
+    {
+        "delta_link": _DELTA_LINK,
+        "page_size": _PAGE_SIZE,
+    }
+)
+_FOLDERS_DELTA["oneOf"] = [
+    _object({"page_size": _PAGE_SIZE}),
+    _object({"delta_link": _DELTA_LINK}, required=("delta_link",)),
+]
+_MESSAGES_DELTA = _object(
+    {
+        "delta_link": _DELTA_LINK,
+        "folder_id": _ID,
+        "page_size": _MESSAGES_PAGE_SIZE,
+    },
+    required=("folder_id",),
+)
+_MESSAGES_DELTA["oneOf"] = [
+    _object(
+        {"folder_id": _ID, "page_size": _MESSAGES_PAGE_SIZE},
+        required=("folder_id",),
+    ),
+    _object(
+        {"delta_link": _DELTA_LINK, "folder_id": _ID},
+        required=("folder_id", "delta_link"),
     ),
 ]
 _MESSAGES_GET = _object(
@@ -463,10 +504,26 @@ MICROSOFT_OPERATIONS: tuple[OperationSpec, ...] = (
     _operation(
         "outlook_mail",
         ConnectorMode.READ,
+        "folders.delta",
+        ConnectorEffect.READ,
+        _MAIL_READ_SCOPES,
+        _FOLDERS_DELTA,
+    ),
+    _operation(
+        "outlook_mail",
+        ConnectorMode.READ,
         "messages.list",
         ConnectorEffect.READ,
         _MAIL_READ_SCOPES,
         _MESSAGES_LIST,
+    ),
+    _operation(
+        "outlook_mail",
+        ConnectorMode.READ,
+        "messages.delta",
+        ConnectorEffect.READ,
+        _MAIL_READ_SCOPES,
+        _MESSAGES_DELTA,
     ),
     _operation(
         "outlook_mail",

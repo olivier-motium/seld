@@ -1474,14 +1474,73 @@ def test_whatsapp_pending_replay_excludes_messages_that_arrive_later(tmp_path: P
 
 
 @_POSIX_STORAGE
-def test_empty_pending_replay_leaves_a_later_message_for_the_next_poll(tmp_path: Path) -> None:
+@pytest.mark.parametrize("pending_kind", ["message", "empty", "legacy_empty"])
+def test_whatsapp_delivery_survives_an_in_place_schema_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_kind: str,
+) -> None:
+    vault, _selected = _selected_vault(tmp_path, "whatsapp")
+    store = tmp_path / "wacli-store"
+    database = _whatsapp_store(store)
+    runtime = _runtime(tmp_path)
+    delivery = LocalSourceDelivery(
+        vault,
+        store_root=store,
+        whatsapp_runtime=runtime,
+        whatsapp_runner=_runner(runtime),
+    )
+    delivery.baseline("whatsapp")
+    if pending_kind == "message":
+        _append_whatsapp(database, "before the schema migration")
+    with monkeypatch.context() as legacy:
+        if pending_kind == "legacy_empty":
+            digest = local_source_delivery._delta_digest
+            legacy.setattr(
+                local_source_delivery,
+                "_delta_digest",
+                lambda delta: digest(delta, legacy_store_reconciled=False),
+            )
+        prepared = delivery.poll("whatsapp")
+    assert len(prepared["messages"]) == (1 if pending_kind == "message" else 0)
+
+    with sqlite3.connect(database) as connection:
+        for column in ("deleted_at INTEGER", "deletion_reason TEXT", "payload_purged_at INTEGER"):
+            connection.execute(f"ALTER TABLE messages ADD COLUMN {column}")
+    _append_whatsapp(database, "arrived after the prepared delivery")
+    replay = delivery.poll("whatsapp")
+    assert replay == prepared
+
+    acknowledged = _ack(delivery, prepared)
+    assert acknowledged["sequence"] == 1
+    following = delivery.poll("whatsapp")
+    assert [message["body"] for message in following["messages"]] == [
+        "arrived after the prepared delivery"
+    ]
+
+
+@_POSIX_STORAGE
+@pytest.mark.parametrize("legacy_digest", [False, True])
+def test_empty_pending_replay_leaves_a_later_message_for_the_next_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_digest: bool,
+) -> None:
     vault, _selected = _selected_vault(tmp_path, "apple_messages")
     store = tmp_path / "Messages"
     database = _apple_store(store)
     delivery = LocalSourceDelivery(vault, store_root=store)
     delivery.baseline("apple_messages")
 
-    empty = delivery.poll("apple_messages", limit=2)
+    with monkeypatch.context() as legacy:
+        if legacy_digest:
+            digest = local_source_delivery._delta_digest
+            legacy.setattr(
+                local_source_delivery,
+                "_delta_digest",
+                lambda delta: digest(delta, legacy_store_reconciled=False),
+            )
+        empty = delivery.poll("apple_messages", limit=2)
     _append_apple(database, "arrived after the empty delivery")
     replay = delivery.poll("apple_messages", limit=99)
 

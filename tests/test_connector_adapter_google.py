@@ -704,6 +704,10 @@ def _sample(operation: OperationSpec) -> dict[str, object]:
                 "send_updates": "none",
             }
     if operation.provider == "google_drive":
+        if name == "changes.get_start_page_token":
+            return {}
+        if name == "changes.list":
+            return {"page_size": 1, "start_change_id": "first-change"}
         if name in {"drives.list", "files.list"}:
             return {"page_size": 1}
         if name in {"permissions.list", "comments.list", "revisions.list"}:
@@ -4373,6 +4377,7 @@ def test_drive_artifact_download_uses_streaming_receipt_without_path_payload(
             "file_id": "file",
             "filename": "report.pdf",
             "mime_type": "application/pdf",
+            "resource_key": "provider-key",
         },
         continuation=None,
         credential=_credential(),
@@ -4390,6 +4395,7 @@ def test_drive_artifact_download_uses_streaming_receipt_without_path_payload(
         assert call["path"] == "/drive/v3/files/file"
         assert call["query"] == (("alt", "media"),)
         assert call["max_bytes"] == 5 * 1024**4
+        assert call["google_drive_resource_key"] == ("file", "provider-key")
     finally:
         if result.artifact is not None:
             scope.complete(result.artifact)
@@ -7174,6 +7180,10 @@ def test_drive_shared_drive_routes_remain_fixed_and_require_support() -> None:
     )
     assert transport.calls[-1]["path"] == "/drive/v3/files"
     assert transport.calls[-1]["query"] == (
+        (
+            "fields",
+            "nextPageToken,files(id,name,mimeType,description,modifiedTime,version,webViewLink,resourceKey,size,trashed)",
+        ),
         ("corpora", "drive"),
         ("driveId", "shared-drive"),
         ("includeItemsFromAllDrives", "true"),
@@ -7199,6 +7209,64 @@ def test_drive_shared_drive_routes_remain_fixed_and_require_support() -> None:
             credential=credential,
             transport=transport,
         )
+
+
+def test_drive_change_routes_use_a_fixed_my_drive_cursor_and_provider_continuation() -> None:
+    adapter = GoogleConnectorAdapter()
+    transport = _Transport(
+        bodies=[
+            b'{"startPageToken":"first-change"}',
+            b'{"nextPageToken":"next-change"}',
+            b'{"newStartPageToken":"final-change"}',
+        ]
+    )
+    credential = _credential()
+
+    start = adapter.execute(
+        _operation("google_drive", "changes.get_start_page_token"),
+        {},
+        continuation=None,
+        credential=credential,
+        transport=transport,
+    )
+    middle = adapter.execute(
+        _operation("google_drive", "changes.list"),
+        {"page_size": 1000, "start_change_id": "first-change"},
+        continuation=None,
+        credential=credential,
+        transport=transport,
+    )
+    final = adapter.execute(
+        _operation("google_drive", "changes.list"),
+        {"page_size": 1000, "start_change_id": "first-change"},
+        continuation=middle.continuation,
+        credential=credential,
+        transport=transport,
+    )
+
+    assert start.payload == {"startPageToken": "first-change"}
+    assert middle.continuation == "next-change"
+    assert final.payload == {"newStartPageToken": "final-change"}
+    assert transport.calls[0]["path"] == "/drive/v3/changes/startPageToken"
+    assert transport.calls[0]["query"] == (("fields", "startPageToken"),)
+    expected_fields = (
+        "nextPageToken,newStartPageToken,changes(fileId,removed,time,"
+        "file(id,name,mimeType,description,modifiedTime,version,webViewLink,resourceKey,size,trashed))"
+    )
+    assert transport.calls[1]["query"] == (
+        ("fields", expected_fields),
+        ("includeCorpusRemovals", "true"),
+        ("includeRemoved", "true"),
+        ("pageSize", "1000"),
+        ("pageToken", "first-change"),
+    )
+    assert transport.calls[2]["query"] == (
+        ("fields", expected_fields),
+        ("includeCorpusRemovals", "true"),
+        ("includeRemoved", "true"),
+        ("pageSize", "1000"),
+        ("pageToken", "next-change"),
+    )
 
 
 def test_drive_downloads_construct_ranges_and_return_provider_offsets() -> None:

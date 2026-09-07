@@ -744,6 +744,9 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         _close(process)
 
     expected = {
+        "gsv_apps_read",
+        "gsv_apps_search",
+        "gsv_apps_status",
         "gsv_backup_create",
         "gsv_context",
         "gsv_connection_list",

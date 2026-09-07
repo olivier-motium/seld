@@ -15,6 +15,7 @@ from typing import IO, Any, Final, cast
 
 import continuity_kernel.update as self_update
 from continuity_kernel import __version__, resident_import
+from continuity_kernel.app_corpus import AppCorpusCompanion
 from continuity_kernel.config import resolve_vault
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_contract import validate_json
@@ -479,6 +480,27 @@ def _call(
                 timeout_seconds=_integer(values, "timeout_seconds", 20),
             )
         )
+    if name == "gsv_apps_status":
+        corpus = AppCorpusCompanion(vault.root)
+        return {
+            "corpus": asdict(corpus.status()),
+            "scopes": [asdict(item) for item in corpus.scopes()],
+        }
+    if name == "gsv_apps_search":
+        return asdict(
+            AppCorpusCompanion(vault.root).search(
+                _string(values, "query"),
+                connection_id=_optional_string(values, "connection_id"),
+                provider=_optional_string(values, "provider"),
+                limit=_integer(values, "limit", 8),
+                timeout_seconds=_integer(values, "timeout_seconds", 20),
+            )
+        )
+    if name == "gsv_apps_read":
+        document = AppCorpusCompanion(vault.root).read(
+            _string(values, "connection_id"), _string(values, "object_id")
+        )
+        return asdict(document) if document is not None else {"document": None}
     if name == "gsv_task_list":
         return _task_list_page(vault, values)
     if name == "gsv_task_show":
@@ -1720,6 +1742,38 @@ TOOLS: Final = [
             "timeout_seconds": {"maximum": 60, "minimum": 1, "type": "integer"},
         },
         ("query",),
+        read_only=True,
+    ),
+    _tool(
+        "gsv_apps_status",
+        (
+            "Read selected app corpus coverage and local QMD readiness. Provider content stays "
+            "outside the Seld vault. This does not contact a provider."
+        ),
+        {},
+        read_only=True,
+    ),
+    _tool(
+        "gsv_apps_search",
+        (
+            "Search the host-local corpus of explicitly selected app content. Scope results with "
+            "one exact connection or provider when the current work requires it."
+        ),
+        {
+            "connection_id": TEXT,
+            "limit": {"maximum": 20, "minimum": 1, "type": "integer"},
+            "provider": TEXT,
+            "query": TEXT,
+            "timeout_seconds": {"maximum": 60, "minimum": 1, "type": "integer"},
+        },
+        ("query",),
+        read_only=True,
+    ),
+    _tool(
+        "gsv_apps_read",
+        "Read one exact host-local app object by its connection and source object IDs.",
+        {"connection_id": TEXT, "object_id": TEXT},
+        ("connection_id", "object_id"),
         read_only=True,
     ),
     _tool(

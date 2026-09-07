@@ -278,7 +278,9 @@ def _input_for(operation: OperationSpec) -> dict[str, object]:
         values: dict[str, dict[str, object]] = {
             "folders.list": {},
             "folders.get": {"folder_id": "folder-1"},
+            "folders.delta": {"page_size": 100},
             "messages.list": {"folder_id": "folder-1"},
+            "messages.delta": {"folder_id": "folder-1", "page_size": 100},
             "messages.get": {"message_id": "message-1"},
             "messages.update": {"is_read": True, "message_id": "message-1"},
             "messages.mime": {"message_id": "message-1"},
@@ -395,7 +397,9 @@ _EXPECTED_REQUESTS = {
     "outlook_mail": {
         "folders.list": (ConnectorMethod.GET, f"{_ME}/mailFolders"),
         "folders.get": (ConnectorMethod.GET, _MAIL_FOLDER),
+        "folders.delta": (ConnectorMethod.GET, f"{_ME}/mailFolders/delta"),
         "messages.list": (ConnectorMethod.GET, f"{_MAIL_FOLDER}/messages"),
+        "messages.delta": (ConnectorMethod.GET, f"{_MAIL_FOLDER}/messages/delta"),
         "messages.get": (ConnectorMethod.GET, _MESSAGE),
         "messages.mime": (ConnectorMethod.GET, f"{_MESSAGE}/$value"),
         "attachments.list": (ConnectorMethod.GET, _MAIL_ATTACHMENT),
@@ -1185,7 +1189,21 @@ def test_every_microsoft_operation_uses_its_fixed_final_graph_route() -> None:
     assert expected_keys == catalog_keys
     restore_handle: str | None = None
     for operation in MICROSOFT_OPERATIONS:
-        transport = _FakeTransport()
+        delta_response = b"{}"
+        if operation.name == "folders.delta":
+            delta_response = json.dumps(
+                {"@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=next"}
+            ).encode()
+        elif operation.name == "messages.delta":
+            delta_response = json.dumps(
+                {
+                    "@odata.deltaLink": (
+                        "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta"
+                        "?$deltatoken=next"
+                    )
+                }
+            ).encode()
+        transport = _FakeTransport(delta_response)
         input_value = _input_for(operation)
         if operation.provider == "outlook_mail" and operation.name == "messages.restore":
             assert restore_handle is not None
@@ -1376,6 +1394,131 @@ def test_immutable_ids_and_continuations_are_internal_and_stripped_from_payload(
         assert raised.value.code == "invalid_next_link"
 
 
+def test_folder_delta_uses_prefer_page_size_without_an_unsupported_top_query() -> None:
+    adapter = MicrosoftConnectorAdapter()
+    operation = _operation("outlook_mail", ConnectorMode.READ, "folders.delta")
+    transport = _FakeTransport(
+        json.dumps(
+            {
+                "@odata.deltaLink": (
+                    "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=next"
+                ),
+                "value": [],
+            }
+        ).encode()
+    )
+
+    adapter.execute(
+        operation,
+        {"page_size": 5},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert transport.calls[0]["query"] == ()
+    assert transport.calls[0]["headers"] == {
+        "Prefer": 'IdType="ImmutableId", odata.maxpagesize=5'
+    }
+
+
+def test_delta_reads_keep_only_a_valid_opaque_delta_link_for_its_fixed_route() -> None:
+    delta_link = "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$deltatoken=next"
+    page_link = "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$skiptoken=page-2&$top=50"
+    operation = _operation("outlook_mail", ConnectorMode.READ, "messages.delta")
+    adapter = MicrosoftConnectorAdapter()
+    first_transport = _FakeTransport(
+        json.dumps({"@odata.nextLink": page_link, "value": [{"id": "message-1"}]}).encode()
+    )
+
+    first = adapter.execute(
+        operation,
+        {"folder_id": "folder-1", "page_size": 50},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, first_transport),
+    )
+
+    assert first.continuation == {
+        "path": "/v1.0/me/mailFolders/folder-1/messages/delta",
+        "query": [["$skiptoken", "page-2"]],
+    }
+    adapter.execute(
+        operation,
+        {"folder_id": "folder-1", "page_size": 50},
+        continuation=first.continuation,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, first_transport),
+    )
+    assert first_transport.calls[1]["query"] == (("$top", "50"), ("$skiptoken", "page-2"))
+
+    final_transport = _FakeTransport(
+        json.dumps({"@odata.deltaLink": delta_link, "value": []}).encode()
+    )
+    final = adapter.execute(
+        operation,
+        {"folder_id": "folder-1", "delta_link": delta_link},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, final_transport),
+    )
+    assert final.payload == {"@odata.deltaLink": delta_link, "value": []}
+    assert final_transport.calls[0]["query"] == (("$deltatoken", "next"),)
+
+
+def test_parenthesized_message_delta_link_matches_an_encoded_fixed_folder_route() -> None:
+    adapter = MicrosoftConnectorAdapter()
+    operation = _operation("outlook_mail", ConnectorMode.READ, "messages.delta")
+    transport = _FakeTransport(
+        json.dumps(
+            {
+                "@odata.deltaLink": (
+                    "https://graph.microsoft.com/v1.0/me/mailFolders('folder=one')/messages/delta"
+                    "?$deltatoken=next"
+                ),
+                "value": [],
+            }
+        ).encode()
+    )
+
+    result = adapter.execute(
+        operation,
+        {"folder_id": "folder=one", "page_size": 5},
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert result.continuation is None
+    assert transport.calls[0]["path"] == "/v1.0/me/mailFolders/folder%3Done/messages/delta"
+
+
+@pytest.mark.parametrize(
+    "delta_link",
+    (
+        "https://example.test/v1.0/me/mailFolders/delta?$deltatoken=next",
+        "https://graph.microsoft.com/v1.0/me/messages/delta?$deltatoken=next",
+        "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$skiptoken=next",
+        "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=next&$filter=x",
+    ),
+)
+def test_delta_link_cannot_escape_its_fixed_graph_collection(delta_link: str) -> None:
+    adapter = MicrosoftConnectorAdapter()
+    transport = _FakeTransport()
+    operation = _operation("outlook_mail", ConnectorMode.READ, "folders.delta")
+
+    with pytest.raises(ValidationError):
+        adapter.execute(
+            operation,
+            {"delta_link": delta_link},
+            continuation=None,
+            credential=_credential(),
+            transport=cast(ConnectorTransport, transport),
+        )
+    assert transport.calls == []
+
+
+
 def test_message_continuation_binds_search_projection_and_page_limit() -> None:
     operation = _operation("outlook_mail", ConnectorMode.READ, "messages.list")
     input_value = {
@@ -1488,6 +1631,112 @@ def test_message_continuation_binds_search_projection_and_page_limit() -> None:
                 transport=cast(ConnectorTransport, forged),
             )
         assert raised.value.code == "invalid_next_link"
+
+
+def test_message_incremental_filter_is_bound_across_graph_pages() -> None:
+    operation = _operation("outlook_mail", ConnectorMode.READ, "messages.list")
+    input_value = {
+        "last_modified_since": "2026-09-05T10:00:00Z",
+        "order_by": "last_modified_at",
+        "page_size": 50,
+        "sort_direction": "descending",
+    }
+    filter_value = "lastModifiedDateTime ge 2026-09-05T10:00:00Z"
+    next_query = [
+        ("$skiptoken", "opaque-page-two"),
+        ("$top", "50"),
+        ("$orderby", "lastModifiedDateTime desc"),
+        ("$filter", filter_value),
+        ("$select", _MESSAGE_SUMMARY_SELECT),
+    ]
+    transport = _FakeTransport(
+        json.dumps(
+            {
+                "@odata.nextLink": (
+                    "https://graph.microsoft.com/v1.0/me/messages?" + urlencode(next_query)
+                ),
+                "value": [],
+            }
+        ).encode()
+    )
+    adapter = MicrosoftConnectorAdapter()
+
+    result = adapter.execute(
+        operation,
+        input_value,
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert transport.calls[0]["query"] == (
+        ("$select", _MESSAGE_SUMMARY_SELECT),
+        ("$top", "50"),
+        ("$orderby", "lastModifiedDateTime desc"),
+        ("$filter", filter_value),
+    )
+    adapter.execute(
+        operation,
+        input_value,
+        continuation=result.continuation,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.calls[1]["query"] == (
+        ("$select", _MESSAGE_SUMMARY_SELECT),
+        ("$top", "50"),
+        ("$orderby", "lastModifiedDateTime desc"),
+        ("$filter", filter_value),
+        ("$skiptoken", "opaque-page-two"),
+    )
+
+
+def test_calendar_parenthesized_next_link_matches_the_fixed_calendar_route() -> None:
+    operation = _operation("outlook_calendar", ConnectorMode.READ, "events.list")
+    input_value = {
+        "calendar_id": "calendar-123",
+        "order_by": "last_modified_at",
+        "page_size": 50,
+        "sort_direction": "descending",
+    }
+    next_query = [
+        ("$skiptoken", "opaque-page-two"),
+        ("$top", "50"),
+        ("$orderby", "lastModifiedDateTime desc"),
+    ]
+    transport = _FakeTransport(
+        json.dumps(
+            {
+                "@odata.nextLink": (
+                    "https://graph.microsoft.com/v1.0/me/calendars('calendar-123')/events?"
+                    + urlencode(next_query)
+                ),
+                "value": [],
+            }
+        ).encode()
+    )
+    adapter = MicrosoftConnectorAdapter()
+
+    result = adapter.execute(
+        operation,
+        input_value,
+        continuation=None,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+
+    assert result.continuation == {
+        "path": "/v1.0/me/calendars/calendar-123/events",
+        "query": [["$skiptoken", "opaque-page-two"]],
+    }
+    adapter.execute(
+        operation,
+        input_value,
+        continuation=result.continuation,
+        credential=_credential(),
+        transport=cast(ConnectorTransport, transport),
+    )
+    assert transport.calls[1]["path"] == "/v1.0/me/calendars/calendar-123/events"
 
 
 def test_tampered_microsoft_continuation_replay_fails_before_transport() -> None:
