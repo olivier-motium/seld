@@ -1423,8 +1423,11 @@ def test_folder_delta_uses_prefer_page_size_without_an_unsupported_top_query() -
 
 
 def test_delta_reads_keep_only_a_valid_opaque_delta_link_for_its_fixed_route() -> None:
-    delta_link = "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$deltatoken=next"
-    page_link = "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$skiptoken=page-2&$top=50"
+    delta_link = (
+        "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta"
+        "?$deltatoken=next&$top=1"
+    )
+    page_link = "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$skiptoken=page-2"
     operation = _operation("outlook_mail", ConnectorMode.READ, "messages.delta")
     adapter = MicrosoftConnectorAdapter()
     first_transport = _FakeTransport(
@@ -1450,7 +1453,14 @@ def test_delta_reads_keep_only_a_valid_opaque_delta_link_for_its_fixed_route() -
         credential=_credential(),
         transport=cast(ConnectorTransport, first_transport),
     )
-    assert first_transport.calls[1]["query"] == (("$top", "50"), ("$skiptoken", "page-2"))
+    assert first_transport.calls[0]["query"] == ()
+    assert first_transport.calls[0]["headers"] == {
+        "Prefer": 'IdType="ImmutableId", odata.maxpagesize=50'
+    }
+    assert first_transport.calls[1]["query"] == (("$skiptoken", "page-2"),)
+    assert first_transport.calls[1]["headers"] == {
+        "Prefer": 'IdType="ImmutableId", odata.maxpagesize=50'
+    }
 
     final_transport = _FakeTransport(
         json.dumps({"@odata.deltaLink": delta_link, "value": []}).encode()

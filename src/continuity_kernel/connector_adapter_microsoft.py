@@ -711,7 +711,8 @@ class MicrosoftConnectorAdapter:
                     body_format=shape.body_format,
                     max_page_size=(
                         _integer(request_data["page_size"])
-                        if known.name == "folders.delta" and "page_size" in request_data
+                        if known.name in {"folders.delta", "messages.delta"}
+                        and "page_size" in request_data
                         else None
                     ),
                 ),
@@ -1074,7 +1075,11 @@ def _mail_shape(name: str, data: dict[str, object]) -> _RequestShape:
             required_select=select,
         )
     if name == "messages.delta":
-        return _delta_shape(data, f"{_folder_path(_text(data, 'folder_id'))}/messages/delta")
+        return _delta_shape(
+            data,
+            f"{_folder_path(_text(data, 'folder_id'))}/messages/delta",
+            page_size_in_query=False,
+        )
     if name == "messages.get":
         select = _message_select(data, default=_MESSAGE_DETAIL_FIELDS)
         return _RequestShape(
@@ -3012,6 +3017,7 @@ def _validated_delta_link(value: object, *, path: str) -> tuple[tuple[str, str],
             if top_seen or not _is_bounded_page_size(item):
                 raise ValidationError("Outlook delta link is invalid")
             top_seen = True
+            continue
         else:
             raise ValidationError("Outlook delta link is invalid")
         result.append((key, item))

@@ -248,13 +248,17 @@ def _next_round(prior: Mapping[str, Any]) -> dict[str, Any]:
 
 def _folder_input(state: Mapping[str, Any], limit: int) -> dict[str, object]:
     delta_link = _optional_text(state.get("folder_delta_link"))
-    return {"delta_link": delta_link} if delta_link is not None else {"page_size": limit}
+    return (
+        {"delta_link": delta_link, "page_size": limit}
+        if delta_link is not None
+        else {"page_size": limit}
+    )
 
 
 def _message_input(folder_id: str, folder: Mapping[str, Any], limit: int) -> dict[str, object]:
     delta_link = _optional_text(folder.get("delta_link"))
     if delta_link is not None:
-        return {"delta_link": delta_link, "folder_id": folder_id}
+        return {"delta_link": delta_link, "folder_id": folder_id, "page_size": limit}
     return {"folder_id": folder_id, "page_size": limit}
 
 

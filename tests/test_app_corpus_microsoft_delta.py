@@ -146,7 +146,8 @@ def test_completed_checkpoint_reuses_opaque_delta_links_in_a_fresh_runtime() -> 
 
     assert resumed.complete is False
     assert resumed_runtime.calls[0][1]["input"] == {
-        "delta_link": "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=folders"
+        "delta_link": "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=folders",
+        "page_size": 10,
     }
 
 

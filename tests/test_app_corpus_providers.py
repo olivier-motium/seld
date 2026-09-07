@@ -884,7 +884,8 @@ def test_microsoft_completed_checkpoint_reuses_graph_delta_links() -> None:
 
     third_input = third_runtime.calls[0][1]["input"]
     assert third_input == {
-        "delta_link": "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=folders"
+        "delta_link": "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=folders",
+        "page_size": 2,
     }
     assert complete.freshness["status"] == "complete"
 
