@@ -111,7 +111,7 @@ class FakeLocalDelivery:
 
     def poll(self, source: str, *, limit: int) -> dict[str, object]:
         assert source == "whatsapp"
-        assert limit == 25
+        assert limit == 100
         return {
             "source": source,
             "messages": [{"body": "PRIVATE TEST MESSAGE"}],
@@ -129,7 +129,7 @@ class FakeLocalDelivery:
 class UnavailableLocalDelivery:
     def poll(self, source: str, *, limit: int) -> dict[str, object]:
         assert source == "whatsapp"
-        assert limit == 25
+        assert limit == 100
         raise SetupError("synthetic local tool is unavailable")
 
 

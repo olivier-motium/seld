@@ -35,7 +35,7 @@ from continuity_kernel.source_state import SourceCompleteness, SourceObservation
 from continuity_kernel.vault import Vault
 
 SUPPORTED_PULSE_SOURCES = SUPPORTED_SOURCE_IDS | frozenset(SUPPORTED_LOCAL_SOURCES) | {"discord"}
-MAX_PULSE_SOURCE_LIMIT = 25
+MAX_PULSE_SOURCE_LIMIT = 100
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REPORT_REF = re.compile(
     r"^source-report:(?P<identifier>[0-9a-f-]{36})@(?P<revision>[0-9a-f]{64})$"
@@ -154,10 +154,15 @@ class PulseSourceAdapter:
         self._committed_fingerprints: dict[str, str] = {}
         self._discord_receipts_recorded: set[str] = set()
 
-    def acquire(self, source_id: str, limit: int = MAX_PULSE_SOURCE_LIMIT) -> AcquiredSourceWindow:
+    def acquire(self, source_id: str, limit: int | None = None) -> AcquiredSourceWindow:
         """Read one currently selected source without advancing its receipt."""
 
         clean_source = _source_id(source_id)
+        if limit is None:
+            # Local delivery already supports bounded batches of 100. Keep
+            # related backlog updates together instead of asking Luna to judge
+            # four separate pages; connector reads retain their smaller window.
+            limit = 100 if clean_source in SUPPORTED_LOCAL_SOURCES else 25
         _limit(limit)
         snapshot = self._selected_snapshot(clean_source)
         observed_at = _format_now(self._now())
