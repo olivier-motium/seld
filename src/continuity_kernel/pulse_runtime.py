@@ -482,6 +482,8 @@ class PulseRuntime:
                         "last_processed_at": _now(),
                         "coverage_status": window.status,
                         "error_code": window.error_code,
+                        "failed_stage": None,
+                        "failure_type": None,
                         "incident_signature": _source_access_signature(self.vault, source),
                         "configuration": self._sessions[source].configuration
                         if source in self._sessions
@@ -715,6 +717,8 @@ class PulseRuntime:
             "report_id": report.identifier,
             "coverage_status": window.status,
             "error_code": window.error_code,
+            "failed_stage": None,
+            "failure_type": None,
             "incident_signature": _source_access_signature(self.vault, source),
         }
 
