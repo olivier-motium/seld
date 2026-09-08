@@ -34,6 +34,7 @@ from continuity_kernel.slack_tasks import SlackTaskReader
 from continuity_kernel.source_state import SourceCompleteness, SourceObservation, source_fingerprint
 from continuity_kernel.vault import Vault
 
+SUPPORTED_PULSE_SOURCES = SUPPORTED_SOURCE_IDS | frozenset(SUPPORTED_LOCAL_SOURCES) | {"discord"}
 MAX_PULSE_SOURCE_LIMIT = 25
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REPORT_REF = re.compile(

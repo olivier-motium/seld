@@ -32,7 +32,11 @@ from continuity_kernel.pulse_codex import LunaSession, LunaTurnResult
 from continuity_kernel.pulse_curation import PulseCurationBridge
 from continuity_kernel.pulse_delivery import PulseDelivery
 from continuity_kernel.pulse_reports import PulseDecision, PulseReport, PulseReportStore
-from continuity_kernel.pulse_sources import AcquiredSourceWindow, PulseSourceAdapter
+from continuity_kernel.pulse_sources import (
+    SUPPORTED_PULSE_SOURCES,
+    AcquiredSourceWindow,
+    PulseSourceAdapter,
+)
 from continuity_kernel.sense_sweep import AUTH_OR_TOOL_INCIDENT_ERROR_CODES
 from continuity_kernel.vault import Vault
 
@@ -216,7 +220,16 @@ class PulseRuntime:
             raise ValidationError("Pulse source interval or concurrency is outside its bound")
         self.vault = vault
         selected = vault.get_source_snapshot().selected_sources
-        self.sources = tuple(sources) if sources is not None else selected
+        self.sources = (
+            tuple(sources)
+            if sources is not None
+            else tuple(source for source in selected if source in SUPPORTED_PULSE_SOURCES)
+        )
+        if any(source not in SUPPORTED_PULSE_SOURCES for source in self.sources):
+            raise ValidationError("Requested source has no event reader; retain Pulse fallback")
+        self.unmonitored_sources = tuple(
+            source for source in selected if source not in self.sources
+        )
         if not self.sources or len(set(self.sources)) != len(self.sources):
             raise ValidationError("Pulse requires distinct selected sources")
         if any(source not in selected for source in self.sources):
@@ -254,6 +267,7 @@ class PulseRuntime:
                         "pid": os.getpid(),
                         "started_at": _now(),
                         "monitored_sources": list(self.sources),
+                        "unmonitored_sources": list(self.unmonitored_sources),
                         "poll_seconds": self.poll_seconds,
                     }
                 )
@@ -491,12 +505,9 @@ class PulseRuntime:
                     "observed_at": window.observed_at,
                 }
             observation = self.vault.get_source_snapshot().observation(source)
-            if (
-                (window is not None and window.result == "failure")
-                or (
-                    observation is not None
-                    and observation.error_code in AUTH_OR_TOOL_INCIDENT_ERROR_CODES
-                )
+            if (window is not None and window.result == "failure") or (
+                observation is not None
+                and observation.error_code in AUTH_OR_TOOL_INCIDENT_ERROR_CODES
             ):
                 raise ValidationError("Source tools are unavailable until access is repaired")
             if source == "slack" and name == "source_search":

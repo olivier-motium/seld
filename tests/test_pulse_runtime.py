@@ -135,7 +135,7 @@ def test_runtime_recovers_a_committed_report_without_another_model_or_actual_wak
 ) -> None:
     vault.select_sources(
         expected_revision=vault.get_source_snapshot().revision,
-        sources=("slack",),
+        sources=("slack", "gsv"),
     )
     _bind_pulse(vault)
     adapter = FakeSourceAdapter(vault)
@@ -155,13 +155,14 @@ def test_runtime_recovers_a_committed_report_without_another_model_or_actual_wak
     )
     runtime = PulseRuntime(
         vault,
-        sources=("slack",),
         session_factory=factory,  # type: ignore[arg-type]
         adapter=adapter,  # type: ignore[arg-type]
         wake_handler=delivery.queue_wake,
     )
 
-    asyncio.run(runtime.run(once=True))
+    state = asyncio.run(runtime.run(once=True))
+    assert state["monitored_sources"] == ["slack"]
+    assert state["unmonitored_sources"] == ["gsv"]
 
     reports = PulseReportStore(vault.root).recent(source_id="slack").reports
     assert len(reports) == 1
@@ -175,7 +176,6 @@ def test_runtime_recovers_a_committed_report_without_another_model_or_actual_wak
     runtime.state.change(lambda state: state["sources"].pop("slack", None))
     restarted = PulseRuntime(
         vault,
-        sources=("slack",),
         session_factory=factory,  # type: ignore[arg-type]
         adapter=adapter,  # type: ignore[arg-type]
         wake_handler=delivery.queue_wake,
