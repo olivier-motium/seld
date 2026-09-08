@@ -900,7 +900,10 @@ def _wake_message(report_ids: tuple[str, ...]) -> str:
         "document:NOW.md is not a supported result ref. Treat dated backfill claims as "
         "historical unless current evidence establishes an open consequence. "
         "Set --interface-change for useful accepted interface changes, "
-        "which the native bridge routes to the existing Diane. For a justified no-change "
+        "which the native bridge routes to the existing Diane. When the affected task "
+        "has an active_thread_id for an existing desktop work item, include that exact "
+        "UUID as --target-desktop-work-id and the task's fresh result ref. "
+        "For a justified no-change "
         "disposition use the source-report ref and omit --interface-change. Queue "
         "acceptance is not semantic completion. Do not independently message Diane "
         "again for that integration.\n" + "\n".join(report_ids)
