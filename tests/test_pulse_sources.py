@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 
 from continuity_kernel.connector_auth import ConnectionHealth
-from continuity_kernel.errors import ConflictError
+from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
 from continuity_kernel.pulse_reports import PulseReportStore
 from continuity_kernel.pulse_sources import AcquiredSourceWindow, PulseSourceAdapter
 from continuity_kernel.vault import Vault
@@ -126,6 +126,19 @@ class FakeLocalDelivery:
         return {"source_revision": REVISION_B, "acknowledged": True}
 
 
+class UnavailableLocalDelivery:
+    def poll(self, source: str, *, limit: int) -> dict[str, object]:
+        assert source == "whatsapp"
+        assert limit == 25
+        raise SetupError("synthetic local tool is unavailable")
+
+
+class UnavailableDiscordBridge:
+    def poll(self, *, limit: int) -> dict[str, object]:
+        assert limit == 25
+        raise ValidationError("synthetic Discord tool is unavailable")
+
+
 def _connector_reader(*args: object, **kwargs: object) -> dict[str, object]:
     assert kwargs["source_id"] == "gmail"
     assert kwargs["connection_id"] == "conn-1"
@@ -165,6 +178,31 @@ def _adapter(
 
 def _report_for(reports: FakeReportStore, window: AcquiredSourceWindow) -> tuple[str, str]:
     return reports.add(window)
+
+
+def test_unavailable_source_subclasses_keep_their_incident_classification() -> None:
+    def unavailable_connector(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise NotFoundError("synthetic connector is unavailable")
+
+    connector = PulseSourceAdapter(
+        FakeVault("gmail"),  # type: ignore[arg-type]
+        connector_reader=unavailable_connector,
+        now=lambda: OBSERVED,
+    ).acquire("gmail")
+    local = PulseSourceAdapter(
+        FakeVault("whatsapp"),  # type: ignore[arg-type]
+        local_delivery=UnavailableLocalDelivery(),  # type: ignore[arg-type]
+        now=lambda: OBSERVED,
+    ).acquire("whatsapp")
+    discord = PulseSourceAdapter(
+        FakeVault("discord"),  # type: ignore[arg-type]
+        discord_bridge=UnavailableDiscordBridge(),  # type: ignore[arg-type]
+        now=lambda: OBSERVED,
+    ).acquire("discord")
+
+    assert (connector.result, connector.error_code) == ("failure", "auth_required")
+    assert (local.result, local.error_code) == ("failure", "tool_absent")
+    assert (discord.result, discord.error_code) == ("failure", "tool_absent")
 
 
 def test_account_mismatch_becomes_a_content_free_failure_checkpoint(tmp_path: Path) -> None:

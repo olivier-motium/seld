@@ -326,15 +326,6 @@ class PulseSourceAdapter:
             )
         except ConflictError:
             raise
-        except ContinuityError:
-            return self._failure_window(
-                source_id=source_id,
-                snapshot=snapshot,
-                observed_at=observed_at,
-                error_code="read_failed",
-                status="failure",
-                kind="connector",
-            )
         except (NotFoundError, SetupError):
             return self._failure_window(
                 source_id=source_id,
@@ -345,6 +336,15 @@ class PulseSourceAdapter:
                 kind="connector",
             )
         except (ValidationError, OSError, TimeoutError):
+            return self._failure_window(
+                source_id=source_id,
+                snapshot=snapshot,
+                observed_at=observed_at,
+                error_code="read_failed",
+                status="failure",
+                kind="connector",
+            )
+        except ContinuityError:
             return self._failure_window(
                 source_id=source_id,
                 snapshot=snapshot,
@@ -393,21 +393,21 @@ class PulseSourceAdapter:
             )
         except ConflictError:
             raise
-        except ContinuityError:
-            return self._failure_window(
-                source_id=source_id,
-                snapshot=snapshot,
-                observed_at=observed_at,
-                error_code="read_failed",
-                status="failure",
-                kind="local_failure",
-            )
         except (NotFoundError, SetupError, ValidationError, OSError, TimeoutError):
             return self._failure_window(
                 source_id=source_id,
                 snapshot=snapshot,
                 observed_at=observed_at,
                 error_code="tool_absent",
+                status="failure",
+                kind="local_failure",
+            )
+        except ContinuityError:
+            return self._failure_window(
+                source_id=source_id,
+                snapshot=snapshot,
+                observed_at=observed_at,
+                error_code="read_failed",
                 status="failure",
                 kind="local_failure",
             )
@@ -430,21 +430,21 @@ class PulseSourceAdapter:
             )
         except ConflictError:
             raise
-        except ContinuityError:
-            return self._failure_window(
-                source_id="discord",
-                snapshot=snapshot,
-                observed_at=observed_at,
-                error_code="tool_error",
-                status="failure",
-                kind="discord",
-            )
         except (NotFoundError, SetupError, ValidationError, OSError, TimeoutError):
             return self._failure_window(
                 source_id="discord",
                 snapshot=snapshot,
                 observed_at=observed_at,
                 error_code="tool_absent",
+                status="failure",
+                kind="discord",
+            )
+        except ContinuityError:
+            return self._failure_window(
+                source_id="discord",
+                snapshot=snapshot,
+                observed_at=observed_at,
+                error_code="tool_error",
                 status="failure",
                 kind="discord",
             )
