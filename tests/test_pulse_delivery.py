@@ -79,7 +79,6 @@ def test_queue_wake_persists_before_exit_zero_and_does_not_claim_consumption(vau
     assert report.identifier in commands[0][5]
 
 
-
 def test_uncertain_wake_never_resends_and_becomes_fallback_due(vault: Vault) -> None:
     _bind_pulse(vault)
     report = _wake_report(vault)

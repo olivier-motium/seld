@@ -694,8 +694,11 @@ class ConnectorRuntime:
             raise ValidationError("connector adapter returned an invalid result")
         # A policy narrowed during the provider call must also restrict its response.
         slack_policy = _enforce_slack_read_channel_policy(
-            provider=provider, mode=mode, connection_id=connection_id,
-            operation=operation_name, input_value=input_value,
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            operation=operation_name,
+            input_value=input_value,
         )
         if provider == "slack" and operation_name == "search.messages" and slack_policy is not None:
             slack_policy.validate_search_result(result.payload)
@@ -825,8 +828,11 @@ class ConnectorRuntime:
         )
         # A policy narrowed during the provider call must also restrict its response.
         slack_policy = _enforce_slack_read_channel_policy(
-            provider=provider, mode=mode, connection_id=connection_id,
-            operation=operation_name, input_value=input_value,
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            operation=operation_name,
+            input_value=input_value,
         )
         if provider == "slack" and operation_name == "search.messages" and slack_policy is not None:
             slack_policy.validate_search_result(result.payload)
@@ -1278,9 +1284,15 @@ class ConnectorRuntime:
             return None
         identity_operation = OPERATION_CATALOG.lookup("slack", ConnectorMode.READ, "identity.get")
         response = self._execute_adapter(
-            self.adapters.get("slack"), identity_operation, {}, continuation=None,
-            credential=credential, write_idempotency_key=None, prepared_bundle=None,
-            connection_id=connection_id, connection_revision=connection_revision,
+            self.adapters.get("slack"),
+            identity_operation,
+            {},
+            continuation=None,
+            credential=credential,
+            write_idempotency_key=None,
+            prepared_bundle=None,
+            connection_id=connection_id,
+            connection_revision=connection_revision,
         )
         payload = response.payload
         if not isinstance(payload, Mapping) or payload.get("ok") is not True:

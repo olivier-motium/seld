@@ -62,9 +62,7 @@ _MAX_GMAIL_RAW_MESSAGE_BYTES: Final = 16 * 1024 * 1024
 _GOOGLE_DOCUMENT_MIME: Final = "application/vnd.google-apps.document"
 _DOCX_MIME: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _PDF_MIME: Final = "application/pdf"
-_GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_CHECKPOINT: Final = (
-    "gmail_legacy_message_gap_recovery_epoch"
-)
+_GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_CHECKPOINT: Final = "gmail_legacy_message_gap_recovery_epoch"
 _GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_EPOCH: Final = "legacy_message_gap_recovery_epoch"
 _GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_STARTED: Final = "legacy_message_gap_recovery_started"
 
@@ -1212,11 +1210,8 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
             calendar = _mapping(state.get("calendar"))
             calendar_checkpoint = _optional_text(calendar.get("delta_checkpoint"))
             primary_calendar_id = _optional_text(calendar.get("primary_calendar_id"))
-            if (
-                primary_calendar_id is not None
-                and calendar_delta_checkpoint_matches_window(
-                    calendar_checkpoint, self._calendar_delta_window
-                )
+            if primary_calendar_id is not None and calendar_delta_checkpoint_matches_window(
+                calendar_checkpoint, self._calendar_delta_window
             ):
                 checkpoint["calendar_delta_checkpoint"] = calendar_checkpoint
                 checkpoint["calendar_delta_primary_calendar_id"] = primary_calendar_id
@@ -1232,11 +1227,8 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
             return
         calendar_checkpoint = _optional_text(checkpoint.get("calendar_delta_checkpoint"))
         primary_calendar_id = _optional_text(checkpoint.get("calendar_delta_primary_calendar_id"))
-        if (
-            primary_calendar_id is not None
-            and calendar_delta_checkpoint_matches_window(
-                calendar_checkpoint, self._calendar_delta_window
-            )
+        if primary_calendar_id is not None and calendar_delta_checkpoint_matches_window(
+            calendar_checkpoint, self._calendar_delta_window
         ):
             calendar = _mapping_state(state, "calendar")
             calendar["delta_checkpoint"] = calendar_checkpoint
@@ -1337,8 +1329,7 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
             _clear_coverage_gaps(
                 mail,
                 prefix=(
-                    "Outlook Mail permanent deletions are not observable without a Graph delta "
-                    "read"
+                    "Outlook Mail permanent deletions are not observable without a Graph delta read"
                 ),
             )
             for detail in delta.coverage_gaps:
@@ -1417,10 +1408,7 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                     if page.continuation is None:
                         calendar.pop("event_continuation", None)
                         calendar["index"] = index + 1
-                        if (
-                            self._calendar_delta_window is None
-                            and index + 1 >= len(calendar_ids)
-                        ):
+                        if self._calendar_delta_window is None and index + 1 >= len(calendar_ids):
                             calendar["done"] = True
                     else:
                         calendar["event_continuation"] = page.continuation
@@ -2212,9 +2200,7 @@ def _parse_gmail_raw_message(path: Path) -> _RawGmailMessage:
                 )
             )
     visible_body = (
-        "\n\n".join(plain)
-        if plain
-        else "\n\n".join(_visible_html_to_text(item) for item in html)
+        "\n\n".join(plain) if plain else "\n\n".join(_visible_html_to_text(item) for item in html)
     )
     body, body_truncated = _bounded_document_text(visible_body)
     return _RawGmailMessage(

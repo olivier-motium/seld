@@ -28,14 +28,20 @@ def test_downloaded_attachment_requires_matching_bytes_and_respects_deletion(
     _append(database, message_id="attachment", text="Agenda", timestamp=AT)
     with closing(sqlite3.connect(database)) as connection:
         for column, kind in (
-            ("local_path", "TEXT"), ("file_sha256", "BLOB"),
-            ("filename", "TEXT"), ("mime_type", "TEXT"),
+            ("local_path", "TEXT"),
+            ("file_sha256", "BLOB"),
+            ("filename", "TEXT"),
+            ("mime_type", "TEXT"),
         ):
             connection.execute(f"ALTER TABLE messages ADD COLUMN {column} {kind}")
         connection.execute(
             "UPDATE messages SET local_path=?, file_sha256=?, filename=?, mime_type=?",
-            (str(attachment), hashlib.sha256(attachment.read_bytes()).digest(),
-             "download.txt", "text/plain; charset=utf-8"),
+            (
+                str(attachment),
+                hashlib.sha256(attachment.read_bytes()).digest(),
+                "download.txt",
+                "text/plain; charset=utf-8",
+            ),
         )
         connection.commit()
     adapter = WhatsAppAppCorpusAdapter(account_fingerprint=ACCOUNT, store_root=root)

@@ -417,9 +417,7 @@ def test_current_qmd_search_maps_hits_back_to_exact_source(tmp_path: Path, monke
             return recall_module._CommandResult(
                 0,
                 (
-                    f"Collection: {collection}\n"
-                    f"  Path:     {documents_root}\n"
-                    "  Pattern:  **/*.md\n"
+                    f"Collection: {collection}\n  Path:     {documents_root}\n  Pattern:  **/*.md\n"
                 ).encode(),
                 b"",
             )

@@ -336,16 +336,23 @@ def test_immutable_outlook_tombstone_cascades_matching_attachment_documents(
     result = companion.sync(adapter, "outlook-connection")
 
     assert result.document_count == 3
-    assert companion.read(
-        "outlook-connection", "outlook-immutable:immutable-parent"
-    ) is None
-    assert companion.read(
-        "outlook-connection", "outlook-immutable-attachment:immutable-parent:attachment-1"
-    ) is None
+    assert companion.read("outlook-connection", "outlook-immutable:immutable-parent") is None
+    assert (
+        companion.read(
+            "outlook-connection", "outlook-immutable-attachment:immutable-parent:attachment-1"
+        )
+        is None
+    )
     assert companion.read("outlook-connection", "outlook:immutable-parent") is not None
-    assert companion.read(
-        "outlook-connection", "outlook-immutable-attachment:other-parent:attachment-1"
-    ) is not None
-    assert companion.read(
-        "other-connection", "outlook-immutable-attachment:immutable-parent:attachment-2"
-    ) is not None
+    assert (
+        companion.read(
+            "outlook-connection", "outlook-immutable-attachment:other-parent:attachment-1"
+        )
+        is not None
+    )
+    assert (
+        companion.read(
+            "other-connection", "outlook-immutable-attachment:immutable-parent:attachment-2"
+        )
+        is not None
+    )

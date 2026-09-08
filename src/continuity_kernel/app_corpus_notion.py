@@ -45,9 +45,7 @@ _OPAQUE_REF = re.compile(r"^notion:sha256:[0-9a-f]{64}$")
 _OPAQUE_CHECKPOINT = re.compile(r"^[A-Za-z0-9._~-]{1,4096}$")
 _MODULE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _GAP_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_DISCOVERY_COVERAGE = frozenset(
-    {"live_workspace_root_pages", "live_workspace_reachable_pages"}
-)
+_DISCOVERY_COVERAGE = frozenset({"live_workspace_root_pages", "live_workspace_reachable_pages"})
 
 BridgeRunner = Callable[[Sequence[str], bytes, float], subprocess.CompletedProcess[bytes]]
 

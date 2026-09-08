@@ -168,7 +168,8 @@ class WhatsAppAppCorpusAdapter:
                         freshness=_freshness(
                             "partial",
                             observed_at,
-                            "Local WhatsApp rows were removed; retrieval continues from the local store. "
+                            "Local WhatsApp rows were removed; retrieval continues "
+                            "from the local store. "
                             "Previously indexed messages are retained without inferred deletions",
                         ),
                     )
@@ -846,7 +847,8 @@ def _document(
     }
     if media_type is not None:
         metadata["media_type"] = media_type
-    filename = _label(row["filename"]) if "filename" in row.keys() else None
+    row_columns = row.keys()  # sqlite3.Row membership checks values, not column names.
+    filename = _label(row["filename"]) if "filename" in row_columns else None
     if filename and not deleted:
         metadata["attachment_name"] = filename
         text = "\n\n".join(value for value in (text, f"Attachment: {filename}") if value)

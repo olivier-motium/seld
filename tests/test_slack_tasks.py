@@ -351,13 +351,13 @@ def test_restricted_search_covers_approved_channels_and_rejects_other_selectors(
     result = reader.search("after:2026-08-01 urgent OR from:anyone", max_results=10)
     queries = [cast(dict[str, object], call["input"])["query"] for call in calls]
     assert queries == [
-        '\"urgent\" \"OR\" \"from\" \"anyone\" after:2026-08-01 in:<#C123456789>',
-        '\"urgent\" \"OR\" \"from\" \"anyone\" after:2026-08-01 in:<#C987654321>',
+        '"urgent" "OR" "from" "anyone" after:2026-08-01 in:<#C123456789>',
+        '"urgent" "OR" "from" "anyone" after:2026-08-01 in:<#C987654321>',
     ]
     # The fake provider returns the first channel for both queries; foreign rows are excluded.
     assert len(cast(list[object], result["messages"])) == 1
     calls.clear()
     result = reader.search("in:project urgent", max_results=10)
     assert len(calls) == 1
-    assert cast(dict[str, object], calls[0]["input"])["query"] == '\"urgent\" in:<#C123456789>'
+    assert cast(dict[str, object], calls[0]["input"])["query"] == '"urgent" in:<#C123456789>'
     assert len(cast(list[object], result["messages"])) == 1

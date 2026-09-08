@@ -44,9 +44,7 @@ _STATE_VERSION = 1
 _OBJECT_ID = re.compile(r"^.{1,1024}$", re.DOTALL)
 _GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_CHECKPOINT = "gmail_legacy_message_gap_recovery_epoch"
 _GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_EPOCH = "legacy_message_gap_recovery_epoch"
-_OUTLOOK_DELTA_MATERIALIZATION_RECOVERY_CHECKPOINT = (
-    "outlook_delta_materialization_recovery_epoch"
-)
+_OUTLOOK_DELTA_MATERIALIZATION_RECOVERY_CHECKPOINT = "outlook_delta_materialization_recovery_epoch"
 
 
 @dataclass(frozen=True)
@@ -571,9 +569,8 @@ class AppCorpusCompanion:
                 for connection in {
                     _string_record(record, "connection_id") for record in visible_documents.values()
                 }
-                if (
-                    binding := _current_qmd_binding(state, visible_documents, connection)
-                ) is not None
+                if (binding := _current_qmd_binding(state, visible_documents, connection))
+                is not None
             }
             documents = _filtered_documents(
                 visible_documents, connection_id=connection_id, provider=provider

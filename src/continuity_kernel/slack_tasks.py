@@ -268,15 +268,18 @@ class SlackTaskReader:
             if expected_channel is not None:
                 original_count = len(matches)
                 matches = [
-                    match for match in matches
+                    match
+                    for match in matches
                     if isinstance(match, Mapping)
                     and isinstance(match.get("channel"), Mapping)
                     and match["channel"].get("id") == expected_channel
                 ]
                 rejected_matches = rejected_matches or len(matches) != original_count
-            messages.extend(self._render_matches(
-                cast(list[object], matches[:remaining]), snippet_chars=snippet_chars
-            ))
+            messages.extend(
+                self._render_matches(
+                    cast(list[object], matches[:remaining]), snippet_chars=snippet_chars
+                )
+            )
             if page_count is not None and page >= page_count:
                 break
             if not matches:

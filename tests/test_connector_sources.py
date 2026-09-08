@@ -1332,14 +1332,26 @@ def test_slack_source_reads_each_approved_channel_without_global_search(
         queries.append(query)
         channel = query.removeprefix("in:<#").removesuffix(">")
         assert channel in policy.channels
-        return {"ok": True, "messages": {"matches": [{
-            "channel": {"id": channel}, "text": "approved project update",
-            "ts": f"{int(BASE_TIME.timestamp())}.000001", "user": "U123456789",
-        }]}}
+        return {
+            "ok": True,
+            "messages": {
+                "matches": [
+                    {
+                        "channel": {"id": channel},
+                        "text": "approved project update",
+                        "ts": f"{int(BASE_TIME.timestamp())}.000001",
+                        "user": "U123456789",
+                    }
+                ]
+            },
+        }
 
     _install_reader(monkeypatch, vault=vault, manager=manager, get_json=get_json)
     delivery = read_connector_source(
-        vault, connection_id=str(connection_id), source_id="slack", limit=5,
+        vault,
+        connection_id=str(connection_id),
+        source_id="slack",
+        limit=5,
         observed_at=BASE_TIME,
     )
     assert queries == ["in:<#C123456789>", "in:<#C987654321>"]

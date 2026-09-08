@@ -451,7 +451,8 @@ def _xlsx_text(descriptor: int) -> ExtractionResult:
                     return _gap("XLSX shared strings are invalid", "invalid_xlsx")
                 output = _BoundedText()
                 output.line(
-                    "Cell values are stored values; number and date display formats are not applied."
+                    "Cell values are stored values; number and date display formats "
+                    "are not applied."
                 )
                 for sheet_name, info in sheet_members:
                     root = _xlsx_xml(archive, info)
@@ -530,11 +531,7 @@ def _xlsx_sheet_members(
 def _xlsx_member_path(target: str) -> str | None:
     if not target or "\x00" in target:
         return None
-    parts = (
-        target.lstrip("/").split("/")
-        if target.startswith("/")
-        else ["xl", *target.split("/")]
-    )
+    parts = target.lstrip("/").split("/") if target.startswith("/") else ["xl", *target.split("/")]
     if not all(part and part not in {".", ".."} for part in parts):
         return None
     return "/".join(parts)
@@ -638,9 +635,7 @@ def _xlsx_cached_value(cell: ElementTree.Element[str], shared_strings: list[str]
     return raw
 
 
-def _xlsx_child(
-    element: ElementTree.Element[str], name: str
-) -> ElementTree.Element[str] | None:
+def _xlsx_child(element: ElementTree.Element[str], name: str) -> ElementTree.Element[str] | None:
     return next((child for child in element if _local_name(child.tag) == name), None)
 
 

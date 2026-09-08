@@ -404,8 +404,7 @@ def test_gmail_detail_provider_failure_surfaces_its_http_status() -> None:
     assert "provider HTTP 503" in result.freshness["detail"]
 
 
-def test_gmail_legacy_message_gap_recovery_restarts_one_baseline_without_rewinding_retry(
-) -> None:
+def test_gmail_legacy_message_gap_recovery_restarts_one_baseline_without_rewinding_retry() -> None:
     checkpoint = json.dumps(
         {
             "gmail_history_anchor": True,
@@ -849,15 +848,10 @@ def test_gmail_large_json_body_uses_bounded_raw_mime_artifact(tmp_path: Path) ->
     raw_path = tmp_path / "large-message.eml"
     attachments = b"".join(
         b"\r\n--boundary\r\n"
-        b"Content-Type: text/plain; name=notes-"
-        + str(index).encode()
-        + b".txt\r\n"
-        b"Content-Disposition: attachment; filename=notes-"
-        + str(index).encode()
-        + b".txt\r\n"
+        b"Content-Type: text/plain; name=notes-" + str(index).encode() + b".txt\r\n"
+        b"Content-Disposition: attachment; filename=notes-" + str(index).encode() + b".txt\r\n"
         b"Content-Transfer-Encoding: base64\r\n"
-        b"\r\n"
-        + base64.b64encode(b"Attachment text")
+        b"\r\n" + base64.b64encode(b"Attachment text")
         for index in range(25)
     )
     raw_path.write_bytes(
@@ -1137,9 +1131,9 @@ def test_microsoft_delta_read_clears_only_the_superseded_legacy_deletion_gap() -
         ]
     )
 
-    result = MicrosoftAppCorpusAdapter(
-        runtime, sources=frozenset({"outlook_mail"})
-    ).sync("connection-2", checkpoint=checkpoint, limit=4)
+    result = MicrosoftAppCorpusAdapter(runtime, sources=frozenset({"outlook_mail"})).sync(
+        "connection-2", checkpoint=checkpoint, limit=4
+    )
 
     assert legacy_gap not in result.freshness.get("detail", "")
     assert "A current Outlook coverage gap" in result.freshness.get("detail", "")
@@ -1190,9 +1184,9 @@ def test_microsoft_delta_change_404_tombstones_and_advances_the_cursor() -> None
             )
         ]
     )
-    first = MicrosoftAppCorpusAdapter(
-        first_runtime, sources=frozenset({"outlook_mail"})
-    ).sync("connection-2", limit=4)  # type: ignore[arg-type]
+    first = MicrosoftAppCorpusAdapter(first_runtime, sources=frozenset({"outlook_mail"})).sync(
+        "connection-2", limit=4
+    )  # type: ignore[arg-type]
     runtime = _Runtime(
         [
             _response(
@@ -1209,9 +1203,9 @@ def test_microsoft_delta_change_404_tombstones_and_advances_the_cursor() -> None
         ]
     )
 
-    result = MicrosoftAppCorpusAdapter(
-        runtime, sources=frozenset({"outlook_mail"})
-    ).sync("connection-2", checkpoint=first.checkpoint, limit=4)  # type: ignore[arg-type]
+    result = MicrosoftAppCorpusAdapter(runtime, sources=frozenset({"outlook_mail"})).sync(
+        "connection-2", checkpoint=first.checkpoint, limit=4
+    )  # type: ignore[arg-type]
 
     assert result.complete is True
     assert [
@@ -1230,9 +1224,9 @@ def test_microsoft_detail_failure_keeps_the_prior_delta_checkpoint_for_retry() -
             )
         ]
     )
-    first = MicrosoftAppCorpusAdapter(
-        first_runtime, sources=frozenset({"outlook_mail"})
-    ).sync("connection-2", limit=4)  # type: ignore[arg-type]
+    first = MicrosoftAppCorpusAdapter(first_runtime, sources=frozenset({"outlook_mail"})).sync(
+        "connection-2", limit=4
+    )  # type: ignore[arg-type]
     prior_delta_checkpoint = json.loads(first.checkpoint)["mail"]["delta_checkpoint"]
     failed_runtime = _Runtime(
         [
@@ -1250,9 +1244,9 @@ def test_microsoft_detail_failure_keeps_the_prior_delta_checkpoint_for_retry() -
         ]
     )
 
-    failed = MicrosoftAppCorpusAdapter(
-        failed_runtime, sources=frozenset({"outlook_mail"})
-    ).sync("connection-2", checkpoint=first.checkpoint, limit=4)  # type: ignore[arg-type]
+    failed = MicrosoftAppCorpusAdapter(failed_runtime, sources=frozenset({"outlook_mail"})).sync(
+        "connection-2", checkpoint=first.checkpoint, limit=4
+    )  # type: ignore[arg-type]
 
     assert failed.documents == ()
     assert failed.complete is False
@@ -1277,9 +1271,9 @@ def test_microsoft_detail_failure_keeps_the_prior_delta_checkpoint_for_retry() -
             ),
         ]
     )
-    retried = MicrosoftAppCorpusAdapter(
-        retry_runtime, sources=frozenset({"outlook_mail"})
-    ).sync("connection-2", checkpoint=failed.checkpoint, limit=4)  # type: ignore[arg-type]
+    retried = MicrosoftAppCorpusAdapter(retry_runtime, sources=frozenset({"outlook_mail"})).sync(
+        "connection-2", checkpoint=failed.checkpoint, limit=4
+    )  # type: ignore[arg-type]
 
     assert retried.complete is True
     assert retried.documents[0].object_id == "outlook-immutable:mail-1"
@@ -1365,13 +1359,7 @@ def test_slack_sync_uses_search_then_authenticated_channel_history() -> None:
                     }
                 }
             ),
-            _response(
-                {
-                    "messages": [
-                        {"text": "History message", "ts": "1712345679.000001"}
-                    ]
-                }
-            ),
+            _response({"messages": [{"text": "History message", "ts": "1712345679.000001"}]}),
         ]
     )
     adapter = SlackAppCorpusAdapter(runtime)  # type: ignore[arg-type]
@@ -1411,15 +1399,7 @@ def test_slack_sync_replaces_a_broad_checkpoint_with_the_channel_policy(
     )
     monkeypatch.setattr(slack_channel_access, "_config_path", lambda: policy_path)
     runtime = _Runtime(
-        [
-            _response(
-                {
-                    "messages": [
-                        {"text": "Approved history", "ts": "1712345679.000001"}
-                    ]
-                }
-            )
-        ]
+        [_response({"messages": [{"text": "Approved history", "ts": "1712345679.000001"}]})]
     )
     adapter = SlackAppCorpusAdapter(runtime)  # type: ignore[arg-type]
     broad_checkpoint = json.dumps(

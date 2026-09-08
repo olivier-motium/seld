@@ -737,7 +737,8 @@ def _read_slack(
     policy = policy_for_verified_slack_workspace(connection_id, team_id)
     queries = (
         [f"in:<#{channel}>" for channel in sorted(policy.channels)]
-        if policy is not None else [_SLACK_SEARCH_QUERY]
+        if policy is not None
+        else [_SLACK_SEARCH_QUERY]
     )
     per_channel = max(1, math.ceil(limit / max(1, len(queries))))
     messages: list[Mapping[str, object]] = []

@@ -277,9 +277,7 @@ def test_macos_keyring_write_updates_in_place_and_only_adds_when_missing(
             self.status = status
             self.calls: list[tuple[dict[str, object], dict[str, object] | None]] = []
 
-        def __call__(
-            self, query: dict[str, object], attributes: dict[str, object] | None
-        ) -> int:
+        def __call__(self, query: dict[str, object], attributes: dict[str, object] | None) -> int:
             self.calls.append((query, attributes))
             return self.status
 

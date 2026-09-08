@@ -2274,9 +2274,7 @@ def test_restricted_slack_reads_fail_before_the_adapter(
         connection_id=str(CONNECTION_ID),
         channels={"CABC123": "allowed"},
     )
-    _vault, _manager, _adapter, runtime = _prepared(
-        tmp_path, adapter=adapter, profile_name="slack"
-    )
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter, profile_name="slack")
     values = {
         "connection_id": str(CONNECTION_ID),
         "input": {"channel": "Cdenied"},

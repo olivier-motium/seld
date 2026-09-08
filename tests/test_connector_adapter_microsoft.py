@@ -1198,7 +1198,9 @@ def test_every_microsoft_operation_uses_its_fixed_final_graph_route() -> None:
         delta_response = b"{}"
         if operation.name == "folders.delta":
             delta_response = json.dumps(
-                {"@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=next"}
+                {
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=next"
+                }
             ).encode()
         elif operation.name == "messages.delta":
             delta_response = json.dumps(
@@ -1213,8 +1215,7 @@ def test_every_microsoft_operation_uses_its_fixed_final_graph_route() -> None:
             delta_response = json.dumps(
                 {
                     "@odata.deltaLink": (
-                        "https://graph.microsoft.com/v1.0/me/calendarView/delta"
-                        "?$deltatoken=next"
+                        "https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=next"
                     )
                 }
             ).encode()
@@ -1432,9 +1433,7 @@ def test_folder_delta_uses_prefer_page_size_without_an_unsupported_top_query() -
     )
 
     assert transport.calls[0]["query"] == ()
-    assert transport.calls[0]["headers"] == {
-        "Prefer": 'IdType="ImmutableId", odata.maxpagesize=5'
-    }
+    assert transport.calls[0]["headers"] == {"Prefer": 'IdType="ImmutableId", odata.maxpagesize=5'}
 
 
 def test_delta_reads_keep_only_a_valid_opaque_delta_link_for_its_fixed_route() -> None:
@@ -1442,7 +1441,9 @@ def test_delta_reads_keep_only_a_valid_opaque_delta_link_for_its_fixed_route() -
         "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta"
         "?$deltatoken=next&$top=1"
     )
-    page_link = "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$skiptoken=page-2"
+    page_link = (
+        "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$skiptoken=page-2"
+    )
     operation = _operation("outlook_mail", ConnectorMode.READ, "messages.delta")
     adapter = MicrosoftConnectorAdapter()
     first_transport = _FakeTransport(
@@ -1541,7 +1542,6 @@ def test_delta_link_cannot_escape_its_fixed_graph_collection(delta_link: str) ->
             transport=cast(ConnectorTransport, transport),
         )
     assert transport.calls == []
-
 
 
 def test_message_continuation_binds_search_projection_and_page_limit() -> None:

@@ -134,7 +134,8 @@ _DRIVE_LIFECYCLE_FIELDS: Final = (
     "canMoveItemOutOfDrive,canMoveItemWithinDrive,canTrash,canUntrash)"
 )
 _DRIVE_FILE_LIST_FIELDS: Final = (
-    "nextPageToken,files(id,name,mimeType,description,modifiedTime,version,webViewLink,resourceKey,size,trashed)"
+    "nextPageToken,files(id,name,mimeType,description,modifiedTime,version,"
+    "webViewLink,resourceKey,size,trashed)"
 )
 _DRIVE_CHANGE_LIST_FIELDS: Final = (
     "nextPageToken,newStartPageToken,changes(fileId,removed,time,"

@@ -1246,9 +1246,7 @@ def _parse_outbox(value: dict[str, object]) -> DianeOutbox:
         target_desktop_work_id=_optional_uuid(
             value.get("targetDesktopWorkId"), "Diane target desktop work ID"
         ),
-        curation_followup=_optional_true(
-            value.get("curationFollowup"), "Diane curation follow-up"
-        ),
+        curation_followup=_optional_true(value.get("curationFollowup"), "Diane curation follow-up"),
         summary=_summary(value.get("summary")),
         observed_at=_time(value.get("observedAt"), "Diane observed time"),
         accepted_at=_time(value.get("acceptedAt"), "Diane accepted time"),
@@ -1297,9 +1295,7 @@ def _validate_integration(value: _Integration) -> None:
         _revision(value.base_integration_id, "Pulse integration base ID")
     elif value.base_integration_id is not None:
         raise ValidationError("ordinary Pulse integration cannot have a follow-up base")
-    if not refs or (
-        not value.curation_followup and value.primary_result_ref != refs[0]
-    ):
+    if not refs or (not value.curation_followup and value.primary_result_ref != refs[0]):
         raise ValidationError("Pulse integration primary result reference is invalid")
     _native_ref(value.primary_result_ref, "Pulse integration primary result reference")
     _summary(value.summary)

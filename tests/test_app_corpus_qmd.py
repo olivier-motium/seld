@@ -111,9 +111,7 @@ def test_scope_view_contains_only_authorized_connection_and_maps_only_manifest_h
             binding.record_key_for_reference(f"qmd://{binding.collection}/{allowed_name}")
             == permitted.key
         )
-        assert (
-            binding.record_key_for_reference(f"qmd://{binding.collection}/{denied_name}") is None
-        )
+        assert binding.record_key_for_reference(f"qmd://{binding.collection}/{denied_name}") is None
         assert (
             binding.record_key_for_reference(str(binding.documents_root / allowed_name))
             == permitted.key

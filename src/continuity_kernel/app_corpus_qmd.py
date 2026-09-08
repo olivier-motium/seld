@@ -153,9 +153,7 @@ class ScopedQMDIndexManager:
         self.run_command = run_command
         self.environment = _environment(environment)
 
-    def refresh(
-        self, snapshot: QMDScopedSnapshot, deadline: float
-    ) -> tuple[QMDScopedBinding, ...]:
+    def refresh(self, snapshot: QMDScopedSnapshot, deadline: float) -> tuple[QMDScopedBinding, ...]:
         """Return bindings only after every affected scope is fully indexed.
 
         An existing view whose scope fingerprint is unchanged is immediately
@@ -276,9 +274,9 @@ class ScopedQMDIndexManager:
             "documents_root": str(self.index_root / documents_relative),
             "record_names": dict(sorted(record_names.items())),
         }
-        encoded = (
-            json.dumps(manifest_value, separators=(",", ":"), sort_keys=True) + "\n"
-        ).encode("utf-8")
+        encoded = (json.dumps(manifest_value, separators=(",", ":"), sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
         if len(encoded) > MAX_MANIFEST_BYTES:
             raise ValidationError("scoped QMD manifest exceeds its size bound")
         self.store.atomic_write(manifest_relative, encoded)
@@ -521,9 +519,7 @@ def _config_has_binding(
         if matched is not None:
             values[matched.group(1)] = _yaml_scalar(matched.group(2))
     return (
-        found
-        and values.get("path") == str(documents_root)
-        and values.get("pattern") == "**/*.md"
+        found and values.get("path") == str(documents_root) and values.get("pattern") == "**/*.md"
     )
 
 

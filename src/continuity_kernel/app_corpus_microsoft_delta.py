@@ -297,11 +297,16 @@ def _decode(value: str) -> dict[str, Any]:
         state = json.loads(value)
     except json.JSONDecodeError as exc:
         raise ValidationError("Microsoft mail delta checkpoint is invalid") from exc
-    if not isinstance(state, dict) or state.get("v") != _VERSION or state.get("phase") not in {
-        "folders",
-        "messages",
-        "complete",
-    }:
+    if (
+        not isinstance(state, dict)
+        or state.get("v") != _VERSION
+        or state.get("phase")
+        not in {
+            "folders",
+            "messages",
+            "complete",
+        }
+    ):
         raise ValidationError("Microsoft mail delta checkpoint is invalid")
     _folders(state)
     _candidates(state)

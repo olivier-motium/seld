@@ -147,9 +147,7 @@ def _bind_pulse(vault: Vault) -> None:
 def test_delivery_reconsiders_waiting_reports_without_a_new_source_event(
     vault: Vault, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    vault.select_sources(
-        expected_revision=vault.get_source_snapshot().revision, sources=("slack",)
-    )
+    vault.select_sources(expected_revision=vault.get_source_snapshot().revision, sources=("slack",))
     store = PulseReportStore(vault.root)
     report = store.append(
         event_key=f"pulse-report:{FINGERPRINT}",
