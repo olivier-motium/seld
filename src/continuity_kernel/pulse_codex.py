@@ -459,6 +459,7 @@ def _isolated_configuration(compact_tokens: int) -> dict[str, Any]:
         "plugins",
         "remote_plugin",
         "memories",
+        "hooks",
         "multi_agent",
         "multi_agent_v2",
         "shell_tool",
