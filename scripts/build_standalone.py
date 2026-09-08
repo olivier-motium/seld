@@ -98,6 +98,8 @@ def main() -> int:
             str(root / "src"),
             "--collect-data",
             "continuity_kernel",
+            "--hidden-import",
+            "keyring",
             str(root / "scripts/standalone_entry.py"),
         ]
     )

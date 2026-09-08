@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -368,7 +369,7 @@ def run_e2e(
         or restored.get("configuration_matches_target") != "unknown"
         or restored.get("activation_required") is not True
         or restored.get("activation_commands")
-        != ["gsv bridge stop", f"gsv --vault {restore} setup"]
+        != ["gsv bridge stop", f"gsv --vault {shlex.quote(str(restore))} setup"]
     ):
         raise RuntimeError("restore did not report the deliberate activation contract")
     config_path.write_bytes(source_config)
@@ -625,8 +626,22 @@ def _connector_readiness_receipt(
     registrations = value.get("registration_readiness")
     if type(ready) is not bool or not isinstance(registrations, dict):
         raise RuntimeError("installed connector readiness has an invalid contract")
-    if required and not ready:
+    if set(registrations) != {"google", "microsoft", "slack"}:
         raise RuntimeError("released artifact is missing one or more OAuth client registrations")
+    for registration in registrations.values():
+        if not isinstance(registration, dict) or (
+            registration.get("status"),
+            registration.get("sign_in"),
+        ) not in {
+            ("ready", "available"),
+            ("setup_required", "setup_required"),
+            ("unavailable", "unavailable"),
+        }:
+            raise RuntimeError("installed connector registration is missing, invalid, or malformed")
+    if ready != all(entry["status"] == "ready" for entry in registrations.values()):
+        raise RuntimeError("installed connector readiness has an inconsistent summary")
+    if required and not ready:
+        raise RuntimeError("installed OAuth provider setup is not ready")
     return {
         "oauth_registration_ready": ready,
         "registration_readiness": registrations,

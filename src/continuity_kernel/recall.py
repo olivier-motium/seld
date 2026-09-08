@@ -52,6 +52,7 @@ _SENSITIVE_WORD = re.compile(
     re.IGNORECASE,
 )
 _LONG_OPAQUE_VALUE = re.compile(r"\b[A-Za-z0-9._~-]{32,}\b")
+_RECORD_METADATA_BLOCK = re.compile(r"<!--\s*gsv:.*?-->\s*", re.DOTALL)
 _DEFAULT_QMD_EXECUTABLES: Final = (
     data_dir() / "qmd/bin/qmd",
     Path("/opt/homebrew/bin/qmd"),
@@ -557,7 +558,7 @@ class RecallCompanion:
                     return RecallSearch(
                         "markdown",
                         discovery.complete,
-                        _fallback_hits(snapshots, terms=terms, limit=limit),
+                        _fallback_hits(snapshots, query=clean_query, terms=terms, limit=limit),
                         "QMD search timed out; exact Markdown recall was used",
                         discovery.skipped,
                     )
@@ -602,7 +603,7 @@ class RecallCompanion:
         return RecallSearch(
             "markdown",
             discovery.complete,
-            _fallback_hits(snapshots, terms=terms, limit=limit),
+            _fallback_hits(snapshots, query=clean_query, terms=terms, limit=limit),
             qmd_reason,
             discovery.skipped,
         )
@@ -1365,13 +1366,26 @@ def _safe_component(value: str) -> str:
     return value
 
 
+def _strip_serialized_metadata(text: str) -> str:
+    clean = _RECORD_METADATA_BLOCK.sub("", text).strip()
+    return clean if clean else text
+
+
+def _is_exact_task_identifier(clean_query: str, relative_path: str) -> bool:
+    if not relative_path.startswith("tasks/"):
+        return False
+    return clean_query == PurePosixPath(relative_path).stem.casefold()
+
+
 def _fallback_hits(
     snapshots: tuple[_DocumentSnapshot, ...],
     *,
+    query: str | None = None,
     terms: tuple[str, ...],
     limit: int,
 ) -> tuple[RecallHit, ...]:
-    matches: list[tuple[int, int, RecallHit]] = []
+    clean_query = " ".join(query.split()).casefold() if query else None
+    matches: list[tuple[int, int, int, RecallHit]] = []
     for snapshot in snapshots:
         text = snapshot.content.decode("utf-8")
         folded = text.casefold()
@@ -1383,6 +1397,12 @@ def _fallback_hits(
             * 1_000_000_000
         )
         score = float(sum(counts))
+        exact_id = (
+            1
+            if clean_query
+            and _is_exact_task_identifier(clean_query, snapshot.document.relative_path)
+            else 0
+        )
         hit = RecallHit(
             modified_at=snapshot.document.modified_at,
             relative_path=snapshot.document.relative_path,
@@ -1390,9 +1410,9 @@ def _fallback_hits(
             snippet=_keyword_snippet(text, terms),
             title=_document_title(text, snapshot.document.relative_path),
         )
-        matches.append((sum(counts), modified_ns, hit))
-    matches.sort(key=lambda item: (-item[0], -item[1], item[2].relative_path))
-    return tuple(item[2] for item in matches[:limit])
+        matches.append((exact_id, sum(counts), modified_ns, hit))
+    matches.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].relative_path))
+    return tuple(item[3] for item in matches[:limit])
 
 
 def _qmd_hits(
@@ -1503,7 +1523,8 @@ def _qmd_collection_target(encoded: bytes, *, collection: str) -> Path | None:
 
 
 def _document_title(text: str, relative: str) -> str:
-    for line in text.splitlines():
+    readable = _strip_serialized_metadata(text)
+    for line in readable.splitlines():
         clean = line.strip()
         if clean.startswith("# "):
             return _plain_excerpt(clean[2:], maximum=180)
@@ -1511,10 +1532,11 @@ def _document_title(text: str, relative: str) -> str:
 
 
 def _keyword_snippet(text: str, terms: tuple[str, ...]) -> str:
-    folded = text.casefold()
+    readable = _strip_serialized_metadata(text)
+    folded = readable.casefold()
     positions = [folded.find(term) for term in terms if folded.find(term) >= 0]
     start = max(0, min(positions, default=0) - 120)
-    return _plain_excerpt(text[start : start + 520])
+    return _plain_excerpt(readable[start : start + 520])
 
 
 def _plain_excerpt(value: str, *, maximum: int = 420) -> str:

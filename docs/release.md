@@ -6,7 +6,7 @@ not gate the source distribution.
 
 ## Inputs
 
-The current workflow is a manual, non-publishing macOS candidate gate. It
+The current workflow is a manual, non-publishing macOS and Windows candidate gate. It
 installs the locked development and
 release environments, runs lint, formatting, strict typing, tests, coverage,
 the privacy gate, and package builds before producing native executables.
@@ -20,6 +20,12 @@ The candidate matrix produces:
 
 - `gsv-macos-arm64`
 - `gsv-macos-x86_64`
+- `gsv-windows-x86_64.exe`
+
+The Windows entry builds an x64 candidate. It does not establish Windows ARM64
+emulation support. A successful workflow uploads candidate artifacts, not files
+at the installer's GitHub release download URL. Publication and an actual
+download from that URL remain separate steps.
 
 Each executable has a sibling `.sha256` file. GitHub artifact attestations bind
 candidate executables and checksums to the workflow run. Each E2E report records the
