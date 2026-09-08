@@ -1295,3 +1295,53 @@ def test_http_boundary_rejects_redirects_without_network(
                 {"Accept": "application/json", "Authorization": "Bearer synthetic"},
                 3.0,
             )
+
+
+def test_slack_source_reads_each_approved_channel_without_global_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from continuity_kernel.slack_channel_access import SlackChannelAccessPolicy
+
+    vault, manager, connection_id = _prepared(
+        tmp_path, source_id="slack", provider="slack", marker="z"
+    )
+    policy = SlackChannelAccessPolicy(
+        workspace_id="T123456789",
+        connection_ids=frozenset({str(connection_id)}),
+        channel_names={"C123456789": "project", "C987654321": "support"},
+        pending_channel_names=frozenset(),
+    )
+    monkeypatch.setattr(connector_sources, "load_slack_channel_access", lambda _: policy)
+
+    def verified(connection: str, workspace: str) -> SlackChannelAccessPolicy:
+        assert connection == str(connection_id)
+        assert workspace == policy.workspace_id
+        return policy
+
+    monkeypatch.setattr(connector_sources, "policy_for_verified_slack_workspace", verified)
+    queries: list[str] = []
+
+    def get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
+        assert headers["Authorization"] == f"Bearer {TOKEN}"
+        assert 0 < timeout <= 15.0
+        parsed = urlsplit(url)
+        if parsed.path == "/api/auth.test":
+            return {"ok": True, "team_id": policy.workspace_id, "user_id": "U123456789"}
+        assert parsed.path == "/api/search.messages"
+        query = parse_qs(parsed.query)["query"][0]
+        queries.append(query)
+        channel = query.removeprefix("in:")
+        assert channel in policy.channels
+        return {"ok": True, "messages": {"matches": [{
+            "channel": {"id": channel}, "text": "approved project update",
+            "ts": f"{int(BASE_TIME.timestamp())}.000001", "user": "U123456789",
+        }]}}
+
+    _install_reader(monkeypatch, vault=vault, manager=manager, get_json=get_json)
+    delivery = read_connector_source(
+        vault, connection_id=str(connection_id), source_id="slack", limit=5,
+        observed_at=BASE_TIME,
+    )
+    assert queries == ["in:C123456789", "in:C987654321"]
+    assert delivery["result"] == "success"
+    assert len(cast(list[object], delivery["items"])) == 2

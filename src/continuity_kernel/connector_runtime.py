@@ -54,7 +54,6 @@ from continuity_kernel.connector_transport import (
     SLACK_AUTH_FAILURE_CODES,
     AuthorizationScheme,
     ConnectorCredential,
-    ConnectorMethod,
     ConnectorOrigin,
     ConnectorProviderError,
     ConnectorTransport,
@@ -461,6 +460,7 @@ class ConnectorRuntime:
             connection_id=connection_id,
             expected=slack_policy,
             credential=credential,
+            connection_revision=connection_snapshot.revision,
         )
         if not operation.scope_grant_satisfies(credential.granted_scopes):
             raise ValidationError(_scope_error(provider, operation_name))
@@ -692,6 +692,11 @@ class ConnectorRuntime:
                             confirmed_bundle.close()
         if not isinstance(result, ConnectorAdapterResult):
             raise ValidationError("connector adapter returned an invalid result")
+        # A policy narrowed during the provider call must also restrict its response.
+        slack_policy = _enforce_slack_read_channel_policy(
+            provider=provider, mode=mode, connection_id=connection_id,
+            operation=operation_name, input_value=input_value,
+        )
         if provider == "slack" and operation_name == "search.messages" and slack_policy is not None:
             slack_policy.validate_search_result(result.payload)
         try:
@@ -788,6 +793,7 @@ class ConnectorRuntime:
             connection_id=connection_id,
             expected=slack_policy,
             credential=credential,
+            connection_revision=connection_snapshot.revision,
         )
         if not operation.scope_grant_satisfies(credential.granted_scopes):
             raise ValidationError(_scope_error(provider, operation_name))
@@ -816,6 +822,11 @@ class ConnectorRuntime:
             prepared_bundle=None,
             connection_id=connection_id,
             connection_revision=connection_snapshot.revision,
+        )
+        # A policy narrowed during the provider call must also restrict its response.
+        slack_policy = _enforce_slack_read_channel_policy(
+            provider=provider, mode=mode, connection_id=connection_id,
+            operation=operation_name, input_value=input_value,
         )
         if provider == "slack" and operation_name == "search.messages" and slack_policy is not None:
             slack_policy.validate_search_result(result.payload)
@@ -1259,19 +1270,19 @@ class ConnectorRuntime:
         connection_id: str,
         expected: SlackChannelAccessPolicy | None,
         credential: ConnectorRuntimeCredential,
+        connection_revision: str,
     ) -> SlackChannelAccessPolicy | None:
         """Bind a restricted connection to auth.test before its target read."""
 
         if provider != "slack" or mode is not ConnectorMode.READ:
             return None
-        response = self.transport.request(
-            origin=ConnectorOrigin.SLACK,
-            method=ConnectorMethod.GET,
-            path="/api/auth.test",
-            credential=credential.credential,
-            response_bound=64 * 1024,
+        identity_operation = OPERATION_CATALOG.lookup("slack", ConnectorMode.READ, "identity.get")
+        response = self._execute_adapter(
+            self.adapters.get("slack"), identity_operation, {}, continuation=None,
+            credential=credential, write_idempotency_key=None, prepared_bundle=None,
+            connection_id=connection_id, connection_revision=connection_revision,
         )
-        payload = response.json()
+        payload = response.payload
         if not isinstance(payload, Mapping) or payload.get("ok") is not True:
             raise ValidationError("Slack workspace identity response is invalid")
         workspace_id = payload.get("team_id")

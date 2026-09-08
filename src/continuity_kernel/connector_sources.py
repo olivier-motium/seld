@@ -34,6 +34,10 @@ from continuity_kernel.connector_token_store import TokenState
 from continuity_kernel.connector_transport import SLACK_AUTH_FAILURE_CODES
 from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
 from continuity_kernel.records import format_time
+from continuity_kernel.slack_channel_access import (
+    load_slack_channel_access,
+    policy_for_verified_slack_workspace,
+)
 from continuity_kernel.source_state import SourceCompleteness
 from continuity_kernel.vault import Vault
 
@@ -210,6 +214,8 @@ def read_connector_source(
         raise ValidationError("connector observation time must be timezone-aware")
     observed = (observed_at or datetime.now(UTC)).astimezone(UTC)
     tool_binding = _digest(_TOOL_NAMESPACE, source_id)
+    if source_id == "slack":
+        load_slack_channel_access(str(clean_connection_id))
     budget = _OperationBudget(monotonic() + timeout_seconds)
 
     auth_manager = ConnectorAuthManager(vault)
@@ -305,6 +311,7 @@ def read_connector_source(
             )
         else:
             result = _read_slack(
+                connection_id=str(clean_connection_id),
                 access_token=access_token,
                 getter=getter,
                 limit=limit,
@@ -708,12 +715,14 @@ def _read_microsoft(
 
 def _read_slack(
     *,
+    connection_id: str,
     access_token: str,
     getter: JsonGetter,
     limit: int,
     observed_at: datetime,
     timeout_seconds: float,
 ) -> _ReadResult:
+    budget = _OperationBudget(monotonic() + timeout_seconds)
     identity = _request_slack_json(
         getter,
         f"{_SLACK_BASE}/auth.test",
@@ -725,22 +734,36 @@ def _read_slack(
     team_id = _provider_id(identity.get("team_id"), "Slack workspace ID")
     user_id = _provider_id(identity.get("user_id"), "Slack user ID")
     account_binding = _digest(_ACCOUNT_NAMESPACE, f"slack:user:{team_id}:{user_id}")
-    search_query = _query(
-        (
-            ("query", _SLACK_SEARCH_QUERY),
-            ("count", str(limit)),
-            ("sort", "timestamp"),
-            ("sort_dir", "desc"),
+    policy = policy_for_verified_slack_workspace(connection_id, team_id)
+    queries = (
+        [f"in:{channel}" for channel in sorted(policy.channels)]
+        if policy is not None else [_SLACK_SEARCH_QUERY]
+    )
+    per_channel = max(1, math.ceil(limit / max(1, len(queries))))
+    messages: list[Mapping[str, object]] = []
+    for query in queries:
+        search_query = _query(
+            (
+                ("query", query),
+                ("count", str(per_channel)),
+                ("sort", "timestamp"),
+                ("sort_dir", "desc"),
+            )
         )
-    )
-    search_payload = _request_slack_json(
-        getter,
-        f"{_SLACK_BASE}/search.messages?{search_query}",
-        access_token=access_token,
-        timeout_seconds=timeout_seconds,
-    )
-    search_messages = _required_object(search_payload.get("messages"), "Slack search response")
-    messages = _object_items(search_messages, "matches", limit, optional=True)
+        search_payload = _request_slack_json(
+            getter,
+            f"{_SLACK_BASE}/search.messages?{search_query}",
+            access_token=access_token,
+            timeout_seconds=budget.remaining(),
+        )
+        # Re-read the policy after the call so revocation cannot release a stale result.
+        current_policy = policy_for_verified_slack_workspace(connection_id, team_id)
+        if policy is not None:
+            if current_policy is None or current_policy.fingerprint != policy.fingerprint:
+                raise ValidationError("Slack channel policy changed during the source read")
+            current_policy.validate_search_result(search_payload)
+        search_messages = _required_object(search_payload.get("messages"), "Slack search response")
+        messages.extend(_object_items(search_messages, "matches", per_channel, optional=True))
     entries: list[tuple[dict[str, object], str]] = []
     for message in messages:
         message_type = message.get("type")

@@ -14,7 +14,7 @@ import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 from continuity_kernel.atomic import atomic_write
 from continuity_kernel.errors import ValidationError
@@ -297,7 +297,7 @@ def _read_json(path: Path, *, missing_ok: bool, label: str) -> object | None:
     if info.st_size > _MAX_CONFIG_BYTES:
         raise ValidationError(f"Slack channel access {label} exceeds its size bound")
     try:
-        return json.loads(path.read_bytes().decode("utf-8"))
+        return cast(object, json.loads(path.read_bytes().decode("utf-8")))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValidationError(f"Slack channel access {label} is invalid") from exc
 
