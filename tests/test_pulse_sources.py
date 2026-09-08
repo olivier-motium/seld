@@ -167,7 +167,7 @@ def _report_for(reports: FakeReportStore, window: AcquiredSourceWindow) -> tuple
     return reports.add(window)
 
 
-def test_account_mismatch_is_rejected_before_a_report_can_be_persisted(tmp_path: Path) -> None:
+def test_account_mismatch_becomes_a_content_free_failure_checkpoint(tmp_path: Path) -> None:
     observed = datetime.now(UTC).replace(microsecond=0)
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Pulse source account lease")
@@ -187,6 +187,8 @@ def test_account_mismatch_is_rejected_before_a_report_can_be_persisted(tmp_path:
         evidence_refs=("synthetic-prior-evidence",),
         observed_at=observed,
     )
+    prior = vault.get_source_snapshot().observation("slack")
+    assert prior is not None
 
     def mismatched_reader(vault: Vault, **_kwargs: object) -> dict[str, object]:
         return {
@@ -213,11 +215,38 @@ def test_account_mismatch_is_rejected_before_a_report_can_be_persisted(tmp_path:
     )
     adapter._connection_id = lambda _source: "conn-1"  # type: ignore[assignment]
 
-    with pytest.raises(ConflictError, match="account binding changed"):
-        adapter.acquire("slack")
-
-    assert vault.get_source_snapshot().revision == before["revision"]
+    window = adapter.acquire("slack")
+    assert window.items == ()
+    assert window.result == "failure"
+    assert window.error_code == "identity_mismatch"
+    assert window.receipt.record == {
+        "source": "slack",
+        "result": "failure",
+        "errorCode": "identity_mismatch",
+    }
     assert PulseReportStore(vault.root).list_pending().reports == ()
+
+    reports = PulseReportStore(vault.root)
+    report = reports.append(
+        event_key=window.report_event_key,
+        claim="The selected source identity does not match its recorded account.",
+        uncertainty="No provider items were retained.",
+        source_id=window.source_id,
+        observed_at=window.observed_at,
+        coverage_ref=window.coverage_ref,
+        coverage_revision=window.source_revision,
+        completeness=window.completeness,
+    )
+    adapter.commit(window, report_ref=report.report_ref, report_revision=report.revision)
+    adapter.release(window)
+
+    after = vault.get_source_snapshot()
+    observation = after.observation("slack")
+    assert observation is not None
+    assert after.revision != before["revision"]
+    assert observation.result.value == "failure"
+    assert observation.error_code == "identity_mismatch"
+    assert observation.account_fingerprint == prior.account_fingerprint
 
 
 def test_connector_window_is_transient_stable_and_requires_report_readback() -> None:

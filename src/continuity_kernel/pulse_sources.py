@@ -494,7 +494,15 @@ class PulseSourceAdapter:
             raise ValidationError("empty Pulse source receipt has provider items")
         if result == "success" and not payload:
             raise ValidationError("successful Pulse source receipt has no provider items")
-        self._assert_account_lease(snapshot, source_id=source_id, record=record)
+        if not self._account_lease_matches(snapshot, source_id=source_id, record=record):
+            return self._failure_window(
+                source_id=source_id,
+                snapshot=snapshot,
+                observed_at=observed_at,
+                error_code="identity_mismatch",
+                status="failure",
+                kind=kind,
+            )
         return self._issue_window(
             source_id=source_id,
             snapshot=snapshot,
@@ -510,30 +518,26 @@ class PulseSourceAdapter:
         )
 
     @staticmethod
-    def _assert_account_lease(
+    def _account_lease_matches(
         snapshot: object,
         *,
         source_id: str,
         record: Mapping[str, object],
-    ) -> None:
-        """Reject a changed provider identity before a report can be persisted.
+    ) -> bool:
+        """Check whether an acquired provider receipt matches the selected account.
 
-        The vault validates this again at receipt commit.  Checking the acquired
-        receipt here prevents a durable report whose source checkpoint is
-        guaranteed to fail because the selected source is already bound to a
-        different account.
+        A mismatch becomes a content-free failure window.  The normal source
+        commit then preserves the prior binding while recording a stable
+        ``identity_mismatch`` incident, without retaining the provider items.
         """
 
         prior = cast(Any, snapshot).observation(source_id)
         expected_account = getattr(prior, "account_fingerprint", None)
-        if expected_account is None:
-            return
+        if not isinstance(expected_account, str):
+            return True
         account_binding = _optional_text(record.get("accountBinding"))
         actual_account = source_fingerprint(account_binding, "Pulse source account binding")
-        if actual_account != expected_account:
-            raise ConflictError(
-                "source account binding changed; deselect and explicitly select it again"
-            )
+        return actual_account == expected_account
 
     def _failure_window(
         self,
