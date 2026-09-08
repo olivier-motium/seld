@@ -31,7 +31,7 @@ from continuity_kernel.errors import (
 from continuity_kernel.local_source_delivery import SUPPORTED_LOCAL_SOURCES, LocalSourceDelivery
 from continuity_kernel.records import format_time, parse_time
 from continuity_kernel.slack_tasks import SlackTaskReader
-from continuity_kernel.source_state import SourceCompleteness, SourceObservation
+from continuity_kernel.source_state import SourceCompleteness, SourceObservation, source_fingerprint
 from continuity_kernel.vault import Vault
 
 MAX_PULSE_SOURCE_LIMIT = 25
@@ -494,6 +494,7 @@ class PulseSourceAdapter:
             raise ValidationError("empty Pulse source receipt has provider items")
         if result == "success" and not payload:
             raise ValidationError("successful Pulse source receipt has no provider items")
+        self._assert_account_lease(snapshot, source_id=source_id, record=record)
         return self._issue_window(
             source_id=source_id,
             snapshot=snapshot,
@@ -507,6 +508,32 @@ class PulseSourceAdapter:
             record=record,
             discord_ack_token=discord_ack_token,
         )
+
+    @staticmethod
+    def _assert_account_lease(
+        snapshot: object,
+        *,
+        source_id: str,
+        record: Mapping[str, object],
+    ) -> None:
+        """Reject a changed provider identity before a report can be persisted.
+
+        The vault validates this again at receipt commit.  Checking the acquired
+        receipt here prevents a durable report whose source checkpoint is
+        guaranteed to fail because the selected source is already bound to a
+        different account.
+        """
+
+        prior = cast(Any, snapshot).observation(source_id)
+        expected_account = getattr(prior, "account_fingerprint", None)
+        if expected_account is None:
+            return
+        account_binding = _optional_text(record.get("accountBinding"))
+        actual_account = source_fingerprint(account_binding, "Pulse source account binding")
+        if actual_account != expected_account:
+            raise ConflictError(
+                "source account binding changed; deselect and explicitly select it again"
+            )
 
     def _failure_window(
         self,

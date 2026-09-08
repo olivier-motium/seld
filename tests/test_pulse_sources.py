@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import cast
 
 import pytest
 
 from continuity_kernel.connector_auth import ConnectionHealth
 from continuity_kernel.errors import ConflictError
+from continuity_kernel.pulse_reports import PulseReportStore
 from continuity_kernel.pulse_sources import AcquiredSourceWindow, PulseSourceAdapter
+from continuity_kernel.vault import Vault
 
 REVISION_A = "a" * 64
 REVISION_B = "b" * 64
@@ -162,6 +165,59 @@ def _adapter(
 
 def _report_for(reports: FakeReportStore, window: AcquiredSourceWindow) -> tuple[str, str]:
     return reports.add(window)
+
+
+def test_account_mismatch_is_rejected_before_a_report_can_be_persisted(tmp_path: Path) -> None:
+    observed = datetime.now(UTC).replace(microsecond=0)
+    vault = Vault(tmp_path / "vault")
+    vault.initialize(name="Pulse source account lease")
+    selected = vault.select_sources(
+        expected_revision=vault.get_source_snapshot().revision,
+        sources=("slack",),
+    )
+    before = vault.record_source_observation(
+        expected_revision=selected["revision"],
+        source_id="slack",
+        actor_ref="system-role:source-test",
+        result="success",
+        covered_through=observed.isoformat().replace("+00:00", "Z"),
+        completeness="partial",
+        account_binding="synthetic-prior-account",
+        tool_binding="synthetic-reader",
+        evidence_refs=("synthetic-prior-evidence",),
+        observed_at=observed,
+    )
+
+    def mismatched_reader(vault: Vault, **_kwargs: object) -> dict[str, object]:
+        return {
+            "source": "slack",
+            "sourceRevision": vault.get_source_snapshot().revision,
+            "result": "success",
+            "items": [{"summary": "synthetic"}],
+            "record": {
+                "source": "slack",
+                "result": "success",
+                "coveredThrough": observed.isoformat().replace("+00:00", "Z"),
+                "completeness": "partial",
+                "accountBinding": "synthetic-current-account",
+                "toolBinding": "synthetic-reader",
+                "evidenceRefs": ["synthetic-current-evidence"],
+            },
+        }
+
+    adapter = PulseSourceAdapter(
+        vault,
+        report_store=PulseReportStore(vault.root),
+        connector_reader=mismatched_reader,
+        now=lambda: observed,
+    )
+    adapter._connection_id = lambda _source: "conn-1"  # type: ignore[assignment]
+
+    with pytest.raises(ConflictError, match="account binding changed"):
+        adapter.acquire("slack")
+
+    assert vault.get_source_snapshot().revision == before["revision"]
+    assert PulseReportStore(vault.root).list_pending().reports == ()
 
 
 def test_connector_window_is_transient_stable_and_requires_report_readback() -> None:
