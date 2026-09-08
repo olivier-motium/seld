@@ -51,6 +51,7 @@ from continuity_kernel.vault import Vault
 DELIVERY_FORMAT_VERSION: Final = 1
 MAX_DELIVERY_STATE_BYTES: Final = 512 * 1024
 MAX_WAKE_REPORTS: Final = 20
+MAX_OUTSTANDING_WAKES: Final = 2
 MAX_WAKE_REQUESTS: Final = 1_000
 MAX_INTEGRATIONS: Final = 2_000
 MAX_CURATION_OUTBOX: Final = 2_000
@@ -232,10 +233,15 @@ class PulseDelivery:
                     "Pulse wake requires reports with an undelivered wake decision"
                 )
         refs = tuple(report.report_ref for report in reports)
+        pending_ids = frozenset(
+            report.identifier
+            for report in self.reports.list_pending(stage="delivery", limit=1_000).reports
+        )
         reservation = self._reserve_wake(
             report_ids=ids,
             report_refs=refs,
             pulse_thread_id=binding.pulse_thread_id,
+            pending_report_ids=pending_ids,
         )
         if not reservation.created:
             if reservation.request is None:
@@ -538,6 +544,7 @@ class PulseDelivery:
         report_ids: tuple[str, ...],
         report_refs: tuple[str, ...],
         pulse_thread_id: str,
+        pending_report_ids: frozenset[str],
     ) -> _WakeReservation:
         now = format_time(self._now())
         with self._transaction() as store:
@@ -564,6 +571,18 @@ class PulseDelivery:
                     None,
                 )
                 return _WakeReservation(existing, False, (), ())
+            outstanding = sum(
+                item.pulse_thread_id == pulse_thread_id
+                and item.state == "queued"
+                and any(identifier in pending_report_ids for identifier in item.report_ids)
+                for item in state.wake_requests
+            )
+            if outstanding >= MAX_OUTSTANDING_WAKES:
+                # Keep one follow-up available while Pulse works. Its bounded
+                # pending-report read includes new arrivals; a separate turn
+                # for every arrival would only lengthen the same serial queue.
+                # These IDs remain unreserved and are reconsidered next tick.
+                return _WakeReservation(None, False, (), ())
             if len(state.wake_requests) >= MAX_WAKE_REQUESTS:
                 raise ValidationError("Pulse wake receipt store reached its bounded limit")
             selected_ids = tuple(identifier for identifier, _ in selected)

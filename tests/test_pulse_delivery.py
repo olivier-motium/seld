@@ -123,6 +123,37 @@ def test_new_wake_reserves_only_reports_not_already_covered(vault: Vault) -> Non
     assert len(commands) == 2
 
 
+def test_wake_backlog_coalesces_without_marking_waiting_reports_delivered(vault: Vault) -> None:
+    _bind_pulse(vault)
+    first = _wake_report(vault, marker="a")
+    second = _wake_report(vault, marker="b")
+    third = _wake_report(vault, marker="c")
+    commands: list[tuple[str, ...]] = []
+    delivery = PulseDelivery(
+        vault,
+        queue_runner=lambda command: commands.append(tuple(command)) or 0,
+        now=lambda: NOW,
+    )
+    delivery.queue_wake((first.identifier,))
+    delivery.queue_wake((second.identifier,))
+    assert delivery.queue_wake((third.identifier,)).state == "noop"
+    assert len(commands) == 2
+    assert delivery.reports.show(third.identifier).delivery is None
+
+    delivery.integrate(
+        first.identifier,
+        expected_revision=first.revision,
+        pulse_thread_id=PULSE_THREAD,
+        result_refs=(first.report_ref,),
+        summary="The report requires no canonical change.",
+        interface_change=False,
+    )
+    resumed = delivery.queue_wake((second.identifier, third.identifier))
+    assert resumed.state == "queued"
+    assert resumed.report_refs == (third.report_ref,)
+    assert len(commands) == 3
+
+
 def test_integration_queues_curation_only_for_interface_change_and_cas_records_result(
     vault: Vault,
 ) -> None:
