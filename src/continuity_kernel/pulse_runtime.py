@@ -358,8 +358,21 @@ class PulseRuntime:
                 stage = "report_recovery"
                 known = previous.get("fingerprint") == window.fingerprint
                 if known:
-                    self._source_state(source, {"last_poll_at": _now(), "state": "idle"})
-                    return
+                    report_id = previous.get("report_id")
+                    if isinstance(report_id, str):
+                        report = self.reports.show(report_id)
+                        await asyncio.to_thread(
+                            self.adapter.commit,
+                            window,
+                            report_ref=report.report_ref,
+                            report_revision=report.revision,
+                            replay=True,
+                        )
+                        self._source_state(
+                            source,
+                            self._replayed_source_facts(source, window, report),
+                        )
+                        return
                 # A durable source report is also a restart dedupe checkpoint.
                 recent = self.reports.recent(source_id=source, limit=5).reports
                 replay = next(
@@ -373,15 +386,7 @@ class PulseRuntime:
                         report_revision=replay.revision,
                         replay=True,
                     )
-                    self._source_state(
-                        source,
-                        {
-                            "last_poll_at": _now(),
-                            "state": "idle",
-                            "fingerprint": window.fingerprint,
-                            "report_id": replay.identifier,
-                        },
-                    )
+                    self._source_state(source, self._replayed_source_facts(source, window, replay))
                     self._arrivals.set()
                     return
                 stage = "source_judgment"
@@ -677,6 +682,23 @@ class PulseRuntime:
         self.state.change(
             lambda state: _record_facts(state["sources"].setdefault(source, {}), fields)
         )
+
+    def _replayed_source_facts(
+        self,
+        source: str,
+        window: AcquiredSourceWindow,
+        report: PulseReport,
+    ) -> dict[str, Any]:
+        return {
+            "last_poll_at": _now(),
+            "last_processed_at": _now(),
+            "state": "idle",
+            "fingerprint": window.fingerprint,
+            "report_id": report.identifier,
+            "coverage_status": window.status,
+            "error_code": window.error_code,
+            "incident_signature": _source_access_signature(self.vault, source),
+        }
 
 
 def _record_relevance(state: dict[str, Any], *, facts: Mapping[str, Any]) -> None:

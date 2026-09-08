@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
@@ -194,6 +194,70 @@ def test_runtime_recovers_a_committed_report_without_another_model_or_actual_wak
     assert adapter.commits == [False, True]
     assert adapter.releases == 2
     assert PulseReportStore(vault.root).recent(source_id="slack").reports == reports
+    assert turns == ["source", "relevance"]
+    assert len(queue_calls) == 1
+
+
+def test_known_fingerprint_replays_the_latest_report_without_another_model_or_wake(
+    vault: Vault,
+) -> None:
+    vault.select_sources(expected_revision=vault.get_source_snapshot().revision, sources=("slack",))
+    _bind_pulse(vault)
+    adapter = FakeSourceAdapter(vault)
+    turns: list[str] = []
+    queue_calls: list[tuple[str, ...]] = []
+
+    def factory(*, instructions: str, **_values: object) -> FakeLunaSession:
+        role = (
+            "relevance" if instructions.startswith("You are the separate relevance") else "source"
+        )
+        return FakeLunaSession(role, turns)
+
+    def queue_runner(command: Sequence[str]) -> int:
+        queue_calls.append(tuple(command))
+        return 0
+
+    delivery = PulseDelivery(
+        vault,
+        queue_runner=queue_runner,
+        now=lambda: NOW,
+    )
+    runtime = PulseRuntime(
+        vault,
+        adapter=adapter,  # type: ignore[arg-type]
+        session_factory=factory,  # type: ignore[arg-type]
+        wake_handler=delivery.queue_wake,
+    )
+    asyncio.run(runtime.run(once=True))
+
+    report_store = PulseReportStore(vault.root)
+    report = report_store.recent(source_id="slack").reports[0]
+    task = vault.get_task("resident-pulse")
+    delivered = report_store.record_delivery(
+        report.identifier,
+        expected_revision=report.revision,
+        result_ref=f"{task.identifier}@{task.revision}",
+        delivered_at=NOW,
+    )
+    runtime._source_state(
+        "slack",
+        {
+            "coverage_status": "failure",
+            "error_code": "auth_required",
+            "incident_signature": "stale-incident-signature",
+        },
+    )
+
+    asyncio.run(runtime.run(once=True))
+
+    source_state = runtime.state.read()["sources"]["slack"]
+    assert adapter.commits == [False, True]
+    assert adapter.releases == 2
+    assert source_state["report_id"] == delivered.identifier
+    assert source_state["coverage_status"] == "success"
+    assert source_state["error_code"] is None
+    assert source_state["incident_signature"] == _source_access_signature(vault, "slack")
+    assert report_store.show(delivered.identifier) == delivered
     assert turns == ["source", "relevance"]
     assert len(queue_calls) == 1
 
