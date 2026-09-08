@@ -374,7 +374,11 @@ class PulseRuntime:
                 stage = "source_judgment"
                 self._windows[source] = window
                 self._source_state(source, {"last_poll_at": _now(), "state": "reading"})
-                if window.empty and window.result == "explicit_empty":
+                if window.result == "failure":
+                    claim = f"The bounded source read is unavailable ({window.error_code})."
+                    uncertainty = "No current source contents were available for interpretation."
+                    turn = None
+                elif window.empty and window.result == "explicit_empty":
                     # Exact emptiness is an acquisition fact, not an AI judgment.
                     claim = "The bounded source read returned no new items."
                     uncertainty = (
@@ -486,6 +490,15 @@ class PulseRuntime:
                     "status": window.status,
                     "observed_at": window.observed_at,
                 }
+            observation = self.vault.get_source_snapshot().observation(source)
+            if (
+                (window is not None and window.result == "failure")
+                or (
+                    observation is not None
+                    and observation.error_code in AUTH_OR_TOOL_INCIDENT_ERROR_CODES
+                )
+            ):
+                raise ValidationError("Source tools are unavailable until access is repaired")
             if source == "slack" and name == "source_search":
                 query = _bounded_text(arguments.get("query"), 500)
                 return await asyncio.to_thread(self.adapter.slack_search, query)
