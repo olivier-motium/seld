@@ -925,7 +925,9 @@ def _wake_message(report_ids: tuple[str, ...]) -> str:
         "has an active_thread_id for an existing desktop work item, include that exact "
         "UUID as --target-desktop-work-id and the task's fresh result ref. "
         "For a justified no-change "
-        "disposition use the source-report ref and omit --interface-change. Queue "
+        "disposition use the source-report ref and omit --interface-change. Do not "
+        "rewrite NOW or tasks merely to record a review, an unverified historical "
+        "claim, or a changed timestamp with no supported current consequence. Queue "
         "acceptance is not semantic completion. Do not independently message Diane "
         "again for that integration.\n" + "\n".join(report_ids)
     )
