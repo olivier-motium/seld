@@ -453,7 +453,9 @@ class PulseRuntime:
                     # Exact emptiness is an acquisition fact, not an AI judgment.
                     claim = "The bounded source read returned no new items."
                     uncertainty = (
-                        "" if window.completeness == "complete" else "Coverage is partial."
+                        "The bounded read is complete."
+                        if window.completeness == "complete"
+                        else "Coverage is partial."
                     )
                     turn = None
                 else:
@@ -488,7 +490,7 @@ class PulseRuntime:
                         },
                     )
                     claim = _bounded_text(turn.output.get("claim"), 2000)
-                    uncertainty = _bounded_text(turn.output.get("uncertainty"), 2000, empty=True)
+                    uncertainty = _report_uncertainty(turn.output.get("uncertainty"))
                 stage = "report_persistence"
                 report = self.reports.append(
                     event_key=window.report_event_key,
@@ -704,7 +706,7 @@ class PulseRuntime:
                 existing = self.reports.append(
                     event_key=f"pulse-report:{key}",
                     claim=_bounded_text(result.output.get("claim"), 2000),
-                    uncertainty=_bounded_text(result.output.get("uncertainty"), 2000, empty=True),
+                    uncertainty=_report_uncertainty(result.output.get("uncertainty")),
                     source_id=report.source_id,
                     observed_at=_now(),
                     coverage_ref=report.coverage_ref,
@@ -813,6 +815,13 @@ def _bounded_text(value: Any, limit: int, *, empty: bool = False) -> str:
     if not isinstance(value, str) or len(value) > limit or (not empty and not value.strip()):
         raise ValidationError("Derived model text is missing or outside its bound")
     return value.strip()
+
+
+def _report_uncertainty(value: Any) -> str:
+    """Keep the report store's non-empty uncertainty invariant after a model turn."""
+
+    uncertainty = _bounded_text(value, 2000, empty=True)
+    return uncertainty or "No additional uncertainty was reported."
 
 
 def _turn_facts(turn: LunaTurnResult) -> dict[str, Any]:

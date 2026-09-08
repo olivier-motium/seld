@@ -609,3 +609,37 @@ def test_verified_connection_repair_resumes_an_incident_skipped_source(vault: Va
     asyncio.run(runtime.run(once=True))
     assert adapter.acquisitions == 1
     assert turns == ["source", "relevance"]
+
+
+def test_complete_empty_source_read_commits_without_a_model_or_blank_uncertainty(
+    vault: Vault,
+) -> None:
+    vault.select_sources(expected_revision=vault.get_source_snapshot().revision, sources=("slack",))
+
+    class CompleteEmptyAdapter(FakeSourceAdapter):
+        def acquire(self, source: str) -> AcquiredSourceWindow:
+            return replace(
+                super().acquire(source),
+                items=(),
+                result="explicit_empty",
+                empty=True,
+                completeness="complete",
+                status="empty",
+            )
+
+    def no_model(*_args: object, **_values: object) -> FakeLunaSession:
+        raise AssertionError("An explicit empty source read must not start a model turn")
+
+    adapter = CompleteEmptyAdapter(vault)
+    runtime = PulseRuntime(
+        vault,
+        adapter=adapter,  # type: ignore[arg-type]
+        session_factory=no_model,  # type: ignore[arg-type]
+    )
+    asyncio.run(runtime.process_source("slack"))
+
+    report = PulseReportStore(vault.root).recent(source_id="slack").reports[0]
+    assert report.completeness == "complete"
+    assert report.uncertainty == "The bounded read is complete."
+    assert adapter.commits == [False]
+    assert adapter.releases == 1
