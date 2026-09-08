@@ -144,6 +144,55 @@ def _bind_pulse(vault: Vault) -> None:
     )
 
 
+def test_delivery_reconsiders_waiting_reports_without_a_new_source_event(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault.select_sources(
+        expected_revision=vault.get_source_snapshot().revision, sources=("slack",)
+    )
+    store = PulseReportStore(vault.root)
+    report = store.append(
+        event_key=f"pulse-report:{FINGERPRINT}",
+        claim="A retained change awaits Pulse.",
+        uncertainty="The source read is partial.",
+        source_id="slack",
+        observed_at=NOW,
+        coverage_ref="source:slack",
+        coverage_revision="a" * 64,
+        completeness="partial",
+    )
+    store.decide(
+        report.identifier, expected_revision=report.revision, decision="wake", reason="Useful."
+    )
+    calls: list[tuple[str, ...]] = []
+
+    async def exercise() -> None:
+        resumed = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def queue(ids: Sequence[str]) -> None:
+            calls.append(tuple(ids))
+            if len(calls) == 2:
+                loop.call_soon_threadsafe(resumed.set)
+
+        async def no_curation() -> None:
+            pass
+
+        runtime = PulseRuntime(vault, wake_handler=queue)
+        monkeypatch.setattr(runtime, "curate_pending", no_curation)
+        task = asyncio.create_task(runtime._curation_loop())
+        try:
+            await asyncio.wait_for(resumed.wait(), timeout=10)
+            assert not runtime._arrivals.is_set()
+        finally:
+            runtime._stop.set()
+            await task
+
+    asyncio.run(exercise())
+    assert calls == [(report.identifier,), (report.identifier,)]
+    assert store.show(report.identifier).delivery is None
+
+
 def test_runtime_recovers_a_committed_report_without_another_model_or_actual_wake(
     vault: Vault,
 ) -> None:

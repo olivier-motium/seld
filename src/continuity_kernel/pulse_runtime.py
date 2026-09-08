@@ -359,6 +359,14 @@ class PulseRuntime:
 
     async def _curation_loop(self) -> None:
         while not self._stop.is_set():
+            # Reconsider coalesced reports when Pulse frees queue capacity,
+            # even if no new source event arrives. This invokes no model.
+            try:
+                await self.deliver_pending()
+                if self.state.read().get("delivery_state") == "unavailable":
+                    self.state.change(lambda state: state.update({"delivery_state": "ready"}))
+            except (ContinuityError, OSError, TimeoutError):
+                self.state.change(lambda state: state.update({"delivery_state": "unavailable"}))
             await self.curate_pending()
             with suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), 3)
