@@ -1432,13 +1432,13 @@ def test_whatsapp_recipe_limit_is_one_replay_unit_not_a_wake_cap(tmp_path: Path)
         whatsapp_runner=_runner(runtime),
     )
     delivery.baseline("whatsapp")
-    for index in range(30):
+    for index in range(105):
         _append_whatsapp(database, f"bounded body {index}")
 
     first = delivery.poll("whatsapp", limit=100)
-    assert len(first["messages"]) == 25
+    assert len(first["messages"]) == 100
     assert first["complete"] is False
-    assert cast(dict[str, Any], first["delivery"])["items_observed"] == 25
+    assert cast(dict[str, Any], first["delivery"])["items_observed"] == 100
     _ack(delivery, first)
 
     second = delivery.poll("whatsapp", limit=100)
