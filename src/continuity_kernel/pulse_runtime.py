@@ -405,7 +405,13 @@ class PulseRuntime:
                         ),
                         output_schema=SOURCE_SCHEMA,
                     )
-                    self._source_state(source, {"last_turn": _turn_facts(turn)})
+                    self._source_state(
+                        source,
+                        {
+                            "last_turn": _turn_facts(turn),
+                            "configuration": session.configuration,
+                        },
+                    )
                     claim = _bounded_text(turn.output.get("claim"), 2000)
                     uncertainty = _bounded_text(turn.output.get("uncertainty"), 2000, empty=True)
                 stage = "report_persistence"
