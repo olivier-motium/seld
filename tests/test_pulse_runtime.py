@@ -23,6 +23,7 @@ from continuity_kernel.pulse_delivery import PulseDelivery
 from continuity_kernel.pulse_reports import PulseReportStore
 from continuity_kernel.pulse_runtime import PulseRuntime, _source_access_signature
 from continuity_kernel.pulse_sources import AcquiredSourceWindow, AcquisitionReceipt
+from continuity_kernel.source_state import source_fingerprint
 from continuity_kernel.vault import Vault
 
 PULSE_THREAD = "11111111-1111-4111-8111-111111111111"
@@ -319,6 +320,7 @@ def test_known_fingerprint_replays_the_latest_report_without_another_model_or_wa
     ("failure", "failure_code"),
     [
         (ValidationError("Pulse report receipt is invalid"), "report_receipt_invalid"),
+        (ValidationError("source evidence digests contain a duplicate"), "duplicate_evidence_refs"),
         (ContinuityError("local source content changed after polling"), "local_content_changed"),
     ],
 )
@@ -361,6 +363,45 @@ def test_checkpoint_failure_keeps_a_fixed_content_free_code(
     assert source_state["failed_stage"] == "source_checkpoint"
     assert source_state["failure_type"] == type(failure).__name__
     assert source_state["failure_code"] == failure_code
+
+
+def test_checkpoint_validation_records_only_its_local_exception_origin(vault: Vault) -> None:
+    vault.select_sources(expected_revision=vault.get_source_snapshot().revision, sources=("slack",))
+    _bind_pulse(vault)
+
+    class DynamicValidationAdapter(FakeSourceAdapter):
+        def commit(
+            self,
+            window: AcquiredSourceWindow,
+            *,
+            report_ref: str,
+            report_revision: str,
+            replay: bool = False,
+        ) -> Mapping[str, object]:
+            del window, report_ref, report_revision
+            self.commits.append(replay)
+            source_fingerprint("x" * 10_000, "tool binding")
+            raise AssertionError("source_fingerprint must reject the oversized binding")
+
+    turns: list[str] = []
+    runtime = PulseRuntime(
+        vault,
+        adapter=DynamicValidationAdapter(vault),  # type: ignore[arg-type]
+        session_factory=lambda *, instructions, **_values: FakeLunaSession(
+            "relevance" if instructions.startswith("You are the separate relevance") else "source",
+            turns,
+        ),
+        wake_handler=lambda _ids: None,
+    )
+
+    asyncio.run(runtime.run(once=True))
+
+    source_state = runtime.state.read()["sources"]["slack"]
+    assert source_state["failure_code"] == "checkpoint_validation_error"
+    assert source_state["failure_origin"].startswith(
+        "continuity_kernel.source_state:source_fingerprint:"
+    )
+    assert "tool binding" not in source_state["failure_origin"]
 
 
 def test_unavailable_source_creates_a_gap_report_without_starting_a_source_model(

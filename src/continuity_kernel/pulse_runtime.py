@@ -94,6 +94,7 @@ _CHECKPOINT_VALIDATION_CODES: Final[Mapping[str, str]] = {
     "canonical result reference must name one typed record revision": "result_reference_invalid",
     "canonical result reference must end in a SHA-256 revision": "result_reference_invalid",
     "source report reference is not in its canonical form": "report_reference_noncanonical",
+    "source evidence digests contain a duplicate": "duplicate_evidence_refs",
 }
 _CHECKPOINT_CONTINUITY_CODES: Final[Mapping[str, str]] = {
     "local source content changed after polling": "local_content_changed",
@@ -512,6 +513,7 @@ class PulseRuntime:
                         "failed_stage": None,
                         "failure_code": None,
                         "failure_type": None,
+                        "failure_origin": None,
                         "incident_signature": _source_access_signature(self.vault, source),
                         "configuration": self._sessions[source].configuration
                         if source in self._sessions
@@ -529,6 +531,7 @@ class PulseRuntime:
                         "failed_stage": stage,
                         "failure_code": _checkpoint_failure_code(stage, exc),
                         "failure_type": type(exc).__name__,
+                        "failure_origin": _checkpoint_failure_origin(stage, exc),
                     },
                 )
             finally:
@@ -751,6 +754,7 @@ class PulseRuntime:
             "failed_stage": None,
             "failure_code": None,
             "failure_type": None,
+            "failure_origin": None,
             "incident_signature": _source_access_signature(self.vault, source),
         }
 
@@ -786,6 +790,22 @@ def _checkpoint_failure_code(stage: str, exc: Exception) -> str | None:
     if isinstance(exc, OSError):
         return "checkpoint_os_error"
     return None
+
+
+def _checkpoint_failure_origin(stage: str, exc: Exception) -> str | None:
+    """Return the deepest local exception location without retaining error content."""
+
+    if stage != "source_checkpoint":
+        return None
+    origin: str | None = None
+    traceback = exc.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        module = frame.f_globals.get("__name__")
+        if isinstance(module, str) and module.startswith("continuity_kernel."):
+            origin = f"{module}:{frame.f_code.co_name}:{traceback.tb_lineno}"
+        traceback = traceback.tb_next
+    return origin
 
 
 def _bounded_text(value: Any, limit: int, *, empty: bool = False) -> str:
