@@ -259,7 +259,9 @@ def _plist(command: tuple[str, ...], *, stdout_path: Path, stderr_path: Path) ->
         },
         "KeepAlive": True,
         "Label": LABEL,
-        "ProcessType": "Background",
+        # This user-requested source watcher must make progress under system load.
+        # Standard retains launchd light limits without the Background QoS clamp.
+        "ProcessType": "Standard",
         "ProgramArguments": list(command),
         "RunAtLoad": True,
         "StandardErrorPath": str(stderr_path),
