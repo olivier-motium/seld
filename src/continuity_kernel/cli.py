@@ -661,6 +661,42 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "pulse":
         if args.pulse_command == "status":
             return _pulse_status(vault)
+        if args.pulse_command == "reports":
+            from continuity_kernel.pulse_reports import PulseReportStore, pulse_report_dict
+
+            reports = PulseReportStore(vault.root)
+            return pulse_report_dict(
+                reports.show(args.id)
+                if args.id
+                else reports.list_pending(stage=args.stage, limit=args.limit)
+            )
+        if args.pulse_command == "watch":
+            import asyncio
+
+            from continuity_kernel.pulse_runtime import PulseRuntime
+
+            return asyncio.run(
+                PulseRuntime(
+                    vault,
+                    sources=args.source,
+                    poll_seconds=args.poll_seconds,
+                    concurrency=args.concurrency,
+                    diane_bridge=Path(args.diane_bridge) if args.diane_bridge else None,
+                ).run(once=args.once)
+            )
+        if args.pulse_command == "integrate":
+            from continuity_kernel.pulse_delivery import PulseDelivery
+
+            return asdict(
+                PulseDelivery(vault).integrate(
+                    args.id,
+                    expected_revision=args.expected_revision,
+                    pulse_thread_id=args.pulse_thread_id,
+                    result_refs=args.result_ref,
+                    summary=args.summary,
+                    interface_change=args.interface_change,
+                )
+            )
         if args.pulse_command == "sweep":
             return sense_sweep(
                 vault,
@@ -1529,6 +1565,9 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
 
 def _pulse_status(vault: Vault) -> dict[str, object]:
     heartbeat = heartbeat_status(vault.root)
+    from continuity_kernel.pulse_delivery import PulseDelivery
+    from continuity_kernel.pulse_runtime import PulseRuntimeState
+
     return {
         # Keep the original field for existing callers.  It is intentionally
         # paired with an explicit scope below so a healthy sensor is never read
@@ -1544,6 +1583,8 @@ def _pulse_status(vault: Vault) -> dict[str, object]:
             "state": "unobserved",
         },
         "signals": vault.resident_signal_status(),
+        "event_runtime": PulseRuntimeState(vault.root).status(),
+        "event_delivery": asdict(PulseDelivery(vault).status()),
     }
 
 
@@ -2756,6 +2797,34 @@ def _parser() -> argparse.ArgumentParser:
         "sweep",
         help="Run one provider-free mechanical sweep and publish its heartbeat.",
     )
+    pulse_reports = pulse_commands.add_parser(
+        "reports",
+        help="Read bounded derived source reports, never raw provider messages.",
+    )
+    pulse_reports.add_argument("--id")
+    pulse_reports.add_argument(
+        "--stage", choices=("relevance", "delivery", "investigation"), default="delivery"
+    )
+    pulse_reports.add_argument("--limit", type=int, default=8)
+    pulse_watch = pulse_commands.add_parser(
+        "watch",
+        help="Run selected source watchers and event-driven Luna cognition.",
+    )
+    pulse_watch.add_argument("--source", action="append")
+    pulse_watch.add_argument("--poll-seconds", type=float, default=60)
+    pulse_watch.add_argument("--concurrency", type=int, default=2)
+    pulse_watch.add_argument("--once", action="store_true")
+    pulse_watch.add_argument("--diane-bridge")
+    pulse_integrate = pulse_commands.add_parser(
+        "integrate",
+        help="Record exact Pulse integration and optionally request Diane curation.",
+    )
+    pulse_integrate.add_argument("--id", required=True)
+    pulse_integrate.add_argument("--expected-revision", required=True)
+    pulse_integrate.add_argument("--pulse-thread-id", required=True)
+    pulse_integrate.add_argument("--result-ref", action="append", required=True)
+    pulse_integrate.add_argument("--summary", required=True)
+    pulse_integrate.add_argument("--interface-change", action="store_true")
 
     scheduler = commands.add_parser(
         "scheduler",

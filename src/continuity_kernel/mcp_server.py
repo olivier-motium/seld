@@ -465,10 +465,41 @@ def _call(
             retain_recent=_integer(values, "retain_recent", 1_000)
         )
     if name == "gsv_pulse_status":
+        from continuity_kernel.pulse_delivery import PulseDelivery
+        from continuity_kernel.pulse_runtime import PulseRuntimeState
+
         return {
             "heartbeat": heartbeat_status(vault.root),
             "signals": vault.resident_signal_status(),
+            "event_runtime": PulseRuntimeState(vault.root).status(),
+            "event_delivery": asdict(PulseDelivery(vault).status()),
         }
+    if name == "gsv_pulse_report_list":
+        from continuity_kernel.pulse_reports import PulseReportStore, pulse_report_dict
+
+        return pulse_report_dict(
+            PulseReportStore(vault.root).list_pending(
+                stage=_string(values, "stage"),
+                limit=_integer(values, "limit", 8),
+            )
+        )
+    if name == "gsv_pulse_report_show":
+        from continuity_kernel.pulse_reports import PulseReportStore, pulse_report_dict
+
+        return pulse_report_dict(PulseReportStore(vault.root).show(_string(values, "id")))
+    if name == "gsv_pulse_report_integrate":
+        from continuity_kernel.pulse_delivery import PulseDelivery
+
+        return asdict(
+            PulseDelivery(vault).integrate(
+                _string(values, "id"),
+                expected_revision=_string(values, "expected_revision"),
+                pulse_thread_id=_string(values, "pulse_thread_id"),
+                result_refs=_strings(values, "result_refs"),
+                summary=_string(values, "summary"),
+                interface_change=values.get("interface_change", False),
+            )
+        )
     if name == "gsv_pulse_sweep":
         return sense_sweep(vault).to_dict()
     if name == "gsv_recall_status":
@@ -1738,6 +1769,48 @@ TOOLS: Final = [
             "or install, remove, or inspect a host scheduler."
         ),
         {},
+        read_only=False,
+    ),
+    _tool(
+        "gsv_pulse_report_list",
+        "Read derived reports awaiting relevance, investigation, or Pulse integration.",
+        {
+            "stage": {"type": "string", "enum": ["relevance", "investigation", "delivery"]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        },
+        ("stage",),
+        read_only=True,
+    ),
+    _tool(
+        "gsv_pulse_report_show",
+        "Read one exact derived source report and its current revision.",
+        {"id": TEXT},
+        ("id",),
+        read_only=True,
+    ),
+    _tool(
+        "gsv_pulse_report_integrate",
+        (
+            "Record a source report's semantic result after native canonical readback. Only the "
+            "bound Pulse task may integrate it. An interface change creates a durable, targeted "
+            "Diane curation request; that request is not proof of a visible update."
+        ),
+        {
+            "id": TEXT,
+            "expected_revision": TEXT,
+            "pulse_thread_id": TEXT,
+            "result_refs": TEXTS,
+            "summary": {"type": "string", "maxLength": 2000},
+            "interface_change": {"type": "boolean"},
+        },
+        (
+            "id",
+            "expected_revision",
+            "pulse_thread_id",
+            "result_refs",
+            "summary",
+            "interface_change",
+        ),
         read_only=False,
     ),
     _tool(
