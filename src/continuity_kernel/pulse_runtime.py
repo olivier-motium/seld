@@ -676,14 +676,7 @@ class PulseRuntime:
                 continue
             assert report.decision is not None
             key = sha256_bytes((report.event_key + report.decision.reason).encode())
-            existing = next(
-                (
-                    child
-                    for child in self.reports.recent(source_id=report.source_id, limit=8).reports
-                    if child.event_key == f"pulse-report:{key}"
-                ),
-                None,
-            )
+            existing = self.reports.find_by_event_key(f"pulse-report:{key}")
             if existing is None:
                 session = self._source_session(report.source_id)
                 result = await session.turn(

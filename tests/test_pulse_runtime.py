@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from continuity_kernel.atomic import sha256_bytes
 from continuity_kernel.connector_auth import (
     AccountMetadata,
     ClientKind,
@@ -248,6 +249,69 @@ def test_runtime_replays_a_report_outside_the_small_recent_context_without_a_mod
     assert adapter.releases == 1
     assert PulseReportStore(vault.root).show(replay.identifier) == replay
     assert runtime.state.read()["sources"]["slack"]["report_id"] == replay.identifier
+
+
+def test_investigation_replays_an_older_child_before_starting_another_model(
+    vault: Vault,
+) -> None:
+    vault.select_sources(expected_revision=vault.get_source_snapshot().revision, sources=("slack",))
+    reports = PulseReportStore(vault.root)
+    source_revision = vault.get_source_snapshot().revision
+    parent = reports.append(
+        event_key="pulse-report:" + "a" * 64,
+        claim="The source needs a bounded follow-up.",
+        uncertainty="The original source window is partial.",
+        source_id="slack",
+        observed_at=NOW - timedelta(minutes=20),
+        coverage_ref="source:slack",
+        coverage_revision=source_revision,
+        completeness="partial",
+        created_at=NOW - timedelta(minutes=20),
+    )
+    investigation = reports.decide(
+        parent.identifier,
+        expected_revision=parent.revision,
+        decision="investigate",
+        reason="Check the retained source context once.",
+        decided_at=NOW - timedelta(minutes=19),
+    )
+    child_event_key = "pulse-report:" + sha256_bytes(
+        (investigation.event_key + investigation.decision.reason).encode()
+    )
+    child = reports.append(
+        event_key=child_event_key,
+        claim="The original follow-up is already durable.",
+        uncertainty="No broader coverage was added.",
+        source_id="slack",
+        observed_at=NOW - timedelta(minutes=10),
+        coverage_ref="source:slack",
+        coverage_revision=source_revision,
+        completeness="partial",
+        causal_key=f"source-report:{sha256_bytes(investigation.identifier.encode())}",
+        created_at=NOW - timedelta(minutes=10),
+    )
+    for index in range(8):
+        reports.append(
+            event_key=f"pulse-report:{index:064x}",
+            claim=f"Newer report {index}.",
+            uncertainty="The source window is partial.",
+            source_id="slack",
+            observed_at=NOW - timedelta(minutes=8 - index),
+            coverage_ref="source:slack",
+            coverage_revision=source_revision,
+            completeness="partial",
+            created_at=NOW - timedelta(minutes=8 - index),
+        )
+
+    def no_follow_up_model(*_args: object, **_values: object) -> FakeLunaSession:
+        raise AssertionError("A durable investigation child must not start a model turn")
+
+    runtime = PulseRuntime(vault, session_factory=no_follow_up_model)  # type: ignore[arg-type]
+    asyncio.run(runtime.investigate_pending())
+
+    delivered = PulseReportStore(vault.root).show(investigation.identifier)
+    assert delivered.delivery is not None
+    assert delivered.delivery.result_ref == child.report_ref
 
 
 def test_known_fingerprint_replays_the_latest_report_without_another_model_or_wake(
