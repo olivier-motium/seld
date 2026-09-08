@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import zipfile
 from pathlib import Path
 
@@ -13,7 +14,7 @@ def test_extract_text_refuses_platform_without_safe_open(
 ) -> None:
     plain = tmp_path / "private.txt"
     plain.write_text("Must not be read", encoding="utf-8")
-    monkeypatch.delattr(app_corpus_text.os, "O_NOFOLLOW", raising=False)
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
     result = app_corpus_text.extract_text(plain)
     assert result.status == "gap"
     assert result.text == ""
