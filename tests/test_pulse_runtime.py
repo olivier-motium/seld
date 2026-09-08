@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from continuity_kernel.pulse_codex import LunaTurnResult
@@ -187,3 +187,39 @@ def test_runtime_recovers_a_committed_report_without_another_model_or_actual_wak
     assert PulseReportStore(vault.root).recent(source_id="slack").reports == reports
     assert turns == ["source", "relevance"]
     assert len(queue_calls) == 1
+
+
+def test_unavailable_source_creates_a_gap_report_without_starting_a_source_model(
+    vault: Vault,
+) -> None:
+    vault.select_sources(expected_revision=vault.get_source_snapshot().revision, sources=("slack",))
+    _bind_pulse(vault)
+
+    class UnavailableAdapter(FakeSourceAdapter):
+        def acquire(self, source: str) -> AcquiredSourceWindow:
+            return replace(
+                super().acquire(source),
+                items=(),
+                result="failure",
+                status="failure",
+                completeness="unavailable",
+                error_code="identity_mismatch",
+            )
+
+    turns: list[str] = []
+
+    def factory(*, instructions: str, **_values: object) -> FakeLunaSession:
+        assert instructions.startswith("You are the separate relevance")
+        return FakeLunaSession("relevance", turns)
+
+    runtime = PulseRuntime(
+        vault,
+        sources=("slack",),
+        adapter=UnavailableAdapter(vault),  # type: ignore[arg-type]
+        session_factory=factory,  # type: ignore[arg-type]
+        wake_handler=lambda _ids: None,
+    )
+    asyncio.run(runtime.run(once=True))
+    report = PulseReportStore(vault.root).recent(source_id="slack").reports[0]
+    assert report.completeness == "unavailable"
+    assert turns == ["relevance"]
