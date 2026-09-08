@@ -470,8 +470,9 @@ def test_pending_local_delivery_replays_after_an_unrelated_source_revision_chang
     assert local.acknowledgements[0]["expected_source_revision"] == REVISION_A
 
 
+@pytest.mark.parametrize("account_mismatch", [False, True])
 def test_codex_activity_exposes_only_structural_events_and_checkpoints_after_report(
-    vault: Vault, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    vault: Vault, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, account_mismatch: bool
 ) -> None:
     import json
 
@@ -481,6 +482,20 @@ def test_codex_activity_exposes_only_structural_events_and_checkpoints_after_rep
     vault.select_sources(
         expected_revision=vault.get_source_snapshot().revision, sources=("codex_activity",)
     )
+    if account_mismatch:
+        observed = datetime.now(UTC).replace(microsecond=0)
+        vault.record_source_observation(
+            expected_revision=vault.get_source_snapshot().revision,
+            source_id="codex_activity",
+            actor_ref="system-role:source-test",
+            result="success",
+            covered_through=observed.isoformat().replace("+00:00", "Z"),
+            completeness="partial",
+            account_binding="previous-explicit-account",
+            tool_binding="previous-reader",
+            evidence_refs=("prior-event",),
+            observed_at=observed,
+        )
     session = tmp_path / "session.jsonl"
     session.write_text(
         "\n".join(
@@ -502,8 +517,14 @@ def test_codex_activity_exposes_only_structural_events_and_checkpoints_after_rep
     reports = PulseReportStore(vault.root)
     adapter = PulseSourceAdapter(vault, report_store=reports)
     window = adapter.acquire("codex_activity")
-    assert len(window.items) == 1
-    assert window.items[0]["event"] == "task_complete"
+    if account_mismatch:
+        assert window.items == ()
+        assert window.result == "failure"
+        assert window.error_code == "identity_mismatch"
+        assert "cursor" not in window.receipt.record
+    else:
+        assert len(window.items) == 1
+        assert window.items[0]["event"] == "task_complete"
     assert "PRIVATE" not in repr(window.items)
     assert not reader.checkpoint.exists()
     report = reports.append(
@@ -517,6 +538,14 @@ def test_codex_activity_exposes_only_structural_events_and_checkpoints_after_rep
         completeness=window.completeness,
     )
     adapter.commit(window, report_ref=report.report_ref, report_revision=report.revision)
+    if account_mismatch:
+        assert not reader.checkpoint.exists()
+        assert (
+            vault.get_source_snapshot().observation("codex_activity").error_code
+            == "identity_mismatch"
+        )
+        adapter.release(window)
+        return
     assert reader.checkpoint.exists()
     adapter.release(window)
     assert adapter.acquire("codex_activity").empty

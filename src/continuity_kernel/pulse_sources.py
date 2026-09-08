@@ -244,7 +244,7 @@ class PulseSourceAdapter:
                 expected_revision=expected_revision,
             )
 
-        if window.receipt.kind == "codex_activity":
+        if window.receipt.kind == "codex_activity" and window.result != "failure":
             assert self._codex_activity is not None and window.receipt.record is not None
             self._codex_activity.acknowledge(str(window.receipt.record["cursor"]))
 
