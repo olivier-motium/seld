@@ -120,6 +120,8 @@ class DianeOutbox:
     event_key: str
     source_gsv_revision: str
     result_refs: tuple[str, ...]
+    target_desktop_work_id: str | None
+    curation_followup: bool
     summary: str
     observed_at: str
     accepted_at: str
@@ -163,6 +165,9 @@ class _Integration:
     pulse_thread_id: str
     result_refs: tuple[str, ...]
     primary_result_ref: str
+    target_desktop_work_id: str | None
+    curation_followup: bool
+    base_integration_id: str | None
     summary: str
     interface_change: bool
     accepted_at: str
@@ -274,6 +279,7 @@ class PulseDelivery:
         result_refs: Sequence[str],
         summary: str,
         interface_change: bool,
+        target_desktop_work_id: str | None = None,
     ) -> PulseIntegrationResult:
         """Persist a completed Pulse integration, then optionally queue UI curation.
 
@@ -289,6 +295,9 @@ class PulseDelivery:
         clean_summary = _summary(summary)
         if not isinstance(interface_change, bool):
             raise ValidationError("Pulse interface_change must be boolean")
+        target = _optional_uuid(target_desktop_work_id, "target desktop work ID")
+        if target is not None and not interface_change:
+            raise ValidationError("Pulse target desktop work requires an interface change")
 
         state = self._snapshot()
         existing = _find_integration(state, report_id=identifier, expected_revision=expected)
@@ -297,11 +306,20 @@ class PulseDelivery:
 
         supplied_refs = _native_refs(result_refs, "Pulse integration result reference")
         if existing is None:
+            followup_base = self._followup_base(
+                state,
+                report=report,
+                expected_revision=expected,
+                interface_change=interface_change,
+            )
             canonical_refs = self._resolve_results(
                 report=report,
                 result_refs=supplied_refs,
                 interface_change=interface_change,
+                target_desktop_work_id=target,
             )
+            if followup_base is not None:
+                _validate_followup_results(canonical_refs, followup_base)
             integration, _ = self._prepare_integration(
                 report=report,
                 expected_revision=expected,
@@ -309,6 +327,8 @@ class PulseDelivery:
                 result_refs=canonical_refs,
                 summary=clean_summary,
                 interface_change=interface_change,
+                target_desktop_work_id=target,
+                followup_base=followup_base,
             )
         else:
             _match_integration(
@@ -317,6 +337,7 @@ class PulseDelivery:
                 result_refs=supplied_refs,
                 summary=clean_summary,
                 interface_change=interface_change,
+                target_desktop_work_id=target,
             )
             integration = existing
             if integration.state == "integrated":
@@ -332,6 +353,7 @@ class PulseDelivery:
                     report=report,
                     result_refs=integration.result_refs,
                     interface_change=integration.interface_change,
+                    target_desktop_work_id=integration.target_desktop_work_id,
                 )
             else:
                 _require_recoverable_delivery(report, integration)
@@ -342,7 +364,10 @@ class PulseDelivery:
                         self.vault.resolve_canonical_result_ref(ref)
 
         current = self.reports.show(identifier)
-        if current.revision == expected:
+        if integration.curation_followup:
+            _require_recoverable_delivery(current, integration)
+            delivered = current
+        elif current.revision == expected:
             delivered = self.reports.record_delivery(
                 identifier,
                 expected_revision=expected,
@@ -358,6 +383,41 @@ class PulseDelivery:
             outbox_id=finalized.outbox_id,
             integration_state="integrated",
         )
+
+    def _followup_base(
+        self,
+        state: _DeliveryState,
+        *,
+        report: PulseReport,
+        expected_revision: str,
+        interface_change: bool,
+    ) -> _Integration | None:
+        if report.delivery is None:
+            return None
+        if not interface_change:
+            raise ValidationError(
+                "a delivered Pulse report can only add an interface curation follow-up"
+            )
+        if report.revision != expected_revision:
+            raise ConflictError(
+                "curation follow-up requires the current delivered pulse report revision"
+            )
+        base = next(
+            (
+                item
+                for item in state.integrations
+                if item.report_id == report.identifier
+                and not item.curation_followup
+                and item.state == "integrated"
+                and item.delivered_report_ref == report.report_ref
+            ),
+            None,
+        )
+        if base is None:
+            raise ConflictError(
+                "curation follow-up requires the preceding integrated Pulse receipt"
+            )
+        return base
 
     def pending_curation(self, *, limit: int = 100) -> CurationList:
         """Return nonterminal UI work for daemon readback, without performing delivery."""
@@ -562,7 +622,10 @@ class PulseDelivery:
         result_refs: tuple[str, ...],
         summary: str,
         interface_change: bool,
+        target_desktop_work_id: str | None,
+        followup_base: _Integration | None,
     ) -> tuple[_Integration, bool]:
+        curation_followup = followup_base is not None
         key = sha256_bytes(
             (
                 report.identifier
@@ -576,6 +639,12 @@ class PulseDelivery:
                 + summary
                 + "\0"
                 + str(interface_change)
+                + "\0"
+                + (target_desktop_work_id or "")
+                + "\0"
+                + str(curation_followup)
+                + "\0"
+                + (followup_base.identifier if followup_base is not None else "")
             ).encode("utf-8")
         )
         accepted_at = format_time(self._now())
@@ -591,6 +660,7 @@ class PulseDelivery:
                     result_refs=result_refs,
                     summary=summary,
                     interface_change=interface_change,
+                    target_desktop_work_id=target_desktop_work_id,
                 )
                 return prior, False
             if len(state.integrations) >= MAX_INTEGRATIONS:
@@ -606,7 +676,16 @@ class PulseDelivery:
                 expected_revision=expected_revision,
                 pulse_thread_id=binding.pulse_thread_id,
                 result_refs=result_refs,
-                primary_result_ref=result_refs[0],
+                primary_result_ref=(
+                    followup_base.primary_result_ref
+                    if followup_base is not None
+                    else result_refs[0]
+                ),
+                target_desktop_work_id=target_desktop_work_id,
+                curation_followup=curation_followup,
+                base_integration_id=(
+                    followup_base.identifier if followup_base is not None else None
+                ),
                 summary=summary,
                 interface_change=interface_change,
                 accepted_at=accepted_at,
@@ -673,6 +752,7 @@ class PulseDelivery:
         report: PulseReport,
         result_refs: tuple[str, ...],
         interface_change: bool,
+        target_desktop_work_id: str | None,
     ) -> tuple[str, ...]:
         canonical = tuple(self.vault.resolve_canonical_result_ref(value) for value in result_refs)
         if len(set(canonical)) != len(canonical):
@@ -682,6 +762,16 @@ class PulseDelivery:
             raise ValidationError(
                 "a source report may be its own result only for explicit no-change integration"
             )
+        if target_desktop_work_id is not None:
+            task_refs = tuple(value for value in canonical if value.startswith("task:"))
+            if not any(
+                self.vault.get_task(_task_identifier(value)).active_thread_id
+                == target_desktop_work_id
+                for value in task_refs
+            ):
+                raise ValidationError(
+                    "Pulse target desktop work must match a supplied canonical task's active thread"
+                )
         return canonical
 
     @contextmanager
@@ -844,6 +934,8 @@ def _new_outbox(identifier: str, integration: _Integration, report: PulseReport)
         + sha256_bytes((integration.identifier + "\0" + report.report_ref).encode("utf-8")),
         source_gsv_revision=report.coverage_revision,
         result_refs=integration.result_refs,
+        target_desktop_work_id=integration.target_desktop_work_id,
+        curation_followup=integration.curation_followup,
         summary=integration.summary,
         observed_at=report.observed_at,
         accepted_at=integration.accepted_at,
@@ -927,6 +1019,34 @@ def _validate_state(state: _DeliveryState) -> None:
     }
     if integration_outbox != {item.identifier for item in state.outbox}:
         raise ValidationError("Pulse delivery outbox does not match its integration receipts")
+    integrations = {item.identifier: item for item in state.integrations}
+    outbox = {item.identifier: item for item in state.outbox}
+    for item in state.integrations:
+        if item.curation_followup:
+            assert item.base_integration_id is not None
+            base = integrations.get(item.base_integration_id)
+            if base is None or base.curation_followup or base.state != "integrated":
+                raise ValidationError("Pulse curation follow-up has no integrated base receipt")
+            if base.report_id != item.report_id or base.delivered_report_ref is None:
+                raise ValidationError(
+                    "Pulse curation follow-up base receipt does not match its report"
+                )
+            expected_ref = f"source-report:{item.report_id}@{item.expected_revision}"
+            if base.delivered_report_ref != expected_ref:
+                raise ValidationError(
+                    "Pulse curation follow-up must use its delivered report revision"
+                )
+            _validate_followup_results(item.result_refs, base)
+            if item.primary_result_ref != base.primary_result_ref:
+                raise ValidationError("Pulse curation follow-up must preserve its original result")
+        if item.outbox_id is not None:
+            linked = outbox[item.outbox_id]
+            if (
+                linked.result_refs != item.result_refs
+                or linked.target_desktop_work_id != item.target_desktop_work_id
+                or linked.curation_followup != item.curation_followup
+            ):
+                raise ValidationError("Diane outbox does not match its integration content")
 
 
 def _wake_dict(value: WakeRequest) -> dict[str, object]:
@@ -971,7 +1091,7 @@ def _parse_wake(value: dict[str, object]) -> WakeRequest:
 
 def _integration_dict(value: _Integration) -> dict[str, object]:
     _validate_integration(value)
-    return {
+    result: dict[str, object] = {
         "acceptedAt": value.accepted_at,
         "deliveredReportRef": value.delivered_report_ref,
         "expectedRevision": value.expected_revision,
@@ -985,6 +1105,13 @@ def _integration_dict(value: _Integration) -> dict[str, object]:
         "state": value.state,
         "summary": value.summary,
     }
+    if value.target_desktop_work_id is not None:
+        result["targetDesktopWorkId"] = value.target_desktop_work_id
+    if value.curation_followup:
+        result["curationFollowup"] = True
+        assert value.base_integration_id is not None
+        result["baseIntegrationId"] = value.base_integration_id
+    return result
 
 
 def _parse_integration(value: dict[str, object]) -> _Integration:
@@ -1002,7 +1129,8 @@ def _parse_integration(value: dict[str, object]) -> _Integration:
         "state",
         "summary",
     }
-    if set(value) != expected:
+    optional = {"targetDesktopWorkId", "curationFollowup", "baseIntegrationId"}
+    if not expected.issubset(value) or set(value) - expected - optional:
         raise ValidationError("Pulse integration receipt has an unsupported shape")
     refs = _native_refs(
         _strings(value.get("resultRefs"), "Pulse integration result references"),
@@ -1019,6 +1147,15 @@ def _parse_integration(value: dict[str, object]) -> _Integration:
         primary_result_ref=_native_ref(
             value.get("primaryResultRef"), "Pulse integration primary result reference"
         ),
+        target_desktop_work_id=_optional_uuid(
+            value.get("targetDesktopWorkId"), "Pulse integration target desktop work ID"
+        ),
+        curation_followup=_optional_true(
+            value.get("curationFollowup"), "Pulse integration curation follow-up"
+        ),
+        base_integration_id=_optional_revision(
+            value.get("baseIntegrationId"), "Pulse integration base ID"
+        ),
         summary=_summary(value.get("summary")),
         interface_change=_bool(value.get("interfaceChange"), "Pulse integration interface change"),
         accepted_at=_time(value.get("acceptedAt"), "Pulse integration accepted time"),
@@ -1034,7 +1171,7 @@ def _parse_integration(value: dict[str, object]) -> _Integration:
 
 def _outbox_dict(value: DianeOutbox) -> dict[str, object]:
     _validate_outbox(value)
-    return {
+    result: dict[str, object] = {
         "acceptedAt": value.accepted_at,
         "eventKey": value.event_key,
         "id": value.identifier,
@@ -1046,6 +1183,11 @@ def _outbox_dict(value: DianeOutbox) -> dict[str, object]:
         "summary": value.summary,
         "updatedAt": value.updated_at,
     }
+    if value.target_desktop_work_id is not None:
+        result["targetDesktopWorkId"] = value.target_desktop_work_id
+    if value.curation_followup:
+        result["curationFollowup"] = True
+    return result
 
 
 def _parse_outbox(value: dict[str, object]) -> DianeOutbox:
@@ -1061,7 +1203,8 @@ def _parse_outbox(value: dict[str, object]) -> DianeOutbox:
         "summary",
         "updatedAt",
     }
-    if set(value) != expected:
+    optional = {"targetDesktopWorkId", "curationFollowup"}
+    if not expected.issubset(value) or set(value) - expected - optional:
         raise ValidationError("Diane outbox has an unsupported shape")
     outbox = DianeOutbox(
         identifier=_uuid(value.get("id"), "Diane outbox ID"),
@@ -1069,6 +1212,12 @@ def _parse_outbox(value: dict[str, object]) -> DianeOutbox:
         source_gsv_revision=_revision(value.get("sourceGSVRevision"), "Diane source GSV revision"),
         result_refs=_native_refs(
             _strings(value.get("resultRefs"), "Diane result references"), "Diane result reference"
+        ),
+        target_desktop_work_id=_optional_uuid(
+            value.get("targetDesktopWorkId"), "Diane target desktop work ID"
+        ),
+        curation_followup=_optional_true(
+            value.get("curationFollowup"), "Diane curation follow-up"
         ),
         summary=_summary(value.get("summary")),
         observed_at=_time(value.get("observedAt"), "Diane observed time"),
@@ -1109,8 +1258,20 @@ def _validate_integration(value: _Integration) -> None:
     _revision(value.expected_revision, "Pulse integration expected revision")
     _uuid(value.pulse_thread_id, "Pulse integration thread ID")
     refs = _native_refs(value.result_refs, "Pulse integration result reference")
-    if not refs or value.primary_result_ref != refs[0]:
+    _optional_uuid(value.target_desktop_work_id, "Pulse integration target desktop work ID")
+    if value.target_desktop_work_id is not None and not value.interface_change:
+        raise ValidationError("Pulse target desktop work requires an interface change")
+    if value.curation_followup:
+        if not value.interface_change or value.base_integration_id is None:
+            raise ValidationError("Pulse curation follow-up is invalid")
+        _revision(value.base_integration_id, "Pulse integration base ID")
+    elif value.base_integration_id is not None:
+        raise ValidationError("ordinary Pulse integration cannot have a follow-up base")
+    if not refs or (
+        not value.curation_followup and value.primary_result_ref != refs[0]
+    ):
         raise ValidationError("Pulse integration primary result reference is invalid")
+    _native_ref(value.primary_result_ref, "Pulse integration primary result reference")
     _summary(value.summary)
     _time(value.accepted_at, "Pulse integration accepted time")
     if value.state not in {"prepared", "integrated"}:
@@ -1132,6 +1293,9 @@ def _validate_outbox(value: DianeOutbox) -> None:
     _event_key(value.event_key, "diane-curation")
     _revision(value.source_gsv_revision, "Diane source GSV revision")
     _native_refs(value.result_refs, "Diane result reference")
+    _optional_uuid(value.target_desktop_work_id, "Diane target desktop work ID")
+    if not isinstance(value.curation_followup, bool):
+        raise ValidationError("Diane curation follow-up must be boolean")
     _summary(value.summary)
     _time(value.observed_at, "Diane observed time")
     _time(value.accepted_at, "Diane accepted time")
@@ -1169,6 +1333,25 @@ def _find_outbox(state: _DeliveryState, identifier: str) -> DianeOutbox | None:
     return next((item for item in state.outbox if item.identifier == identifier), None)
 
 
+def _validate_followup_results(result_refs: tuple[str, ...], base: _Integration) -> None:
+    base_identifiers = {_result_identifier(value) for value in base.result_refs}
+    if not {_result_identifier(value) for value in result_refs}.issubset(base_identifiers):
+        raise ValidationError(
+            "Pulse curation follow-up results must refer only to the original integrated records"
+        )
+
+
+def _result_identifier(value: str) -> str:
+    return value.rsplit("@", 1)[0]
+
+
+def _task_identifier(value: str) -> str:
+    identifier = value.removeprefix("task:").rsplit("@", 1)[0]
+    if not identifier or not value.startswith("task:"):
+        raise ValidationError("Pulse task result reference is invalid")
+    return identifier
+
+
 def _match_integration(
     value: _Integration,
     *,
@@ -1176,12 +1359,14 @@ def _match_integration(
     result_refs: tuple[str, ...],
     summary: str,
     interface_change: bool,
+    target_desktop_work_id: str | None,
 ) -> None:
     if (
         value.pulse_thread_id != pulse_thread_id
         or value.result_refs != result_refs
         or value.summary != summary
         or value.interface_change != interface_change
+        or value.target_desktop_work_id != target_desktop_work_id
     ):
         raise ConflictError("Pulse integration receipt already has different content")
 
@@ -1270,6 +1455,18 @@ def _uuid(value: object, label: str) -> str:
 
 def _optional_uuid(value: object, label: str) -> str | None:
     return None if value is None else _uuid(value, label)
+
+
+def _optional_revision(value: object, label: str) -> str | None:
+    return None if value is None else _revision(value, label)
+
+
+def _optional_true(value: object, label: str) -> bool:
+    if value is None:
+        return False
+    if value is not True:
+        raise ValidationError(f"{label} must be true when present")
+    return True
 
 
 def _revision(value: object, label: str) -> str:

@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from continuity_kernel.errors import ValidationError
+from continuity_kernel.errors import ConflictError, ValidationError
 from continuity_kernel.pulse_delivery import PulseDelivery
 from continuity_kernel.pulse_reports import PulseReport, PulseReportStore
 from continuity_kernel.vault import Vault
@@ -14,6 +14,8 @@ CHIEF_THREAD = "22222222-2222-4222-8222-222222222222"
 NOW = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
 REVISION_A = "a" * 64
 REVISION_B = "b" * 64
+TARGET_WORK = "33333333-3333-4333-8333-333333333333"
+OTHER_WORK = "44444444-4444-4444-8444-444444444444"
 
 
 def _bind_pulse(vault: Vault) -> None:
@@ -203,3 +205,122 @@ def test_source_report_self_result_requires_explicit_no_change(vault: Vault) -> 
         interface_change=False,
     )
     assert integrated.outbox_id is None
+
+
+def test_targeted_curation_followup_preserves_the_delivered_report(vault: Vault) -> None:
+    _bind_pulse(vault)
+    report = _wake_report(vault)
+    result = vault.create_task(
+        identifier="pulse-result",
+        title="Pulse result",
+        outcome="Record the Pulse conclusion.",
+        status="doing",
+        active_thread_id=TARGET_WORK,
+        observed_at=NOW,
+    )
+    delivery = PulseDelivery(vault, now=lambda: NOW)
+    normal = delivery.integrate(
+        report.identifier,
+        expected_revision=report.revision,
+        pulse_thread_id=PULSE_THREAD,
+        result_refs=(f"task:{result.identifier}@{result.revision}",),
+        summary="The native task records the Pulse conclusion.",
+        interface_change=False,
+    )
+    delivered = normal.report
+    assert delivered.delivery is not None
+    delivered_history = delivered.history
+
+    refreshed = vault.update_task(
+        result.identifier,
+        expected_revision=result.revision,
+        outcome="Record the refined Pulse conclusion.",
+        observed_at=NOW + timedelta(minutes=1),
+    )
+    fresh_result = f"task:{refreshed.identifier}@{refreshed.revision}"
+
+    with pytest.raises(ValidationError, match="requires an interface change"):
+        delivery.integrate(
+            report.identifier,
+            expected_revision=delivered.revision,
+            pulse_thread_id=PULSE_THREAD,
+            result_refs=(fresh_result,),
+            summary="A target cannot accompany a no-change integration.",
+            interface_change=False,
+            target_desktop_work_id=TARGET_WORK,
+        )
+    with pytest.raises(ValidationError, match="must match"):
+        delivery.integrate(
+            report.identifier,
+            expected_revision=delivered.revision,
+            pulse_thread_id=PULSE_THREAD,
+            result_refs=(fresh_result,),
+            summary="The target must be the result task's active desktop work.",
+            interface_change=True,
+            target_desktop_work_id=OTHER_WORK,
+        )
+
+    unrelated = vault.create_task(
+        identifier="unrelated-result",
+        title="Unrelated result",
+        outcome="This task was not part of the original result.",
+        status="doing",
+        active_thread_id=OTHER_WORK,
+        observed_at=NOW + timedelta(minutes=1),
+    )
+    with pytest.raises(ValidationError, match="only to the original"):
+        delivery.integrate(
+            report.identifier,
+            expected_revision=delivered.revision,
+            pulse_thread_id=PULSE_THREAD,
+            result_refs=(f"task:{unrelated.identifier}@{unrelated.revision}",),
+            summary="An unrelated task cannot create a curation follow-up.",
+            interface_change=True,
+            target_desktop_work_id=OTHER_WORK,
+        )
+    with pytest.raises(ConflictError):
+        delivery.integrate(
+            report.identifier,
+            expected_revision=report.revision,
+            pulse_thread_id=PULSE_THREAD,
+            result_refs=(fresh_result,),
+            summary="A stale report revision cannot create a curation follow-up.",
+            interface_change=True,
+            target_desktop_work_id=TARGET_WORK,
+        )
+
+    followup = delivery.integrate(
+        report.identifier,
+        expected_revision=delivered.revision,
+        pulse_thread_id=PULSE_THREAD,
+        result_refs=(fresh_result,),
+        summary="Curate the refined Pulse conclusion in the selected desktop work.",
+        interface_change=True,
+        target_desktop_work_id=TARGET_WORK,
+    )
+
+    assert followup.report.delivery == delivered.delivery
+    assert followup.report.history == delivered_history
+    assert followup.outbox_id is not None
+    pending = delivery.pending_curation()
+    assert pending.remaining == 0
+    assert pending.outbox[0].target_desktop_work_id == TARGET_WORK
+    assert pending.outbox[0].curation_followup is True
+    snapshot = delivery._snapshot()
+    assert len(snapshot.integrations) == 2
+    followup_receipt = snapshot.integrations[-1]
+    assert followup_receipt.curation_followup is True
+    assert followup_receipt.primary_result_ref == delivered.delivery.result_ref
+    assert (
+        delivery.integrate(
+            report.identifier,
+            expected_revision=delivered.revision,
+            pulse_thread_id=PULSE_THREAD,
+            result_refs=(fresh_result,),
+            summary="Curate the refined Pulse conclusion in the selected desktop work.",
+            interface_change=True,
+            target_desktop_work_id=TARGET_WORK,
+        )
+        == followup
+    )
+    assert len(delivery._snapshot().integrations) == 2
