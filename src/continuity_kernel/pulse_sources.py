@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Any, Protocol, cast
 
 from continuity_kernel.atomic import sha256_bytes
+from continuity_kernel.codex_activity import CodexActivity
 from continuity_kernel.connector_auth import ConnectionHealth
 from continuity_kernel.connector_sources import SUPPORTED_SOURCE_IDS, read_connector_source
 from continuity_kernel.discord_source import DiscordSourceBridge
@@ -34,7 +35,9 @@ from continuity_kernel.slack_tasks import SlackTaskReader
 from continuity_kernel.source_state import SourceCompleteness, SourceObservation, source_fingerprint
 from continuity_kernel.vault import Vault
 
-SUPPORTED_PULSE_SOURCES = SUPPORTED_SOURCE_IDS | frozenset(SUPPORTED_LOCAL_SOURCES) | {"discord"}
+SUPPORTED_PULSE_SOURCES = (
+    SUPPORTED_SOURCE_IDS | frozenset(SUPPORTED_LOCAL_SOURCES) | {"discord", "codex_activity"}
+)
 MAX_PULSE_SOURCE_LIMIT = 100
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REPORT_REF = re.compile(
@@ -144,6 +147,7 @@ class PulseSourceAdapter:
         self.vault = vault
         self.report_store = report_store
         self._connector_reader = connector_reader
+        self._codex_activity: CodexActivity | None = None
         self._local_delivery = local_delivery
         self._discord_bridge = discord_bridge
         self._connection_ids = dict(connection_ids or {})
@@ -171,6 +175,18 @@ class PulseSourceAdapter:
             return self._acquire_connector(clean_source, limit, snapshot, observed_at)
         if clean_source in SUPPORTED_LOCAL_SOURCES:
             return self._acquire_local(clean_source, limit, snapshot, observed_at)
+        if clean_source == "codex_activity":
+            if self._codex_activity is None:
+                self._codex_activity = CodexActivity(self.vault.root)
+            delivery = self._codex_activity.acquire(limit=limit, observed_at=observed_at)
+            delivery["sourceRevision"] = _snapshot_revision(snapshot)
+            return self._window_from_delivery(
+                source_id=clean_source,
+                snapshot=snapshot,
+                observed_at=observed_at,
+                delivery=delivery,
+                kind="codex_activity",
+            )
         if clean_source == "discord":
             return self._acquire_discord(limit, snapshot, observed_at)
         return self._failure_window(
@@ -227,6 +243,10 @@ class PulseSourceAdapter:
                 report_ref=report_ref,
                 expected_revision=expected_revision,
             )
+
+        if window.receipt.kind == "codex_activity":
+            assert self._codex_activity is not None and window.receipt.record is not None
+            self._codex_activity.acknowledge(str(window.receipt.record["cursor"]))
 
         frozen = _freeze_mapping(result)
         self._committed[window.receipt.identifier] = frozen

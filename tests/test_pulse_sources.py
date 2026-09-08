@@ -468,3 +468,55 @@ def test_pending_local_delivery_replays_after_an_unrelated_source_revision_chang
     adapter.commit(window, report_ref=report_ref, report_revision=report_revision)
 
     assert local.acknowledgements[0]["expected_source_revision"] == REVISION_A
+
+
+def test_codex_activity_exposes_only_structural_events_and_checkpoints_after_report(
+    vault: Vault, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import json
+
+    from continuity_kernel.codex_activity import CodexActivity
+
+    monkeypatch.setenv("GSV_DATA_DIR", str(tmp_path / "host"))
+    vault.select_sources(
+        expected_revision=vault.get_source_snapshot().revision, sources=("codex_activity",)
+    )
+    session = tmp_path / "session.jsonl"
+    session.write_text(
+        "\n".join(
+            json.dumps(value)
+            for value in (
+                {"type": "response_item", "payload": {"type": "reasoning", "text": "PRIVATE"}},
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": "PRIVATE"}},
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "last_agent_message": "PRIVATE"},
+                },
+            )
+        )
+        + "\n"
+    )
+    reader = CodexActivity(vault.root)
+    reader.root.mkdir(parents=True)
+    reader.manifest.write_text(json.dumps({"files": [{"path": str(session), "start_offset": 0}]}))
+    reports = PulseReportStore(vault.root)
+    adapter = PulseSourceAdapter(vault, report_store=reports)
+    window = adapter.acquire("codex_activity")
+    assert len(window.items) == 1
+    assert window.items[0]["event"] == "task_complete"
+    assert "PRIVATE" not in repr(window.items)
+    assert not reader.checkpoint.exists()
+    report = reports.append(
+        event_key=window.report_event_key,
+        claim="A model turn ended; outcome unknown.",
+        uncertainty="Structural events alone cannot prove task success.",
+        source_id="codex_activity",
+        observed_at=window.observed_at,
+        coverage_ref=window.coverage_ref,
+        coverage_revision=window.source_revision,
+        completeness=window.completeness,
+    )
+    adapter.commit(window, report_ref=report.report_ref, report_revision=report.revision)
+    assert reader.checkpoint.exists()
+    adapter.release(window)
+    assert adapter.acquire("codex_activity").empty

@@ -619,7 +619,15 @@ class PulseRuntime:
                     }
                 )
         session = self.session_factory(
-            instructions=SOURCE_INSTRUCTIONS,
+            instructions=SOURCE_INSTRUCTIONS
+            + (
+                "\nThis source contains structural session events only. Report possible "
+                "progress or failure without deciding task meaning or completion. A "
+                "task_complete event proves only that a model turn ended. Preserve "
+                "the supplied codex-event references in the compact observation."
+                if source == "codex_activity"
+                else ""
+            ),
             work_directory=Path(self._scratch.name),
             tools=tools,
             tool_handler=handle,
