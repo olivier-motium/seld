@@ -8,6 +8,18 @@ from pytest import MonkeyPatch
 import continuity_kernel.app_corpus_text as app_corpus_text
 
 
+def test_extract_text_refuses_platform_without_safe_open(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    plain = tmp_path / "private.txt"
+    plain.write_text("Must not be read", encoding="utf-8")
+    monkeypatch.delattr(app_corpus_text.os, "O_NOFOLLOW", raising=False)
+    result = app_corpus_text.extract_text(plain)
+    assert result.status == "gap"
+    assert result.text == ""
+    assert result.omissions == ("unsafe_file",)
+
+
 def test_extract_text_handles_local_document_content_and_names_coverage_gaps(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:

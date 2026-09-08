@@ -175,6 +175,8 @@ def extract_text(path: Path | str, mime: str | None = None) -> ExtractionResult:
     kind = _kind(candidate, mime)
     if kind is None:
         return _gap("local artifact type is unsupported", "unsupported_document_type")
+    if not getattr(os, "O_NOFOLLOW", 0):
+        return _gap("secure local artifact reads are unavailable on this platform", "unsafe_file")
     try:
         descriptor, initial = _open_regular_file(candidate)
     except FileNotFoundError:
