@@ -451,3 +451,20 @@ def test_local_checkpoint_acknowledges_only_after_matching_durable_report() -> N
             "actor_ref": "system-role:resident-pulse",
         }
     ]
+
+
+def test_pending_local_delivery_replays_after_an_unrelated_source_revision_change() -> None:
+    vault = FakeVault("whatsapp", "slack")
+    vault.source_snapshot.revision = REVISION_B
+    reports = FakeReportStore()
+    local = FakeLocalDelivery()
+    adapter = _adapter(vault, reports, local_delivery=local)
+
+    window = adapter.acquire("whatsapp")
+
+    assert window.source_revision == REVISION_A
+    assert window.receipt.source_revision == REVISION_A
+    report_ref, report_revision = _report_for(reports, window)
+    adapter.commit(window, report_ref=report_ref, report_revision=report_revision)
+
+    assert local.acknowledgements[0]["expected_source_revision"] == REVISION_A

@@ -371,8 +371,11 @@ class PulseSourceAdapter:
             source_revision = _required_text(
                 receipt_value.get("source_revision"), "local Pulse source revision"
             )
-            if source_revision != _snapshot_revision(snapshot):
-                raise ConflictError("source state changed during local Pulse acquisition")
+            if _SHA256.fullmatch(source_revision) is None:
+                raise ValidationError("local Pulse source revision is invalid")
+            # A pending local token remains bound to its prepared revision.
+            # LocalSourceDelivery acknowledges it only after replaying and
+            # validating the original account, store, and provider delta.
             complete = delivery.get("complete")
             if not isinstance(complete, bool):
                 raise ValidationError("local Pulse source completeness is invalid")
@@ -390,6 +393,7 @@ class PulseSourceAdapter:
                 kind="local",
                 record=None,
                 local_token=token,
+                receipt_source_revision=source_revision,
             )
         except ConflictError:
             raise
@@ -585,6 +589,7 @@ class PulseSourceAdapter:
         record: Mapping[str, object] | None,
         local_token: str | None = None,
         discord_ack_token: str | None = None,
+        receipt_source_revision: str | None = None,
     ) -> AcquiredSourceWindow:
         fingerprint = _window_fingerprint(
             source_id=source_id,
@@ -597,7 +602,7 @@ class PulseSourceAdapter:
         receipt = AcquisitionReceipt(
             identifier=secrets.token_hex(16),
             kind=kind,
-            source_revision=_snapshot_revision(snapshot),
+            source_revision=receipt_source_revision or _snapshot_revision(snapshot),
             prior_observation=cast(Any, snapshot).observation(source_id),
             record=record,
             local_token=local_token,
