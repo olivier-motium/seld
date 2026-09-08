@@ -164,7 +164,11 @@ def test_cli_resident_activation_survives_a_fresh_process(tmp_path: Path) -> Non
     assert status["skills"][0]["name"] == "exact-native"
     assert status["excluded_paths"] == ["context/resident/control"]
     assert "legacy-private-task" not in repr(status)
-    assert bindings["active_hands"] == [
+    assert bindings["active_hands"][0]["work"]["outcome"] == task.outcome
+    assert [
+        {key: value for key, value in hand.items() if key != "work"}
+        for hand in bindings["active_hands"]
+    ] == [
         {
             "active_thread_id": "fresh-process-hand",
             "revision": task.revision,
