@@ -74,6 +74,9 @@ class PulseCurationBridge:
                         "presentation_revision": result.get("appliedPresentationRevision"),
                         "completed_at": result.get("completedAt"),
                         "observed_at": item.observed_at,
+                        "observation_to_curation_seconds": _elapsed(
+                            item.observed_at, result.get("completedAt")
+                        ),
                     },
                     separators=(",", ":"),
                 )
@@ -118,3 +121,15 @@ class PulseCurationBridge:
         if not isinstance(result, dict):
             raise ValidationError("Native desktop bridge returned an invalid response")
         return result
+
+
+def _elapsed(observed_at: str, completed_at: object) -> float | None:
+    if not isinstance(completed_at, str):
+        return None
+    try:
+        start = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        elapsed = (end - start).total_seconds()
+    except (ValueError, TypeError):
+        return None
+    return round(elapsed, 3) if elapsed >= 0 else None
