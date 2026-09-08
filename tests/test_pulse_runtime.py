@@ -201,6 +201,54 @@ def test_runtime_recovers_a_committed_report_without_another_model_or_actual_wak
     assert len(queue_calls) == 1
 
 
+def test_runtime_replays_a_report_outside_the_small_recent_context_without_a_model(
+    vault: Vault,
+) -> None:
+    vault.select_sources(expected_revision=vault.get_source_snapshot().revision, sources=("slack",))
+    adapter = FakeSourceAdapter(vault)
+    reports = PulseReportStore(vault.root)
+    source_revision = vault.get_source_snapshot().revision
+    replay = reports.append(
+        event_key=f"pulse-report:{FINGERPRINT}",
+        claim="The original source report is durable.",
+        uncertainty="The source window is partial.",
+        source_id="slack",
+        observed_at=NOW - timedelta(minutes=6),
+        coverage_ref="source:slack",
+        coverage_revision=source_revision,
+        completeness="partial",
+        created_at=NOW - timedelta(minutes=6),
+    )
+    for index in range(5):
+        reports.append(
+            event_key=f"pulse-report:{index:064x}",
+            claim=f"Newer report {index}.",
+            uncertainty="The source window is partial.",
+            source_id="slack",
+            observed_at=NOW - timedelta(minutes=5 - index),
+            coverage_ref="source:slack",
+            coverage_revision=source_revision,
+            completeness="partial",
+            created_at=NOW - timedelta(minutes=5 - index),
+        )
+
+    def no_source_model(*, instructions: str, **_values: object) -> FakeLunaSession:
+        del instructions
+        raise AssertionError("A durable report replay must not start a source model turn")
+
+    runtime = PulseRuntime(
+        vault,
+        adapter=adapter,  # type: ignore[arg-type]
+        session_factory=no_source_model,  # type: ignore[arg-type]
+    )
+    asyncio.run(runtime.process_source("slack"))
+
+    assert adapter.commits == [True]
+    assert adapter.releases == 1
+    assert PulseReportStore(vault.root).show(replay.identifier) == replay
+    assert runtime.state.read()["sources"]["slack"]["report_id"] == replay.identifier
+
+
 def test_known_fingerprint_replays_the_latest_report_without_another_model_or_wake(
     vault: Vault,
 ) -> None:

@@ -217,6 +217,13 @@ class PulseReportStore:
                 raise NotFoundError(f"pulse report does not exist: {identifier}")
             return report
 
+    def find_by_event_key(self, event_key: str) -> PulseReport | None:
+        """Return the exact durable report for one opaque event key, if retained."""
+
+        key = _event_key(event_key)
+        with self._transaction() as store:
+            return next((item for item in self._all_reports(store) if item.event_key == key), None)
+
     def list_pending(
         self,
         *,

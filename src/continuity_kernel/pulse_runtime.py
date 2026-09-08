@@ -420,10 +420,8 @@ class PulseRuntime:
                         )
                         return
                 # A durable source report is also a restart dedupe checkpoint.
-                recent = self.reports.recent(source_id=source, limit=5).reports
-                replay = next(
-                    (item for item in recent if item.event_key == window.report_event_key), None
-                )
+                # The small recent list below is model context, not an event index.
+                replay = self.reports.find_by_event_key(window.report_event_key)
                 if replay is not None:
                     await self._commit_source_window(
                         window,
@@ -434,6 +432,7 @@ class PulseRuntime:
                     self._source_state(source, self._replayed_source_facts(source, window, replay))
                     self._arrivals.set()
                     return
+                recent = self.reports.recent(source_id=source, limit=5).reports
                 stage = "source_judgment"
                 self._windows[source] = window
                 self._source_state(source, {"last_poll_at": _now(), "state": "reading"})
