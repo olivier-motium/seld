@@ -6,10 +6,12 @@ import shlex
 import stat
 import subprocess
 import sys
+import threading
 import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from time import monotonic
 from typing import Any, cast
 
 import pytest
@@ -17,7 +19,10 @@ import pytest
 from continuity_kernel import bridge as bridge_module
 from continuity_kernel import cli, resident_import
 from continuity_kernel import vault_backup as vault_backup_module
-from continuity_kernel.atomic import durable_replace as actual_durable_replace
+from continuity_kernel.atomic import (
+    durable_replace as actual_durable_replace,
+)
+from continuity_kernel.atomic import exclusive_lock
 from continuity_kernel.codex_integration import CodexInstallResult
 from continuity_kernel.config import config_path, load_config, save_config
 from continuity_kernel.errors import SetupError, ValidationError
@@ -57,6 +62,37 @@ def test_pulse_status_separates_mechanical_and_ai_wake_health(tmp_path: Path) ->
         "reason": "Mechanical sweep status does not record AI Pulse wake completion.",
         "state": "unobserved",
     }
+
+
+def test_pulse_status_returns_partial_when_resident_signals_are_busy(tmp_path: Path) -> None:
+    vault = Vault(tmp_path / "pulse-status-lock-vault")
+    vault.initialize(name="Pulse status lock scope")
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_signal_lock() -> None:
+        with exclusive_lock(vault.root / ".gsv/locks/resident-signals.lock"):
+            acquired.set()
+            assert release.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_signal_lock)
+    holder.start()
+    try:
+        assert acquired.wait(timeout=2)
+        started = monotonic()
+        status = cli._pulse_status(vault)
+        assert monotonic() - started < 1
+    finally:
+        release.set()
+        holder.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert status["signals"] == {
+        "state": "unavailable",
+        "reason": "resident_signals_lock_busy",
+    }
+    assert "event_runtime" in status
+    assert "event_delivery" in status
 
 
 def test_cli_resident_activation_survives_a_fresh_process(tmp_path: Path) -> None:

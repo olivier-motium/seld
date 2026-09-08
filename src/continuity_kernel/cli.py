@@ -84,7 +84,7 @@ from continuity_kernel.dispatch import (
     evaluate_task_deadline,
     write_task_blocker,
 )
-from continuity_kernel.errors import ContinuityError, SetupError, ValidationError
+from continuity_kernel.errors import ConflictError, ContinuityError, SetupError, ValidationError
 from continuity_kernel.local_source_delivery import (
     RESET_DISPOSITIONS,
     SUPPORTED_LOCAL_SOURCES,
@@ -1569,6 +1569,11 @@ def _pulse_status(vault: Vault) -> dict[str, object]:
     from continuity_kernel.pulse_delivery import PulseDelivery
     from continuity_kernel.pulse_runtime import PulseRuntimeState
 
+    try:
+        signals = vault.resident_signal_status(lock_timeout_seconds=0.0)
+    except ConflictError:
+        signals = {"state": "unavailable", "reason": "resident_signals_lock_busy"}
+
     return {
         # Keep the original field for existing callers.  It is intentionally
         # paired with an explicit scope below so a healthy sensor is never read
@@ -1583,7 +1588,7 @@ def _pulse_status(vault: Vault) -> dict[str, object]:
             "reason": "Mechanical sweep status does not record AI Pulse wake completion.",
             "state": "unobserved",
         },
-        "signals": vault.resident_signal_status(),
+        "signals": signals,
         "event_runtime": PulseRuntimeState(vault.root).status(),
         "event_delivery": asdict(PulseDelivery(vault).status()),
     }

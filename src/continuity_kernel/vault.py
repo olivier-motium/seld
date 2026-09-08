@@ -2817,10 +2817,12 @@ class Vault:
     def context_pack(self, *, max_characters: int = 48_000) -> str:
         return _build_context_pack(self, max_characters=max_characters)
 
-    def resident_signal_status(self) -> dict[str, Any]:
+    def resident_signal_status(self, *, lock_timeout_seconds: float = 10.0) -> dict[str, Any]:
         """Return validated, content-free mailbox counts."""
 
-        return signal_dict(ResidentSignalStore(self.root).status())
+        return signal_dict(
+            ResidentSignalStore(self.root).status(lock_timeout_seconds=lock_timeout_seconds)
+        )
 
     def list_resident_signals(
         self,
