@@ -4,12 +4,21 @@ import asyncio
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
+from continuity_kernel.connector_auth import (
+    AccountMetadata,
+    ClientKind,
+    ClientMetadata,
+    ConnectionHealth,
+    ConnectionMetadata,
+    CredentialKind,
+    parse_connection_id,
+)
 from continuity_kernel.pulse_codex import LunaTurnResult
 from continuity_kernel.pulse_delivery import PulseDelivery
 from continuity_kernel.pulse_reports import PulseReportStore
-from continuity_kernel.pulse_runtime import PulseRuntime
+from continuity_kernel.pulse_runtime import PulseRuntime, _source_access_signature
 from continuity_kernel.pulse_sources import AcquiredSourceWindow, AcquisitionReceipt
 from continuity_kernel.vault import Vault
 
@@ -223,3 +232,61 @@ def test_unavailable_source_creates_a_gap_report_without_starting_a_source_model
     report = PulseReportStore(vault.root).recent(source_id="slack").reports[0]
     assert report.completeness == "unavailable"
     assert turns == ["relevance"]
+
+
+def test_verified_connection_repair_resumes_an_incident_skipped_source(vault: Vault) -> None:
+    vault.select_sources(expected_revision=vault.get_source_snapshot().revision, sources=("slack",))
+    _bind_pulse(vault)
+    connection = ConnectionMetadata(
+        connection_id=parse_connection_id("con-" + "a" * 32),
+        provider="slack",
+        source_ids=("slack",),
+        credential_kind=CredentialKind.BEARER,
+        account=AccountMetadata(),
+        scopes=(),
+        client=ClientMetadata(kind=ClientKind.EXTERNAL),
+        health=ConnectionHealth.REAUTHORIZATION_REQUIRED,
+        created_at=NOW - timedelta(days=1),
+        updated_at=NOW - timedelta(days=1),
+        version=1,
+    )
+    vault.put_connection(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection=connection,
+        observed_at=NOW - timedelta(days=1),
+    )
+    adapter = FakeSourceAdapter(vault)
+    turns: list[str] = []
+
+    def factory(*, instructions: str, **_values: object) -> FakeLunaSession:
+        role = (
+            "relevance" if instructions.startswith("You are the separate relevance") else "source"
+        )
+        return FakeLunaSession(role, turns)
+
+    runtime = PulseRuntime(
+        vault,
+        adapter=adapter,
+        session_factory=factory,  # type: ignore[arg-type]
+        wake_handler=lambda _ids: None,
+    )
+    runtime._source_state(
+        "slack",
+        {
+            "error_code": "auth_required",
+            "incident_signature": _source_access_signature(vault, "slack"),
+        },
+    )
+    asyncio.run(runtime.run(once=True))
+    assert adapter.acquisitions == 0
+    assert turns == []
+    vault.mark_connection_health(
+        expected_revision=vault.get_connection_snapshot().revision,
+        connection_id=connection.connection_id,
+        health=ConnectionHealth.READY,
+        verified=True,
+        observed_at=NOW - timedelta(days=1) + timedelta(seconds=1),
+    )
+    asyncio.run(runtime.run(once=True))
+    assert adapter.acquisitions == 1
+    assert turns == ["source", "relevance"]

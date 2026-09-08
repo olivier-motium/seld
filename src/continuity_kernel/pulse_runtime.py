@@ -347,8 +347,7 @@ class PulseRuntime:
             stage = "acquisition"
             try:
                 previous = self.state.read().get("sources", {}).get(source, {})
-                observation = self.vault.get_source_snapshot().observation(source)
-                incident_signature = _observation_signature(observation)
+                incident_signature = _source_access_signature(self.vault, source)
                 if (
                     previous.get("error_code") in AUTH_OR_TOOL_INCIDENT_ERROR_CODES
                     and previous.get("incident_signature") == incident_signature
@@ -460,9 +459,7 @@ class PulseRuntime:
                         "last_processed_at": _now(),
                         "coverage_status": window.status,
                         "error_code": window.error_code,
-                        "incident_signature": _observation_signature(
-                            self.vault.get_source_snapshot().observation(source)
-                        ),
+                        "incident_signature": _source_access_signature(self.vault, source),
                         "configuration": self._sessions[source].configuration
                         if source in self._sessions
                         else None,
@@ -728,6 +725,14 @@ def _judgment_input(report: PulseReport) -> dict[str, Any]:
     }
 
 
-def _observation_signature(observation: Any) -> str:
-    value = asdict(observation) if observation is not None else None
+def _source_access_signature(vault: Vault, source: str) -> str:
+    observation = vault.get_source_snapshot().observation(source)
+    value = {
+        "observation": asdict(observation) if observation is not None else None,
+        "connections": [
+            connection.to_dict()
+            for connection in vault.get_connection_snapshot().connections
+            if source in connection.source_ids
+        ],
+    }
     return sha256_bytes(json.dumps(value, sort_keys=True, default=str).encode())
