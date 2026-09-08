@@ -475,11 +475,15 @@ def _call(
             "event_delivery": asdict(PulseDelivery(vault).status()),
         }
     if name == "gsv_pulse_report_list":
-        from continuity_kernel.pulse_reports import PulseReportStore, pulse_report_dict
+        from continuity_kernel.pulse_reports import (
+            PulsePendingStage,
+            PulseReportStore,
+            pulse_report_dict,
+        )
 
         return pulse_report_dict(
             PulseReportStore(vault.root).list_pending(
-                stage=_string(values, "stage"),
+                stage=cast(PulsePendingStage, _string(values, "stage")),
                 limit=_integer(values, "limit", 8),
             )
         )

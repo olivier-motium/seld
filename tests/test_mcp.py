@@ -11,8 +11,9 @@ from typing import Any, cast
 
 import pytest
 
+import continuity_kernel.mcp_server as mcp_server
+import continuity_kernel.resident_import as resident_import
 import continuity_kernel.update as self_update
-from continuity_kernel import mcp_server, resident_import
 from continuity_kernel.connector_auth import (
     AccountMetadata,
     ClientKind,

@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -32,7 +33,7 @@ class _Bridge:
     requests: list[dict[str, Any]] = field(default_factory=list)
 
     def __call__(
-        self, command: list[str] | tuple[str, ...], payload: bytes, timeout_seconds: float
+        self, command: Sequence[str], payload: bytes, timeout_seconds: float
     ) -> subprocess.CompletedProcess[bytes]:
         del timeout_seconds
         self.requests.append(json.loads(payload.decode("utf-8")))

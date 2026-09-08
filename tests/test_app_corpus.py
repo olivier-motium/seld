@@ -4,15 +4,18 @@ import argparse
 import hashlib
 import json
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 
-from continuity_kernel import app_corpus, cli
+import continuity_kernel.app_corpus as app_corpus
+import continuity_kernel.cli as cli
 from continuity_kernel import recall as recall_module
 from continuity_kernel.app_corpus import (
+    AppCorpusAdapter,
     AppCorpusCompanion,
     AppCorpusDocument,
     AppCorpusSyncResult,
@@ -101,7 +104,9 @@ def test_two_mebibyte_provider_checkpoint_is_preserved_without_truncation(tmp_pa
             self.calls: list[str | None] = []
             self.token = token
 
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             self.calls.append(checkpoint)
             return AppCorpusSyncResult(
                 documents=(),
@@ -159,7 +164,7 @@ def test_read_only_status_and_scopes_do_not_wait_for_the_corpus_writer_lock(
     )
     companion.configure("con_abc", adapter="gmail")
 
-    def writer_lock_is_unavailable(*_args, **_kwargs):
+    def writer_lock_is_unavailable(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("read-only corpus snapshot took the writer lock")
 
     monkeypatch.setattr(PinnedPathRoot, "exclusive_file_lock", writer_lock_is_unavailable)
@@ -178,13 +183,18 @@ def test_apps_sync_passes_whatsapp_existing_row_recheck_to_its_adapter(
     received: list[bool] = []
 
     class Runtime:
-        def __init__(self, *_args, **_kwargs) -> None:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
         def close(self) -> None:
             pass
 
-    def adapters(_runtime, _corpus, *, recheck_existing: bool):
+    def adapters(
+        _runtime: object,
+        _corpus: AppCorpusCompanion,
+        *,
+        recheck_existing: bool,
+    ) -> dict[str, AppCorpusAdapter]:
         received.append(recheck_existing)
         return {"whatsapp": adapter}
 
@@ -221,7 +231,9 @@ def test_tombstone_removes_the_pinned_content_addressed_document(tmp_path: Path)
     class Adapter:
         deleted = False
 
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             return AppCorpusSyncResult(
                 documents=(
                     AppCorpusDocument(
@@ -264,9 +276,18 @@ def test_configured_whatsapp_capabilities_are_visible_but_apps_call_rejects_them
     monkeypatch.setattr(app_corpus, "data_dir", lambda: tmp_path / "data")
     companion = AppCorpusCompanion(vault.root)
 
+    def app_operations() -> list[dict[str, object]]:
+        operations = cli._app_capabilities(vault)["operations"]
+        assert isinstance(operations, list)
+        return operations
+
+    def operation_name(operation: dict[str, object]) -> str:
+        name = operation.get("name")
+        assert isinstance(name, str)
+        return name
+
     assert not any(
-        operation["name"].startswith("whatsapp.")
-        for operation in cli._app_capabilities(vault)["operations"]
+        operation_name(operation).startswith("whatsapp.") for operation in app_operations()
     )
 
     companion.configure(
@@ -274,12 +295,12 @@ def test_configured_whatsapp_capabilities_are_visible_but_apps_call_rejects_them
         adapter="whatsapp",
         settings={"store_root": str(tmp_path / "local-wacli")},
     )
-    operations = cli._app_capabilities(vault)["operations"]
+    operations = app_operations()
     whatsapp_operations = [
-        operation for operation in operations if operation["name"].startswith("whatsapp.")
+        operation for operation in operations if operation_name(operation).startswith("whatsapp.")
     ]
 
-    assert {operation["name"] for operation in whatsapp_operations} == {
+    assert {operation_name(operation) for operation in whatsapp_operations} == {
         "whatsapp.messages.context",
         "whatsapp.messages.delete",
         "whatsapp.messages.edit_sent_text",
@@ -321,14 +342,20 @@ def test_apps_call_executes_a_confirmed_write_inside_one_runtime(
     class Runtime:
         instances: ClassVar[list[Runtime]] = []
 
-        def __init__(self, _vault, *, adapters, require_confirmation_for_safe_mutations):
+        def __init__(
+            self,
+            _vault: Vault,
+            *,
+            adapters: object,
+            require_confirmation_for_safe_mutations: bool,
+        ) -> None:
             assert adapters == {"adapter": "registry"}
             assert require_confirmation_for_safe_mutations is True
             self.calls: list[dict[str, object]] = []
             self.closed = False
             self.instances.append(self)
 
-        def call_tool(self, name, values):
+        def call_tool(self, name: str, values: Mapping[str, object]) -> dict[str, object]:
             assert name == "gsv_gmail_write"
             current = dict(values)
             self.calls.append(current)
@@ -350,7 +377,7 @@ def test_apps_call_executes_a_confirmed_write_inside_one_runtime(
                 "status": "ok",
             }
 
-        def close(self):
+        def close(self) -> None:
             self.closed = True
 
     monkeypatch.setattr(cli, "ConnectorRuntime", Runtime)
@@ -383,7 +410,9 @@ def test_apps_call_executes_a_confirmed_write_inside_one_runtime(
     assert Runtime.instances[1].closed is True
 
 
-def test_current_qmd_search_maps_hits_back_to_exact_source(tmp_path: Path, monkeypatch) -> None:
+def test_current_qmd_search_maps_hits_back_to_exact_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Corpus")
     executable = tmp_path / "qmd"
@@ -412,7 +441,7 @@ def test_current_qmd_search_maps_hits_back_to_exact_source(tmp_path: Path, monke
     collection = state["qmd_bindings"]["con_abc"]["collection"]
     documents_root = state["qmd_bindings"]["con_abc"]["documents_root"]
 
-    def query(command, **_kwargs):
+    def query(command: tuple[str, ...], **_kwargs: object) -> recall_module._CommandResult:
         if command[3:5] == ("collection", "show"):
             return recall_module._CommandResult(
                 0,
@@ -471,7 +500,7 @@ def test_rebound_scoped_qmd_collection_uses_local_lexical_search(
     state = json.loads(companion.state_path.read_text(encoding="utf-8"))
     collection = state["qmd_bindings"]["con_abc"]["collection"]
 
-    def rebound(command, **_kwargs):
+    def rebound(command: tuple[str, ...], **_kwargs: object) -> recall_module._CommandResult:
         if command[3:5] == ("collection", "show"):
             return recall_module._CommandResult(
                 0,
@@ -495,7 +524,9 @@ def test_rebound_scoped_qmd_collection_uses_local_lexical_search(
     assert result.hits[0].source_ref == "gmail:message-1"
 
 
-def test_sync_removes_replaced_content_addressed_documents(tmp_path: Path, monkeypatch) -> None:
+def test_sync_removes_replaced_content_addressed_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Corpus")
     executable = tmp_path / "qmd"
@@ -508,7 +539,9 @@ def test_sync_removes_replaced_content_addressed_documents(tmp_path: Path, monke
     class Adapter:
         text = "first"
 
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             return AppCorpusSyncResult(
                 documents=(
                     AppCorpusDocument(
@@ -561,7 +594,9 @@ def test_refresh_reuses_a_bound_collection_for_changed_content(
     class Adapter:
         text = "first"
 
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             return AppCorpusSyncResult(
                 documents=(
                     AppCorpusDocument(
@@ -585,7 +620,7 @@ def test_refresh_reuses_a_bound_collection_for_changed_content(
 
     commands: list[tuple[str, ...]] = []
 
-    def run(command, **_kwargs):
+    def run(command: tuple[str, ...], **_kwargs: object) -> recall_module._CommandResult:
         commands.append(command)
         if command[3:5] == ("collection", "add"):
             collection = command[command.index("--name") + 1]
@@ -633,13 +668,12 @@ def test_refresh_ignores_legacy_global_qmd_config_and_builds_a_physical_scope(
         encoding="utf-8",
     )
     commands: list[tuple[str, ...]] = []
-    monkeypatch.setattr(
-        recall_module,
-        "_run_command",
-        lambda command, **_kwargs: (
-            commands.append(command) or recall_module._CommandResult(0, b"", b"")
-        ),
-    )
+
+    def record_command(command: tuple[str, ...], **_kwargs: object) -> recall_module._CommandResult:
+        commands.append(command)
+        return recall_module._CommandResult(0, b"", b"")
+
+    monkeypatch.setattr(recall_module, "_run_command", record_command)
 
     companion.refresh()
 
@@ -694,7 +728,9 @@ def test_refresh_continues_smallest_scope_first_after_a_quick_scope_failure(
         def __init__(self, object_ids: tuple[str, ...]) -> None:
             self.object_ids = object_ids
 
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             return AppCorpusSyncResult(
                 documents=tuple(
                     AppCorpusDocument(
@@ -722,7 +758,7 @@ def test_refresh_continues_smallest_scope_first_after_a_quick_scope_failure(
     calls: list[tuple[str, ...]] = []
     small_index = hashlib.sha256(b"con_small").hexdigest()[:32]
 
-    def run(command, **_kwargs):
+    def run(command: tuple[str, ...], **_kwargs: object) -> recall_module._CommandResult:
         calls.append(command)
         if command[2].endswith(small_index):
             return recall_module._CommandResult(1, b"", b"failure")
@@ -791,7 +827,9 @@ def test_search_uses_committed_content_while_a_provider_read_is_in_flight(tmp_pa
         started = threading.Event()
         release = threading.Event()
 
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             if self.update:
                 self.started.set()
                 assert self.release.wait(2)
@@ -840,7 +878,9 @@ def test_search_uses_committed_content_while_a_provider_read_is_in_flight(tmp_pa
     assert errors == []
     assert result.backend == "local"
     assert result.hits[0].source_ref == "gmail:message-1"
-    assert companion.read("con_abc", "message-1").text == "newly fetched content"
+    document = companion.read("con_abc", "message-1")
+    assert document is not None
+    assert document.text == "newly fetched content"
 
 
 def test_search_degrades_to_committed_exact_text_during_qmd_refresh(
@@ -858,7 +898,9 @@ def test_search_degrades_to_committed_exact_text_during_qmd_refresh(
     class Adapter:
         text = "first committed text"
 
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             return AppCorpusSyncResult(
                 documents=(
                     AppCorpusDocument(
@@ -884,7 +926,7 @@ def test_search_degrades_to_committed_exact_text_during_qmd_refresh(
     started = threading.Event()
     release = threading.Event()
 
-    def run(command, **_kwargs):
+    def run(command: tuple[str, ...], **_kwargs: object) -> recall_module._CommandResult:
         if block.is_set() and command[-1] == "update":
             started.set()
             release.wait(2)
@@ -920,7 +962,9 @@ def test_status_surfaces_extraction_gaps_without_changing_walk_completion(tmp_pa
     )
 
     class Adapter:
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             return AppCorpusSyncResult(
                 documents=(
                     AppCorpusDocument(
@@ -1031,7 +1075,9 @@ def test_legacy_gmail_message_gap_recovery_starts_once_per_connection(tmp_path: 
         def __init__(self) -> None:
             self.calls: list[str | None] = []
 
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             del connection_id, limit
             self.calls.append(checkpoint)
             call = len(self.calls)
@@ -1122,7 +1168,9 @@ def test_outlook_detail_failure_recovery_rewinds_once_per_connection(tmp_path: P
         def __init__(self) -> None:
             self.calls: list[str | None] = []
 
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             del connection_id, limit
             self.calls.append(checkpoint)
             return AppCorpusSyncResult(
@@ -1158,7 +1206,9 @@ def test_whatsapp_status_derives_legacy_media_coverage_from_metadata(tmp_path: P
     )
 
     class Adapter:
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             documents = (
                 ("audio-relay", {"media_type": "audio", "transcript_source": "local_relay"}),
                 ("audio-missing", {"media_type": "audio"}),
@@ -1235,7 +1285,9 @@ def test_source_event_time_uses_drive_modification_when_no_occurrence_time_exist
     assert app_corpus._source_event_at(document) == "2026-09-06T10:00:00Z"
 
 
-def test_lexical_search_keeps_scoped_indexes_and_updates_changed_bodies(tmp_path, monkeypatch):
+def test_lexical_search_keeps_scoped_indexes_and_updates_changed_bodies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from dataclasses import replace
 
     vault = Vault(tmp_path / "vault")
@@ -1246,10 +1298,10 @@ def test_lexical_search_keeps_scoped_indexes_and_updates_changed_bodies(tmp_path
     adapter = _PagedAdapter([])
     companion.sync(adapter, "con_a")
     companion.sync(adapter, "con_b")
-    reads = []
+    reads: list[Path | str] = []
     original = PinnedPathRoot.read_regular_file
 
-    def observe(self, path, **kwargs):
+    def observe(self: PinnedPathRoot, path: Path | str, **kwargs: Any) -> bytes | None:
         if kwargs.get("label") == "app corpus lexical document":
             reads.append(path)
         return original(self, path, **kwargs)
@@ -1262,7 +1314,9 @@ def test_lexical_search_keeps_scoped_indexes_and_updates_changed_bodies(tmp_path
     assert len(reads) == 2
 
     class Refetched:
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             document = adapter.sync(connection_id).documents[0]
             return AppCorpusSyncResult(
                 documents=(replace(document, fetched_at="2026-09-07T12:00:00Z"),),
@@ -1278,7 +1332,9 @@ def test_lexical_search_keeps_scoped_indexes_and_updates_changed_bodies(tmp_path
     assert len(reads) == 2
 
     class Updated:
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             document = adapter.sync(connection_id).documents[0]
             return AppCorpusSyncResult(
                 documents=(replace(document, revision="r2", text="The correction is decisive."),),

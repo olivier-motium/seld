@@ -8,11 +8,14 @@ from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
-from continuity_kernel import app_corpus_whatsapp
+import pytest
+
+import continuity_kernel.app_corpus_whatsapp as app_corpus_whatsapp
 from continuity_kernel.app_corpus_whatsapp import (
     WhatsAppAppCorpusAdapter,
     whatsapp_app_capabilities,
 )
+from continuity_kernel.sqlite_snapshot import pinned_sqlite_snapshot
 
 ACCOUNT = "sha256:" + "a" * 64
 AT = int(datetime(2026, 9, 7, 10, 0, tzinfo=UTC).timestamp())
@@ -242,15 +245,15 @@ def test_whatsapp_explicit_recheck_starts_one_existing_row_pass_without_rewindin
 
 
 def test_whatsapp_refuses_replaced_store_without_credential_database(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     original = _store(tmp_path / "wacli")
     _append(original, message_id="message-1", text="original", timestamp=AT)
     adapter = WhatsAppAppCorpusAdapter(account_fingerprint=ACCOUNT, store_root=original.parent)
     inspected: list[Path] = []
-    original_snapshot = app_corpus_whatsapp.pinned_sqlite_snapshot
+    original_snapshot = pinned_sqlite_snapshot
 
-    def pinned_snapshot(database: Path, *, label: str):
+    def pinned_snapshot(database: Path, *, label: str) -> object:
         inspected.append(database)
         return original_snapshot(database, label=label)
 
@@ -549,4 +552,5 @@ def test_whatsapp_retention_replays_same_store_without_inferred_deletions(tmp_pa
     assert next_page.complete
     assert next_page.freshness["status"] == "partial"
     assert all(not doc.deleted for doc in (*page.documents, *next_page.documents))
+    assert next_page.checkpoint is not None
     assert json.loads(next_page.checkpoint)["continuity_gap"] is True

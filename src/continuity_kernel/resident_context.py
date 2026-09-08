@@ -111,7 +111,7 @@ class _ExecutionBindingSource(Protocol):
 def execution_bindings(source: _ExecutionBindingSource) -> dict[str, Any]:
     """Project complete explicit runtime bindings without semantic selection."""
 
-    active_hands = [
+    active_hands: list[dict[str, Any]] = [
         {
             "active_thread_id": task.active_thread_id,
             "revision": task.revision,

@@ -4,6 +4,7 @@ import hashlib
 import os
 import stat
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -46,8 +47,10 @@ def _write_source(store: PinnedPathRoot, record: QMDScopedRecord, content: bytes
     store.atomic_write(record.document_path, content)
 
 
-def _runner(store: PinnedPathRoot, calls: list[tuple[str, ...]]):
-    def run(command, **_kwargs):
+def _runner(
+    store: PinnedPathRoot, calls: list[tuple[str, ...]]
+) -> Callable[..., recall_module._CommandResult]:
+    def run(command: tuple[str, ...], **_kwargs: object) -> recall_module._CommandResult:
         calls.append(command)
         if command[3:5] == ("collection", "add"):
             index = command[2]
@@ -188,7 +191,7 @@ def test_qmd_failure_never_returns_a_scope_binding(tmp_path: Path) -> None:
         _write_source(store, record, content)
         calls: list[tuple[str, ...]] = []
 
-        def fail(command, **_kwargs):
+        def fail(command: tuple[str, ...], **_kwargs: object) -> recall_module._CommandResult:
             calls.append(command)
             return recall_module._CommandResult(1, b"", b"failure")
 
@@ -228,7 +231,7 @@ def test_scope_binding_check_requires_the_exact_qmd_collection_target(tmp_path: 
         )
         binding = manager.refresh(_snapshot("a" * 64, record), deadline=time.monotonic() + 10)[0]
 
-        def bound(command, **_kwargs):
+        def bound(command: tuple[str, ...], **_kwargs: object) -> recall_module._CommandResult:
             if command[3:5] == ("collection", "show"):
                 return recall_module._CommandResult(
                     0,
@@ -252,7 +255,7 @@ def test_scope_binding_check_requires_the_exact_qmd_collection_target(tmp_path: 
             is None
         )
 
-        def rebound(command, **_kwargs):
+        def rebound(command: tuple[str, ...], **_kwargs: object) -> recall_module._CommandResult:
             if command[3:5] == ("collection", "show"):
                 return recall_module._CommandResult(
                     0,

@@ -209,19 +209,14 @@ def _rebuild(
 def _row(
     store: PinnedPathRoot, key: str, record: Mapping[str, Any]
 ) -> tuple[str, str, str, str, str, str, str, str, str, str, str, str]:
-    values = tuple(
-        _required_text(record, field)
-        for field in (
-            "connection_id",
-            "provider",
-            "fetched_at",
-            "object_id",
-            "revision",
-            "source_ref",
-            "digest",
-            "title",
-        )
-    )
+    connection_id = _required_text(record, "connection_id")
+    provider = _required_text(record, "provider")
+    fetched_at = _required_text(record, "fetched_at")
+    object_id = _required_text(record, "object_id")
+    revision = _required_text(record, "revision")
+    source_ref = _required_text(record, "source_ref")
+    digest = _required_text(record, "digest")
+    title = _required_text(record, "title")
     source_event_at = record.get("source_event_at")
     if source_event_at is not None and not isinstance(source_event_at, str):
         raise ValidationError("app corpus lexical state is invalid")
@@ -237,13 +232,26 @@ def _row(
     content = store.read_regular_file(
         path, label="app corpus lexical document", max_bytes=4 * 1024 * 1024
     )
-    if content is None or hashlib.sha256(content).hexdigest() != values[6]:
+    if content is None or hashlib.sha256(content).hexdigest() != digest:
         raise ValidationError("app corpus lexical document changed before indexing")
     try:
         body = content.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValidationError("app corpus lexical document is not text") from exc
-    return (key, *values[:6], source_event_at or "", values[6], values[7], metadata_text, body)
+    return (
+        key,
+        connection_id,
+        provider,
+        fetched_at,
+        object_id,
+        revision,
+        source_ref,
+        source_event_at or "",
+        digest,
+        title,
+        metadata_text,
+        body,
+    )
 
 
 def _required_text(record: Mapping[str, Any], field: str) -> str:
@@ -265,9 +273,9 @@ def _matches(
     per_connection: dict[str, list[LexicalMatch]] = {}
     connection_ids = sorted(
         {
-            record.get("connection_id")
+            connection_id
             for record in selected_documents.values()
-            if isinstance(record.get("connection_id"), str)
+            if isinstance(connection_id := record.get("connection_id"), str)
         }
     )
     for connection_id in connection_ids:

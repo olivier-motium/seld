@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -64,8 +65,8 @@ def test_queue_wake_persists_before_exit_zero_and_does_not_claim_consumption(vau
     commands: list[tuple[str, ...]] = []
     delivery: PulseDelivery
 
-    def queue(command: tuple[str, ...]) -> int:
-        commands.append(command)
+    def queue(command: Sequence[str]) -> int:
+        commands.append(tuple(command))
         assert delivery.status().wake_requests[0].state == "prepared"
         return 0
 
@@ -85,8 +86,8 @@ def test_uncertain_wake_never_resends_and_becomes_fallback_due(vault: Vault) -> 
     clock = [NOW]
     commands: list[tuple[str, ...]] = []
 
-    def queue(command: tuple[str, ...]) -> int:
-        commands.append(command)
+    def queue(command: Sequence[str]) -> int:
+        commands.append(tuple(command))
         return 1
 
     delivery = PulseDelivery(vault, queue_runner=queue, now=lambda: clock[0])
@@ -104,11 +105,12 @@ def test_new_wake_reserves_only_reports_not_already_covered(vault: Vault) -> Non
     first = _wake_report(vault, marker="e")
     second = _wake_report(vault, marker="f")
     commands: list[tuple[str, ...]] = []
-    delivery = PulseDelivery(
-        vault,
-        queue_runner=lambda command: commands.append(tuple(command)) or 0,
-        now=lambda: NOW,
-    )
+
+    def queue(command: Sequence[str]) -> int:
+        commands.append(tuple(command))
+        return 0
+
+    delivery = PulseDelivery(vault, queue_runner=queue, now=lambda: NOW)
 
     delivery.queue_wake((first.identifier,))
     added = delivery.queue_wake((first.identifier, second.identifier))
@@ -128,11 +130,12 @@ def test_wake_backlog_coalesces_without_marking_waiting_reports_delivered(vault:
     second = _wake_report(vault, marker="b")
     third = _wake_report(vault, marker="c")
     commands: list[tuple[str, ...]] = []
-    delivery = PulseDelivery(
-        vault,
-        queue_runner=lambda command: commands.append(tuple(command)) or 0,
-        now=lambda: NOW,
-    )
+
+    def queue(command: Sequence[str]) -> int:
+        commands.append(tuple(command))
+        return 0
+
+    delivery = PulseDelivery(vault, queue_runner=queue, now=lambda: NOW)
     delivery.queue_wake((first.identifier,))
     delivery.queue_wake((second.identifier,))
     assert delivery.queue_wake((third.identifier,)).state == "noop"

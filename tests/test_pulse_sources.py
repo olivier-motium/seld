@@ -521,6 +521,7 @@ def test_codex_activity_exposes_only_structural_events_and_checkpoints_after_rep
         assert window.items == ()
         assert window.result == "failure"
         assert window.error_code == "identity_mismatch"
+        assert window.receipt.record is not None
         assert "cursor" not in window.receipt.record
     else:
         assert len(window.items) == 1
@@ -540,10 +541,9 @@ def test_codex_activity_exposes_only_structural_events_and_checkpoints_after_rep
     adapter.commit(window, report_ref=report.report_ref, report_revision=report.revision)
     if account_mismatch:
         assert not reader.checkpoint.exists()
-        assert (
-            vault.get_source_snapshot().observation("codex_activity").error_code
-            == "identity_mismatch"
-        )
+        observation = vault.get_source_snapshot().observation("codex_activity")
+        assert observation is not None
+        assert observation.error_code == "identity_mismatch"
         adapter.release(window)
         return
     assert reader.checkpoint.exists()

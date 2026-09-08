@@ -21,7 +21,7 @@ from email.parser import BytesParser
 from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Final
+from typing import Any, Final, TypedDict
 
 from continuity_kernel.app_corpus import AppCorpusDocument, AppCorpusSyncResult
 from continuity_kernel.app_corpus_microsoft_calendar_delta import (
@@ -43,7 +43,7 @@ from continuity_kernel.app_corpus_microsoft_delta import (
     clear_continuations as _clear_microsoft_delta_continuations,
 )
 from continuity_kernel.app_corpus_text import ExtractionResult, extract_text
-from continuity_kernel.connector_runtime import ConnectorRuntime
+from continuity_kernel.connector_runtime import AppCorpusReader
 from continuity_kernel.connector_transport import ConnectorOrigin, ConnectorProviderError
 from continuity_kernel.errors import ContinuityError, ValidationError
 from continuity_kernel.slack_channel_access import load_slack_channel_access
@@ -65,6 +65,16 @@ _PDF_MIME: Final = "application/pdf"
 _GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_CHECKPOINT: Final = "gmail_legacy_message_gap_recovery_epoch"
 _GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_EPOCH: Final = "legacy_message_gap_recovery_epoch"
 _GMAIL_LEGACY_MESSAGE_GAP_RECOVERY_STARTED: Final = "legacy_message_gap_recovery_started"
+
+
+class _DocumentFields(TypedDict):
+    connection_id: str
+    provider: str
+    object_id: str
+    revision: str
+    fetched_at: str
+    source_ref: str
+    title: str
 
 
 class _PlainText(HTMLParser):
@@ -142,7 +152,7 @@ class _CorpusProviderAdapter:
 
     provider_name: str
 
-    def __init__(self, runtime: ConnectorRuntime) -> None:
+    def __init__(self, runtime: AppCorpusReader) -> None:
         self._runtime = runtime
 
     def sync(
@@ -294,7 +304,7 @@ class GoogleAppCorpusAdapter(_CorpusProviderAdapter):
 
     def __init__(
         self,
-        runtime: ConnectorRuntime,
+        runtime: AppCorpusReader,
         *,
         sources: frozenset[str] | None = None,
     ) -> None:
@@ -736,7 +746,7 @@ class GoogleAppCorpusAdapter(_CorpusProviderAdapter):
         file_id = _required_identifier(file, "id", "Google Drive file")
         mime_type = _optional_text(file.get("mimeType"))
         metadata = _drive_metadata(file, mime_type=mime_type)
-        common = {
+        common: _DocumentFields = {
             "connection_id": connection_id,
             "provider": "google_drive",
             "object_id": f"drive:{file_id}",
@@ -1172,7 +1182,7 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
 
     def __init__(
         self,
-        runtime: ConnectorRuntime,
+        runtime: AppCorpusReader,
         *,
         sources: frozenset[str] | None = None,
         calendar_delta_window: MicrosoftCalendarDeltaWindow | None = None,
@@ -1251,13 +1261,13 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
         if "outlook_mail" not in self._sources:
             mail["done"] = True
         elif not mail.get("done"):
-            delta = MicrosoftMailDeltaSync(self._runtime).sync(
+            mail_delta = MicrosoftMailDeltaSync(self._runtime).sync(
                 connection_id,
                 checkpoint=_optional_text(mail.get("delta_checkpoint")),
                 limit=page_size,
             )
-            scanned += delta.scanned
-            for change in delta.changes:
+            scanned += mail_delta.scanned
+            for change in mail_delta.changes:
                 try:
                     detail = self._call(
                         "gsv_outlook_mail_read",
@@ -1291,7 +1301,7 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                         immutable_ids=True,
                     )
                 )
-            for removal in delta.removals:
+            for removal in mail_delta.removals:
                 try:
                     detail = self._call(
                         "gsv_outlook_mail_read",
@@ -1325,16 +1335,16 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                         immutable_ids=True,
                     )
                 )
-            mail["delta_checkpoint"] = delta.checkpoint
+            mail["delta_checkpoint"] = mail_delta.checkpoint
             _clear_coverage_gaps(
                 mail,
                 prefix=(
                     "Outlook Mail permanent deletions are not observable without a Graph delta read"
                 ),
             )
-            for detail in delta.coverage_gaps:
-                _record_coverage_gap(mail, detail)
-            mail["done"] = delta.complete
+            for coverage_gap in mail_delta.coverage_gaps:
+                _record_coverage_gap(mail, coverage_gap)
+            mail["done"] = mail_delta.complete
 
         if "outlook_calendar" not in self._sources:
             calendar["done"] = True
@@ -1427,21 +1437,21 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                         "Outlook Calendar permanent deletions in the configured primary-calendar "
                         "window are not current until its Graph delta cursor finishes",
                     )
-                    delta = MicrosoftCalendarDeltaSync(
+                    calendar_delta = MicrosoftCalendarDeltaSync(
                         self._runtime, window=self._calendar_delta_window
                     ).sync(
                         connection_id,
                         checkpoint=_optional_text(calendar.get("delta_checkpoint")),
                         limit=page_size,
                     )
-                    scanned += delta.scanned
-                    for change in delta.changes:
-                        if not change.removed:
+                    scanned += calendar_delta.scanned
+                    for calendar_change in calendar_delta.changes:
+                        if not calendar_change.removed:
                             documents.append(
                                 _outlook_event_document(
                                     connection_id,
                                     primary_calendar_id,
-                                    change.value,
+                                    calendar_change.value,
                                     fetched_at,
                                 )
                             )
@@ -1451,7 +1461,7 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                                 "gsv_outlook_calendar_read",
                                 connection_id,
                                 "events.get",
-                                {"calendar_id": "primary", "event_id": change.event_id},
+                                {"calendar_id": "primary", "event_id": calendar_change.event_id},
                             ).payload
                         except ConnectorProviderError as exc:
                             if exc.status != 404:
@@ -1460,12 +1470,12 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                                 _outlook_calendar_delta_deleted_document(
                                     connection_id,
                                     primary_calendar_id,
-                                    change.event_id,
+                                    calendar_change.event_id,
                                     _revision(
-                                        change.value,
+                                        calendar_change.value,
                                         "changeKey",
                                         "lastModifiedDateTime",
-                                        fallback=change.event_id,
+                                        fallback=calendar_change.event_id,
                                     ),
                                     fetched_at,
                                 )
@@ -1479,9 +1489,9 @@ class MicrosoftAppCorpusAdapter(_CorpusProviderAdapter):
                                 fetched_at,
                             )
                         )
-                    calendar["delta_checkpoint"] = delta.checkpoint
-                    calendar["done"] = delta.complete
-                    if delta.complete:
+                    calendar["delta_checkpoint"] = calendar_delta.checkpoint
+                    calendar["done"] = calendar_delta.complete
+                    if calendar_delta.complete:
                         _clear_coverage_gaps(
                             calendar,
                             prefix=(
@@ -1787,7 +1797,7 @@ class SlackAppCorpusAdapter(_CorpusProviderAdapter):
         state["search"] = {"done": True}
 
 
-def default_app_corpus_adapters(runtime: ConnectorRuntime) -> dict[str, _CorpusProviderAdapter]:
+def default_app_corpus_adapters(runtime: AppCorpusReader) -> dict[str, _CorpusProviderAdapter]:
     """Return source-ID adapters for the existing account-aware connector runtime."""
 
     gmail = GoogleAppCorpusAdapter(runtime, sources=frozenset({"gmail"}))
@@ -1860,7 +1870,7 @@ def _gmail_raw_attachment_document(
         received_at=received_at,
         size=len(attachment.content),
     )
-    common = {
+    common: _DocumentFields = {
         "connection_id": connection_id,
         "provider": "gmail",
         "object_id": f"gmail-attachment:{message_id}:{attachment_id}",

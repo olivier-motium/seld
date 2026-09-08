@@ -579,6 +579,7 @@ class AppCorpusCompanion:
                 _string_record(record, "connection_id") for record in documents.values()
             }
             current = bool(selected_connections) and selected_connections.issubset(qmd_bindings)
+            hits: tuple[AppCorpusHit, ...] | None
             if recall_module._resolved_executable(self.executable) is None:
                 hits = _lexical_hits(
                     store,
@@ -626,6 +627,7 @@ class AppCorpusCompanion:
                 else:
                     reason = None
                     backend = "qmd"
+            assert hits is not None
             return AppCorpusSearch(backend, complete, hits, reason)
 
     def read(self, connection_id: str, object_id: str) -> AppCorpusDocument | None:
@@ -646,6 +648,8 @@ class AppCorpusCompanion:
             content = store.read_regular_file(
                 path, label="app corpus document", max_bytes=MAX_DOCUMENT_BYTES
             )
+            if content is None:
+                raise ValidationError("app corpus document disappeared before it was read")
             text = _strip_document_header(content.decode("utf-8"))
             return AppCorpusDocument(
                 connection_id=_string_record(record, "connection_id"),
@@ -1033,7 +1037,11 @@ def _stored_collection_binding(state: Mapping[str, Any]) -> dict[str, str] | Non
     collection = value.get("collection")
     documents_root = value.get("documents_root")
     mask = value.get("mask")
-    if not all(isinstance(item, str) for item in (collection, documents_root, mask)):
+    if (
+        not isinstance(collection, str)
+        or not isinstance(documents_root, str)
+        or not isinstance(mask, str)
+    ):
         return None
     return {
         "collection": collection,
@@ -1086,8 +1094,12 @@ def _current_qmd_binding(
     index = value.get("index")
     collection = value.get("collection")
     documents_root = value.get("documents_root")
-    if not all(
-        isinstance(item, str) for item in (snapshot, scope, index, collection, documents_root)
+    if (
+        not isinstance(snapshot, str)
+        or not isinstance(scope, str)
+        or not isinstance(index, str)
+        or not isinstance(collection, str)
+        or not isinstance(documents_root, str)
     ):
         return None
     if snapshot != expected or scope != expected:
@@ -1144,9 +1156,9 @@ def _binding_state(binding: Any) -> dict[str, str]:
         "collection": getattr(binding, "collection", None),
         "documents_root": str(getattr(binding, "documents_root", "")),
     }
-    if not all(isinstance(item, str) for item in value.values()):
+    if any(not isinstance(item, str) for item in value.values()):
         raise ValidationError("scoped app QMD binding is invalid")
-    return value
+    return {key: item for key, item in value.items() if isinstance(item, str)}
 
 
 def _config_has_collection_binding(
@@ -1444,6 +1456,8 @@ def _fallback_hits(
         encoded = store.read_regular_file(
             path, label="app corpus document", max_bytes=MAX_DOCUMENT_BYTES
         )
+        if encoded is None:
+            raise ValidationError("app corpus document disappeared before it was searched")
         text = encoded.decode("utf-8")
         folded = text.casefold()
         counts = tuple(folded.count(term) for term in terms)
@@ -1769,9 +1783,9 @@ def _qmd_hits(
     if not isinstance(rows, list):
         return None
     paths = {
-        _stored_path(record).removeprefix("documents/"): record
+        path.removeprefix("documents/"): record
         for record in documents.values()
-        if _stored_path(record) is not None
+        if (path := _stored_path(record)) is not None
     }
     hits: list[AppCorpusHit] = []
     seen: set[str] = set()
@@ -1798,6 +1812,8 @@ def _qmd_hits(
         content = store.read_regular_file(
             path, label="app corpus document", max_bytes=MAX_DOCUMENT_BYTES
         )
+        if content is None:
+            raise ValidationError("app corpus document disappeared before it was searched")
         raw_score = row.get("score", 0.0)
         score = (
             float(raw_score)

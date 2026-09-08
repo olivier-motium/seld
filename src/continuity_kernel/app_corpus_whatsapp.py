@@ -1400,6 +1400,8 @@ def _label(value: object) -> str | None:
 
 
 def _epoch_iso(value: object) -> str:
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        raise ContinuityError("WhatsApp message timestamp is invalid")
     try:
         return _iso(datetime.fromtimestamp(int(value), tz=UTC))
     except (OSError, OverflowError, TypeError, ValueError) as exc:
@@ -1409,6 +1411,8 @@ def _epoch_iso(value: object) -> str:
 def _optional_epoch_iso(value: object) -> str | None:
     if value is None:
         return None
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        raise ContinuityError("WhatsApp edit timestamp is invalid")
     try:
         timestamp = int(value)
     except (TypeError, ValueError) as exc:

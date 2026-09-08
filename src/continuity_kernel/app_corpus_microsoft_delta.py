@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
-from continuity_kernel.connector_runtime import ConnectorRuntime
+from continuity_kernel.connector_runtime import AppCorpusReader
 from continuity_kernel.errors import ValidationError
 
 MAX_FOLDERS: Final = 128
@@ -54,7 +54,7 @@ class MicrosoftMailDeltaResult:
 class MicrosoftMailDeltaSync:
     """Synchronize every readable mailbox folder through closed runtime reads."""
 
-    def __init__(self, runtime: ConnectorRuntime) -> None:
+    def __init__(self, runtime: AppCorpusReader) -> None:
         self._runtime = runtime
 
     def sync(

@@ -16,8 +16,8 @@ from continuity_kernel.connector_auth import (
     ConnectionHealth,
     ConnectionMetadata,
     CredentialKind,
-    parse_connection_id,
 )
+from continuity_kernel.connector_identifiers import parse_connection_id
 from continuity_kernel.errors import ContinuityError, ValidationError
 from continuity_kernel.pulse_codex import LunaTurnResult
 from continuity_kernel.pulse_delivery import PulseDelivery
@@ -84,6 +84,12 @@ class FakeSourceAdapter:
         assert window.source_id == "slack"
         self.releases += 1
 
+    def slack_search(self, query: str) -> Mapping[str, object]:
+        raise AssertionError(f"unexpected Slack search: {query}")
+
+    def slack_context(self, reference: str) -> Mapping[str, object]:
+        raise AssertionError(f"unexpected Slack context read: {reference}")
+
 
 @dataclass
 class FakeLunaSession:
@@ -100,7 +106,7 @@ class FakeLunaSession:
         self.turns.append(self.role)
         if self.role == "relevance":
             reports = json.loads(prompt)["reports"]
-            output = {
+            output: dict[str, object] = {
                 "decisions": [
                     {
                         "report_id": report["report_id"],
@@ -209,15 +215,15 @@ def test_runtime_recovers_a_committed_report_without_another_model_or_actual_wak
         )
         return FakeLunaSession(role, turns)
 
-    delivery = PulseDelivery(
-        vault,
-        queue_runner=lambda command: queue_calls.append(tuple(command)) or 0,
-        now=lambda: NOW,
-    )
+    def queue(command: Sequence[str]) -> int:
+        queue_calls.append(tuple(command))
+        return 0
+
+    delivery = PulseDelivery(vault, queue_runner=queue, now=lambda: NOW)
     runtime = PulseRuntime(
         vault,
-        session_factory=factory,  # type: ignore[arg-type]
-        adapter=adapter,  # type: ignore[arg-type]
+        session_factory=factory,
+        adapter=adapter,
         wake_handler=delivery.queue_wake,
     )
 
@@ -237,8 +243,8 @@ def test_runtime_recovers_a_committed_report_without_another_model_or_actual_wak
     runtime.state.change(lambda state: state["sources"].pop("slack", None))
     restarted = PulseRuntime(
         vault,
-        session_factory=factory,  # type: ignore[arg-type]
-        adapter=adapter,  # type: ignore[arg-type]
+        session_factory=factory,
+        adapter=adapter,
         wake_handler=delivery.queue_wake,
     )
     asyncio.run(restarted.run(once=True))
@@ -287,8 +293,8 @@ def test_runtime_replays_a_report_outside_the_small_recent_context_without_a_mod
 
     runtime = PulseRuntime(
         vault,
-        adapter=adapter,  # type: ignore[arg-type]
-        session_factory=no_source_model,  # type: ignore[arg-type]
+        adapter=adapter,
+        session_factory=no_source_model,
     )
     asyncio.run(runtime.process_source("slack"))
 
@@ -322,6 +328,7 @@ def test_investigation_replays_an_older_child_before_starting_another_model(
         reason="Check the retained source context once.",
         decided_at=NOW - timedelta(minutes=19),
     )
+    assert investigation.decision is not None
     child_event_key = "pulse-report:" + sha256_bytes(
         (investigation.event_key + investigation.decision.reason).encode()
     )
@@ -353,7 +360,7 @@ def test_investigation_replays_an_older_child_before_starting_another_model(
     def no_follow_up_model(*_args: object, **_values: object) -> FakeLunaSession:
         raise AssertionError("A durable investigation child must not start a model turn")
 
-    runtime = PulseRuntime(vault, session_factory=no_follow_up_model)  # type: ignore[arg-type]
+    runtime = PulseRuntime(vault, session_factory=no_follow_up_model)
     asyncio.run(runtime.investigate_pending())
 
     delivered = PulseReportStore(vault.root).show(investigation.identifier)
@@ -387,8 +394,8 @@ def test_known_fingerprint_replays_the_latest_report_without_another_model_or_wa
     )
     runtime = PulseRuntime(
         vault,
-        adapter=adapter,  # type: ignore[arg-type]
-        session_factory=factory,  # type: ignore[arg-type]
+        adapter=adapter,
+        session_factory=factory,
         wake_handler=delivery.queue_wake,
     )
     asyncio.run(runtime.run(once=True))
@@ -459,7 +466,7 @@ def test_checkpoint_failure_keeps_a_fixed_content_free_code(
     turns: list[str] = []
     runtime = PulseRuntime(
         vault,
-        adapter=CheckpointFailureAdapter(vault),  # type: ignore[arg-type]
+        adapter=CheckpointFailureAdapter(vault),
         session_factory=lambda *, instructions, **_values: FakeLunaSession(
             "relevance" if instructions.startswith("You are the separate relevance") else "source",
             turns,
@@ -497,7 +504,7 @@ def test_checkpoint_validation_records_only_its_local_exception_origin(vault: Va
     turns: list[str] = []
     runtime = PulseRuntime(
         vault,
-        adapter=DynamicValidationAdapter(vault),  # type: ignore[arg-type]
+        adapter=DynamicValidationAdapter(vault),
         session_factory=lambda *, instructions, **_values: FakeLunaSession(
             "relevance" if instructions.startswith("You are the separate relevance") else "source",
             turns,
@@ -541,8 +548,8 @@ def test_unavailable_source_creates_a_gap_report_without_starting_a_source_model
     runtime = PulseRuntime(
         vault,
         sources=("slack",),
-        adapter=UnavailableAdapter(vault),  # type: ignore[arg-type]
-        session_factory=factory,  # type: ignore[arg-type]
+        adapter=UnavailableAdapter(vault),
+        session_factory=factory,
         wake_handler=lambda _ids: None,
     )
     asyncio.run(runtime.run(once=True))
@@ -584,7 +591,7 @@ def test_verified_connection_repair_resumes_an_incident_skipped_source(vault: Va
     runtime = PulseRuntime(
         vault,
         adapter=adapter,
-        session_factory=factory,  # type: ignore[arg-type]
+        session_factory=factory,
         wake_handler=lambda _ids: None,
     )
     runtime._source_state(
@@ -631,8 +638,8 @@ def test_complete_empty_source_read_commits_without_a_model_or_blank_uncertainty
     adapter = CompleteEmptyAdapter(vault)
     runtime = PulseRuntime(
         vault,
-        adapter=adapter,  # type: ignore[arg-type]
-        session_factory=no_model,  # type: ignore[arg-type]
+        adapter=adapter,
+        session_factory=no_model,
     )
     asyncio.run(runtime.process_source("slack"))
 

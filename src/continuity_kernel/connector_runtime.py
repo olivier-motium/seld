@@ -10,7 +10,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from inspect import Parameter, signature
 from threading import RLock
-from typing import Final, cast
+from typing import Final, Protocol, cast
 
 from continuity_kernel.connector_adapter import (
     ConnectorAdapter,
@@ -86,6 +86,20 @@ _PROFILE_PROVIDERS: Final = {
     "outlook_mail": "microsoft",
     "slack": "slack",
 }
+
+
+class AppCorpusReader(Protocol):
+    """The bounded read surface used by corpus source adapters."""
+
+    def call_app_corpus_read(
+        self,
+        name: str,
+        values: Mapping[str, object],
+        *,
+        continuation: object | None = None,
+    ) -> Mapping[str, object]: ...
+
+
 _EFFECT_ORDER: Final = {
     ConnectorEffect.READ: 0,
     ConnectorEffect.SAFE_MUTATION: 1,

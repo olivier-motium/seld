@@ -66,7 +66,7 @@ def test_delta_sync_resumes_all_folders_and_releases_removals_only_at_round_end(
             ),
         ]
     )
-    sync = MicrosoftMailDeltaSync(runtime)  # type: ignore[arg-type]
+    sync = MicrosoftMailDeltaSync(runtime)
 
     folders_first = sync.sync("outlook", limit=50)
     folders_last = sync.sync("outlook", checkpoint=folders_first.checkpoint, limit=50)
@@ -125,8 +125,8 @@ def test_completed_checkpoint_reuses_opaque_delta_links_in_a_fresh_runtime() -> 
             ),
         ]
     )
-    first = MicrosoftMailDeltaSync(initial).sync("outlook", limit=10)  # type: ignore[arg-type]
-    complete = MicrosoftMailDeltaSync(initial).sync(  # type: ignore[arg-type]
+    first = MicrosoftMailDeltaSync(initial).sync("outlook", limit=10)
+    complete = MicrosoftMailDeltaSync(initial).sync(
         "outlook", checkpoint=first.checkpoint, limit=10
     )
 
@@ -140,7 +140,7 @@ def test_completed_checkpoint_reuses_opaque_delta_links_in_a_fresh_runtime() -> 
             ),
         ]
     )
-    resumed = MicrosoftMailDeltaSync(resumed_runtime).sync(  # type: ignore[arg-type]
+    resumed = MicrosoftMailDeltaSync(resumed_runtime).sync(
         "outlook", checkpoint=complete.checkpoint, limit=10
     )
 
@@ -220,7 +220,7 @@ def test_folder_cap_is_visible_and_never_truncates_the_checkpoint() -> None:
         ]
     )
 
-    result = MicrosoftMailDeltaSync(runtime).sync("outlook", limit=1_000)  # type: ignore[arg-type]
+    result = MicrosoftMailDeltaSync(runtime).sync("outlook", limit=1_000)
     saved = json.loads(result.checkpoint)
 
     assert len(saved["folders"]) == MAX_FOLDERS
@@ -241,8 +241,10 @@ def test_immutable_outlook_tombstone_cascades_matching_attachment_documents(
     class Adapter:
         deleted = False
 
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
-            documents = (
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
+            documents: tuple[AppCorpusDocument, ...] = (
                 AppCorpusDocument(
                     connection_id=connection_id,
                     provider="outlook_mail",
@@ -308,7 +310,9 @@ def test_immutable_outlook_tombstone_cascades_matching_attachment_documents(
     companion.sync(adapter, "outlook-connection")
 
     class OtherConnectionAdapter:
-        def sync(self, connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             return AppCorpusSyncResult(
                 documents=(
                     AppCorpusDocument(

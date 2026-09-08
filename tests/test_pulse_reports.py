@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from continuity_kernel.errors import ConflictError, ValidationError
-from continuity_kernel.pulse_reports import PulseReportStore
+from continuity_kernel.pulse_reports import PulseReport, PulseReportStore
 
 OBSERVED_AT = datetime(2026, 9, 8, 9, 0, tzinfo=UTC)
 CREATED_AT = datetime(2026, 9, 8, 9, 1, tzinfo=UTC)
@@ -19,7 +19,9 @@ RESULT = "d" * 64
 EVENT = "pulse-report:" + "e" * 64
 
 
-def _append(store: PulseReportStore, *, claim: str = "A source requires a Pulse decision."):
+def _append(
+    store: PulseReportStore, *, claim: str = "A source requires a Pulse decision."
+) -> PulseReport:
     return store.append(
         event_key=EVENT,
         claim=claim,

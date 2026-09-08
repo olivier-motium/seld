@@ -17,7 +17,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final, Protocol, cast
 
 from continuity_kernel.atomic import (
     PINNED_PATH_ROOT_SUPPORTED,
@@ -108,6 +108,43 @@ _CHECKPOINT_CONTINUITY_CODES: Final[Mapping[str, str]] = {
     "source receipt revision differs from its prepared commit marker": "receipt_marker_mismatch",
     "host-local source adapter binding durability is unknown": "adapter_binding_durability_unknown",
 }
+
+
+class PulseSession(Protocol):
+    """The in-memory model-session surface needed by Pulse orchestration."""
+
+    @property
+    def alive(self) -> bool: ...
+
+    @property
+    def configuration(self) -> Mapping[str, object]: ...
+
+    async def turn(self, prompt: str, *, output_schema: Mapping[str, object]) -> LunaTurnResult: ...
+
+    async def close(self) -> None: ...
+
+
+class PulseSource(Protocol):
+    """The acquire, commit, and release surface used by the Pulse runtime."""
+
+    def acquire(self, source_id: str) -> AcquiredSourceWindow: ...
+
+    def commit(
+        self,
+        window: AcquiredSourceWindow,
+        *,
+        report_ref: str,
+        report_revision: str,
+        replay: bool = False,
+    ) -> Mapping[str, object]: ...
+
+    def release(self, window: AcquiredSourceWindow) -> None: ...
+
+    def slack_search(self, query: str) -> Mapping[str, object]: ...
+
+    def slack_context(self, reference: str) -> Mapping[str, object]: ...
+
+
 DECISION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -238,8 +275,8 @@ class PulseRuntime:
         sources: Sequence[str] | None = None,
         poll_seconds: float = 60,
         concurrency: int = 2,
-        session_factory: Callable[..., LunaSession] = LunaSession,
-        adapter: PulseSourceAdapter | None = None,
+        session_factory: Callable[..., PulseSession] = LunaSession,
+        adapter: PulseSource | None = None,
         wake_handler: Callable[[Sequence[str]], Any] | None = None,
         diane_bridge: Path | None = None,
     ):
@@ -269,7 +306,7 @@ class PulseRuntime:
         self.wake_handler = wake_handler
         self.diane_bridge = diane_bridge
         self._curation_bridge = PulseCurationBridge(PulseDelivery(vault), executable=diane_bridge)
-        self._sessions: dict[str, LunaSession] = {}
+        self._sessions: dict[str, PulseSession] = {}
         self._windows: dict[str, AcquiredSourceWindow] = {}
         self._gate = asyncio.Semaphore(concurrency)
         self._source_io_gate = asyncio.Lock()
@@ -277,7 +314,7 @@ class PulseRuntime:
         self._arrivals = asyncio.Event()
         self._stop = asyncio.Event()
         self._scratch: tempfile.TemporaryDirectory[str] | None = None
-        self._judge: LunaSession | None = None
+        self._judge: PulseSession | None = None
 
     async def run(self, *, once: bool = False) -> dict[str, Any]:
         # The process owns exactly one lease for this vault. Another monitor
@@ -549,7 +586,7 @@ class PulseRuntime:
                 if window is not None:
                     self.adapter.release(window)
 
-    def _source_session(self, source: str) -> LunaSession:
+    def _source_session(self, source: str) -> PulseSession:
         session = self._sessions.get(source)
         if session is not None and session.alive:
             return session

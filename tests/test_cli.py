@@ -16,8 +16,9 @@ from typing import Any, cast
 
 import pytest
 
+import continuity_kernel.cli as cli
+import continuity_kernel.resident_import as resident_import
 from continuity_kernel import bridge as bridge_module
-from continuity_kernel import cli, resident_import
 from continuity_kernel import vault_backup as vault_backup_module
 from continuity_kernel.atomic import (
     durable_replace as actual_durable_replace,
@@ -575,7 +576,7 @@ def test_cli_source_read_returns_the_transient_connector_result_unchanged(
     vault_path = tmp_path / "source-read-vault"
     Vault(vault_path).initialize(name="Source read")
     received: dict[str, object] = {}
-    transient = {
+    transient: dict[str, object] = {
         "result": "success",
         "items": [{"text": "transient"}],
         "record": {"completeness": "partial"},

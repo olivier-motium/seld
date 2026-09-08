@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from ctypes import string_at
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -286,7 +287,7 @@ def test_macos_keyring_write_updates_in_place_and_only_adds_when_missing(
             self.calls: list[bytes] = []
 
         def __call__(self, _allocator: object, value: object, length: int) -> int:
-            data = string_at(value, length)
+            data = string_at(cast(int | bytes, value), length)
             self.calls.append(data)
             return 42
 
@@ -312,7 +313,7 @@ def test_macos_keyring_write_updates_in_place_and_only_adds_when_missing(
             self.add = FakeCall(add_status)
             self.data_create = FakeDataCreate()
             self.release = FakeRelease()
-            self.value_data = None
+            self.value_data: Any = None
             self._sec = type("Security", (), {"SecItemUpdate": self.update})()
             self._found = type(
                 "Foundation",

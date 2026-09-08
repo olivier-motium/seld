@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pytest import MonkeyPatch
 
-from continuity_kernel import app_corpus_text
+import continuity_kernel.app_corpus_text as app_corpus_text
 
 
 def test_extract_text_handles_local_document_content_and_names_coverage_gaps(

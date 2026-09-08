@@ -17,8 +17,10 @@ from urllib.error import URLError
 
 import pytest
 
+import continuity_kernel.cli as cli
+import continuity_kernel.codex_integration as codex_integration
 import continuity_kernel.update as self_update
-from continuity_kernel import cli, codex_integration, whatsapp
+import continuity_kernel.whatsapp as whatsapp
 from continuity_kernel.errors import ConflictError, SetupError, ValidationError
 from continuity_kernel.vault import Vault
 

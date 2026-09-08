@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from continuity_kernel.connector_contract import ConnectorEffect, ConnectorMode, OperationSpec
 
 
-def _object(properties: dict[str, object], *, required: tuple[str, ...] = ()) -> dict[str, object]:
+def _object(
+    properties: Mapping[str, object], *, required: tuple[str, ...] = ()
+) -> dict[str, object]:
     return {
         "additionalProperties": False,
         "properties": properties,

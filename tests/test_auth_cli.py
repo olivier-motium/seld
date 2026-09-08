@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from continuity_kernel import auth_cli
+import continuity_kernel.auth_cli as auth_cli
 from continuity_kernel.connector_auth import (
     AccountMetadata,
     ClientKind,

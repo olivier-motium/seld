@@ -52,7 +52,9 @@ def test_policy_keeps_unapproved_cached_slack_documents_unreadable(
     )
 
     class Adapter:
-        def sync(self, current_connection_id, *, checkpoint=None, limit=100):
+        def sync(
+            self, current_connection_id: str, *, checkpoint: str | None = None, limit: int = 100
+        ) -> AppCorpusSyncResult:
             assert current_connection_id == connection_id
             assert checkpoint is None
             assert limit == 100

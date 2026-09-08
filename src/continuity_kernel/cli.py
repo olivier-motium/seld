@@ -18,7 +18,7 @@ from typing import Any, cast
 
 import continuity_kernel.update as self_update
 from continuity_kernel import __version__, resident_import, whatsapp
-from continuity_kernel.app_corpus import AppCorpusCompanion
+from continuity_kernel.app_corpus import AppCorpusAdapter, AppCorpusCompanion, AppCorpusSyncResult
 from continuity_kernel.bridge import (
     bridge_status,
     open_bridge,
@@ -58,6 +58,7 @@ from continuity_kernel.connector_onboarding import (
 )
 from continuity_kernel.connector_operations import (
     CONNECTOR_PROFILE,
+    CONNECTOR_TOOL_BINDINGS,
     CONNECTOR_TOOL_NAMES,
     OPERATION_CATALOG,
 )
@@ -65,11 +66,7 @@ from continuity_kernel.connector_profiles import (
     CONNECTOR_PROFILES,
     ConnectorAccessTier,
 )
-from continuity_kernel.connector_runtime import (
-    CONNECTOR_TOOL_BINDINGS,
-    ConnectorRuntime,
-    default_connector_adapters,
-)
+from continuity_kernel.connector_runtime import ConnectorRuntime, default_connector_adapters
 from continuity_kernel.connector_sources import SUPPORTED_SOURCE_IDS, read_connector_source
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
@@ -1128,22 +1125,22 @@ def _app_corpus_adapters(
     corpus: AppCorpusCompanion,
     *,
     recheck_existing: bool = False,
-) -> dict[str, object]:
+) -> dict[str, AppCorpusAdapter]:
     """Load optional source normalizers without making the generic CLI depend on one provider."""
 
     try:
         from continuity_kernel.app_corpus_providers import default_app_corpus_adapters
     except ImportError:
-        adapters: dict[str, object] = {}
+        adapters: dict[str, AppCorpusAdapter] = {}
     else:
-        adapters = default_app_corpus_adapters(runtime)
-    local_adapters: dict[str, dict[str, object]] = {}
+        adapters = dict(default_app_corpus_adapters(runtime))
+    local_adapters: dict[str, dict[str, AppCorpusAdapter]] = {}
     for scope in corpus.scopes():
         if scope.adapter == "outlook_calendar":
             start = scope.settings.get("calendar_delta_start")
             end = scope.settings.get("calendar_delta_end")
             if start is None and end is None:
-                calendar_adapter: object = adapters["outlook_calendar"]
+                calendar_adapter: AppCorpusAdapter = adapters["outlook_calendar"]
             elif isinstance(start, str) and isinstance(end, str):
                 from continuity_kernel.app_corpus_microsoft_calendar_delta import (
                     validate_calendar_delta_window,
@@ -1187,8 +1184,6 @@ def _app_corpus_adapters(
             )
     for name, scoped in local_adapters.items():
         adapters[name] = _ConnectionScopedCorpusAdapter(scoped)
-    if not isinstance(adapters, dict) or not all(isinstance(key, str) for key in adapters):
-        raise ValidationError("app corpus adapter registry is invalid")
     return adapters
 
 
@@ -1219,7 +1214,7 @@ def _outlook_calendar_delta_settings(args: argparse.Namespace) -> dict[str, str]
 class _ConnectionScopedCorpusAdapter:
     """Dispatch a local corpus source only to its configured host account/workspace."""
 
-    def __init__(self, adapters: Mapping[str, object]) -> None:
+    def __init__(self, adapters: Mapping[str, AppCorpusAdapter]) -> None:
         self._adapters = dict(adapters)
 
     def sync(
@@ -1228,14 +1223,11 @@ class _ConnectionScopedCorpusAdapter:
         *,
         checkpoint: str | None = None,
         limit: int = 100,
-    ) -> object:
+    ) -> AppCorpusSyncResult:
         adapter = self._adapters.get(connection_id)
         if adapter is None:
             raise ValidationError("local app corpus connection is not configured")
-        method = getattr(adapter, "sync", None)
-        if not callable(method):
-            raise ValidationError("local app corpus adapter is invalid")
-        return method(connection_id, checkpoint=checkpoint, limit=limit)
+        return adapter.sync(connection_id, checkpoint=checkpoint, limit=limit)
 
 
 def _assert_connection_source(vault: Vault, connection_id: str, source_id: str) -> None:

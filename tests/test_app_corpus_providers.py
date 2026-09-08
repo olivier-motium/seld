@@ -53,6 +53,17 @@ def _response(result: object, *, continuation: object | None = None) -> dict[str
     return response
 
 
+def _checkpoint(value: str | None) -> str:
+    assert value is not None
+    return value
+
+
+def _input(runtime: _Runtime, index: int) -> Mapping[str, object]:
+    value = runtime.calls[index][1].get("input")
+    assert isinstance(value, Mapping)
+    return value
+
+
 def test_google_sync_pages_gmail_and_extracts_plain_text_body() -> None:
     runtime = _Runtime(
         [
@@ -92,7 +103,7 @@ def test_google_sync_pages_gmail_and_extracts_plain_text_body() -> None:
             _response({"changes": [], "newStartPageToken": "drive-next"}),
         ]
     )
-    adapter = GoogleAppCorpusAdapter(runtime)  # type: ignore[arg-type]
+    adapter = GoogleAppCorpusAdapter(runtime)
 
     first = adapter.sync("connection-1", limit=3)
 
@@ -140,7 +151,7 @@ def test_source_scoped_gmail_checkpoint_resumes_in_a_fresh_runtime() -> None:
             ),
         ]
     )
-    first_adapter = default_app_corpus_adapters(first_runtime)["gmail"]  # type: ignore[arg-type]
+    first_adapter = default_app_corpus_adapters(first_runtime)["gmail"]
 
     first = first_adapter.sync("gmail-connection", limit=10)
 
@@ -156,14 +167,14 @@ def test_source_scoped_gmail_checkpoint_resumes_in_a_fresh_runtime() -> None:
             ),
         ]
     )
-    second_adapter = default_app_corpus_adapters(second_runtime)["gmail"]  # type: ignore[arg-type]
+    second_adapter = default_app_corpus_adapters(second_runtime)["gmail"]
 
     second = second_adapter.sync("gmail-connection", checkpoint=first.checkpoint, limit=10)
 
     assert first.complete is False
     assert second.complete is True
-    saved_first = json.loads(first.checkpoint)
-    saved_second = json.loads(second.checkpoint)
+    saved_first = json.loads(_checkpoint(first.checkpoint))
+    saved_second = json.loads(_checkpoint(second.checkpoint))
     assert saved_first["gmail"]["history_anchor_id"] == "41"
     assert saved_second["gmail_history_id"] == "41"
     assert second_runtime.continuations == [{"pageToken": "provider-next"}, None]
@@ -184,7 +195,7 @@ def test_gmail_history_preserves_incremental_additions_and_deletions() -> None:
             ),
         ]
     )
-    first_adapter = GoogleAppCorpusAdapter(first_runtime, sources=frozenset({"gmail"}))  # type: ignore[arg-type]
+    first_adapter = GoogleAppCorpusAdapter(first_runtime, sources=frozenset({"gmail"}))
     first = first_adapter.sync("gmail-connection", limit=10)
 
     second_runtime = _Runtime(
@@ -210,7 +221,7 @@ def test_gmail_history_preserves_incremental_additions_and_deletions() -> None:
             ),
         ]
     )
-    second_adapter = GoogleAppCorpusAdapter(second_runtime, sources=frozenset({"gmail"}))  # type: ignore[arg-type]
+    second_adapter = GoogleAppCorpusAdapter(second_runtime, sources=frozenset({"gmail"}))
     second = second_adapter.sync("gmail-connection", checkpoint=first.checkpoint, limit=10)
 
     deleted = next(document for document in second.documents if document.object_id == "gmail:m-1")
@@ -219,7 +230,7 @@ def test_gmail_history_preserves_incremental_additions_and_deletions() -> None:
     assert added.text == "two"
     assert second.freshness["status"] == "complete"
     assert second_runtime.calls[0][1]["operation"] == "history.list"
-    assert second_runtime.calls[0][1]["input"]["start_history_id"] == "41"
+    assert _input(second_runtime, 0)["start_history_id"] == "41"
 
 
 def test_gmail_history_cursor_ignores_newer_message_details_until_final_page() -> None:
@@ -259,7 +270,7 @@ def test_gmail_history_cursor_ignores_newer_message_details_until_final_page() -
             _response({"history": [], "historyId": "43"}),
         ]
     )
-    adapter = GoogleAppCorpusAdapter(runtime, sources=frozenset({"gmail"}))  # type: ignore[arg-type]
+    adapter = GoogleAppCorpusAdapter(runtime, sources=frozenset({"gmail"}))
 
     middle = adapter.sync("gmail-connection", checkpoint=first.checkpoint, limit=10)
     final = adapter.sync("gmail-connection", checkpoint=middle.checkpoint, limit=10)
@@ -267,11 +278,11 @@ def test_gmail_history_cursor_ignores_newer_message_details_until_final_page() -
     assert middle.complete is False
     assert final.complete is True
     assert [
-        values["input"]["start_history_id"]
-        for _name, values in runtime.calls
+        _input(runtime, index)["start_history_id"]
+        for index, (_name, values) in enumerate(runtime.calls)
         if values["operation"] == "history.list"
     ] == ["41", "41"]
-    assert json.loads(final.checkpoint)["gmail_history_id"] == "43"
+    assert json.loads(_checkpoint(final.checkpoint))["gmail_history_id"] == "43"
 
 
 def test_gmail_detail_failure_keeps_prior_body_and_retries_its_provider_page(
@@ -325,7 +336,7 @@ def test_gmail_detail_failure_keeps_prior_body_and_retries_its_provider_page(
     assert preserved is not None
     assert preserved.text == "old"
     assert failed_runtime.calls[0][1]["operation"] == "history.list"
-    assert failed_runtime.calls[0][1]["input"]["start_history_id"] == "41"
+    assert _input(failed_runtime, 0)["start_history_id"] == "41"
 
     retry_runtime = _Runtime(
         [
@@ -354,7 +365,7 @@ def test_gmail_detail_failure_keeps_prior_body_and_retries_its_provider_page(
     assert updated is not None
     assert updated.text == "new"
     assert retry_runtime.calls[0][1]["operation"] == "history.list"
-    assert retry_runtime.calls[0][1]["input"]["start_history_id"] == "41"
+    assert _input(retry_runtime, 0)["start_history_id"] == "41"
 
 
 def test_gmail_detail_not_found_does_not_block_a_backfill_page() -> None:
@@ -372,14 +383,14 @@ def test_gmail_detail_not_found_does_not_block_a_backfill_page() -> None:
 
     result = GoogleAppCorpusAdapter(runtime, sources=frozenset({"gmail"})).sync(
         "gmail-connection", limit=10
-    )  # type: ignore[arg-type]
+    )
 
     assert result.complete is True
     assert result.documents == ()
     assert result.freshness["status"] == "partial"
     assert "could not be read" in result.freshness["detail"]
     assert "unavailable objects" in result.freshness["detail"]
-    assert json.loads(result.checkpoint)["gmail_history_id"] == "41"
+    assert json.loads(_checkpoint(result.checkpoint))["gmail_history_id"] == "41"
 
 
 def test_gmail_detail_provider_failure_surfaces_its_http_status() -> None:
@@ -397,7 +408,7 @@ def test_gmail_detail_provider_failure_surfaces_its_http_status() -> None:
 
     result = GoogleAppCorpusAdapter(runtime, sources=frozenset({"gmail"})).sync(
         "gmail-connection", limit=10
-    )  # type: ignore[arg-type]
+    )
 
     assert result.complete is False
     assert result.freshness["status"] == "partial"
@@ -431,9 +442,9 @@ def test_gmail_legacy_message_gap_recovery_restarts_one_baseline_without_rewindi
     )
     first = GoogleAppCorpusAdapter(first_runtime, sources=frozenset({"gmail"})).sync(
         "gmail-connection", checkpoint=checkpoint, limit=10
-    )  # type: ignore[arg-type]
+    )
 
-    saved_first = json.loads(first.checkpoint)
+    saved_first = json.loads(_checkpoint(first.checkpoint))
     assert first.complete is False
     assert first.documents[0].object_id == "gmail:m-1"
     assert [values["operation"] for _name, values in first_runtime.calls] == [
@@ -441,7 +452,7 @@ def test_gmail_legacy_message_gap_recovery_restarts_one_baseline_without_rewindi
         "messages.list",
         "messages.get",
     ]
-    assert "query" not in first_runtime.calls[1][1]["input"]
+    assert "query" not in _input(first_runtime, 1)
     assert "gmail_legacy_message_gap_recovery_epoch" not in saved_first
     assert saved_first["gmail"]["legacy_message_gap_recovery_epoch"] == 1
     assert saved_first["gmail"]["legacy_message_gap_recovery_started"] is True
@@ -461,9 +472,9 @@ def test_gmail_legacy_message_gap_recovery_restarts_one_baseline_without_rewindi
     )
     second = GoogleAppCorpusAdapter(second_runtime, sources=frozenset({"gmail"})).sync(
         "gmail-connection", checkpoint=first.checkpoint, limit=10
-    )  # type: ignore[arg-type]
+    )
 
-    saved_second = json.loads(second.checkpoint)
+    saved_second = json.loads(_checkpoint(second.checkpoint))
     assert second.complete is True
     assert second.documents[0].object_id == "gmail:m-2"
     assert [values["operation"] for _name, values in second_runtime.calls] == [
@@ -502,13 +513,13 @@ def test_unanchored_gmail_backfill_checkpoint_restarts_without_its_old_continuat
 
     result = GoogleAppCorpusAdapter(runtime, sources=frozenset({"gmail"})).sync(
         "gmail-connection", checkpoint=checkpoint, limit=10
-    )  # type: ignore[arg-type]
+    )
 
     assert result.complete is False
     assert "fixed history anchor" in result.freshness["detail"]
     assert runtime.calls[0][1]["operation"] == "profile.get"
     assert runtime.continuations[1] is None
-    assert json.loads(result.checkpoint)["gmail"]["history_anchor_id"] == "41"
+    assert json.loads(_checkpoint(result.checkpoint))["gmail"]["history_anchor_id"] == "41"
 
 
 def test_legacy_completed_gmail_subscan_is_not_treated_as_a_deletion_cursor() -> None:
@@ -526,12 +537,12 @@ def test_legacy_completed_gmail_subscan_is_not_treated_as_a_deletion_cursor() ->
 
     result = GoogleAppCorpusAdapter(runtime, sources=frozenset({"gmail"})).sync(
         "gmail-connection", checkpoint=checkpoint, limit=10
-    )  # type: ignore[arg-type]
+    )
 
     assert result.complete is True
     assert result.freshness["status"] == "complete"
     assert runtime.calls[0][1]["operation"] == "profile.get"
-    saved = json.loads(result.checkpoint)
+    saved = json.loads(_checkpoint(result.checkpoint))
     assert saved["gmail_history_anchor"] is True
     assert saved["gmail_history_id"] == "41"
 
@@ -552,7 +563,7 @@ def test_expired_gmail_history_forces_a_full_rescan() -> None:
     )
     first = GoogleAppCorpusAdapter(first_runtime, sources=frozenset({"gmail"})).sync(
         "gmail-connection", limit=10
-    )  # type: ignore[arg-type]
+    )
     expired_runtime = _Runtime(
         [
             ConnectorProviderError(
@@ -565,9 +576,9 @@ def test_expired_gmail_history_forces_a_full_rescan() -> None:
 
     result = GoogleAppCorpusAdapter(expired_runtime, sources=frozenset({"gmail"})).sync(
         "gmail-connection", checkpoint=first.checkpoint, limit=10
-    )  # type: ignore[arg-type]
+    )
 
-    saved = json.loads(result.checkpoint)
+    saved = json.loads(_checkpoint(result.checkpoint))
     assert result.complete is False
     assert saved["gmail"].get("history_id") is None
     assert "incremental_since" not in saved
@@ -594,13 +605,13 @@ def test_drive_trash_is_preserved_and_permanent_deletion_gap_stays_visible() -> 
     )
     result = GoogleAppCorpusAdapter(runtime, sources=frozenset({"google_drive"})).sync(
         "drive-connection", limit=10
-    )  # type: ignore[arg-type]
+    )
 
     assert result.documents[0].object_id == "drive:file-1"
     assert result.documents[0].deleted is True
     assert result.freshness["status"] == "partial"
     assert "permanent deletions" in result.freshness["detail"]
-    assert runtime.calls[1][1]["input"]["include_trashed"] is True
+    assert _input(runtime, 1)["include_trashed"] is True
 
 
 def test_drive_change_cursor_reconciles_removals_and_only_commits_the_final_cursor() -> None:
@@ -644,7 +655,7 @@ def test_drive_change_cursor_reconciles_removals_and_only_commits_the_final_curs
             ),
         ]
     )
-    adapter = GoogleAppCorpusAdapter(runtime, sources=frozenset({"google_drive"}))  # type: ignore[arg-type]
+    adapter = GoogleAppCorpusAdapter(runtime, sources=frozenset({"google_drive"}))
 
     bootstrap = adapter.sync("drive-connection", limit=10)
     middle = adapter.sync("drive-connection", checkpoint=bootstrap.checkpoint, limit=10)
@@ -659,10 +670,10 @@ def test_drive_change_cursor_reconciles_removals_and_only_commits_the_final_curs
     assert final.documents[0].text == "Updated document"
     assert final.freshness["status"] == "partial"
     assert "shared drives" in final.freshness["detail"]
-    assert runtime.calls[2][1]["input"]["start_change_id"] == "drive-start"
-    assert runtime.calls[3][1]["input"]["start_change_id"] == "drive-start"
+    assert _input(runtime, 2)["start_change_id"] == "drive-start"
+    assert _input(runtime, 3)["start_change_id"] == "drive-start"
     assert runtime.continuations[3] == {"pageToken": "more-changes"}
-    saved = json.loads(final.checkpoint)
+    saved = json.loads(_checkpoint(final.checkpoint))
     assert saved["drive_change_id"] == "drive-next"
     assert saved["drive_change_anchor"] is True
     assert "change_anchor" not in saved
@@ -685,13 +696,13 @@ def test_drive_change_cursor_reconciles_removals_and_only_commits_the_final_curs
     )
     next_result = GoogleAppCorpusAdapter(next_runtime, sources=frozenset({"google_drive"})).sync(
         "drive-connection", checkpoint=final.checkpoint, limit=10
-    )  # type: ignore[arg-type]
+    )
 
     assert next_result.complete is True
     assert next_result.documents[0].object_id == "drive:next-removed-file"
     assert next_result.documents[0].deleted is True
     assert next_runtime.calls[0][1]["operation"] == "changes.list"
-    assert next_runtime.calls[0][1]["input"]["start_change_id"] == "drive-next"
+    assert _input(next_runtime, 0)["start_change_id"] == "drive-next"
 
 
 def test_legacy_drive_checkpoint_restarts_a_full_scan_until_the_change_cursor_is_final() -> None:
@@ -707,16 +718,16 @@ def test_legacy_drive_checkpoint_restarts_a_full_scan_until_the_change_cursor_is
 
     result = GoogleAppCorpusAdapter(runtime, sources=frozenset({"google_drive"})).sync(
         "drive-connection", checkpoint=checkpoint, limit=10
-    )  # type: ignore[arg-type]
+    )
 
-    saved = json.loads(result.checkpoint)
+    saved = json.loads(_checkpoint(result.checkpoint))
     assert result.complete is False
     assert "permanent deletions" in result.freshness["detail"]
     assert saved["drive"]["change_anchor"] == "drive-start"
     assert "change_id" not in saved["drive"]
     assert runtime.calls[0][1]["operation"] == "changes.get_start_page_token"
     assert runtime.calls[1][1]["operation"] == "files.list"
-    assert "query" not in runtime.calls[1][1]["input"]
+    assert "query" not in _input(runtime, 1)
 
 
 def test_google_calendar_keeps_event_occurrence_separate_from_last_update() -> None:
@@ -737,7 +748,7 @@ def test_google_calendar_keeps_event_occurrence_separate_from_last_update() -> N
             ),
         ]
     )
-    adapter = GoogleAppCorpusAdapter(runtime, sources=frozenset({"google_calendar"}))  # type: ignore[arg-type]
+    adapter = GoogleAppCorpusAdapter(runtime, sources=frozenset({"google_calendar"}))
 
     first = adapter.sync("calendar-connection", limit=10)
     second = adapter.sync("calendar-connection", checkpoint=first.checkpoint, limit=10)
@@ -776,7 +787,7 @@ def test_google_exports_text_drive_docs_without_downloading_other_files() -> Non
             ),
         ]
     )
-    adapter = GoogleAppCorpusAdapter(runtime)  # type: ignore[arg-type]
+    adapter = GoogleAppCorpusAdapter(runtime)
 
     result = adapter.sync("connection-1", limit=6)
 
@@ -826,7 +837,7 @@ def test_google_sync_indexes_bounded_readable_gmail_attachments_separately() -> 
         ]
     )
 
-    result = GoogleAppCorpusAdapter(runtime).sync("connection-1", limit=3)  # type: ignore[arg-type]
+    result = GoogleAppCorpusAdapter(runtime).sync("connection-1", limit=3)
 
     attachment = next(
         document
@@ -902,12 +913,12 @@ def test_gmail_large_json_body_uses_bounded_raw_mime_artifact(tmp_path: Path) ->
         ]
     )
 
-    result = GoogleAppCorpusAdapter(runtime).sync("connection-1", limit=3)  # type: ignore[arg-type]
+    result = GoogleAppCorpusAdapter(runtime).sync("connection-1", limit=3)
 
     message = next(
         document for document in result.documents if document.object_id == "gmail:m-large"
     )
-    attachments = [
+    attachment_documents = [
         document
         for document in result.documents
         if document.object_id.startswith("gmail-attachment:m-large:raw-")
@@ -920,9 +931,9 @@ def test_gmail_large_json_body_uses_bounded_raw_mime_artifact(tmp_path: Path) ->
     assert "only the first 24 named attachments" in message.metadata["extraction_omissions"]
     assert message.metadata["thread_id"] == "t-large"
     assert message.freshness["status"] == "partial"
-    assert len(attachments) == 24
-    assert attachments[0].text == "Attachment text"
-    assert attachments[0].metadata["parent_message_id"] == "m-large"
+    assert len(attachment_documents) == 24
+    assert attachment_documents[0].text == "Attachment text"
+    assert attachment_documents[0].metadata["parent_message_id"] == "m-large"
     assert runtime.calls[2][1]["input"] == {"format": "full", "message_id": "m-large"}
     assert runtime.calls[3][1]["input"] == {
         "format": "metadata",
@@ -973,7 +984,7 @@ def test_microsoft_sync_gets_full_message_body_then_calendar_events() -> None:
             ),
         ]
     )
-    adapter = MicrosoftAppCorpusAdapter(runtime)  # type: ignore[arg-type]
+    adapter = MicrosoftAppCorpusAdapter(runtime)
 
     first = adapter.sync("connection-2", limit=4)
     second = adapter.sync("connection-2", checkpoint=first.checkpoint, limit=4)
@@ -1025,7 +1036,7 @@ def test_microsoft_primary_calendar_delta_confirms_permanent_removals() -> None:
         ]
     )
     adapter = MicrosoftAppCorpusAdapter(
-        runtime,  # type: ignore[arg-type]
+        runtime,
         sources=frozenset({"outlook_calendar"}),
         calendar_delta_window=validate_calendar_delta_window(
             "2025-09-07T00:00:00Z", "2028-09-07T00:00:00Z"
@@ -1066,11 +1077,11 @@ def test_microsoft_completed_checkpoint_reuses_graph_delta_links() -> None:
             )
         ]
     )
-    first_adapter = MicrosoftAppCorpusAdapter(first_runtime, sources=frozenset({"outlook_mail"}))  # type: ignore[arg-type]
+    first_adapter = MicrosoftAppCorpusAdapter(first_runtime, sources=frozenset({"outlook_mail"}))
     first = first_adapter.sync("connection-2", limit=4)
 
     second_runtime = _Runtime([])
-    second_adapter = MicrosoftAppCorpusAdapter(second_runtime, sources=frozenset({"outlook_mail"}))  # type: ignore[arg-type]
+    second_adapter = MicrosoftAppCorpusAdapter(second_runtime, sources=frozenset({"outlook_mail"}))
     complete = second_adapter.sync("connection-2", checkpoint=first.checkpoint, limit=4)
 
     third_runtime = _Runtime(
@@ -1083,7 +1094,7 @@ def test_microsoft_completed_checkpoint_reuses_graph_delta_links() -> None:
             )
         ]
     )
-    third_adapter = MicrosoftAppCorpusAdapter(third_runtime, sources=frozenset({"outlook_mail"}))  # type: ignore[arg-type]
+    third_adapter = MicrosoftAppCorpusAdapter(third_runtime, sources=frozenset({"outlook_mail"}))
     third_adapter.sync("connection-2", checkpoint=complete.checkpoint, limit=4)
 
     third_input = third_runtime.calls[0][1]["input"]
@@ -1161,7 +1172,7 @@ def test_microsoft_delta_tombstones_only_the_typed_immutable_record_after_404() 
             ),
         ]
     )
-    adapter = MicrosoftAppCorpusAdapter(runtime, sources=frozenset({"outlook_mail"}))  # type: ignore[arg-type]
+    adapter = MicrosoftAppCorpusAdapter(runtime, sources=frozenset({"outlook_mail"}))
 
     first = adapter.sync("connection-2", limit=4)
     result = adapter.sync("connection-2", checkpoint=first.checkpoint, limit=4)
@@ -1186,7 +1197,7 @@ def test_microsoft_delta_change_404_tombstones_and_advances_the_cursor() -> None
     )
     first = MicrosoftAppCorpusAdapter(first_runtime, sources=frozenset({"outlook_mail"})).sync(
         "connection-2", limit=4
-    )  # type: ignore[arg-type]
+    )
     runtime = _Runtime(
         [
             _response(
@@ -1205,7 +1216,7 @@ def test_microsoft_delta_change_404_tombstones_and_advances_the_cursor() -> None
 
     result = MicrosoftAppCorpusAdapter(runtime, sources=frozenset({"outlook_mail"})).sync(
         "connection-2", checkpoint=first.checkpoint, limit=4
-    )  # type: ignore[arg-type]
+    )
 
     assert result.complete is True
     assert [
@@ -1226,8 +1237,8 @@ def test_microsoft_detail_failure_keeps_the_prior_delta_checkpoint_for_retry() -
     )
     first = MicrosoftAppCorpusAdapter(first_runtime, sources=frozenset({"outlook_mail"})).sync(
         "connection-2", limit=4
-    )  # type: ignore[arg-type]
-    prior_delta_checkpoint = json.loads(first.checkpoint)["mail"]["delta_checkpoint"]
+    )
+    prior_delta_checkpoint = json.loads(_checkpoint(first.checkpoint))["mail"]["delta_checkpoint"]
     failed_runtime = _Runtime(
         [
             _response(
@@ -1246,12 +1257,15 @@ def test_microsoft_detail_failure_keeps_the_prior_delta_checkpoint_for_retry() -
 
     failed = MicrosoftAppCorpusAdapter(failed_runtime, sources=frozenset({"outlook_mail"})).sync(
         "connection-2", checkpoint=first.checkpoint, limit=4
-    )  # type: ignore[arg-type]
+    )
 
     assert failed.documents == ()
     assert failed.complete is False
     assert failed.freshness["status"] == "error"
-    assert json.loads(failed.checkpoint)["mail"]["delta_checkpoint"] == prior_delta_checkpoint
+    assert (
+        json.loads(_checkpoint(failed.checkpoint))["mail"]["delta_checkpoint"]
+        == prior_delta_checkpoint
+    )
 
     retry_runtime = _Runtime(
         [
@@ -1273,16 +1287,16 @@ def test_microsoft_detail_failure_keeps_the_prior_delta_checkpoint_for_retry() -
     )
     retried = MicrosoftAppCorpusAdapter(retry_runtime, sources=frozenset({"outlook_mail"})).sync(
         "connection-2", checkpoint=failed.checkpoint, limit=4
-    )  # type: ignore[arg-type]
+    )
 
     assert retried.complete is True
     assert retried.documents[0].object_id == "outlook-immutable:mail-1"
     assert retried.documents[0].text == "Recovered mail body"
 
 
-def test_microsoft_sync_extracts_bounded_attachment_artifact(tmp_path: object) -> None:
-    path = tmp_path / "notes.txt"  # type: ignore[operator]
-    path.write_text("Attachment content", encoding="utf-8")  # type: ignore[union-attr]
+def test_microsoft_sync_extracts_bounded_attachment_artifact(tmp_path: Path) -> None:
+    path = tmp_path / "notes.txt"
+    path.write_text("Attachment content", encoding="utf-8")
     runtime = _Runtime(
         [
             _response(
@@ -1325,10 +1339,10 @@ def test_microsoft_sync_extracts_bounded_attachment_artifact(tmp_path: object) -
         ]
     )
 
-    first = MicrosoftAppCorpusAdapter(runtime, sources=frozenset({"outlook_mail"})).sync(  # type: ignore[arg-type]
+    first = MicrosoftAppCorpusAdapter(runtime, sources=frozenset({"outlook_mail"})).sync(
         "connection-2", limit=4
     )
-    result = MicrosoftAppCorpusAdapter(runtime, sources=frozenset({"outlook_mail"})).sync(  # type: ignore[arg-type]
+    result = MicrosoftAppCorpusAdapter(runtime, sources=frozenset({"outlook_mail"})).sync(
         "connection-2", checkpoint=first.checkpoint, limit=4
     )
 
@@ -1362,7 +1376,7 @@ def test_slack_sync_uses_search_then_authenticated_channel_history() -> None:
             _response({"messages": [{"text": "History message", "ts": "1712345679.000001"}]}),
         ]
     )
-    adapter = SlackAppCorpusAdapter(runtime)  # type: ignore[arg-type]
+    adapter = SlackAppCorpusAdapter(runtime)
 
     first = adapter.sync("connection-3", limit=5)
     second = adapter.sync("connection-3", checkpoint=first.checkpoint, limit=5)
@@ -1401,7 +1415,7 @@ def test_slack_sync_replaces_a_broad_checkpoint_with_the_channel_policy(
     runtime = _Runtime(
         [_response({"messages": [{"text": "Approved history", "ts": "1712345679.000001"}]})]
     )
-    adapter = SlackAppCorpusAdapter(runtime)  # type: ignore[arg-type]
+    adapter = SlackAppCorpusAdapter(runtime)
     broad_checkpoint = json.dumps(
         {
             "history": {"channels": ["COTHER"], "index": 0},
@@ -1417,7 +1431,7 @@ def test_slack_sync_replaces_a_broad_checkpoint_with_the_channel_policy(
     assert result.complete is True
     assert [call[1]["operation"] for call in runtime.calls] == ["messages.list"]
     assert runtime.calls[0][1]["input"] == {"channel": "CABC123", "limit": 5}
-    checkpoint = json.loads(result.checkpoint)
+    checkpoint = json.loads(_checkpoint(result.checkpoint))
     assert checkpoint["round"] == "complete"
     assert "history" not in checkpoint
 
@@ -1438,17 +1452,17 @@ def test_slack_search_keeps_current_documents_when_the_provider_exceeds_local_pa
         }
     )
     runtime = _Runtime([page, page])
-    adapter = SlackAppCorpusAdapter(runtime)  # type: ignore[arg-type]
+    adapter = SlackAppCorpusAdapter(runtime)
 
     first = adapter.sync("connection-3", limit=50)
-    first_checkpoint = json.loads(first.checkpoint)
+    first_checkpoint = json.loads(_checkpoint(first.checkpoint))
     assert first.documents[0].source_ref == "slack:message:C1:1712345678.000001"
     assert first.freshness["status"] == "partial"
     assert first_checkpoint["search"]["page"] == 2
 
     first_checkpoint["search"]["page"] = 100
     bounded = adapter.sync("connection-3", checkpoint=json.dumps(first_checkpoint), limit=50)
-    bounded_checkpoint = json.loads(bounded.checkpoint)
+    bounded_checkpoint = json.loads(_checkpoint(bounded.checkpoint))
 
     assert bounded.documents[0].source_ref == "slack:message:C1:1712345678.000001"
     assert bounded_checkpoint["search"]["done"] is True
@@ -1461,7 +1475,7 @@ def test_refused_connector_read_is_visible_and_never_claims_completion() -> None
         [ValidationError("connector credential does not satisfy the operation scope")]
     )
 
-    result = GoogleAppCorpusAdapter(runtime).sync("connection-4")  # type: ignore[arg-type]
+    result = GoogleAppCorpusAdapter(runtime).sync("connection-4")
 
     assert result.complete is False
     assert result.checkpoint is not None
@@ -1472,7 +1486,7 @@ def test_refused_connector_read_is_visible_and_never_claims_completion() -> None
 def test_default_mapping_shares_one_adapter_per_provider_family() -> None:
     runtime = _Runtime([_response({"historyId": "41"}), _response({"messages": []})])
 
-    adapters = default_app_corpus_adapters(runtime)  # type: ignore[arg-type]
+    adapters = default_app_corpus_adapters(runtime)
 
     gmail = adapters["gmail"].sync("gmail-connection")
 

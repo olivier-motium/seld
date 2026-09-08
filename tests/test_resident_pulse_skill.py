@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from continuity_kernel import bridge, mcp_server
+import continuity_kernel.bridge as bridge
+import continuity_kernel.mcp_server as mcp_server
 from continuity_kernel.errors import ValidationError
 from continuity_kernel.portfolio import ABSENT_PORTFOLIO_REVISION, portfolio_item
 from continuity_kernel.records import RESIDENT_PULSE_REF, RESIDENT_PULSE_TASK_ID

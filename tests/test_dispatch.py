@@ -11,14 +11,10 @@ from typing import Any
 
 import pytest
 
-from continuity_kernel import (
-    cli,
-    mcp_server,
-    task_pointer,
-)
-from continuity_kernel import (
-    dispatch as dispatch_module,
-)
+import continuity_kernel.cli as cli
+import continuity_kernel.dispatch as dispatch_module
+import continuity_kernel.mcp_server as mcp_server
+import continuity_kernel.task_pointer as task_pointer
 from continuity_kernel.dispatch import (
     bind_task_hand,
     claim_task,

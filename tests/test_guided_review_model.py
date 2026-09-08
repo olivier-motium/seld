@@ -9,7 +9,9 @@ from typing import TypedDict
 
 import pytest
 
-from continuity_kernel import bridge, cli, mcp_server
+import continuity_kernel.bridge as bridge
+import continuity_kernel.cli as cli
+import continuity_kernel.mcp_server as mcp_server
 from continuity_kernel.direction import (
     ABSENT_DIRECTION_REVISION,
     Direction,

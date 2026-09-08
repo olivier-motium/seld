@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
 
-from continuity_kernel.connector_runtime import ConnectorRuntime
+from continuity_kernel.connector_runtime import AppCorpusReader
 from continuity_kernel.errors import ValidationError
 
 MAX_CHECKPOINT_CHARS: Final = 64 * 1024
@@ -51,7 +51,7 @@ class MicrosoftCalendarDeltaResult:
 class MicrosoftCalendarDeltaSync:
     """Read one bounded primary-calendar delta page through the closed runtime."""
 
-    def __init__(self, runtime: ConnectorRuntime, *, window: MicrosoftCalendarDeltaWindow) -> None:
+    def __init__(self, runtime: AppCorpusReader, *, window: MicrosoftCalendarDeltaWindow) -> None:
         self._runtime = runtime
         self._window = validate_calendar_delta_window(window.start, window.end)
 
