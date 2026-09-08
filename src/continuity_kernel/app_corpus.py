@@ -27,6 +27,10 @@ from continuity_kernel.app_corpus_microsoft_delta import (
 from continuity_kernel.atomic import PinnedPathRoot
 from continuity_kernel.config import data_dir
 from continuity_kernel.errors import ValidationError
+from continuity_kernel.slack_channel_access import (
+    SlackChannelAccessPolicy,
+    load_slack_channel_access,
+)
 
 MAX_DOCUMENTS = 250_000
 MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
@@ -191,7 +195,7 @@ class AppCorpusCompanion:
         # must not wait behind a long provider or QMD writer.
         with _open_store(self.index_root) as store:
             state = _load_state(store)
-            documents = _documents(state)
+            documents = _visible_documents(_documents(state))
             qmd = recall_module._resolved_executable(self.executable) is not None
             scopes = _scopes(state)
             ready = qmd and _all_scoped_qmd_current(state, documents)
@@ -515,7 +519,8 @@ class AppCorpusCompanion:
         indexed, reason = (
             (True, None)
             if not content_changed
-            and _stored_index_fingerprint(state) == _fingerprint(proposed_documents)
+            and _stored_index_fingerprint(state)
+            == _fingerprint(_visible_documents(proposed_documents))
             else (False, "app corpus QMD refresh is pending")
         )
         return AppCorpusSync(
@@ -556,6 +561,7 @@ class AppCorpusCompanion:
             # any potentially slow QMD or exact-text work without the global lock.
             state = _load_state(store)
             all_documents = dict(_documents(state))
+            visible_documents = _visible_documents(all_documents)
             scopes = _scopes(state)
             complete = bool(scopes) and all(
                 _connection_complete(_connections(state).get(scope_id, {})) for scope_id in scopes
@@ -563,12 +569,14 @@ class AppCorpusCompanion:
             qmd_bindings = {
                 connection: binding
                 for connection in {
-                    _string_record(record, "connection_id") for record in all_documents.values()
+                    _string_record(record, "connection_id") for record in visible_documents.values()
                 }
-                if (binding := _current_qmd_binding(state, all_documents, connection)) is not None
+                if (
+                    binding := _current_qmd_binding(state, visible_documents, connection)
+                ) is not None
             }
             documents = _filtered_documents(
-                all_documents, connection_id=connection_id, provider=provider
+                visible_documents, connection_id=connection_id, provider=provider
             )
             selected_connections = {
                 _string_record(record, "connection_id") for record in documents.values()
@@ -633,6 +641,8 @@ class AppCorpusCompanion:
             record = _documents(state).get(_document_key(connection_id, object_id))
             if not isinstance(record, dict):
                 return None
+            if not _visible_documents({_document_key(connection_id, object_id): record}):
+                return None
             path = _stored_path(record)
             if path is None:
                 raise ValidationError("app corpus document state is invalid")
@@ -662,7 +672,7 @@ class AppCorpusCompanion:
         ):
             with store.exclusive_file_lock("locks/app-corpus.lock", timeout=_remaining(deadline)):
                 state = _load_state(store)
-                documents = dict(_documents(state))
+                documents = _visible_documents(_documents(state))
                 complete = all(
                     _connection_complete(value) for value in _connections(state).values()
                 )
@@ -731,7 +741,7 @@ class AppCorpusCompanion:
                     "locks/app-corpus.lock", timeout=_remaining(deadline)
                 ):
                     state = _load_state(store)
-                    current_documents = _documents(state)
+                    current_documents = _visible_documents(_documents(state))
                     if (
                         _scope_qmd_fingerprint(current_documents, connection_id)
                         != snapshot.fingerprint
@@ -749,7 +759,7 @@ class AppCorpusCompanion:
                         _write_state(store, state)
             with store.exclusive_file_lock("locks/app-corpus.lock", timeout=_remaining(deadline)):
                 state = _load_state(store)
-                current_documents = _documents(state)
+                current_documents = _visible_documents(_documents(state))
                 ready = _all_scoped_qmd_current(state, current_documents)
                 current_fingerprint = _fingerprint(current_documents)
                 if (_stored_index_fingerprint(state) != current_fingerprint and ready) or (
@@ -786,7 +796,7 @@ class AppCorpusCompanion:
             state = _load_state(store)
             return AppCorpusSync(
                 complete=all(_connection_complete(value) for value in _connections(state).values()),
-                document_count=len(_documents(state)),
+                document_count=len(_visible_documents(_documents(state))),
                 freshness={},
                 indexed=False,
                 reason="QMD executable is unavailable; exact app search remains available",
@@ -1532,8 +1542,11 @@ def _lexical_hits(
 
 
 def _filtered_documents(
-    documents: Mapping[str, dict[str, Any]], *, connection_id: str | None, provider: str | None
-) -> dict[str, dict[str, Any]]:
+    documents: Mapping[str, Mapping[str, Any]],
+    *,
+    connection_id: str | None,
+    provider: str | None,
+) -> dict[str, Mapping[str, Any]]:
     if connection_id is not None and (not isinstance(connection_id, str) or not connection_id):
         raise ValidationError("app corpus connection filter must be text")
     if provider is not None and (not isinstance(provider, str) or not provider):
@@ -1544,6 +1557,34 @@ def _filtered_documents(
         if (connection_id is None or value.get("connection_id") == connection_id)
         and (provider is None or value.get("provider") == provider)
     }
+
+
+def _visible_documents(
+    documents: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """Return records visible under the current local Slack channel policy.
+
+    Existing corpus leaves are intentionally left in place.  This filter is the
+    read boundary for direct reads, lexical search, and every QMD physical view.
+    """
+
+    policies: dict[str, SlackChannelAccessPolicy | None] = {}
+    visible: dict[str, Mapping[str, Any]] = {}
+    for key, record in documents.items():
+        if record.get("provider") != "slack":
+            visible[key] = record
+            continue
+        connection_id = record.get("connection_id")
+        if not isinstance(connection_id, str):
+            # A malformed Slack record must not escape a policy boundary.
+            continue
+        policy = policies.get(connection_id)
+        if connection_id not in policies:
+            policy = load_slack_channel_access(connection_id)
+            policies[connection_id] = policy
+        if policy is None or policy.allows_document(record.get("metadata")):
+            visible[key] = record
+    return visible
 
 
 def _scoped_qmd_hits(

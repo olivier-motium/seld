@@ -46,6 +46,7 @@ from continuity_kernel.app_corpus_text import ExtractionResult, extract_text
 from continuity_kernel.connector_runtime import ConnectorRuntime
 from continuity_kernel.connector_transport import ConnectorOrigin, ConnectorProviderError
 from continuity_kernel.errors import ContinuityError, ValidationError
+from continuity_kernel.slack_channel_access import load_slack_channel_access
 
 _CHECKPOINT_VERSION: Final = 1
 _MAX_CHECKPOINT_CHARS: Final = 12_000
@@ -1692,6 +1693,7 @@ class SlackAppCorpusAdapter(_CorpusProviderAdapter):
         limit: int,
         fetched_at: str,
     ) -> tuple[list[AppCorpusDocument], int, bool]:
+        self._apply_channel_policy(connection_id, state)
         search = _mapping_state(state, "search")
         history = _mapping_state(state, "history")
         _record_coverage_gap(
@@ -1759,6 +1761,12 @@ class SlackAppCorpusAdapter(_CorpusProviderAdapter):
                     continuation=history.get("continuation"),
                 )
                 messages = _items(page.payload, "messages")
+                for message in messages:
+                    reported_channel_id = _slack_channel_id(message)
+                    if reported_channel_id is not None and reported_channel_id != channel_id:
+                        raise ValidationError(
+                            "Slack history response escaped its requested channel"
+                        )
                 scanned += len(messages)
                 documents.extend(
                     _slack_document(
@@ -1777,6 +1785,18 @@ class SlackAppCorpusAdapter(_CorpusProviderAdapter):
                     history["continuation"] = page.continuation
 
         return documents, scanned, bool(search.get("done")) and bool(history.get("done"))
+
+    def _apply_channel_policy(self, connection_id: str, state: dict[str, Any]) -> None:
+        """Replace any broad Slack checkpoint with the current fixed channel list."""
+
+        policy = load_slack_channel_access(connection_id)
+        if policy is None or state.get("channel_policy") == policy.fingerprint:
+            return
+        state.clear()
+        state.update(self._initial_state())
+        state["channel_policy"] = policy.fingerprint
+        state["history"] = {"channels": sorted(policy.channels), "index": 0}
+        state["search"] = {"done": True}
 
 
 def default_app_corpus_adapters(runtime: ConnectorRuntime) -> dict[str, _CorpusProviderAdapter]:

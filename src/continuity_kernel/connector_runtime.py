@@ -54,6 +54,7 @@ from continuity_kernel.connector_transport import (
     SLACK_AUTH_FAILURE_CODES,
     AuthorizationScheme,
     ConnectorCredential,
+    ConnectorMethod,
     ConnectorOrigin,
     ConnectorProviderError,
     ConnectorTransport,
@@ -69,6 +70,11 @@ from continuity_kernel.local_files import (
     LocalFileAuthorityUse,
     LocalFileGrantStore,
     LocalFileTransferCandidate,
+)
+from continuity_kernel.slack_channel_access import (
+    SlackChannelAccessPolicy,
+    load_slack_channel_access,
+    policy_for_verified_slack_workspace,
 )
 from continuity_kernel.vault import Vault
 
@@ -232,6 +238,24 @@ _OPERATION_WARNINGS: Final = {
         "events.delete",
     ): ("If this is an organized meeting, Outlook will email attendees a cancellation notice."),
 }
+
+
+def _enforce_slack_read_channel_policy(
+    *,
+    provider: str,
+    mode: ConnectorMode,
+    connection_id: str,
+    operation: str,
+    input_value: object,
+) -> SlackChannelAccessPolicy | None:
+    """Reject restricted Slack reads before credentials or a provider call."""
+
+    if provider != "slack" or mode is not ConnectorMode.READ:
+        return None
+    policy = load_slack_channel_access(connection_id)
+    if policy is not None and not policy.allows_read_operation(operation, input_value):
+        raise ValidationError("Slack read is outside the approved channel scope")
+    return policy
 
 
 @dataclass(frozen=True)
@@ -407,6 +431,13 @@ class ConnectorRuntime:
             raise ValidationError("connection does not authorize this connector")
         if connection.health not in {ConnectionHealth.READY, ConnectionHealth.DEGRADED}:
             raise ValidationError("connection must be verified before interactive use")
+        slack_policy = _enforce_slack_read_channel_policy(
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            operation=operation_name,
+            input_value=input_value,
+        )
         profile = get_profile_for_connection(
             connection.provider,
             connection.source_ids,
@@ -423,6 +454,13 @@ class ConnectorRuntime:
             expected_connection_revision=connection_snapshot.revision,
             credential_kind=connection.credential_kind,
             configured_scopes=connection.scopes,
+        )
+        slack_policy = self._verify_slack_workspace_policy(
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            expected=slack_policy,
+            credential=credential,
         )
         if not operation.scope_grant_satisfies(credential.granted_scopes):
             raise ValidationError(_scope_error(provider, operation_name))
@@ -654,6 +692,8 @@ class ConnectorRuntime:
                             confirmed_bundle.close()
         if not isinstance(result, ConnectorAdapterResult):
             raise ValidationError("connector adapter returned an invalid result")
+        if provider == "slack" and operation_name == "search.messages" and slack_policy is not None:
+            slack_policy.validate_search_result(result.payload)
         try:
             state_changed = self._state_changed(
                 connection_id,
@@ -729,11 +769,25 @@ class ConnectorRuntime:
             raise ValidationError("connection does not authorize this connector")
         if connection.health not in {ConnectionHealth.READY, ConnectionHealth.DEGRADED}:
             raise ValidationError("connection must be verified before interactive use")
+        slack_policy = _enforce_slack_read_channel_policy(
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            operation=operation_name,
+            input_value=input_value,
+        )
         credential = self._resolve_credential(
             connection_id=connection_id,
             expected_connection_revision=connection_snapshot.revision,
             credential_kind=connection.credential_kind,
             configured_scopes=connection.scopes,
+        )
+        slack_policy = self._verify_slack_workspace_policy(
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            expected=slack_policy,
+            credential=credential,
         )
         if not operation.scope_grant_satisfies(credential.granted_scopes):
             raise ValidationError(_scope_error(provider, operation_name))
@@ -763,6 +817,8 @@ class ConnectorRuntime:
             connection_id=connection_id,
             connection_revision=connection_snapshot.revision,
         )
+        if provider == "slack" and operation_name == "search.messages" and slack_policy is not None:
+            slack_policy.validate_search_result(result.payload)
         try:
             state_changed = self._state_changed(
                 connection_id,
@@ -1194,6 +1250,39 @@ class ConnectorRuntime:
                 version=resolved_bearer.state.version,
             )
         raise ValidationError("connection credential kind is unsupported for interactive use")
+
+    def _verify_slack_workspace_policy(
+        self,
+        *,
+        provider: str,
+        mode: ConnectorMode,
+        connection_id: str,
+        expected: SlackChannelAccessPolicy | None,
+        credential: ConnectorRuntimeCredential,
+    ) -> SlackChannelAccessPolicy | None:
+        """Bind a restricted connection to auth.test before its target read."""
+
+        if provider != "slack" or mode is not ConnectorMode.READ:
+            return None
+        response = self.transport.request(
+            origin=ConnectorOrigin.SLACK,
+            method=ConnectorMethod.GET,
+            path="/api/auth.test",
+            credential=credential.credential,
+            response_bound=64 * 1024,
+        )
+        payload = response.json()
+        if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+            raise ValidationError("Slack workspace identity response is invalid")
+        workspace_id = payload.get("team_id")
+        if not isinstance(workspace_id, str) or not workspace_id:
+            raise ValidationError("Slack workspace identity response is invalid")
+        verified = policy_for_verified_slack_workspace(connection_id, workspace_id)
+        if expected is not None and (
+            verified is None or verified.workspace_id != expected.workspace_id
+        ):
+            raise ValidationError("Slack connection does not match its approved workspace")
+        return verified
 
     def _confirmation_preview(
         self,

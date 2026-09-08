@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from continuity_kernel import slack_channel_access
 from continuity_kernel.app_corpus import AppCorpusCompanion
 from continuity_kernel.app_corpus_microsoft_calendar_delta import validate_calendar_delta_window
 from continuity_kernel.app_corpus_providers import (
@@ -1388,6 +1389,57 @@ def test_slack_sync_uses_search_then_authenticated_channel_history() -> None:
     assert "edits and deletions" in second.freshness["detail"]
     assert [name for name, _values in runtime.calls] == ["gsv_slack_read", "gsv_slack_read"]
     assert runtime.calls[1][1]["operation"] == "messages.list"
+
+
+def test_slack_sync_replaces_a_broad_checkpoint_with_the_channel_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy_path = tmp_path / "slack-channel-access.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workspaces": {
+                    "T1": {
+                        "channels": {"CABC123": "project"},
+                        "connection_ids": ["connection-3"],
+                        "pending_channel_names": [],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(slack_channel_access, "_config_path", lambda: policy_path)
+    runtime = _Runtime(
+        [
+            _response(
+                {
+                    "messages": [
+                        {"text": "Approved history", "ts": "1712345679.000001"}
+                    ]
+                }
+            )
+        ]
+    )
+    adapter = SlackAppCorpusAdapter(runtime)  # type: ignore[arg-type]
+    broad_checkpoint = json.dumps(
+        {
+            "history": {"channels": ["COTHER"], "index": 0},
+            "provider": "slack",
+            "round": "running",
+            "search": {"done": False, "page": 1},
+            "v": 1,
+        }
+    )
+
+    result = adapter.sync("connection-3", checkpoint=broad_checkpoint, limit=5)
+
+    assert result.complete is True
+    assert [call[1]["operation"] for call in runtime.calls] == ["messages.list"]
+    assert runtime.calls[0][1]["input"] == {"channel": "CABC123", "limit": 5}
+    checkpoint = json.loads(result.checkpoint)
+    assert checkpoint["round"] == "complete"
+    assert "history" not in checkpoint
 
 
 def test_slack_search_keeps_current_documents_when_the_provider_exceeds_local_page_bound() -> None:

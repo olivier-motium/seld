@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ from urllib.request import Request
 import pytest
 
 from continuity_kernel import connector_runtime as connector_runtime_module
+from continuity_kernel import slack_channel_access
 from continuity_kernel.connector_adapter import (
     ConnectorAdapterRegistry,
     ConnectorAdapterResult,
@@ -352,6 +354,30 @@ def _prepared(
         require_confirmation_for_safe_mutations=require_confirmation_for_safe_mutations,
     )
     return vault, manager, adapter, runtime
+
+
+def _restrict_slack_channels(
+    monkeypatch: pytest.MonkeyPatch,
+    path: Path,
+    *,
+    connection_id: str,
+    channels: dict[str, str],
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workspaces": {
+                    "T1": {
+                        "channels": channels,
+                        "connection_ids": [connection_id],
+                        "pending_channel_names": [],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(slack_channel_access, "_config_path", lambda: path)
 
 
 def _install_local_upload_catalog(
@@ -2235,3 +2261,31 @@ def test_runtime_rejects_foreign_receipt_and_cleans_artifact_on_adapter_failure(
     assert not list(artifacts.root.glob("*.part"))
     runtime.close()
     foreign_store.close()
+
+
+def test_restricted_slack_reads_fail_before_the_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _Adapter()
+    adapter.providers = frozenset({"slack"})
+    _restrict_slack_channels(
+        monkeypatch,
+        tmp_path / "slack-channel-access.json",
+        connection_id=str(CONNECTION_ID),
+        channels={"CABC123": "allowed"},
+    )
+    _vault, _manager, _adapter, runtime = _prepared(
+        tmp_path, adapter=adapter, profile_name="slack"
+    )
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"channel": "Cdenied"},
+        "operation": "messages.list",
+    }
+
+    with pytest.raises(ValidationError, match="approved channel scope"):
+        runtime.call_tool("gsv_slack_read", values)
+    with pytest.raises(ValidationError, match="approved channel scope"):
+        runtime.call_app_corpus_read("gsv_slack_read", values)
+
+    assert adapter.calls == []
