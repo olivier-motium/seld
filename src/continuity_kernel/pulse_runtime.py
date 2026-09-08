@@ -245,6 +245,7 @@ class PulseRuntime:
         self._sessions: dict[str, LunaSession] = {}
         self._windows: dict[str, AcquiredSourceWindow] = {}
         self._gate = asyncio.Semaphore(concurrency)
+        self._source_io_gate = asyncio.Lock()
         self._decide_lock = asyncio.Lock()
         self._arrivals = asyncio.Event()
         self._stop = asyncio.Event()
@@ -341,6 +342,25 @@ class PulseRuntime:
         except (ContinuityError, OSError):
             self.state.change(lambda state: state.update({"curation_state": "unavailable"}))
 
+    async def _commit_source_window(
+        self,
+        window: AcquiredSourceWindow,
+        *,
+        report_ref: str,
+        report_revision: str,
+        replay: bool = False,
+    ) -> None:
+        # Native reads validate a global source revision. Keep our short reads
+        # and commits from racing, while source model turns remain concurrent.
+        async with self._source_io_gate:
+            await asyncio.to_thread(
+                self.adapter.commit,
+                window,
+                report_ref=report_ref,
+                report_revision=report_revision,
+                replay=replay,
+            )
+
     async def process_source(self, source: str) -> None:
         async with self._gate:
             window: AcquiredSourceWindow | None = None
@@ -354,15 +374,15 @@ class PulseRuntime:
                 ):
                     self._source_state(source, {"state": "unavailable", "last_checked_at": _now()})
                     return
-                window = await asyncio.to_thread(self.adapter.acquire, source)
+                async with self._source_io_gate:
+                    window = await asyncio.to_thread(self.adapter.acquire, source)
                 stage = "report_recovery"
                 known = previous.get("fingerprint") == window.fingerprint
                 if known:
                     report_id = previous.get("report_id")
                     if isinstance(report_id, str):
                         report = self.reports.show(report_id)
-                        await asyncio.to_thread(
-                            self.adapter.commit,
+                        await self._commit_source_window(
                             window,
                             report_ref=report.report_ref,
                             report_revision=report.revision,
@@ -379,8 +399,7 @@ class PulseRuntime:
                     (item for item in recent if item.event_key == window.report_event_key), None
                 )
                 if replay is not None:
-                    await asyncio.to_thread(
-                        self.adapter.commit,
+                    await self._commit_source_window(
                         window,
                         report_ref=replay.report_ref,
                         report_revision=replay.revision,
@@ -449,8 +468,7 @@ class PulseRuntime:
                 )
                 report = self.reports.show(report.identifier)
                 stage = "source_checkpoint"
-                await asyncio.to_thread(
-                    self.adapter.commit,
+                await self._commit_source_window(
                     window,
                     report_ref=report.report_ref,
                     report_revision=report.revision,
