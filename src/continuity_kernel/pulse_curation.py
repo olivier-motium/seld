@@ -48,6 +48,8 @@ class PulseCurationBridge:
                         .isoformat(timespec="seconds")
                         .replace("+00:00", "Z"),
                     }
+                    if item.target_desktop_work_id is not None:
+                        event["targetDesktopWorkID"] = item.target_desktop_work_id
                     with tempfile.TemporaryDirectory(prefix="seld-pulse-curation-") as temporary:
                         path = Path(temporary) / "request.json"
                         atomic_write(path, json.dumps(event).encode())

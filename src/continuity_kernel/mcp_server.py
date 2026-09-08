@@ -498,6 +498,7 @@ def _call(
                 result_refs=_strings(values, "result_refs"),
                 summary=_string(values, "summary"),
                 interface_change=values.get("interface_change", False),
+                target_desktop_work_id=_optional_string(values, "target_desktop_work_id"),
             )
         )
     if name == "gsv_pulse_sweep":
@@ -1802,6 +1803,7 @@ TOOLS: Final = [
             "result_refs": TEXTS,
             "summary": {"type": "string", "maxLength": 2000},
             "interface_change": {"type": "boolean"},
+            "target_desktop_work_id": TEXT,
         },
         (
             "id",

@@ -695,6 +695,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
                     result_refs=args.result_ref,
                     summary=args.summary,
                     interface_change=args.interface_change,
+                    target_desktop_work_id=args.target_desktop_work_id,
                 )
             )
         if args.pulse_command == "sweep":
@@ -2825,6 +2826,10 @@ def _parser() -> argparse.ArgumentParser:
     pulse_integrate.add_argument("--result-ref", action="append", required=True)
     pulse_integrate.add_argument("--summary", required=True)
     pulse_integrate.add_argument("--interface-change", action="store_true")
+    pulse_integrate.add_argument(
+        "--target-desktop-work-id",
+        help="Existing desktop task UUID, verified against a supplied canonical task result.",
+    )
 
     scheduler = commands.add_parser(
         "scheduler",
