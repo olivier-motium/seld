@@ -50,7 +50,9 @@ single foreground conversation for orientations, alerts, task notices, and
 reminders; it is not a second memory, task, reminder, inbox, score, or
 dashboard system. Pulse never uses Bridge operations for delivery,
 acknowledgement, or semantic work; the exact Chief of Staff task is its only
-foreground route.
+foreground route. Internal work coordination uses the exact existing execution
+task under [current work and follow-through](references/current-work.md).
+An internal handoff is not a foreground alert or authority to contact people.
 
 ## Freeze one useful wake
 
@@ -60,6 +62,14 @@ At the start, freeze the smallest set of canon that can change this wake:
 - selected source state and its exact revision; and
 - the Task, WorkThread, Entity, Direction, or Portfolio item named by a signal
   or needed for the one decision at hand.
+
+Include a compact view of current execution ownership on each wake. Follow
+[current work and follow-through](references/current-work.md): reconcile native
+execution bindings with a bounded live Codex task listing, inspect only work
+whose changed evidence or due follow-up can change this wake, and route useful
+changes to its existing owner. Source polling alone does not complete a wake
+when an actionable work handoff is due. A binding is ownership, not live status
+or completion evidence.
 
 Read the full Direction, Portfolio, or open-task set only when the current
 decision requires it. Do not load them as a routine context dump.
@@ -240,6 +250,10 @@ an intervention, or remain silent. It does not run a long implementation,
 browser session, or investigation inline.
 
 Continue an existing approved durable outcome in its one visible Codex task.
+Before creating or resuming work, check the current owner and any unresolved
+handoff. Continue relevant new context there; do not create a parallel executor
+or turn a receipt into a completed outcome. A human or external dependency is
+not runnable agent work merely because the last Codex turn ended.
 Create a new sustained-work droid only when the task-creation gate already produced
 or identified a real durable outcome. Bind the real returned task UUID through
 fresh CAS. Never invent an ID, dispatch a duplicate, or treat a stopped Codex
