@@ -1761,7 +1761,12 @@ class SlackAppCorpusAdapter(_CorpusProviderAdapter):
                 messages = _items(page.payload, "messages")
                 scanned += len(messages)
                 documents.extend(
-                    _slack_document(connection_id, item, fetched_at) for item in messages
+                    _slack_document(
+                        connection_id,
+                        {**item, "channel_id": channel_id},
+                        fetched_at,
+                    )
+                    for item in messages
                 )
                 if page.continuation is None:
                     history.pop("continuation", None)

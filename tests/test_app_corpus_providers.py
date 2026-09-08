@@ -1367,7 +1367,7 @@ def test_slack_sync_uses_search_then_authenticated_channel_history() -> None:
             _response(
                 {
                     "messages": [
-                        {"channel_id": "C1", "text": "History message", "ts": "1712345679.000001"}
+                        {"text": "History message", "ts": "1712345679.000001"}
                     ]
                 }
             ),
@@ -1381,6 +1381,7 @@ def test_slack_sync_uses_search_then_authenticated_channel_history() -> None:
     assert first.documents[0].source_ref == "slack:message:C1:1712345678.000001"
     assert first.documents[0].metadata["sent_at"] == "2024-04-05T19:34:38.000001Z"
     assert second.documents[0].text == "History message"
+    assert second.documents[0].source_ref == "slack:message:C1:1712345679.000001"
     assert second.documents[0].metadata["sent_at"] == "2024-04-05T19:34:39.000001Z"
     assert second.complete is True
     assert second.freshness["status"] == "partial"
