@@ -736,7 +736,7 @@ def _read_slack(
     account_binding = _digest(_ACCOUNT_NAMESPACE, f"slack:user:{team_id}:{user_id}")
     policy = policy_for_verified_slack_workspace(connection_id, team_id)
     queries = (
-        [f"in:{channel}" for channel in sorted(policy.channels)]
+        [f"in:<#{channel}>" for channel in sorted(policy.channels)]
         if policy is not None else [_SLACK_SEARCH_QUERY]
     )
     per_channel = max(1, math.ceil(limit / max(1, len(queries))))

@@ -1330,7 +1330,7 @@ def test_slack_source_reads_each_approved_channel_without_global_search(
         assert parsed.path == "/api/search.messages"
         query = parse_qs(parsed.query)["query"][0]
         queries.append(query)
-        channel = query.removeprefix("in:")
+        channel = query.removeprefix("in:<#").removesuffix(">")
         assert channel in policy.channels
         return {"ok": True, "messages": {"matches": [{
             "channel": {"id": channel}, "text": "approved project update",
@@ -1342,6 +1342,6 @@ def test_slack_source_reads_each_approved_channel_without_global_search(
         vault, connection_id=str(connection_id), source_id="slack", limit=5,
         observed_at=BASE_TIME,
     )
-    assert queries == ["in:C123456789", "in:C987654321"]
+    assert queries == ["in:<#C123456789>", "in:<#C987654321>"]
     assert delivery["result"] == "success"
     assert len(cast(list[object], delivery["items"])) == 2

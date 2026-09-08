@@ -32,7 +32,7 @@ _CHANNEL_OPERATIONS: Final = frozenset(
 )
 _SEARCH_TERM = re.compile(r'"[^"\\\r\n]{1,128}"')
 _SEARCH_AFTER = re.compile(r"after:[0-9]{4}-[0-9]{2}-[0-9]{2}")
-_SEARCH_CHANNEL = re.compile(r"in:([A-Za-z0-9]{1,128})")
+_SEARCH_CHANNEL = re.compile(r"in:<#([CG][A-Z0-9]+)>")
 
 
 @dataclass(frozen=True)

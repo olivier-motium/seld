@@ -193,7 +193,7 @@ class SlackTaskReader:
         per_channel = max(1, (max_results + len(channels) - 1) // max(1, len(channels)))
         for channel in sorted(channels):
             part = self._search_pages(
-                f"{terms} in:{channel}".strip(),
+                f"{terms} in:<#{channel}>".strip(),
                 max_pages=max_pages,
                 max_results=per_channel,
                 snippet_chars=snippet_chars,
