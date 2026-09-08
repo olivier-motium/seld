@@ -928,8 +928,19 @@ def _local_attachment_text(row: sqlite3.Row) -> ExtractionResult | None:
         return None
     if not isinstance(digest, bytes) or len(digest) != 32:
         return ExtractionResult("", "gap", "attachment digest unavailable", ())
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    non_block = getattr(os, "O_NONBLOCK", None)
+    if (
+        not isinstance(no_follow, int)
+        or no_follow <= 0
+        or not isinstance(non_block, int)
+        or non_block <= 0
+    ):
+        return ExtractionResult(
+            "", "gap", "secure local attachment reads are unsupported on this platform", ()
+        )
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        descriptor = os.open(path, os.O_RDONLY | no_follow | non_block)
         with os.fdopen(descriptor, "rb") as source:
             info = os.fstat(source.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_INPUT_BYTES:

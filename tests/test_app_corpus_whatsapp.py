@@ -23,6 +23,7 @@ AT = int(datetime(2026, 9, 7, 10, 0, tzinfo=UTC).timestamp())
 
 def test_downloaded_attachment_requires_matching_bytes_and_respects_deletion(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "store"
     database = _store(root)
@@ -49,12 +50,31 @@ def test_downloaded_attachment_requires_matching_bytes_and_respects_deletion(
         connection.commit()
     adapter = WhatsAppAppCorpusAdapter(account_fingerprint=ACCOUNT, store_root=root)
     document = adapter.sync("wa-test").documents[0]
-    assert "approved agenda" in document.text
-    assert document.metadata["media_extraction_status"] == "local_text"
-    attachment.write_text("Replacement bytes must not be indexed.")
-    document = adapter.sync("wa-test").documents[0]
-    assert "Replacement" not in document.text
-    assert document.metadata["extraction_reason"] == "attachment digest mismatch"
+    secure_flags_available = all(
+        isinstance(getattr(os, flag, None), int) and getattr(os, flag) > 0
+        for flag in ("O_NOFOLLOW", "O_NONBLOCK")
+    )
+    if secure_flags_available:
+        assert "approved agenda" in document.text
+        assert document.metadata["media_extraction_status"] == "local_text"
+        with monkeypatch.context() as platform:
+            platform.delattr(os, "O_NOFOLLOW", raising=False)
+            unsupported = adapter.sync("wa-test").documents[0]
+        assert unsupported.metadata["media_extraction_status"] == "not_extracted"
+        assert (
+            unsupported.metadata["extraction_reason"]
+            == "secure local attachment reads are unsupported on this platform"
+        )
+        attachment.write_text("Replacement bytes must not be indexed.")
+        document = adapter.sync("wa-test").documents[0]
+        assert "Replacement" not in document.text
+        assert document.metadata["extraction_reason"] == "attachment digest mismatch"
+    else:
+        assert document.metadata["media_extraction_status"] == "not_extracted"
+        assert (
+            document.metadata["extraction_reason"]
+            == "secure local attachment reads are unsupported on this platform"
+        )
     with closing(sqlite3.connect(database)) as connection:
         connection.execute("UPDATE messages SET deleted_at=?", (AT + 1,))
         connection.commit()

@@ -569,6 +569,7 @@ def test_install_retry_and_uninstall_preserve_existing_instructions(
     pulse = generated_marketplace / "plugins/gsv/skills/gsv-pulse"
     assert (pulse / "SKILL.md").is_file()
     assert {path.name for path in (pulse / "references").iterdir() if path.is_file()} == {
+        "current-work.md",
         "registration.md",
         "source-acquisition.md",
     }

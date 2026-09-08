@@ -832,7 +832,15 @@ def _private_directory() -> _PrivateDirectory:
 def _create_private_file(path: Path) -> int:
     descriptor = os.open(path, _WRITE_FLAGS, 0o600)
     if os.name != "nt":
-        os.fchmod(descriptor, 0o600)
+        fchmod = getattr(os, "fchmod", None)
+        if not callable(fchmod):
+            os.close(descriptor)
+            raise OSError("private file permissions cannot be set on this platform")
+        try:
+            fchmod(descriptor, 0o600)
+        except OSError:
+            os.close(descriptor)
+            raise
     return descriptor
 
 

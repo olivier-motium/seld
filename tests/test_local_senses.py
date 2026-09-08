@@ -226,12 +226,14 @@ def test_whatsapp_service_probe_accepts_a_running_versioned_runtime_alias() -> N
             stderr="",
         )
 
+    uid = getattr(os, "getuid", None)
+    assert callable(uid)
     assert whatsapp._service_running(whatsapp.DEFAULT_SERVICE_LABEL, runner=runner)
     assert calls == [
         (
             "/bin/launchctl",
             "print",
-            f"gui/{os.getuid()}/{whatsapp.DEFAULT_SERVICE_LABEL}",
+            f"gui/{uid()}/{whatsapp.DEFAULT_SERVICE_LABEL}",
         )
     ]
 

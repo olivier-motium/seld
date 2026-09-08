@@ -367,7 +367,10 @@ def _unlink_exact(path: Path, expected: bytes) -> None:
 
 
 def _domain() -> str:
-    return f"gui/{os.getuid()}"
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        raise UsageError("launchd requires a POSIX user ID")
+    return f"gui/{getuid()}"
 
 
 def _launchctl(*arguments: str) -> LaunchctlResult:

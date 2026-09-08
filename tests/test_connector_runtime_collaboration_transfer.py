@@ -135,8 +135,10 @@ class _SlackTransport(ConnectorTransport):
     def request(self, **kwargs: Any) -> ConnectorResponse:
         self.requests.append(kwargs)
         path = kwargs["path"]
-        if path == "/api/files.getUploadURLExternal":
-            payload: object = {"file_id": "F123", "ok": True, "upload_url": _UPLOAD_LOCATION}
+        if path == "/api/auth.test":
+            payload: object = {"ok": True, "team_id": "T123"}
+        elif path == "/api/files.getUploadURLExternal":
+            payload = {"file_id": "F123", "ok": True, "upload_url": _UPLOAD_LOCATION}
         elif path == "/api/files.completeUploadExternal":
             payload = {"files": [{"id": "F123"}], "ok": True}
         elif path == "/api/files.info":
@@ -408,6 +410,10 @@ def test_slack_download_defaults_to_an_owner_only_artifact(
         assert path.stat().st_mode & 0o777 == 0o600
         assert transport.downloads[0]["location"] == _DOWNLOAD_LOCATION
         assert transport.downloads[0]["credential"].scheme is AuthorizationScheme.BEARER
+        assert [request["path"] for request in transport.requests] == [
+            "/api/auth.test",
+            "/api/files.info",
+        ]
     finally:
         runtime.close()
 
