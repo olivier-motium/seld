@@ -906,7 +906,7 @@ def test_slack_user_refresh_uses_rotation_endpoint_and_exact_rotating_shape() ->
         scopes=("channels:history",),
         post_form=successful,
     )
-    assert successful.endpoint == "https://slack.com/api/oauth.v2.access"
+    assert successful.endpoint == "https://slack.com/api/oauth.v2.user.access"
     assert successful.fields == {
         "client_id": "123.456",
         "grant_type": "refresh_token",
@@ -925,7 +925,7 @@ def test_slack_user_refresh_uses_rotation_endpoint_and_exact_rotating_shape() ->
     assert failure.value.error == "invalid_refresh_token"
 
 
-def test_slack_user_refresh_rejects_authed_user_scope_without_top_level_scope() -> None:
+def test_slack_user_refresh_accepts_documented_authed_user_scope() -> None:
     config = OAuthClientConfig(
         authorization_endpoint="https://slack.com/oauth/v2_user/authorize",
         token_endpoint="https://slack.com/api/oauth.v2.user.access",
@@ -935,20 +935,21 @@ def test_slack_user_refresh_rejects_authed_user_scope_without_top_level_scope() 
         dialect=OAuthDialect.SLACK_USER,
     )
 
-    with pytest.raises(OAuthTransportError, match="user scope"):
-        refresh_access_token(
-            config,
-            refresh_token="xoxe-refresh",
-            scopes=("channels:history",),
-            post_form=RecordingTransport(
-                (
-                    200,
-                    b'{"ok":true,"access_token":"fresh","token_type":"user",'
-                    b'"refresh_token":"xoxe-next","expires_in":43200,'
-                    b'"authed_user":{"scope":"channels:history"}}',
-                )
-            ),
-        )
+    refreshed = refresh_access_token(
+        config,
+        refresh_token="xoxe-refresh",
+        scopes=("channels:history",),
+        post_form=RecordingTransport(
+            (
+                200,
+                b'{"ok":true,"access_token":"fresh","token_type":"user",'
+                b'"refresh_token":"xoxe-next","expires_in":43200,'
+                b'"authed_user":{"scope":"channels:history"}}',
+            )
+        ),
+    )
+
+    assert refreshed.scopes == ("channels:history",)
 
 
 @pytest.mark.parametrize(

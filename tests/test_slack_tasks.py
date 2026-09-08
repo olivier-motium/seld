@@ -21,6 +21,7 @@ from continuity_kernel.connector_identifiers import parse_connection_id, parse_s
 from continuity_kernel.connector_profiles import get_profile
 from continuity_kernel.connector_runtime import ConnectorRuntime
 from continuity_kernel.connector_secrets import InMemorySecretStore
+from continuity_kernel.errors import ValidationError
 from continuity_kernel.slack_tasks import SlackTaskReader
 from continuity_kernel.vault import Vault
 
@@ -324,3 +325,39 @@ def test_slack_poll_records_the_canonical_source_checkpoint(
         if cast(dict[str, object], item["recipe"])["source"] == "slack"
     )
     assert slack["freshness"] == "current"
+
+
+def test_restricted_search_covers_approved_channels_and_rejects_other_selectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    calls: list[dict[str, object]] = []
+
+    class ScopedRuntime(_Runtime):
+        def call_tool(self, name: str, values: dict[str, object]) -> dict[str, object]:
+            calls.append(values)
+            return super().call_tool(name, values)
+
+    policy = SimpleNamespace(
+        channels=frozenset({CHANNEL_ID, "C987654321"}),
+        channel_names={CHANNEL_ID: "project", "C987654321": "support"},
+    )
+    monkeypatch.setattr("continuity_kernel.slack_tasks.load_slack_channel_access", lambda _: policy)
+    _vault, reader = _reader(tmp_path, runtime=ScopedRuntime())
+    with pytest.raises(ValidationError, match="outside the approved scope"):
+        reader.search("after:2026-08-01 urgent OR in:anywhere", max_results=10)
+    assert calls == []
+    result = reader.search("after:2026-08-01 urgent OR from:anyone", max_results=10)
+    queries = [cast(dict[str, object], call["input"])["query"] for call in calls]
+    assert queries == [
+        '"urgent" "OR" "from" "anyone" after:2026-08-01 in:<#C123456789>',
+        '"urgent" "OR" "from" "anyone" after:2026-08-01 in:<#C987654321>',
+    ]
+    # The fake provider returns the first channel for both queries; foreign rows are excluded.
+    assert len(cast(list[object], result["messages"])) == 1
+    calls.clear()
+    result = reader.search("in:project urgent", max_results=10)
+    assert len(calls) == 1
+    assert cast(dict[str, object], calls[0]["input"])["query"] == '"urgent" in:<#C123456789>'
+    assert len(cast(list[object], result["messages"])) == 1

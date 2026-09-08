@@ -2817,10 +2817,12 @@ class Vault:
     def context_pack(self, *, max_characters: int = 48_000) -> str:
         return _build_context_pack(self, max_characters=max_characters)
 
-    def resident_signal_status(self) -> dict[str, Any]:
+    def resident_signal_status(self, *, lock_timeout_seconds: float = 10.0) -> dict[str, Any]:
         """Return validated, content-free mailbox counts."""
 
-        return signal_dict(ResidentSignalStore(self.root).status())
+        return signal_dict(
+            ResidentSignalStore(self.root).status(lock_timeout_seconds=lock_timeout_seconds)
+        )
 
     def list_resident_signals(
         self,
@@ -2894,6 +2896,16 @@ class Vault:
             ) from exc
         if SHA256_REVISION.fullmatch(expected_revision) is None:
             raise ValidationError("canonical result reference must end in a SHA-256 revision")
+        if record_kind == "source-report":
+            from continuity_kernel.pulse_reports import PulseReportStore
+
+            report = PulseReportStore(self.root).show(identifier)
+            if report.revision != expected_revision:
+                raise ConflictError("source report changed; reload before acknowledging")
+            canonical_report = f"source-report:{report.report_id}@{report.revision}"
+            if canonical_report != value:
+                raise ValidationError("source report reference is not in its canonical form")
+            return canonical_report
         record: Task | WorkThread | Entity | Direction | Portfolio
         if record_kind == "task":
             record = self.get_task(identifier)

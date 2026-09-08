@@ -14,13 +14,15 @@ behavior.
    structural ref `system-role:resident-pulse`, its exact Pulse task UUID as
    `active_thread_id`, and exactly one
    `codex-chief-of-staff:<foreground-task-uuid>` ref. Require explicit takeover
-   before changing an existing bound hand.
+   before changing an existing bound execution unit.
 5. Run `$gsv-pulse` manually once. Prove both identity guards, one bounded
    context/source read, reversible local CAS and readback, compact NOW, silence
-   when no delivery gate is crossed, and the unattended authority boundary.
+   when no delivery gate is crossed, and the unattended authority boundary. A
+   mechanical sweep is not this proof; it only shows that due evidence was
+   queued.
 6. Register one active app-native heartbeat targeting that exact Pulse task at
    a reliable thirty-minute cadence. Its prompt must invoke `$gsv-pulse`, apply
-   the task-birth and delivery gates, route foreground output to the exact Chief
+   the task-creation and delivery gates, route foreground output to the exact Chief
    of Staff ref. Foreground output must be answer-first, concise, visibly
    progressive, and state one obvious next move; prohibit guilt-based nudges,
    Bridge, raw payload persistence, duplicate schedules, parallel memory/task/
@@ -29,9 +31,10 @@ behavior.
    orientation and first post-20:00 evening wrap, with date markers in NOW.
    Codex permits one heartbeat per task; do not add competing schedulers for
    these briefs.
-8. Read the automation back, observe one installed wake, and verify the same
-   Pulse UUID, no duplicate automation, no task explosion, no unauthorized
-   external mutation, and honest source freshness.
+8. Read the automation back, observe one installed AI wake, and verify the
+   same Pulse UUID, no duplicate automation, no task explosion, no unauthorized
+   external mutation, and honest source freshness. Keep that evidence distinct
+   from the mechanical sweep heartbeat and from optional QMD maintenance.
 
 Thirty reliable minutes is the default. Move to fifteen only after connector
 and wake reliability is observed and the additional cadence produces material

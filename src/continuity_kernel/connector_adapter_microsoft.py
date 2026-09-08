@@ -218,6 +218,7 @@ class _RequestShape:
     body_format: str | None = None
     required_select: str | None = None
     continuation_window: tuple[tuple[str, str], tuple[str, str]] | None = None
+    delta: bool = False
     mime: bool = False
     metadata_only: bool = False
     response_bound: int = 16 * 1024 * 1024
@@ -708,6 +709,12 @@ class MicrosoftConnectorAdapter:
                     request_data,
                     time_zone=shape.time_zone,
                     body_format=shape.body_format,
+                    max_page_size=(
+                        _integer(request_data["page_size"])
+                        if known.name in {"folders.delta", "messages.delta", "events.delta"}
+                        and "page_size" in request_data
+                        else None
+                    ),
                 ),
                 expected_statuses=shape.expected_statuses,
                 response_bound=shape.response_bound,
@@ -730,6 +737,7 @@ class MicrosoftConnectorAdapter:
         return _result(
             response,
             path=shape.path,
+            delta=shape.delta,
             mime=shape.mime,
             metadata_only=shape.metadata_only,
             initial_query=shape.query,
@@ -1050,6 +1058,12 @@ def _mail_shape(name: str, data: dict[str, object]) -> _RequestShape:
         return _RequestShape(path, ConnectorMethod.GET, query=_folder_query(data))
     if name == "folders.get":
         return _RequestShape(_folder_path(_text(data, "folder_id")), ConnectorMethod.GET)
+    if name == "folders.delta":
+        return _delta_shape(
+            data,
+            f"{_ROOT}/mailFolders/delta",
+            page_size_in_query=False,
+        )
     if name == "messages.list":
         folder = _optional_text(data, "folder_id")
         path = f"{_folder_path(folder)}/messages" if folder is not None else f"{_ROOT}/messages"
@@ -1059,6 +1073,12 @@ def _mail_shape(name: str, data: dict[str, object]) -> _RequestShape:
             ConnectorMethod.GET,
             query=_message_query(data, select=select),
             required_select=select,
+        )
+    if name == "messages.delta":
+        return _delta_shape(
+            data,
+            f"{_folder_path(_text(data, 'folder_id'))}/messages/delta",
+            page_size_in_query=False,
         )
     if name == "messages.get":
         select = _message_select(data, default=_MESSAGE_DETAIL_FIELDS)
@@ -1208,6 +1228,8 @@ def _calendar_shape(name: str, data: dict[str, object]) -> _RequestShape:
             query=_event_query(data),
             time_zone=_optional_text(data, "time_zone"),
         )
+    if name == "events.delta":
+        return _calendar_delta_shape(data)
     if name == "events.get":
         return _RequestShape(
             _event_path(_text(data, "calendar_id"), _text(data, "event_id")),
@@ -1567,6 +1589,48 @@ def _window_shape(
     )
 
 
+def _calendar_delta_shape(data: dict[str, object]) -> _RequestShape:
+    """Build the documented fixed primary-calendar calendarView delta request."""
+
+    path = f"{_ROOT}/calendarView/delta"
+    if "delta_link" in data:
+        return _delta_link_shape(_text(data, "delta_link"), path=path)
+    return _RequestShape(
+        path,
+        ConnectorMethod.GET,
+        query=(
+            ("startDateTime", _text(data, "start")),
+            ("endDateTime", _text(data, "end")),
+        ),
+        delta=True,
+    )
+
+
+def _delta_shape(
+    data: dict[str, object],
+    path: str,
+    *,
+    page_size_in_query: bool = True,
+) -> _RequestShape:
+    """Build a fixed Graph delta request or replay its validated delta link."""
+
+    if "delta_link" in data:
+        return _delta_link_shape(_text(data, "delta_link"), path=path)
+    query: tuple[tuple[str, str], ...] = ()
+    if page_size_in_query and "page_size" in data:
+        query = (("$top", str(_integer(data["page_size"]))),)
+    return _RequestShape(path, ConnectorMethod.GET, query=query, delta=True)
+
+
+def _delta_link_shape(value: str, *, path: str) -> _RequestShape:
+    return _RequestShape(
+        path,
+        ConnectorMethod.GET,
+        query=_validated_delta_link(value, path=path),
+        delta=True,
+    )
+
+
 def _folder_query(data: dict[str, object]) -> tuple[tuple[str, str], ...]:
     return _list_query(data, {"display_name": "displayName"})
 
@@ -1588,6 +1652,13 @@ def _message_query(data: dict[str, object], *, select: str) -> tuple[tuple[str, 
         query.append(("$orderby", f"{order} {'asc' if direction == 'ascending' else 'desc'}"))
     if "is_read" in data:
         query.append(("$filter", f"isRead eq {str(data['is_read']).lower()}"))
+    if "last_modified_since" in data:
+        query.append(
+            (
+                "$filter",
+                f"lastModifiedDateTime ge {_text(data, 'last_modified_since')}",
+            )
+        )
     return tuple(query)
 
 
@@ -1663,8 +1734,11 @@ def _headers(
     *,
     time_zone: str | None,
     body_format: str | None = None,
+    max_page_size: int | None = None,
 ) -> dict[str, str]:
     prefer = 'IdType="ImmutableId"'
+    if max_page_size is not None:
+        prefer += f", odata.maxpagesize={max_page_size}"
     if time_zone is not None:
         prefer += f', outlook.timezone="{_preference_time_zone(time_zone)}"'
     if body_format is not None:
@@ -2717,6 +2791,7 @@ def _result(
     response: ConnectorResponse,
     *,
     path: str,
+    delta: bool = False,
     mime: bool,
     metadata_only: bool = False,
     initial_query: tuple[tuple[str, str], ...] = (),
@@ -2738,6 +2813,7 @@ def _result(
         return ConnectorAdapterResult({} if value is None else value)
     payload: dict[str, object] = {}
     next_link: object | None = None
+    delta_link: object | None = None
     for key, item in value.items():
         if not isinstance(key, str):
             raise ConnectorProviderError(
@@ -2747,8 +2823,24 @@ def _result(
             )
         if key == "@odata.nextLink":
             next_link = item
+        elif key == "@odata.deltaLink" and delta:
+            delta_link = item
+            _validated_delta_link(item, path=path)
+            payload[key] = item
         else:
             payload[key] = item
+    if delta and next_link is not None and delta_link is not None:
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=response.status,
+            code="invalid_delta_response",
+        )
+    if delta and next_link is None and delta_link is None:
+        raise ConnectorProviderError(
+            origin=_ORIGIN,
+            status=response.status,
+            code="invalid_delta_response",
+        )
     continuation = _next_link(
         next_link,
         path=path,
@@ -2903,17 +2995,72 @@ def _next_link(
     return {"path": path, "query": [[key, item] for key, item in continuation_pairs]}
 
 
+def _validated_delta_link(value: object, *, path: str) -> tuple[tuple[str, str], ...]:
+    """Accept one opaque Graph delta URL only for the operation's fixed collection."""
+
+    if not isinstance(value, str) or not value or len(value) > 16_384:
+        raise ValidationError("Outlook delta link is invalid")
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValidationError("Outlook delta link is invalid") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != _GRAPH_HOST
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or parsed.fragment
+        or not _matches_graph_continuation_path(parsed.path, path)
+    ):
+        raise ValidationError("Outlook delta link is invalid")
+    try:
+        pairs = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=8,
+        )
+    except ValueError as exc:
+        raise ValidationError("Outlook delta link is invalid") from exc
+    token_seen = False
+    top_seen = False
+    result: list[tuple[str, str]] = []
+    for key, item in pairs:
+        if key == "$deltatoken":
+            if token_seen or not item:
+                raise ValidationError("Outlook delta link is invalid")
+            token_seen = True
+        elif key == "$top":
+            if top_seen or not _is_bounded_page_size(item):
+                raise ValidationError("Outlook delta link is invalid")
+            top_seen = True
+            continue
+        else:
+            raise ValidationError("Outlook delta link is invalid")
+        result.append((key, item))
+    if not token_seen:
+        raise ValidationError("Outlook delta link is invalid")
+    return tuple(result)
+
+
 def _matches_graph_continuation_path(candidate: str, requested: str) -> bool:
     if candidate == requested:
         return True
     match = re.fullmatch(
-        rf"{re.escape(_ROOT)}/mailFolders/([A-Za-z]+)/(childFolders|messages)",
+        rf"{re.escape(_ROOT)}/mailFolders/([^/]+)/(childFolders|messages|messages/delta)",
         requested,
     )
+    if match is not None:
+        encoded_folder, collection = match.groups()
+        folder = unquote(encoded_folder)
+        return candidate == f"{_ROOT}/mailFolders('{folder}')/{collection}"
+    match = re.fullmatch(rf"{re.escape(_ROOT)}/calendars/([^/]+)/events", requested)
     if match is None:
         return False
-    folder, collection = match.groups()
-    return candidate == f"{_ROOT}/mailFolders('{folder}')/{collection}"
+    calendar_id = unquote(match.group(1))
+    return candidate == f"{_ROOT}/calendars('{calendar_id}')/events"
 
 
 def _continuation_query(

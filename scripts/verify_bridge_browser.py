@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from playwright.sync_api import Browser, Error, Page, sync_playwright
 
-from continuity_kernel import bridge
+import continuity_kernel.bridge as bridge
 from continuity_kernel.demo import run_demo
 from continuity_kernel.local_files import LOCAL_FILE_READER_TOOL
 from continuity_kernel.source_state import ABSENT_SOURCE_REVISION

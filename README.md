@@ -379,6 +379,39 @@ Restore verifies files before publishing them and never silently switches the
 active records folder. See [Installation](docs/installation.md) for the full
 backup and restore contract.
 
+### Search connected app content
+
+The optional app corpus keeps selected provider content and its QMD embeddings
+in a private directory on this computer, outside the Seld vault. Commands use
+the active vault from any working directory. Connecting an account does not
+automatically copy its content; select each connection and source explicitly.
+
+```bash
+gsv apps capabilities       # Exact account connections and available operations
+gsv apps configure --connection-id CONNECTION --adapter gmail
+gsv apps sync --connection-id CONNECTION --adapter gmail --limit 100
+gsv apps refresh             # Update embeddings after a backfill
+gsv apps search "project discussion" --connection-id CONNECTION
+gsv apps read --connection-id CONNECTION --object-id OBJECT
+gsv apps status              # Per-source coverage and index readiness
+gsv apps sync-all            # Advance configured sources and refresh the index
+```
+
+Repeat bounded syncs to finish a backfill. Provider read checkpoints survive
+process restarts. Failed reads preserve prior content and remain visible in
+status. Search labels its local exact fallback when embeddings are unavailable
+or outdated; a connected account alone never means its content is indexed.
+Unsupported attachments and incomplete source discovery remain coverage gaps.
+
+`gsv apps configure-whatsapp` selects the verified local wacli account.
+`gsv apps configure-notion` selects an explicit host bridge configuration with
+account and workspace pins. These sources require their existing local setup.
+The MCP tools `gsv_apps_status`, `gsv_apps_search`, and `gsv_apps_read` expose the
+same corpus after the MCP server restarts. Provider changes use the existing
+connector operations and confirmation rules; `gsv apps call` exposes those
+operations at the command line. Host CLI capabilities identify their own
+supported route and do not imply support through `apps call`.
+
 ## Remove it
 
 Remove only the ChatGPT app integration while keeping the executable:

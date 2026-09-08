@@ -10,7 +10,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from inspect import Parameter, signature
 from threading import RLock
-from typing import Final, cast
+from typing import Final, Protocol, cast
 
 from continuity_kernel.connector_adapter import (
     ConnectorAdapter,
@@ -70,6 +70,11 @@ from continuity_kernel.local_files import (
     LocalFileGrantStore,
     LocalFileTransferCandidate,
 )
+from continuity_kernel.slack_channel_access import (
+    SlackChannelAccessPolicy,
+    load_slack_channel_access,
+    policy_for_verified_slack_workspace,
+)
 from continuity_kernel.vault import Vault
 
 _PROFILE_PROVIDERS: Final = {
@@ -81,6 +86,20 @@ _PROFILE_PROVIDERS: Final = {
     "outlook_mail": "microsoft",
     "slack": "slack",
 }
+
+
+class AppCorpusReader(Protocol):
+    """The bounded read surface used by corpus source adapters."""
+
+    def call_app_corpus_read(
+        self,
+        name: str,
+        values: Mapping[str, object],
+        *,
+        continuation: object | None = None,
+    ) -> Mapping[str, object]: ...
+
+
 _EFFECT_ORDER: Final = {
     ConnectorEffect.READ: 0,
     ConnectorEffect.SAFE_MUTATION: 1,
@@ -234,6 +253,24 @@ _OPERATION_WARNINGS: Final = {
 }
 
 
+def _enforce_slack_read_channel_policy(
+    *,
+    provider: str,
+    mode: ConnectorMode,
+    connection_id: str,
+    operation: str,
+    input_value: object,
+) -> SlackChannelAccessPolicy | None:
+    """Reject restricted Slack reads before credentials or a provider call."""
+
+    if provider != "slack" or mode is not ConnectorMode.READ:
+        return None
+    policy = load_slack_channel_access(connection_id)
+    if policy is not None and not policy.allows_read_operation(operation, input_value):
+        raise ValidationError("Slack read is outside the approved channel scope")
+    return policy
+
+
 @dataclass(frozen=True)
 class _PreparedInput:
     adapter_input: object
@@ -327,7 +364,10 @@ class ConnectorRuntime:
         prepared_uploads: PreparedUploadCache | None = None,
         artifact_store: ArtifactStore | None = None,
         local_files: LocalFileGrantStore | None = None,
+        require_confirmation_for_safe_mutations: bool = False,
     ) -> None:
+        if not isinstance(require_confirmation_for_safe_mutations, bool):
+            raise ValidationError("safe-mutation confirmation setting is invalid")
         self.vault = vault
         self.auth_manager = auth_manager or ConnectorAuthManager(vault)
         self.adapters = adapters
@@ -336,6 +376,7 @@ class ConnectorRuntime:
         self.prepared_uploads = prepared_uploads or PreparedUploadCache()
         self._artifact_store_instance = artifact_store
         self._local_file_store = local_files
+        self._require_confirmation_for_safe_mutations = require_confirmation_for_safe_mutations
         self._closed = False
 
     def call_tool(self, name: str, values: Mapping[str, object]) -> dict[str, object]:
@@ -344,6 +385,28 @@ class ConnectorRuntime:
         self.prepared_uploads.prune()
         try:
             return self._call_tool(name, values)
+        finally:
+            self.prepared_uploads.prune()
+
+    def call_app_corpus_read(
+        self,
+        name: str,
+        values: Mapping[str, object],
+        *,
+        continuation: object | None = None,
+    ) -> dict[str, object]:
+        """Read one corpus page with provider JSON continuation, never a write or session token.
+
+        The continuation is a bounded provider value returned by an earlier call to this
+        method.  It is re-authorized against the current exact connection, operation,
+        scopes, credential version, and source-specific adapter validation on every page.
+        """
+
+        if self._closed:
+            raise ValidationError("connector runtime is closed")
+        self.prepared_uploads.prune()
+        try:
+            return self._call_app_corpus_read(name, values, continuation=continuation)
         finally:
             self.prepared_uploads.prune()
 
@@ -381,6 +444,13 @@ class ConnectorRuntime:
             raise ValidationError("connection does not authorize this connector")
         if connection.health not in {ConnectionHealth.READY, ConnectionHealth.DEGRADED}:
             raise ValidationError("connection must be verified before interactive use")
+        slack_policy = _enforce_slack_read_channel_policy(
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            operation=operation_name,
+            input_value=input_value,
+        )
         profile = get_profile_for_connection(
             connection.provider,
             connection.source_ids,
@@ -397,6 +467,14 @@ class ConnectorRuntime:
             expected_connection_revision=connection_snapshot.revision,
             credential_kind=connection.credential_kind,
             configured_scopes=connection.scopes,
+        )
+        slack_policy = self._verify_slack_workspace_policy(
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            expected=slack_policy,
+            credential=credential,
+            connection_revision=connection_snapshot.revision,
         )
         if not operation.scope_grant_satisfies(credential.granted_scopes):
             raise ValidationError(_scope_error(provider, operation_name))
@@ -461,7 +539,10 @@ class ConnectorRuntime:
                         transfer=_prepared_transfer_context(prepared.bundle),
                     )
                     effect = _promote_prepared_upload_effect(effect, prepared.bundle)
-                    if effect is ConnectorEffect.SAFE_MUTATION:
+                    if (
+                        effect is ConnectorEffect.SAFE_MUTATION
+                        and not self._require_confirmation_for_safe_mutations
+                    ):
                         result = self._execute_adapter(
                             adapter,
                             operation,
@@ -558,7 +639,10 @@ class ConnectorRuntime:
                         transfer=_prepared_transfer_context(prepared.bundle),
                     )
                     effect = _promote_prepared_upload_effect(effect, prepared.bundle)
-                    if effect is ConnectorEffect.SAFE_MUTATION:
+                    if (
+                        effect is ConnectorEffect.SAFE_MUTATION
+                        and not self._require_confirmation_for_safe_mutations
+                    ):
                         raise ValidationError("this operation does not use a confirmation token")
                     _reject_provider_target_key(prepared.confirmation_input)
                     target = self._resolve_confirmation_target(
@@ -622,6 +706,16 @@ class ConnectorRuntime:
                             confirmed_bundle.close()
         if not isinstance(result, ConnectorAdapterResult):
             raise ValidationError("connector adapter returned an invalid result")
+        # A policy narrowed during the provider call must also restrict its response.
+        slack_policy = _enforce_slack_read_channel_policy(
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            operation=operation_name,
+            input_value=input_value,
+        )
+        if provider == "slack" and operation_name == "search.messages" and slack_policy is not None:
+            slack_policy.validate_search_result(result.payload)
         try:
             state_changed = self._state_changed(
                 connection_id,
@@ -657,6 +751,125 @@ class ConnectorRuntime:
                     credential_version=credential.version,
                     continuation=result.continuation,
                 )
+            return response
+        except Exception:
+            if result.artifact is not None:
+                with suppress(Exception):
+                    self._artifacts().discard(result.artifact)
+            raise
+
+    def _call_app_corpus_read(
+        self,
+        name: str,
+        values: Mapping[str, object],
+        *,
+        continuation: object | None,
+    ) -> dict[str, object]:
+        try:
+            provider, mode = CONNECTOR_TOOL_BINDINGS[name]
+        except KeyError as exc:
+            raise ValidationError("unknown connector tool") from exc
+        if mode is not ConnectorMode.READ:
+            raise ValidationError("app corpus continuation is available only for connector reads")
+        validated = validate_json(dict(values), OPERATION_CATALOG.tool_input_schema(provider, mode))
+        envelope = cast(dict[str, object], validated)
+        operation_name = cast(str, envelope["operation"])
+        operation = OPERATION_CATALOG.lookup(provider, mode, operation_name)
+        input_value = operation.validate_input(envelope["input"])
+        connection_id = cast(str, envelope["connection_id"])
+        if continuation is not None:
+            continuation = canonicalize_json(continuation)
+            if len(canonical_json(continuation)) > 16_384:
+                raise ValidationError("app corpus provider continuation exceeds its size bound")
+
+        connection_snapshot = self.vault.get_connection_snapshot()
+        connection = connection_snapshot.connection(connection_id)
+        if connection is None:
+            raise NotFoundError("connection was not found")
+        profile_provider = _PROFILE_PROVIDERS[provider]
+        if connection.provider != profile_provider or provider not in connection.source_ids:
+            raise ValidationError("connection does not authorize this connector")
+        if connection.health not in {ConnectionHealth.READY, ConnectionHealth.DEGRADED}:
+            raise ValidationError("connection must be verified before interactive use")
+        slack_policy = _enforce_slack_read_channel_policy(
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            operation=operation_name,
+            input_value=input_value,
+        )
+        credential = self._resolve_credential(
+            connection_id=connection_id,
+            expected_connection_revision=connection_snapshot.revision,
+            credential_kind=connection.credential_kind,
+            configured_scopes=connection.scopes,
+        )
+        slack_policy = self._verify_slack_workspace_policy(
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            expected=slack_policy,
+            credential=credential,
+            connection_revision=connection_snapshot.revision,
+        )
+        if not operation.scope_grant_satisfies(credential.granted_scopes):
+            raise ValidationError(_scope_error(provider, operation_name))
+        if self.vault.get_connection_snapshot().revision != connection_snapshot.revision:
+            raise ConflictError("connection changed while its credential was being resolved")
+
+        adapter = self.adapters.get(provider)
+        effect = self._classify_effect(
+            operation.effect,
+            adapter,
+            operation,
+            input_value,
+            connection_id=connection_id,
+            connection_revision=connection_snapshot.revision,
+            credential=credential,
+        )
+        if effect is not ConnectorEffect.READ:
+            raise ValidationError("app corpus reads must remain read-only")
+        result = self._execute_adapter(
+            adapter,
+            operation,
+            input_value,
+            continuation=continuation,
+            credential=credential,
+            write_idempotency_key=None,
+            prepared_bundle=None,
+            connection_id=connection_id,
+            connection_revision=connection_snapshot.revision,
+        )
+        # A policy narrowed during the provider call must also restrict its response.
+        slack_policy = _enforce_slack_read_channel_policy(
+            provider=provider,
+            mode=mode,
+            connection_id=connection_id,
+            operation=operation_name,
+            input_value=input_value,
+        )
+        if provider == "slack" and operation_name == "search.messages" and slack_policy is not None:
+            slack_policy.validate_search_result(result.payload)
+        try:
+            state_changed = self._state_changed(
+                connection_id,
+                connection_revision=connection_snapshot.revision,
+                credential_version=credential.version,
+            )
+            if state_changed:
+                raise ConflictError("connection changed during the provider read")
+            response: dict[str, object] = {
+                "connection_id": connection_id,
+                "effect": effect.value,
+                "operation": operation_name,
+                "provider": provider,
+                "result": result.payload,
+                "status": "ok",
+            }
+            if result.artifact is not None:
+                response["artifact"] = result.artifact.to_dict()
+            if result.continuation is not None:
+                response["continuation"] = result.continuation
             return response
         except Exception:
             if result.artifact is not None:
@@ -1068,6 +1281,45 @@ class ConnectorRuntime:
                 version=resolved_bearer.state.version,
             )
         raise ValidationError("connection credential kind is unsupported for interactive use")
+
+    def _verify_slack_workspace_policy(
+        self,
+        *,
+        provider: str,
+        mode: ConnectorMode,
+        connection_id: str,
+        expected: SlackChannelAccessPolicy | None,
+        credential: ConnectorRuntimeCredential,
+        connection_revision: str,
+    ) -> SlackChannelAccessPolicy | None:
+        """Bind a restricted connection to auth.test before its target read."""
+
+        if provider != "slack" or mode is not ConnectorMode.READ:
+            return None
+        identity_operation = OPERATION_CATALOG.lookup("slack", ConnectorMode.READ, "identity.get")
+        response = self._execute_adapter(
+            self.adapters.get("slack"),
+            identity_operation,
+            {},
+            continuation=None,
+            credential=credential,
+            write_idempotency_key=None,
+            prepared_bundle=None,
+            connection_id=connection_id,
+            connection_revision=connection_revision,
+        )
+        payload = response.payload
+        if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+            raise ValidationError("Slack workspace identity response is invalid")
+        workspace_id = payload.get("team_id")
+        if not isinstance(workspace_id, str) or not workspace_id:
+            raise ValidationError("Slack workspace identity response is invalid")
+        verified = policy_for_verified_slack_workspace(connection_id, workspace_id)
+        if expected is not None and (
+            verified is None or verified.workspace_id != expected.workspace_id
+        ):
+            raise ValidationError("Slack connection does not match its approved workspace")
+        return verified
 
     def _confirmation_preview(
         self,

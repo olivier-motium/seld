@@ -94,6 +94,7 @@ _MAX_OAUTH_CLIENT_SECRET_BYTES: Final = 2 * 1024
 _GMAIL_MODIFY_SCOPE: Final = "https://www.googleapis.com/auth/gmail.modify"
 _GMAIL_READ_SCOPE: Final = "https://www.googleapis.com/auth/gmail.readonly"
 _GMAIL_PURGE_SCOPE: Final = "https://mail.google.com/"
+_SLACK_IMPLICIT_USER_SCOPES: Final = frozenset({"identify"})
 CustodyStatus = Literal["valid", "missing", "invalid", "pointer_invalid"]
 
 
@@ -1197,6 +1198,10 @@ class ConnectorAuthManager:
             granted_access = frozenset(
                 scope for scope in granted if scope.casefold() != "offline_access"
             )
+            if metadata.provider == "slack":
+                # Slack adds this legacy identity scope to user-token grants. It grants
+                # no selected connector capability and is not part of the profile surface.
+                granted_access -= _SLACK_IMPLICIT_USER_SCOPES
         profile = get_profile_for_connection(
             metadata.provider,
             metadata.source_ids,
@@ -1295,6 +1300,12 @@ class ConnectorAuthManager:
             scopes = canonicalize_google_scopes(credential.scopes)
         elif metadata.provider == "microsoft":
             scopes = canonicalize_microsoft_access_scopes(credential.scopes)
+        elif metadata.provider == "slack":
+            # Slack automatically adds this legacy identity scope to user-token grants.
+            # It carries no selected connector capability, so do not persist it as one.
+            scopes = tuple(
+                scope for scope in credential.scopes if scope not in _SLACK_IMPLICIT_USER_SCOPES
+            )
         else:
             return credential
         if scopes == credential.scopes:

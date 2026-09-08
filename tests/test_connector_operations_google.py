@@ -88,6 +88,8 @@ _EXPECTED_NAMES = {
         "events.delete",
     },
     "google_drive": {
+        "changes.get_start_page_token",
+        "changes.list",
         "drives.list",
         "files.content",
         "files.list",
@@ -201,13 +203,13 @@ def test_google_provider_mode_partitions_and_exact_operation_surface() -> None:
         for provider in _EXPECTED_NAMES
     }
     assert names == _EXPECTED_NAMES
-    assert len(GOOGLE_OPERATIONS) == 97
+    assert len(GOOGLE_OPERATIONS) == 99
     assert {
         provider: sum(item.provider == provider for item in GOOGLE_OPERATIONS) for provider in names
     } == {
         "gmail": 49,
         "google_calendar": 19,
-        "google_drive": 29,
+        "google_drive": 31,
     }
     assert all(item.endpoint == item.name for item in GOOGLE_OPERATIONS)
 
@@ -1121,9 +1123,10 @@ def test_google_schemas_and_tool_envelopes_keep_transport_sealed() -> None:
 
 def test_drive_metadata_scope_does_not_satisfy_content_or_write_operations() -> None:
     metadata_scope = ["https://www.googleapis.com/auth/drive.metadata.readonly"]
-    assert _operation("google_drive", ConnectorMode.READ, "files.list").scope_grant_satisfies(
-        metadata_scope
-    )
+    for name in ("changes.get_start_page_token", "changes.list", "files.list"):
+        assert _operation("google_drive", ConnectorMode.READ, name).scope_grant_satisfies(
+            metadata_scope
+        )
     assert not _operation(
         "google_drive", ConnectorMode.READ, "files.download"
     ).scope_grant_satisfies(metadata_scope)
@@ -1164,6 +1167,7 @@ def test_google_catalog_uses_provider_page_limits_and_drive_capacity() -> None:
         ("google_calendar", "events.list"): 2_500,
         ("google_calendar", "events.instances"): 2_500,
         ("google_drive", "drives.list"): 100,
+        ("google_drive", "changes.list"): 1_000,
         ("google_drive", "files.list"): 1_000,
         ("google_drive", "permissions.list"): 100,
         ("google_drive", "comments.list"): 100,

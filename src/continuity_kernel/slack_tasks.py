@@ -16,6 +16,7 @@ from continuity_kernel.connector_identifiers import ConnectionId, SecretName, pa
 from continuity_kernel.connector_runtime import ConnectorRuntime, default_connector_adapters
 from continuity_kernel.connector_sources import read_connector_source
 from continuity_kernel.errors import NotFoundError, SetupError, ValidationError
+from continuity_kernel.slack_channel_access import load_slack_channel_access
 from continuity_kernel.vault import Vault
 
 MAX_SEARCH_PAGES: Final = 20
@@ -158,6 +159,78 @@ class SlackTaskReader:
         max_results: int = 100,
         snippet_chars: int = 320,
     ) -> dict[str, object]:
+        clean = _query(query)
+        policy = load_slack_channel_access(str(self.connection_id))
+        if policy is None:
+            return self._search_pages(
+                clean, max_pages=max_pages, max_results=max_results, snippet_chars=snippet_chars
+            )
+        _bounded_int(max_pages, "Slack search page bound", 1, MAX_SEARCH_PAGES)
+        _bounded_int(max_results, "Slack search result bound", 1, MAX_SEARCH_RESULTS)
+        _bounded_int(snippet_chars, "Slack snippet bound", 40, MAX_SNIPPET_CHARS)
+        selectors = re.findall(r"(?:^|\s)in:([^\s]+)", clean)
+        by_name = {name: channel for channel, name in policy.channel_names.items()}
+        channels = set(policy.channels)
+        if selectors:
+            selected = {value if value in channels else by_name.get(value) for value in selectors}
+            if None in selected:
+                raise ValidationError("Slack search channel is outside the approved scope")
+            channels = {value for value in selected if value is not None}
+        clean_terms = re.sub(r"(?:^|\s)in:[^\s]+", " ", clean)
+        dates = re.findall(r"(?:^|\s)after:(\d{4}-\d{2}-\d{2})(?=\s|$)", clean_terms)
+        clean_terms = re.sub(r"(?:^|\s)after:\d{4}-\d{2}-\d{2}(?=\s|$)", " ", clean_terms)
+        terms = " ".join('"' + word + '"' for word in re.findall(r"[^\W_]+", clean_terms)[:40])
+        if dates:
+            try:
+                date = max(datetime.strptime(value, "%Y-%m-%d").date() for value in dates)
+            except ValueError as exc:
+                raise ValidationError("Slack search date is invalid") from exc
+            terms = f"{terms} after:{date.isoformat()}".strip()
+        messages: list[dict[str, object]] = []
+        pages_read = 0
+        complete = bool(channels)
+        # Each channel gets a bounded share, so a busy channel cannot hide another project.
+        per_channel = max(1, (max_results + len(channels) - 1) // max(1, len(channels)))
+        for channel in sorted(channels):
+            part = self._search_pages(
+                f"{terms} in:<#{channel}>".strip(),
+                max_pages=max_pages,
+                max_results=per_channel,
+                snippet_chars=snippet_chars,
+                expected_channel=channel,
+            )
+            coverage = cast(dict[str, object], part["coverage"])
+            pages_read += cast(int, coverage["pages_read"])
+            complete = complete and coverage["status"] == "complete"
+            messages.extend(cast(list[dict[str, object]], part["messages"]))
+        messages.sort(key=lambda item: str(item.get("at") or ""), reverse=True)
+        complete = complete and len(messages) <= max_results
+        messages = messages[:max_results]
+        return {
+            "coverage": {
+                "checkpoint_safe": True,
+                "known_omissions": ["Only owner-approved Slack channels are searched."],
+                "pages_read": pages_read,
+                "returned": len(messages),
+                "scope": "approved_channels",
+                "status": "complete" if complete else "partial",
+                "total_known": None,
+                "truncated_reason": None if complete else "search_bound",
+            },
+            "messages": messages,
+            "observed_at": self._now().isoformat().replace("+00:00", "Z"),
+            "query": query,
+        }
+
+    def _search_pages(
+        self,
+        query: str,
+        *,
+        max_pages: int = 1,
+        max_results: int = 100,
+        snippet_chars: int = 320,
+        expected_channel: str | None = None,
+    ) -> dict[str, object]:
         clean_query = _query(query)
         _bounded_int(max_pages, "Slack search page bound", 1, MAX_SEARCH_PAGES)
         _bounded_int(max_results, "Slack search result bound", 1, MAX_SEARCH_RESULTS)
@@ -167,6 +240,7 @@ class SlackTaskReader:
         page_count: int | None = None
         pages_read = 0
         page_size = min(MAX_SEARCH_PAGE_SIZE, max_results)
+        rejected_matches = False
         for page in range(1, max_pages + 1):
             remaining = max_results - len(messages)
             if remaining <= 0:
@@ -191,7 +265,21 @@ class SlackTaskReader:
                 total_known = _optional_int(pagination.get("total_count"))
                 page_count = _optional_int(pagination.get("page_count"))
             pages_read += 1
-            messages.extend(self._render_matches(matches[:remaining], snippet_chars=snippet_chars))
+            if expected_channel is not None:
+                original_count = len(matches)
+                matches = [
+                    match
+                    for match in matches
+                    if isinstance(match, Mapping)
+                    and isinstance(match.get("channel"), Mapping)
+                    and match["channel"].get("id") == expected_channel
+                ]
+                rejected_matches = rejected_matches or len(matches) != original_count
+            messages.extend(
+                self._render_matches(
+                    cast(list[object], matches[:remaining]), snippet_chars=snippet_chars
+                )
+            )
             if page_count is not None and page >= page_count:
                 break
             if not matches:
@@ -199,6 +287,7 @@ class SlackTaskReader:
         complete = page_count is not None and pages_read >= page_count
         if total_known is not None and len(messages) >= total_known:
             complete = True
+        complete = complete and not rejected_matches
         return {
             "coverage": {
                 "checkpoint_safe": True,

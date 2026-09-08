@@ -10,7 +10,7 @@ import shlex
 import subprocess
 import sys
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +18,7 @@ from typing import Any, cast
 
 import continuity_kernel.update as self_update
 from continuity_kernel import __version__, resident_import, whatsapp
+from continuity_kernel.app_corpus import AppCorpusAdapter, AppCorpusCompanion, AppCorpusSyncResult
 from continuity_kernel.bridge import (
     bridge_status,
     open_bridge,
@@ -47,6 +48,7 @@ from continuity_kernel.config import (
     save_config,
 )
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
+from continuity_kernel.connector_contract import ConnectorMode
 from continuity_kernel.connector_identifiers import parse_connection_id
 from continuity_kernel.connector_onboarding import (
     BrowserMode,
@@ -54,11 +56,18 @@ from continuity_kernel.connector_onboarding import (
     ConnectorOnboarding,
     provider_revocation_guidance,
 )
-from continuity_kernel.connector_operations import CONNECTOR_PROFILE
+from continuity_kernel.connector_operations import (
+    CONNECTOR_PROFILE,
+    CONNECTOR_TOOL_BINDINGS,
+    CONNECTOR_TOOL_NAMES,
+    OPERATION_CATALOG,
+)
 from continuity_kernel.connector_profiles import (
     CONNECTOR_PROFILES,
     ConnectorAccessTier,
 )
+from continuity_kernel.connector_runtime import ConnectorRuntime, default_connector_adapters
+from continuity_kernel.connector_sources import SUPPORTED_SOURCE_IDS, read_connector_source
 from continuity_kernel.control_queue import CONTROL_STORE_SUPPORTED
 from continuity_kernel.demo import run_demo
 from continuity_kernel.direction import direction_aim, direction_dict
@@ -72,7 +81,7 @@ from continuity_kernel.dispatch import (
     evaluate_task_deadline,
     write_task_blocker,
 )
-from continuity_kernel.errors import ContinuityError, SetupError, ValidationError
+from continuity_kernel.errors import ConflictError, ContinuityError, SetupError, ValidationError
 from continuity_kernel.local_source_delivery import (
     RESET_DISPOSITIONS,
     SUPPORTED_LOCAL_SOURCES,
@@ -451,6 +460,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return execution_bindings(vault)
     if args.command == "connectors":
         return _connectors(vault, args)
+    if args.command == "apps":
+        return _apps(vault, args)
     if args.command.startswith("slack-"):
         if args.command == "slack-capabilities":
             return SlackTaskReader.capabilities()
@@ -487,6 +498,13 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "source":
         if args.source_command == "list":
             return {"catalog": list_recipes(), "state": vault.source_status()}
+        if args.source_command == "read":
+            return read_connector_source(
+                vault,
+                connection_id=args.connection_id,
+                source_id=args.source,
+                limit=args.limit,
+            )
         if args.source_command == "select":
             return vault.select_sources(
                 expected_revision=args.expected_revision,
@@ -547,6 +565,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         )
         if args.local_source_command == "status":
             return delivery.status(args.source)
+        if args.local_source_command == "recent":
+            return delivery.recent(args.source, limit=args.limit)
         if args.local_source_command == "baseline":
             return delivery.baseline(args.source)
         if args.local_source_command == "staged-status":
@@ -638,6 +658,43 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "pulse":
         if args.pulse_command == "status":
             return _pulse_status(vault)
+        if args.pulse_command == "reports":
+            from continuity_kernel.pulse_reports import PulseReportStore, pulse_report_dict
+
+            reports = PulseReportStore(vault.root)
+            return pulse_report_dict(
+                reports.show(args.id)
+                if args.id
+                else reports.list_pending(stage=args.stage, limit=args.limit)
+            )
+        if args.pulse_command == "watch":
+            import asyncio
+
+            from continuity_kernel.pulse_runtime import PulseRuntime
+
+            return asyncio.run(
+                PulseRuntime(
+                    vault,
+                    sources=args.source,
+                    poll_seconds=args.poll_seconds,
+                    concurrency=args.concurrency,
+                    diane_bridge=Path(args.diane_bridge) if args.diane_bridge else None,
+                ).run(once=args.once)
+            )
+        if args.pulse_command == "integrate":
+            from continuity_kernel.pulse_delivery import PulseDelivery
+
+            return asdict(
+                PulseDelivery(vault).integrate(
+                    args.id,
+                    expected_revision=args.expected_revision,
+                    pulse_thread_id=args.pulse_thread_id,
+                    result_refs=args.result_ref,
+                    summary=args.summary,
+                    interface_change=args.interface_change,
+                    target_desktop_work_id=args.target_desktop_work_id,
+                )
+            )
         if args.pulse_command == "sweep":
             return sense_sweep(
                 vault,
@@ -912,6 +969,338 @@ def _connectors(vault: Vault, args: argparse.Namespace) -> dict[str, object]:
     raise AssertionError("unreachable connectors command")
 
 
+def _apps(vault: Vault, args: argparse.Namespace) -> Any:
+    """Expose the finite connector runtime and local app corpus from any cwd."""
+
+    corpus = AppCorpusCompanion(vault.root, executable=getattr(args, "executable", "qmd"))
+    if args.apps_command == "status":
+        return {
+            "corpus": asdict(corpus.status()),
+            "scopes": [asdict(item) for item in corpus.scopes()],
+        }
+    if args.apps_command == "configure":
+        _assert_connection_source(vault, args.connection_id, args.adapter)
+        return asdict(
+            corpus.configure(
+                args.connection_id,
+                adapter=args.adapter,
+                settings=_outlook_calendar_delta_settings(args),
+            )
+        )
+    if args.apps_command == "configure-whatsapp":
+        status = whatsapp.inspect_whatsapp(
+            store_root=Path(args.store_root).expanduser() if args.store_root else None
+        )
+        fingerprint = status.account_fingerprint
+        if fingerprint is None:
+            raise ValidationError("WhatsApp linked-account fingerprint is unavailable")
+        return asdict(
+            corpus.configure(
+                args.connection_id,
+                adapter="whatsapp",
+                settings={
+                    "account_fingerprint": fingerprint,
+                    "store_root": str(Path(args.store_root).expanduser())
+                    if args.store_root
+                    else None,
+                },
+            )
+        )
+    if args.apps_command == "configure-notion":
+        return asdict(
+            corpus.configure(
+                args.connection_id,
+                adapter="notion",
+                settings={"config_path": str(Path(args.config_path).expanduser())},
+            )
+        )
+    if args.apps_command == "search":
+        return asdict(
+            corpus.search(
+                args.query,
+                connection_id=args.connection_id,
+                provider=args.provider,
+                limit=args.limit,
+                timeout_seconds=args.timeout,
+            )
+        )
+    if args.apps_command == "read":
+        document = corpus.read(args.connection_id, args.object_id)
+        return asdict(document) if document is not None else {"document": None}
+    if args.apps_command == "refresh":
+        return asdict(corpus.refresh(timeout_seconds=args.timeout))
+    if args.apps_command in {"sync", "sync-all"}:
+        runtime = ConnectorRuntime(vault, adapters=default_connector_adapters())
+        try:
+            recheck_existing = bool(getattr(args, "recheck_existing", False))
+            if args.apps_command == "sync":
+                if recheck_existing and args.adapter != "whatsapp":
+                    raise ValidationError("--recheck-existing is available only for WhatsApp sync")
+                if args.adapter not in {"notion", "whatsapp"}:
+                    _assert_connection_source(vault, args.connection_id, args.adapter)
+                    corpus.configure(
+                        args.connection_id,
+                        adapter=args.adapter,
+                        settings=_outlook_calendar_delta_settings(args),
+                    )
+                adapters = _app_corpus_adapters(runtime, corpus, recheck_existing=recheck_existing)
+                adapter = adapters.get(args.adapter)
+                if adapter is None:
+                    raise ValidationError("configured app corpus adapter is unavailable")
+                return asdict(
+                    corpus.sync(
+                        adapter,
+                        args.connection_id,
+                        limit=args.limit,
+                        timeout_seconds=args.timeout,
+                    )
+                )
+            adapters = _app_corpus_adapters(runtime, corpus, recheck_existing=recheck_existing)
+            return list(corpus.sync_all(adapters, limit=args.limit, timeout_seconds=args.timeout))
+        finally:
+            runtime.close()
+    if args.apps_command == "capabilities":
+        return _app_capabilities(vault)
+    if args.apps_command == "call":
+        if args.tool not in CONNECTOR_TOOL_NAMES:
+            raise ValidationError("app calls must use one listed closed connector tool")
+        _provider, mode = CONNECTOR_TOOL_BINDINGS[args.tool]
+        if args.confirmation_token is not None:
+            raise ValidationError(
+                "CLI confirmation tokens are process-local; use --execute-confirmed after approval"
+            )
+        if args.execute_confirmed and mode is not ConnectorMode.WRITE:
+            raise ValidationError(
+                "--execute-confirmed is available only for connector write operations"
+            )
+        try:
+            input_value = json.loads(args.input)
+        except json.JSONDecodeError as exc:
+            raise ValidationError("app call input must be a JSON value") from exc
+        values: dict[str, object] = {
+            "connection_id": args.connection_id,
+            "input": input_value,
+            "operation": args.operation,
+        }
+        if args.cursor is not None:
+            values["cursor"] = args.cursor
+        runtime = ConnectorRuntime(
+            vault,
+            adapters=default_connector_adapters(),
+            require_confirmation_for_safe_mutations=mode is ConnectorMode.WRITE,
+        )
+        try:
+            preview = runtime.call_tool(args.tool, values)
+            if mode is not ConnectorMode.WRITE:
+                return preview
+            if not args.execute_confirmed:
+                return _cli_write_preview(preview)
+            token = preview.get("confirmation_token")
+            if preview.get("status") != "confirmation_required" or not isinstance(token, str):
+                raise ValidationError("connector write did not produce a confirmation preview")
+            return {
+                "execution": runtime.call_tool(args.tool, {**values, "confirmation_token": token}),
+                "preview": _cli_write_preview(preview),
+                "status": "executed",
+            }
+        finally:
+            runtime.close()
+    raise AssertionError("unreachable apps command")
+
+
+def _cli_write_preview(preview: Mapping[str, object]) -> dict[str, object]:
+    """Keep an unusable process-local confirmation token out of one-shot CLI output."""
+
+    returned = dict(preview)
+    returned.pop("confirmation_token", None)
+    returned["next_action"] = (
+        "After conversational approval, rerun this exact command with --execute-confirmed. "
+        "The confirmation is created and consumed in that one invocation."
+    )
+    return returned
+
+
+def _app_corpus_adapters(
+    runtime: ConnectorRuntime,
+    corpus: AppCorpusCompanion,
+    *,
+    recheck_existing: bool = False,
+) -> dict[str, AppCorpusAdapter]:
+    """Load optional source normalizers without making the generic CLI depend on one provider."""
+
+    try:
+        from continuity_kernel.app_corpus_providers import default_app_corpus_adapters
+    except ImportError:
+        adapters: dict[str, AppCorpusAdapter] = {}
+    else:
+        adapters = dict(default_app_corpus_adapters(runtime))
+    local_adapters: dict[str, dict[str, AppCorpusAdapter]] = {}
+    for scope in corpus.scopes():
+        if scope.adapter == "outlook_calendar":
+            start = scope.settings.get("calendar_delta_start")
+            end = scope.settings.get("calendar_delta_end")
+            if start is None and end is None:
+                calendar_adapter: AppCorpusAdapter = adapters["outlook_calendar"]
+            elif isinstance(start, str) and isinstance(end, str):
+                from continuity_kernel.app_corpus_microsoft_calendar_delta import (
+                    validate_calendar_delta_window,
+                )
+                from continuity_kernel.app_corpus_providers import MicrosoftAppCorpusAdapter
+
+                calendar_adapter = MicrosoftAppCorpusAdapter(
+                    runtime,
+                    sources=frozenset({"outlook_calendar"}),
+                    calendar_delta_window=validate_calendar_delta_window(start, end),
+                )
+            else:
+                raise ValidationError("Outlook Calendar app corpus delta window is invalid")
+            local_adapters.setdefault("outlook_calendar", {})[scope.connection_id] = (
+                calendar_adapter
+            )
+        if scope.adapter == "whatsapp":
+            fingerprint = scope.settings.get("account_fingerprint")
+            root = scope.settings.get("store_root")
+            if not isinstance(fingerprint, str):
+                raise ValidationError("WhatsApp app corpus scope has no account fingerprint")
+            if root is not None and not isinstance(root, str):
+                raise ValidationError("WhatsApp app corpus scope has an invalid store root")
+            from continuity_kernel.app_corpus_whatsapp import WhatsAppAppCorpusAdapter
+
+            local_adapters.setdefault("whatsapp", {})[scope.connection_id] = (
+                WhatsAppAppCorpusAdapter(
+                    account_fingerprint=fingerprint,
+                    store_root=Path(root) if root else None,
+                    recheck_existing=recheck_existing,
+                )
+            )
+        if scope.adapter == "notion":
+            config_path = scope.settings.get("config_path")
+            if not isinstance(config_path, str):
+                raise ValidationError("Notion app corpus scope has no host config")
+            from continuity_kernel.app_corpus_notion import NotionAppCorpusAdapter
+
+            local_adapters.setdefault("notion", {})[scope.connection_id] = NotionAppCorpusAdapter(
+                runtime, config_path=config_path
+            )
+    for name, scoped in local_adapters.items():
+        adapters[name] = _ConnectionScopedCorpusAdapter(scoped)
+    return adapters
+
+
+def _outlook_calendar_delta_settings(args: argparse.Namespace) -> dict[str, str] | None:
+    """Return one explicitly selected primary-calendar delta window, if supplied."""
+
+    start = getattr(args, "calendar_delta_start", None)
+    end = getattr(args, "calendar_delta_end", None)
+    if start is None and end is None:
+        return None
+    if (
+        getattr(args, "adapter", None) != "outlook_calendar"
+        or not isinstance(start, str)
+        or not isinstance(end, str)
+    ):
+        raise ValidationError(
+            "Outlook Calendar delta configuration needs both --calendar-delta-start and "
+            "--calendar-delta-end"
+        )
+    from continuity_kernel.app_corpus_microsoft_calendar_delta import (
+        validate_calendar_delta_window,
+    )
+
+    window = validate_calendar_delta_window(start, end)
+    return {"calendar_delta_start": window.start, "calendar_delta_end": window.end}
+
+
+class _ConnectionScopedCorpusAdapter:
+    """Dispatch a local corpus source only to its configured host account/workspace."""
+
+    def __init__(self, adapters: Mapping[str, AppCorpusAdapter]) -> None:
+        self._adapters = dict(adapters)
+
+    def sync(
+        self,
+        connection_id: str,
+        *,
+        checkpoint: str | None = None,
+        limit: int = 100,
+    ) -> AppCorpusSyncResult:
+        adapter = self._adapters.get(connection_id)
+        if adapter is None:
+            raise ValidationError("local app corpus connection is not configured")
+        return adapter.sync(connection_id, checkpoint=checkpoint, limit=limit)
+
+
+def _assert_connection_source(vault: Vault, connection_id: str, source_id: str) -> None:
+    connection = vault.get_connection_snapshot().connection(connection_id)
+    if connection is None:
+        raise ValidationError("connection was not found")
+    if source_id not in connection.source_ids:
+        raise ValidationError("connection does not authorize this app source")
+
+
+def _app_capabilities(vault: Vault) -> dict[str, object]:
+    status = ConnectorAuthManager(vault).status()
+    connections = status.get("connections")
+    if not isinstance(connections, list):
+        raise ValidationError("connector status is invalid")
+    source_ids = {
+        source
+        for connection in connections
+        if isinstance(connection, dict)
+        for source in connection.get("source_ids", [])
+        if isinstance(source, str)
+    }
+    operations: list[dict[str, object]] = [
+        {
+            "effect": operation.effect.value,
+            "mode": operation.mode.value,
+            "name": operation.name,
+            "source": operation.provider,
+            "tool": f"gsv_{operation.provider}_{operation.mode.value}",
+        }
+        for operation in OPERATION_CATALOG.operations
+        if operation.provider in source_ids
+    ]
+    corpus_scopes = AppCorpusCompanion(vault.root).scopes()
+    for scope in corpus_scopes:
+        if scope.adapter != "whatsapp":
+            continue
+        store_root = scope.settings.get("store_root")
+        if store_root is not None and not isinstance(store_root, str):
+            raise ValidationError("WhatsApp app corpus scope has an invalid store root")
+        from continuity_kernel.app_corpus_whatsapp import whatsapp_app_capabilities
+
+        operations.extend(
+            {
+                **capability,
+                "connection_id": scope.connection_id,
+            }
+            for capability in whatsapp_app_capabilities(
+                store_root=Path(store_root) if store_root else None
+            )
+        )
+    return {
+        "app_corpus_scopes": [
+            {
+                "adapter": scope.adapter,
+                "connection_id": scope.connection_id,
+                "selection": _app_corpus_scope_selection(scope.adapter),
+            }
+            for scope in corpus_scopes
+        ],
+        "connections": connections,
+        "operations": operations,
+    }
+
+
+def _app_corpus_scope_selection(adapter: str) -> str:
+    if adapter == "whatsapp":
+        return "selected local WhatsApp account"
+    if adapter == "notion":
+        return "selected pinned Notion account and workspace"
+    return "selected app source"
+
+
 def _connector_registration_status(
     vault: Vault,
     *,
@@ -1168,9 +1557,32 @@ def _result_failure(args: argparse.Namespace, result: Any) -> tuple[int, str] | 
 
 
 def _pulse_status(vault: Vault) -> dict[str, object]:
+    heartbeat = heartbeat_status(vault.root)
+    from continuity_kernel.pulse_delivery import PulseDelivery
+    from continuity_kernel.pulse_runtime import PulseRuntimeState
+
+    try:
+        signals = vault.resident_signal_status(lock_timeout_seconds=0.0)
+    except ConflictError:
+        signals = {"state": "unavailable", "reason": "resident_signals_lock_busy"}
+
     return {
-        "heartbeat": heartbeat_status(vault.root),
-        "signals": vault.resident_signal_status(),
+        # Keep the original field for existing callers.  It is intentionally
+        # paired with an explicit scope below so a healthy sensor is never read
+        # as proof that the resident AI completed a wake.
+        "heartbeat": heartbeat,
+        "mechanical_sweep": {
+            "failure": heartbeat["failure"] if heartbeat is not None else None,
+            "observed_at": heartbeat["observed_at"] if heartbeat is not None else None,
+            "state": heartbeat["status"] if heartbeat is not None else "unobserved",
+        },
+        "ai_wake": {
+            "reason": "Mechanical sweep status does not record AI Pulse wake completion.",
+            "state": "unobserved",
+        },
+        "signals": signals,
+        "event_runtime": PulseRuntimeState(vault.root).status(),
+        "event_delivery": asdict(PulseDelivery(vault).status()),
     }
 
 
@@ -1997,6 +2409,104 @@ def _parser() -> argparse.ArgumentParser:
     )
     connector_revoke.add_argument("connection_id")
 
+    apps = commands.add_parser(
+        "apps",
+        help="Search selected app content locally and call only closed connector operations.",
+    )
+    apps_commands = apps.add_subparsers(dest="apps_command", required=True)
+    apps_status = apps_commands.add_parser("status", help="Show host-local app corpus coverage.")
+    apps_status.add_argument("--executable", default="qmd")
+    apps_configure = apps_commands.add_parser(
+        "configure", help="Persist one exact connected source for bounded scheduled indexing."
+    )
+    apps_configure.add_argument("--connection-id", required=True)
+    apps_configure.add_argument("--adapter", required=True)
+    apps_configure.add_argument(
+        "--calendar-delta-start",
+        help="Outlook Calendar only: retained primary-calendar delta window start (ISO 8601).",
+    )
+    apps_configure.add_argument(
+        "--calendar-delta-end",
+        help="Outlook Calendar only: retained primary-calendar delta window end (ISO 8601).",
+    )
+    apps_configure_whatsapp = apps_commands.add_parser(
+        "configure-whatsapp",
+        help="Read the linked local WhatsApp account fingerprint and pin it for corpus indexing.",
+    )
+    apps_configure_whatsapp.add_argument("--connection-id", required=True)
+    apps_configure_whatsapp.add_argument("--store-root")
+    apps_configure_notion = apps_commands.add_parser(
+        "configure-notion",
+        help="Pin one Notion desktop-session host config for local corpus indexing.",
+    )
+    apps_configure_notion.add_argument("--connection-id", required=True)
+    apps_configure_notion.add_argument("--config-path", required=True)
+    apps_search = apps_commands.add_parser("search", help="Search host-local selected app content.")
+    apps_search.add_argument("query")
+    apps_search.add_argument("--connection-id")
+    apps_search.add_argument("--provider")
+    apps_search.add_argument("--limit", type=int, default=8)
+    apps_search.add_argument("--timeout", type=int, default=20)
+    apps_search.add_argument("--executable", default="qmd")
+    apps_read = apps_commands.add_parser("read", help="Read one exact host-local app object.")
+    apps_read.add_argument("--connection-id", required=True)
+    apps_read.add_argument("--object-id", required=True)
+    apps_refresh = apps_commands.add_parser("refresh", help="Refresh the local QMD app collection.")
+    apps_refresh.add_argument("--timeout", type=int, default=120)
+    apps_refresh.add_argument("--executable", default="qmd")
+    apps_sync = apps_commands.add_parser(
+        "sync", help="Sync one configured provider page into the local corpus."
+    )
+    apps_sync.add_argument("--connection-id", required=True)
+    apps_sync.add_argument("--adapter", required=True)
+    apps_sync.add_argument("--limit", type=int, default=100)
+    apps_sync.add_argument("--timeout", type=int, default=120)
+    apps_sync.add_argument("--executable", default="qmd")
+    apps_sync.add_argument(
+        "--calendar-delta-start",
+        help="Outlook Calendar only: retain this primary-calendar delta window start (ISO 8601).",
+    )
+    apps_sync.add_argument(
+        "--calendar-delta-end",
+        help="Outlook Calendar only: retain this primary-calendar delta window end (ISO 8601).",
+    )
+    apps_sync.add_argument(
+        "--recheck-existing",
+        action="store_true",
+        help="Run one bounded WhatsApp pass over existing local rows before resuming steady sync.",
+    )
+    apps_sync_all = apps_commands.add_parser(
+        "sync-all",
+        help="Sync only explicitly configured app sources; failures preserve prior content.",
+    )
+    apps_sync_all.add_argument("--limit", type=int, default=100)
+    apps_sync_all.add_argument("--timeout", type=int, default=120)
+    apps_sync_all.add_argument("--executable", default="qmd")
+    apps_commands.add_parser(
+        "capabilities", help="List exact connected source operations and effects."
+    )
+    apps_call = apps_commands.add_parser(
+        "call",
+        help="Call one listed closed connector operation; confirmations stay runtime-enforced.",
+    )
+    apps_call.add_argument("--tool", required=True)
+    apps_call.add_argument("--connection-id", required=True)
+    apps_call.add_argument("--operation", required=True)
+    apps_call.add_argument("--input", required=True)
+    apps_call.add_argument("--cursor")
+    apps_call.add_argument(
+        "--confirmation-token",
+        help="Unsupported for CLI calls: confirmations are process-local. Use --execute-confirmed.",
+    )
+    apps_call.add_argument(
+        "--execute-confirmed",
+        action="store_true",
+        help=(
+            "After conversational approval, create and consume this write confirmation in this "
+            "one invocation."
+        ),
+    )
+
     slack_status = commands.add_parser(
         "slack-status",
         help="Verify the live identity of one portable Slack connection.",
@@ -2054,6 +2564,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     source_commands = source.add_subparsers(dest="source_command", required=True)
     source_commands.add_parser("list")
+    source_read = source_commands.add_parser(
+        "read",
+        help="Read one selected OAuth source without recording its transient result.",
+    )
+    source_read.add_argument("--source", choices=sorted(SUPPORTED_SOURCE_IDS), required=True)
+    source_read.add_argument("--connection-id", required=True)
+    source_read.add_argument("--limit", type=int, default=5)
     source_select = source_commands.add_parser(
         "select",
         help="CAS-replace the user-approved source set; deselection purges its coverage.",
@@ -2136,6 +2653,10 @@ def _parser() -> argparse.ArgumentParser:
     local_source_baseline = local_source_commands.add_parser(
         "baseline", help="Start forward-only delivery at the current aggregate cursor."
     )
+    local_source_recent = local_source_commands.add_parser(
+        "recent",
+        help="Read bounded newest-first WhatsApp context without advancing its delivery cursor.",
+    )
     local_source_poll = local_source_commands.add_parser(
         "poll", help="Read or replay one bounded transient delta without advancing."
     )
@@ -2163,6 +2684,7 @@ def _parser() -> argparse.ArgumentParser:
         local_source_adopt_staged,
     ):
         command.add_argument("--source", choices=SUPPORTED_LOCAL_SOURCES, required=True)
+    local_source_recent.add_argument("--source", choices=("whatsapp",), required=True)
     for command in (
         local_source_baseline,
         local_source_poll,
@@ -2180,6 +2702,7 @@ def _parser() -> argparse.ArgumentParser:
         )
         command.add_argument("--runtime", default=str(whatsapp.DEFAULT_RUNTIME))
         command.add_argument("--service-label")
+    local_source_recent.add_argument("--limit", type=int, default=25)
     local_source_poll.add_argument("--limit", type=int, default=100)
     local_source_ack.add_argument("--token", required=True)
     local_source_ack.add_argument("--expected-source-revision", required=True)
@@ -2264,10 +2787,45 @@ def _parser() -> argparse.ArgumentParser:
         help="Inspect or run one bounded mechanical resident sweep.",
     )
     pulse_commands = pulse.add_subparsers(dest="pulse_command", required=True)
-    pulse_commands.add_parser("status", help="Read the latest content-free sweep heartbeat.")
+    pulse_commands.add_parser(
+        "status",
+        help="Read mechanical sweep health; it does not prove an AI Pulse wake completed.",
+    )
     pulse_commands.add_parser(
         "sweep",
         help="Run one provider-free mechanical sweep and publish its heartbeat.",
+    )
+    pulse_reports = pulse_commands.add_parser(
+        "reports",
+        help="Read bounded derived source reports, never raw provider messages.",
+    )
+    pulse_reports.add_argument("--id")
+    pulse_reports.add_argument(
+        "--stage", choices=("relevance", "delivery", "investigation"), default="delivery"
+    )
+    pulse_reports.add_argument("--limit", type=int, default=8)
+    pulse_watch = pulse_commands.add_parser(
+        "watch",
+        help="Run selected source watchers and event-driven Luna cognition.",
+    )
+    pulse_watch.add_argument("--source", action="append")
+    pulse_watch.add_argument("--poll-seconds", type=float, default=60)
+    pulse_watch.add_argument("--concurrency", type=int, default=2)
+    pulse_watch.add_argument("--once", action="store_true")
+    pulse_watch.add_argument("--diane-bridge")
+    pulse_integrate = pulse_commands.add_parser(
+        "integrate",
+        help="Record exact Pulse integration and optionally request Diane curation.",
+    )
+    pulse_integrate.add_argument("--id", required=True)
+    pulse_integrate.add_argument("--expected-revision", required=True)
+    pulse_integrate.add_argument("--pulse-thread-id", required=True)
+    pulse_integrate.add_argument("--result-ref", action="append", required=True)
+    pulse_integrate.add_argument("--summary", required=True)
+    pulse_integrate.add_argument("--interface-change", action="store_true")
+    pulse_integrate.add_argument(
+        "--target-desktop-work-id",
+        help="Existing desktop task UUID, verified against a supplied canonical task result.",
     )
 
     scheduler = commands.add_parser(

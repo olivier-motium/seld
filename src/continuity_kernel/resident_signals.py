@@ -173,7 +173,9 @@ class ResidentSignalStore:
         return self.root / "compaction.json"
 
     @contextmanager
-    def _transaction(self) -> Iterator[PinnedPathRoot | None]:
+    def _transaction(
+        self, *, lock_timeout_seconds: float = 10.0
+    ) -> Iterator[PinnedPathRoot | None]:
         """Serialize one mailbox operation beneath a single pinned signals binding."""
 
         store: PinnedPathRoot | None = None
@@ -181,7 +183,7 @@ class ResidentSignalStore:
             try:
                 if not PINNED_PATH_ROOT_SUPPORTED:
                     self.root.mkdir(parents=True, exist_ok=True)
-                    with exclusive_lock(self.lock_path):
+                    with exclusive_lock(self.lock_path, timeout=lock_timeout_seconds):
                         yield None
                     return
                 store = PinnedPathRoot(self.vault_root)
@@ -189,7 +191,9 @@ class ResidentSignalStore:
                     store.watch_directory(".gsv", create=True),
                     store.watch_directory(".gsv/locks", create=True),
                     store.bind_directory(".gsv/signals", create=True),
-                    store.exclusive_file_lock(".gsv/locks/resident-signals.lock"),
+                    store.exclusive_file_lock(
+                        ".gsv/locks/resident-signals.lock", timeout=lock_timeout_seconds
+                    ),
                 ):
                     yield store
             except DurablePublishError as exc:
@@ -308,9 +312,14 @@ class ResidentSignalStore:
             raise NotFoundError(f"resident signal does not exist: {clean_id}")
         return match
 
-    def status(self, *, verify_archive_history: bool = False) -> SignalQueueStatus:
+    def status(
+        self,
+        *,
+        verify_archive_history: bool = False,
+        lock_timeout_seconds: float = 10.0,
+    ) -> SignalQueueStatus:
         """Validate the complete live queue and return content-free counts."""
-        with self._transaction() as store:
+        with self._transaction(lock_timeout_seconds=lock_timeout_seconds) as store:
             inputs_state, acknowledgements_state, settled_state = self._read_state(
                 store,
                 verify_archive_history=verify_archive_history,

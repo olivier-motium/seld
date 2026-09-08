@@ -11,8 +11,9 @@ from typing import Any, cast
 
 import pytest
 
+import continuity_kernel.mcp_server as mcp_server
+import continuity_kernel.resident_import as resident_import
 import continuity_kernel.update as self_update
-from continuity_kernel import mcp_server, resident_import
 from continuity_kernel.connector_auth import (
     AccountMetadata,
     ClientKind,
@@ -744,6 +745,9 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         _close(process)
 
     expected = {
+        "gsv_apps_read",
+        "gsv_apps_search",
+        "gsv_apps_status",
         "gsv_backup_create",
         "gsv_context",
         "gsv_connection_list",
@@ -779,6 +783,7 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         "gsv_local_source_baseline",
         "gsv_local_source_poll",
         "gsv_local_source_rebaseline",
+        "gsv_local_source_recent",
         "gsv_local_source_staged_status",
         "gsv_local_source_status",
         "gsv_operation_accept",
@@ -789,6 +794,9 @@ def test_default_mcp_profile_remains_the_full_backwards_compatible_surface(
         "gsv_portfolio_migrate_review_session",
         "gsv_portfolio_set",
         "gsv_portfolio_show",
+        "gsv_pulse_report_integrate",
+        "gsv_pulse_report_list",
+        "gsv_pulse_report_show",
         "gsv_pulse_status",
         "gsv_pulse_sweep",
         "gsv_recall_search",

@@ -16,7 +16,7 @@ from typing import Any, cast
 import pytest
 
 import continuity_kernel.bridge_launcher as launcher
-from continuity_kernel import cli
+import continuity_kernel.cli as cli
 from continuity_kernel.bridge_launcher import (
     APP_BUNDLE_NAME,
     BUNDLE_IDENTIFIER,

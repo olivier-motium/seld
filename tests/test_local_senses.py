@@ -200,6 +200,44 @@ def test_whatsapp_service_probe_fails_closed_without_callable_posix_uid(
     assert not any(call[:2] == ("/bin/launchctl", "print") for call in calls)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="the standalone WhatsApp service uses launchd")
+def test_whatsapp_service_probe_accepts_a_running_versioned_runtime_alias() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(*args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = args[0]
+        assert isinstance(command, list)
+        normalized = tuple(str(part) for part in command)
+        calls.append(normalized)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "state = running\n"
+                "program = /private/runtime/wacli-quoted-alias/wacli\n"
+                "arguments = {\n"
+                "  /private/runtime/wacli-quoted-alias/wacli\n"
+                "  --store\n"
+                "  /private/store\n"
+                "  sync\n"
+                "  --follow\n"
+                "}\n"
+            ),
+            stderr="",
+        )
+
+    uid = getattr(os, "getuid", None)
+    assert callable(uid)
+    assert whatsapp._service_running(whatsapp.DEFAULT_SERVICE_LABEL, runner=runner)
+    assert calls == [
+        (
+            "/bin/launchctl",
+            "print",
+            f"gui/{uid()}/{whatsapp.DEFAULT_SERVICE_LABEL}",
+        )
+    ]
+
+
 def test_apple_messages_forward_baseline_replays_until_verified_ack(tmp_path: Path) -> None:
     store = tmp_path / "Messages"
     database = _apple_store(store)

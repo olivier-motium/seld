@@ -18,7 +18,9 @@ MAIL_NAMES = frozenset(
     {
         "folders.list",
         "folders.get",
+        "folders.delta",
         "messages.list",
+        "messages.delta",
         "messages.get",
         "messages.mime",
         "attachments.list",
@@ -50,6 +52,7 @@ CALENDAR_NAMES = frozenset(
         "calendars.list",
         "calendars.get",
         "events.list",
+        "events.delta",
         "events.get",
         "events.window",
         "events.instances",
@@ -108,9 +111,9 @@ def test_microsoft_catalog_has_the_exact_mail_and_calendar_operation_sets() -> N
         operation for operation in MICROSOFT_OPERATIONS if operation.provider == "outlook_calendar"
     )
 
-    assert len(MICROSOFT_OPERATIONS) == 51
-    assert len(mail) == 27
-    assert len(calendar) == 24
+    assert len(MICROSOFT_OPERATIONS) == 54
+    assert len(mail) == 29
+    assert len(calendar) == 25
     assert {operation.name for operation in mail} == MAIL_NAMES
     assert {operation.name for operation in calendar} == CALENDAR_NAMES
     assert all(operation.endpoint == operation.name for operation in MICROSOFT_OPERATIONS)
@@ -223,6 +226,31 @@ def test_message_page_size_and_follow_up_status_are_bounded(catalog: OperationCa
         )
 
 
+def test_graph_delta_reads_are_closed_and_reuse_existing_mail_read_scope(
+    catalog: OperationCatalog,
+) -> None:
+    folders = catalog.lookup("outlook_mail", ConnectorMode.READ, "folders.delta")
+    messages = catalog.lookup("outlook_mail", ConnectorMode.READ, "messages.delta")
+
+    assert folders.effect is ConnectorEffect.READ
+    assert messages.effect is ConnectorEffect.READ
+    assert folders.required_scopes == (frozenset({"Mail.Read"}), frozenset({"Mail.ReadWrite"}))
+    assert messages.required_scopes == folders.required_scopes
+    assert catalog.validate_input(
+        "outlook_mail", ConnectorMode.READ, "folders.delta", {"page_size": 100}
+    ) == {"page_size": 100}
+    assert catalog.validate_input(
+        "outlook_mail",
+        ConnectorMode.READ,
+        "messages.delta",
+        {"folder_id": "folder-1", "page_size": 1_000},
+    ) == {"folder_id": "folder-1", "page_size": 1_000}
+    with pytest.raises(ValidationError):
+        catalog.validate_input(
+            "outlook_mail", ConnectorMode.READ, "messages.delta", {"page_size": 10}
+        )
+
+
 def test_message_list_schema_exposes_only_provider_valid_query_combinations(
     catalog: OperationCatalog,
 ) -> None:
@@ -232,6 +260,11 @@ def test_message_list_schema_exposes_only_provider_valid_query_combinations(
         {"is_read": False, "page_size": 25},
         {"order_by": "received_at"},
         {"order_by": "subject", "sort_direction": "descending"},
+        {
+            "last_modified_since": "2026-09-05T10:00:00Z",
+            "order_by": "last_modified_at",
+            "sort_direction": "descending",
+        },
         {"search": "from:ada@example.test", "page_size": 50},
     )
     for value in valid:
@@ -250,6 +283,8 @@ def test_message_list_schema_exposes_only_provider_valid_query_combinations(
         {"sort_direction": "ascending"},
         {"is_read": True, "order_by": "received_at"},
         {"is_read": True, "search": "subject:planning"},
+        {"last_modified_since": "2026-09-05"},
+        {"last_modified_since": "2026-09-05T10:00:00Z", "search": "subject:planning"},
         {"order_by": "sent_at", "search": "subject:planning"},
         {"search": "subject:planning", "sort_direction": "descending"},
     )

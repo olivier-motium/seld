@@ -6,7 +6,9 @@ import base64
 import binascii
 import importlib
 import threading
-from typing import Final, Protocol, cast
+from ctypes import c_int32, c_long, c_void_p, create_string_buffer
+from ctypes import cast as ctypes_cast
+from typing import Any, Final, Protocol, cast
 
 from continuity_kernel.connector_identifiers import (
     ConnectionId,
@@ -17,6 +19,7 @@ from continuity_kernel.connector_identifiers import (
 from continuity_kernel.errors import SetupError, ValidationError
 
 MAX_SECRET_BYTES: Final = 1024 * 1024
+_MACOS_KEYRING_MODULE: Final = "keyring.backends.macOS"
 _SECURE_KEYRING_MODULES: Final = (
     "keyring.backends.macOS",
     "keyring.backends.SecretService",
@@ -70,6 +73,7 @@ class KeyringSecretStore:
     def __init__(self, service_name: str = "seld.connector-auth") -> None:
         self._service_name = _service_name(service_name)
         self._module: _KeyringModule | None = None
+        self._backend_module: str | None = None
 
     def get_secret(self, connection_id: ConnectionId, name: SecretName) -> bytes | None:
         username = _secret_username(connection_id, name)
@@ -93,7 +97,14 @@ class KeyringSecretStore:
         username = _secret_username(connection_id, name)
         encoded = "v1:" + base64.b64encode(_secret_bytes(value)).decode("ascii")
         try:
-            self._keyring().set_password(self._service_name, username, encoded)
+            module = self._keyring()
+            if self._backend_module == _MACOS_KEYRING_MODULE or (
+                self._backend_module is not None
+                and self._backend_module.startswith(f"{_MACOS_KEYRING_MODULE}.")
+            ):
+                _set_macos_generic_password(self._service_name, username, encoded)
+            else:
+                module.set_password(self._service_name, username, encoded)
         except SetupError:
             raise
         except Exception as exc:
@@ -125,7 +136,63 @@ class KeyringSecretStore:
         if priority <= 0 or not approved:
             raise SetupError("the selected keyring backend is not an approved OS keyring")
         self._module = module
+        self._backend_module = backend_module
         return module
+
+
+def _set_macos_generic_password(service: str, username: str, password: str) -> None:
+    """Replace only the data of an existing macOS generic-password item."""
+    api = cast(Any, importlib.import_module("keyring.backends.macOS.api"))
+    value_data = _macos_cf_data(api, password)
+    query: object | None = None
+    attributes: object | None = None
+    item: object | None = None
+    try:
+        query = api.create_query(
+            kSecClass=api.k_("kSecClassGenericPassword"),
+            kSecAttrService=service,
+            kSecAttrAccount=username,
+        )
+        attributes = api.create_query(kSecValueData=value_data)
+        update = api._sec.SecItemUpdate
+        update.restype = c_int32
+        update.argtypes = (c_void_p, c_void_p)
+        status = update(query, attributes)
+        if status == api.error.item_not_found:
+            item = api.create_query(
+                kSecClass=api.k_("kSecClassGenericPassword"),
+                kSecAttrService=service,
+                kSecAttrAccount=username,
+                kSecValueData=value_data,
+            )
+            status = api.SecItemAdd(item, None)
+        api.Error.raise_for_status(status)
+    finally:
+        _release_macos_cf(api, item)
+        _release_macos_cf(api, attributes)
+        _release_macos_cf(api, query)
+        _release_macos_cf(api, value_data)
+
+
+def _macos_cf_data(api: Any, value: str) -> object:
+    encoded = value.encode("utf-8")
+    buffer = create_string_buffer(encoded)
+    create = api._found.CFDataCreate
+    create.restype = c_void_p
+    create.argtypes = (c_void_p, c_void_p, c_long)
+    data = create(None, ctypes_cast(buffer, c_void_p), len(encoded))
+    if not data:
+        raise RuntimeError("macOS Keychain value data could not be created")
+    return c_void_p(data) if isinstance(data, int) else data
+
+
+def _release_macos_cf(api: Any, value: object | None) -> None:
+    if value is None:
+        return
+    release = api._found.CFRelease
+    release.restype = None
+    release.argtypes = (c_void_p,)
+    release(value)
 
 
 def _secret_key(connection_id: ConnectionId, name: SecretName) -> tuple[ConnectionId, SecretName]:

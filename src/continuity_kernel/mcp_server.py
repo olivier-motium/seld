@@ -15,6 +15,7 @@ from typing import IO, Any, Final, cast
 
 import continuity_kernel.update as self_update
 from continuity_kernel import __version__, resident_import
+from continuity_kernel.app_corpus import AppCorpusCompanion
 from continuity_kernel.config import resolve_vault
 from continuity_kernel.connector_auth_manager import ConnectorAuthManager
 from continuity_kernel.connector_contract import validate_json
@@ -392,6 +393,11 @@ def _call(
         )
     if name == "gsv_local_source_status":
         return LocalSourceDelivery(vault).status(_string(values, "source"))
+    if name == "gsv_local_source_recent":
+        return LocalSourceDelivery(vault).recent(
+            _string(values, "source"),
+            limit=_integer(values, "limit", 25),
+        )
     if name == "gsv_local_source_baseline":
         return LocalSourceDelivery(vault).baseline(_string(values, "source"))
     if name == "gsv_local_source_staged_status":
@@ -459,10 +465,46 @@ def _call(
             retain_recent=_integer(values, "retain_recent", 1_000)
         )
     if name == "gsv_pulse_status":
+        from continuity_kernel.pulse_delivery import PulseDelivery
+        from continuity_kernel.pulse_runtime import PulseRuntimeState
+
         return {
             "heartbeat": heartbeat_status(vault.root),
             "signals": vault.resident_signal_status(),
+            "event_runtime": PulseRuntimeState(vault.root).status(),
+            "event_delivery": asdict(PulseDelivery(vault).status()),
         }
+    if name == "gsv_pulse_report_list":
+        from continuity_kernel.pulse_reports import (
+            PulsePendingStage,
+            PulseReportStore,
+            pulse_report_dict,
+        )
+
+        return pulse_report_dict(
+            PulseReportStore(vault.root).list_pending(
+                stage=cast(PulsePendingStage, _string(values, "stage")),
+                limit=_integer(values, "limit", 8),
+            )
+        )
+    if name == "gsv_pulse_report_show":
+        from continuity_kernel.pulse_reports import PulseReportStore, pulse_report_dict
+
+        return pulse_report_dict(PulseReportStore(vault.root).show(_string(values, "id")))
+    if name == "gsv_pulse_report_integrate":
+        from continuity_kernel.pulse_delivery import PulseDelivery
+
+        return asdict(
+            PulseDelivery(vault).integrate(
+                _string(values, "id"),
+                expected_revision=_string(values, "expected_revision"),
+                pulse_thread_id=_string(values, "pulse_thread_id"),
+                result_refs=_strings(values, "result_refs"),
+                summary=_string(values, "summary"),
+                interface_change=values.get("interface_change", False),
+                target_desktop_work_id=_optional_string(values, "target_desktop_work_id"),
+            )
+        )
     if name == "gsv_pulse_sweep":
         return sense_sweep(vault).to_dict()
     if name == "gsv_recall_status":
@@ -479,6 +521,27 @@ def _call(
                 timeout_seconds=_integer(values, "timeout_seconds", 20),
             )
         )
+    if name == "gsv_apps_status":
+        corpus = AppCorpusCompanion(vault.root)
+        return {
+            "corpus": asdict(corpus.status()),
+            "scopes": [asdict(item) for item in corpus.scopes()],
+        }
+    if name == "gsv_apps_search":
+        return asdict(
+            AppCorpusCompanion(vault.root).search(
+                _string(values, "query"),
+                connection_id=_optional_string(values, "connection_id"),
+                provider=_optional_string(values, "provider"),
+                limit=_integer(values, "limit", 8),
+                timeout_seconds=_integer(values, "timeout_seconds", 20),
+            )
+        )
+    if name == "gsv_apps_read":
+        document = AppCorpusCompanion(vault.root).read(
+            _string(values, "connection_id"), _string(values, "object_id")
+        )
+        return asdict(document) if document is not None else {"document": None}
     if name == "gsv_task_list":
         return _task_list_page(vault, values)
     if name == "gsv_task_show":
@@ -1543,6 +1606,20 @@ TOOLS: Final = [
         read_only=False,
     ),
     _tool(
+        "gsv_local_source_recent",
+        (
+            "Read up to 25 newest WhatsApp messages as partial transient context. "
+            "It preserves the unread delivery backlog and never creates a pending token, "
+            "advances coverage, writes provider state, sends, reacts, or replies."
+        ),
+        {
+            "limit": {"maximum": 25, "minimum": 1, "type": "integer"},
+            "source": {"enum": ["whatsapp"], "type": "string"},
+        },
+        ("source",),
+        read_only=True,
+    ),
+    _tool(
         "gsv_local_source_poll",
         (
             "Read or replay one bounded transient Apple Messages or WhatsApp delta. Returned "
@@ -1700,6 +1777,49 @@ TOOLS: Final = [
         read_only=False,
     ),
     _tool(
+        "gsv_pulse_report_list",
+        "Read derived reports awaiting relevance, investigation, or Pulse integration.",
+        {
+            "stage": {"type": "string", "enum": ["relevance", "investigation", "delivery"]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        },
+        ("stage",),
+        read_only=True,
+    ),
+    _tool(
+        "gsv_pulse_report_show",
+        "Read one exact derived source report and its current revision.",
+        {"id": TEXT},
+        ("id",),
+        read_only=True,
+    ),
+    _tool(
+        "gsv_pulse_report_integrate",
+        (
+            "Record a source report's semantic result after native canonical readback. Only the "
+            "bound Pulse task may integrate it. An interface change creates a durable, targeted "
+            "Diane curation request; that request is not proof of a visible update."
+        ),
+        {
+            "id": TEXT,
+            "expected_revision": TEXT,
+            "pulse_thread_id": TEXT,
+            "result_refs": TEXTS,
+            "summary": {"type": "string", "maxLength": 2000},
+            "interface_change": {"type": "boolean"},
+            "target_desktop_work_id": TEXT,
+        },
+        (
+            "id",
+            "expected_revision",
+            "pulse_thread_id",
+            "result_refs",
+            "summary",
+            "interface_change",
+        ),
+        read_only=False,
+    ),
+    _tool(
         "gsv_recall_status",
         (
             "Read the host-local QMD readiness and current canonical Markdown fingerprint. "
@@ -1720,6 +1840,38 @@ TOOLS: Final = [
             "timeout_seconds": {"maximum": 60, "minimum": 1, "type": "integer"},
         },
         ("query",),
+        read_only=True,
+    ),
+    _tool(
+        "gsv_apps_status",
+        (
+            "Read selected app corpus coverage and local QMD readiness. Provider content stays "
+            "outside the Seld vault. This does not contact a provider."
+        ),
+        {},
+        read_only=True,
+    ),
+    _tool(
+        "gsv_apps_search",
+        (
+            "Search the host-local corpus of explicitly selected app content. Scope results with "
+            "one exact connection or provider when the current work requires it."
+        ),
+        {
+            "connection_id": TEXT,
+            "limit": {"maximum": 20, "minimum": 1, "type": "integer"},
+            "provider": TEXT,
+            "query": TEXT,
+            "timeout_seconds": {"maximum": 60, "minimum": 1, "type": "integer"},
+        },
+        ("query",),
+        read_only=True,
+    ),
+    _tool(
+        "gsv_apps_read",
+        "Read one exact host-local app object by its connection and source object IDs.",
+        {"connection_id": TEXT, "object_id": TEXT},
+        ("connection_id", "object_id"),
         read_only=True,
     ),
     _tool(

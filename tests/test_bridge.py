@@ -24,8 +24,11 @@ from urllib.request import ProxyHandler, Request, urlopen
 
 import pytest
 
+import continuity_kernel.bridge as bridge
+import continuity_kernel.bridge_projection as bridge_projection
+import continuity_kernel.mcp_server as mcp_server
 import continuity_kernel.update as self_update
-from continuity_kernel import __version__, bridge, bridge_projection, mcp_server
+from continuity_kernel import __version__
 from continuity_kernel import control_queue as control_queue_module
 from continuity_kernel.config import data_dir
 from continuity_kernel.control_queue import (

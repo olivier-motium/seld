@@ -1095,6 +1095,16 @@ def _drive_list() -> dict[str, object]:
     )
 
 
+def _drive_changes() -> dict[str, object]:
+    return _object(
+        {
+            "page_size": {"maximum": 1_000, "minimum": 1, "type": "integer"},
+            "start_change_id": _text(4_096),
+        },
+        required=("start_change_id",),
+    )
+
+
 def _shared_drive_list() -> dict[str, object]:
     return _object(
         {
@@ -2043,6 +2053,22 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
     _operation(
         "google_drive",
         ConnectorMode.READ,
+        "changes.get_start_page_token",
+        ConnectorEffect.READ,
+        _DRIVE_METADATA_SCOPES,
+        _object({}),
+    ),
+    _operation(
+        "google_drive",
+        ConnectorMode.READ,
+        "changes.list",
+        ConnectorEffect.READ,
+        _DRIVE_METADATA_SCOPES,
+        _drive_changes(),
+    ),
+    _operation(
+        "google_drive",
+        ConnectorMode.READ,
         "files.get",
         ConnectorEffect.READ,
         _DRIVE_METADATA_SCOPES,
@@ -2065,6 +2091,7 @@ GOOGLE_OPERATIONS: Final[tuple[OperationSpec, ...]] = (
         _drive_content_schema(
             {
                 "file_id": _id(),
+                "resource_key": _drive_resource_key(),
                 "supports_all_drives": {"type": "boolean"},
             },
             ("file_id",),

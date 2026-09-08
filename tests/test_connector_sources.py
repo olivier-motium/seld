@@ -890,7 +890,7 @@ def test_provider_auth_rejection_requires_reauthorization_before_retry(
     assert provider_calls == 1
 
 
-def test_slack_reads_recent_messages_across_visible_conversations(
+def test_slack_reads_recent_messages_from_one_search(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -902,7 +902,6 @@ def test_slack_reads_recent_messages_across_visible_conversations(
     )
     channel_id = "C123456789"
     dm_id = "D123456789"
-    unavailable_dm_id = "D987654321"
     team_id = "T123456789"
     user_id = "U123456789"
     channel_timestamp = f"{int(BASE_TIME.timestamp())}.000001"
@@ -917,39 +916,33 @@ def test_slack_reads_recent_messages_across_visible_conversations(
         parsed = urlsplit(url)
         if parsed.path == "/api/auth.test":
             return {"ok": True, "team_id": team_id, "user_id": user_id}
-        if parsed.path == "/api/conversations.list":
+        if parsed.path == "/api/search.messages":
             assert parse_qs(parsed.query) == {
-                "exclude_archived": ["true"],
-                "limit": ["50"],
-                "types": ["public_channel,private_channel,mpim,im"],
+                "query": ["after:1970-01-01"],
+                "count": ["25"],
+                "sort": ["timestamp"],
+                "sort_dir": ["desc"],
             }
             return {
                 "ok": True,
-                "channels": [
-                    {"id": channel_id},
-                    {"id": dm_id},
-                    {"id": unavailable_dm_id},
-                ],
-                "response_metadata": {"next_cursor": ""},
-            }
-        if parsed.path == "/api/conversations.history":
-            query = parse_qs(parsed.query)
-            assert query["limit"] == ["1"]
-            if query["channel"] == [unavailable_dm_id]:
-                return {"ok": False, "error": "channel_not_found"}
-            timestamp = dm_timestamp if query["channel"] == [dm_id] else channel_timestamp
-            return {
-                "ok": True,
-                "messages": [
-                    {
-                        "type": "message",
-                        "user": user_id,
-                        "text": "x" * 600,
-                        "ts": timestamp,
-                    }
-                ],
-                "has_more": False,
-                "response_metadata": {"next_cursor": ""},
+                "messages": {
+                    "matches": [
+                        {
+                            "type": "message",
+                            "channel": {"id": channel_id},
+                            "user": user_id,
+                            "text": "x" * 600,
+                            "ts": channel_timestamp,
+                        },
+                        {
+                            "type": "im",
+                            "channel": {"id": dm_id},
+                            "user": user_id,
+                            "text": "x" * 600,
+                            "ts": dm_timestamp,
+                        },
+                    ]
+                },
             }
         pytest.fail("unexpected fixed Slack endpoint")
 
@@ -971,14 +964,13 @@ def test_slack_reads_recent_messages_across_visible_conversations(
     assert str(items[0]["authorRef"]).startswith("sha256:")
     record = cast(dict[str, object], delivery["record"])
     assert record["completeness"] == "partial"
-    assert len(calls) == 5
+    assert len(calls) == 2
     serialized_delivery = json.dumps(delivery, sort_keys=True)
     for private_value in (
         TOKEN,
         "ambient-token-must-not-be-used",
         channel_id,
         dm_id,
-        unavailable_dm_id,
         team_id,
         user_id,
         channel_timestamp,
@@ -990,43 +982,36 @@ def test_slack_reads_recent_messages_across_visible_conversations(
     assert "x" * 100 not in stored
 
 
-def _slack_conversation_reader(
+def _slack_search_reader(
     readable: dict[str, tuple[str, str]],
-    *,
-    unreadable: dict[str, str] | None = None,
 ) -> Callable[[str, Mapping[str, str], float], object]:
-    """Serve one bounded message for each readable conversation of a fixed workspace."""
-
-    rejected = unreadable or {}
+    """Serve bounded search matches for a fixed workspace."""
 
     def get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
         del headers, timeout
         parsed = urlsplit(url)
         if parsed.path == "/api/auth.test":
             return {"ok": True, "team_id": "T123456789", "user_id": "U123456789"}
-        if parsed.path == "/api/conversations.list":
+        if parsed.path == "/api/search.messages":
+            count = int(parse_qs(parsed.query)["count"][0])
             return {
                 "ok": True,
-                "channels": [{"id": channel} for channel in (*readable, *rejected)],
-                "response_metadata": {"next_cursor": ""},
-            }
-        if parsed.path == "/api/conversations.history":
-            channel = parse_qs(parsed.query)["channel"][0]
-            if channel in rejected:
-                return {"ok": False, "error": rejected[channel]}
-            timestamp, text = readable[channel]
-            return {
-                "ok": True,
-                "messages": [
-                    {
-                        "type": "message",
-                        "user": "U123456789",
-                        "text": text,
-                        "ts": timestamp,
-                    }
-                ],
-                "has_more": False,
-                "response_metadata": {"next_cursor": ""},
+                "messages": {
+                    "matches": [
+                        {
+                            "type": "message",
+                            "channel": {"id": channel},
+                            "user": "U123456789",
+                            "text": text,
+                            "ts": timestamp,
+                        }
+                        for channel, (timestamp, text) in sorted(
+                            readable.items(),
+                            key=lambda entry: entry[1][0],
+                            reverse=True,
+                        )[:count]
+                    ]
+                },
             }
         pytest.fail("unexpected fixed Slack endpoint")
 
@@ -1057,7 +1042,7 @@ def test_slack_evidence_refs_stay_bound_to_their_message_after_sort_and_truncati
             monkeypatch,
             vault=vault,
             manager=manager,
-            get_json=_slack_conversation_reader(channels),
+            get_json=_slack_search_reader(channels),
         )
         delivery = read_connector_source(
             vault,
@@ -1082,57 +1067,6 @@ def test_slack_evidence_refs_stay_bound_to_their_message_after_sort_and_truncati
     assert [item["text"] for item in items] == ["newest", "middle"]
     assert items == [alone["newest"][0], alone["middle"][0]]
     assert refs == [alone["newest"][1], alone["middle"][1]]
-
-
-def test_slack_omits_one_unreadable_conversation_but_fails_a_wholly_unreadable_read(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    vault, manager, connection_id = _prepared(
-        tmp_path,
-        source_id="slack",
-        provider="slack",
-        marker="x",
-    )
-    timestamp = f"{int(BASE_TIME.timestamp())}.000001"
-    _install_reader(
-        monkeypatch,
-        vault=vault,
-        manager=manager,
-        get_json=_slack_conversation_reader(
-            {"C111111111": (timestamp, "readable")},
-            unreadable={"C222222222": "not_in_channel"},
-        ),
-    )
-    delivery = read_connector_source(
-        vault,
-        connection_id=str(connection_id),
-        source_id="slack",
-        limit=25,
-        observed_at=BASE_TIME,
-    )
-    items = cast(list[dict[str, object]], delivery["items"])
-    record = cast(dict[str, object], delivery["record"])
-
-    assert delivery["result"] == "success"
-    assert [item["text"] for item in items] == ["readable"]
-    assert record["completeness"] == "partial"
-
-    _install_reader(
-        monkeypatch,
-        vault=vault,
-        manager=manager,
-        get_json=_slack_conversation_reader({}, unreadable={"C222222222": "not_in_channel"}),
-    )
-    blocked = read_connector_source(
-        vault,
-        connection_id=str(connection_id),
-        source_id="slack",
-        limit=25,
-        observed_at=BASE_TIME,
-    )
-
-    assert blocked["errorCode"] == "permission_denied"
 
 
 def test_slack_requires_ok_and_rejects_bot_identity(
@@ -1181,31 +1115,25 @@ def test_slack_requires_ok_and_rejects_bot_identity(
         assert failure["errorCode"] == expected_error
 
 
-def test_slack_history_error_and_credential_rotation_fail_closed(
+def test_slack_search_error_and_credential_rotation_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("SLACK_CHANNEL_ID", "C123456789")
     vault, manager, connection_id = _prepared(
         tmp_path,
         source_id="slack",
         provider="slack",
         marker="p",
     )
-    history_calls = 0
+    search_calls = 0
 
     def get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
-        nonlocal history_calls
+        nonlocal search_calls
         del headers, timeout
         if url.endswith("/auth.test"):
             return {"ok": True, "team_id": "T123456789", "user_id": "U123456789"}
-        if "/conversations.list?" in url:
-            return {
-                "ok": True,
-                "channels": [{"id": "C123456789"}],
-                "response_metadata": {"next_cursor": ""},
-            }
-        history_calls += 1
+        assert "/search.messages?" in url
+        search_calls += 1
         return {"ok": False, "error": "missing_scope"}
 
     _install_reader(monkeypatch, vault=vault, manager=manager, get_json=get_json)
@@ -1216,7 +1144,7 @@ def test_slack_history_error_and_credential_rotation_fail_closed(
         observed_at=BASE_TIME,
     )
     assert denied["errorCode"] == "permission_denied"
-    assert history_calls == 1
+    assert search_calls == 1
 
     def rotating_get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
         del headers, timeout
@@ -1298,27 +1226,21 @@ class _SuccessOpener:
         return self.response
 
 
-def test_http_boundary_allows_exact_slack_conversation_reads(
+def test_http_boundary_allows_exact_slack_search_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opener = _SuccessOpener(_JSONResponse(b'{"ok":true,"messages":[]}'))
     monkeypatch.setattr(connector_http, "build_opener", lambda *handlers: opener)
 
-    listing = connector_http.get_json(
+    result = connector_http.get_json(
         (
-            "https://slack.com/api/conversations.list?"
-            "exclude_archived=true&limit=50&types=public_channel,private_channel,mpim,im"
+            "https://slack.com/api/search.messages?"
+            "query=after%3A1970-01-01&count=15&sort=timestamp&sort_dir=desc"
         ),
         {"Accept": "application/json", "Authorization": "Bearer synthetic"},
         3.0,
     )
-    result = connector_http.get_json(
-        "https://slack.com/api/conversations.history?channel=C123456789&limit=15",
-        {"Accept": "application/json", "Authorization": "Bearer synthetic"},
-        3.0,
-    )
 
-    assert listing == {"ok": True, "messages": []}
     assert result == {"ok": True, "messages": []}
     assert opener.request is not None
     assert opener.request.get_method() == "GET"
@@ -1373,3 +1295,65 @@ def test_http_boundary_rejects_redirects_without_network(
                 {"Accept": "application/json", "Authorization": "Bearer synthetic"},
                 3.0,
             )
+
+
+def test_slack_source_reads_each_approved_channel_without_global_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from continuity_kernel.slack_channel_access import SlackChannelAccessPolicy
+
+    vault, manager, connection_id = _prepared(
+        tmp_path, source_id="slack", provider="slack", marker="z"
+    )
+    policy = SlackChannelAccessPolicy(
+        workspace_id="T123456789",
+        connection_ids=frozenset({str(connection_id)}),
+        channel_names={"C123456789": "project", "C987654321": "support"},
+        pending_channel_names=frozenset(),
+    )
+    monkeypatch.setattr(connector_sources, "load_slack_channel_access", lambda _: policy)
+
+    def verified(connection: str, workspace: str) -> SlackChannelAccessPolicy:
+        assert connection == str(connection_id)
+        assert workspace == policy.workspace_id
+        return policy
+
+    monkeypatch.setattr(connector_sources, "policy_for_verified_slack_workspace", verified)
+    queries: list[str] = []
+
+    def get_json(url: str, headers: Mapping[str, str], timeout: float) -> object:
+        assert headers["Authorization"] == f"Bearer {TOKEN}"
+        assert 0 < timeout <= 15.0
+        parsed = urlsplit(url)
+        if parsed.path == "/api/auth.test":
+            return {"ok": True, "team_id": policy.workspace_id, "user_id": "U123456789"}
+        assert parsed.path == "/api/search.messages"
+        query = parse_qs(parsed.query)["query"][0]
+        queries.append(query)
+        channel = query.removeprefix("in:<#").removesuffix(">")
+        assert channel in policy.channels
+        return {
+            "ok": True,
+            "messages": {
+                "matches": [
+                    {
+                        "channel": {"id": channel},
+                        "text": "approved project update",
+                        "ts": f"{int(BASE_TIME.timestamp())}.000001",
+                        "user": "U123456789",
+                    }
+                ]
+            },
+        }
+
+    _install_reader(monkeypatch, vault=vault, manager=manager, get_json=get_json)
+    delivery = read_connector_source(
+        vault,
+        connection_id=str(connection_id),
+        source_id="slack",
+        limit=5,
+        observed_at=BASE_TIME,
+    )
+    assert queries == ["in:<#C123456789>", "in:<#C987654321>"]
+    assert delivery["result"] == "success"
+    assert len(cast(list[object], delivery["items"])) == 2

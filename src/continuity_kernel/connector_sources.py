@@ -34,6 +34,10 @@ from continuity_kernel.connector_token_store import TokenState
 from continuity_kernel.connector_transport import SLACK_AUTH_FAILURE_CODES
 from continuity_kernel.errors import ConflictError, NotFoundError, SetupError, ValidationError
 from continuity_kernel.records import format_time
+from continuity_kernel.slack_channel_access import (
+    load_slack_channel_access,
+    policy_for_verified_slack_workspace,
+)
 from continuity_kernel.source_state import SourceCompleteness
 from continuity_kernel.vault import Vault
 
@@ -130,8 +134,7 @@ _GRAPH_BASE: Final = "https://graph.microsoft.com/v1.0"
 _SLACK_BASE: Final = "https://slack.com/api"
 _SLACK_ERROR = re.compile(r"^[a-z0-9_]{1,128}$")
 _SLACK_TIMESTAMP = re.compile(r"^(?P<seconds>[0-9]{10,12})\.(?P<microseconds>[0-9]{6})$")
-_SLACK_CONVERSATION_TYPES: Final = "public_channel,private_channel,mpim,im"
-_SLACK_MAX_CONVERSATIONS: Final = 50
+_SLACK_SEARCH_QUERY: Final = "after:1970-01-01"
 _SLACK_PREVIEW_CHARS: Final = 500
 _SLACK_LOCALIZED_OMISSION_CODES: Final = frozenset(
     {
@@ -211,6 +214,8 @@ def read_connector_source(
         raise ValidationError("connector observation time must be timezone-aware")
     observed = (observed_at or datetime.now(UTC)).astimezone(UTC)
     tool_binding = _digest(_TOOL_NAMESPACE, source_id)
+    if source_id == "slack":
+        load_slack_channel_access(str(clean_connection_id))
     budget = _OperationBudget(monotonic() + timeout_seconds)
 
     auth_manager = ConnectorAuthManager(vault)
@@ -306,6 +311,7 @@ def read_connector_source(
             )
         else:
             result = _read_slack(
+                connection_id=str(clean_connection_id),
                 access_token=access_token,
                 getter=getter,
                 limit=limit,
@@ -709,12 +715,14 @@ def _read_microsoft(
 
 def _read_slack(
     *,
+    connection_id: str,
     access_token: str,
     getter: JsonGetter,
     limit: int,
     observed_at: datetime,
     timeout_seconds: float,
 ) -> _ReadResult:
+    budget = _OperationBudget(monotonic() + timeout_seconds)
     identity = _request_slack_json(
         getter,
         f"{_SLACK_BASE}/auth.test",
@@ -726,97 +734,78 @@ def _read_slack(
     team_id = _provider_id(identity.get("team_id"), "Slack workspace ID")
     user_id = _provider_id(identity.get("user_id"), "Slack user ID")
     account_binding = _digest(_ACCOUNT_NAMESPACE, f"slack:user:{team_id}:{user_id}")
-    conversation_query = _query(
-        (
-            ("exclude_archived", "true"),
-            ("limit", str(_SLACK_MAX_CONVERSATIONS)),
-            ("types", _SLACK_CONVERSATION_TYPES),
+    policy = policy_for_verified_slack_workspace(connection_id, team_id)
+    queries = (
+        [f"in:<#{channel}>" for channel in sorted(policy.channels)]
+        if policy is not None
+        else [_SLACK_SEARCH_QUERY]
+    )
+    per_channel = max(1, math.ceil(limit / max(1, len(queries))))
+    messages: list[Mapping[str, object]] = []
+    for query in queries:
+        search_query = _query(
+            (
+                ("query", query),
+                ("count", str(per_channel)),
+                ("sort", "timestamp"),
+                ("sort_dir", "desc"),
+            )
         )
-    )
-    conversations_payload = _request_slack_json(
-        getter,
-        f"{_SLACK_BASE}/conversations.list?{conversation_query}",
-        access_token=access_token,
-        timeout_seconds=timeout_seconds,
-    )
-    conversations = _object_items(
-        conversations_payload,
-        "channels",
-        _SLACK_MAX_CONVERSATIONS,
-        optional=True,
-    )
-    incomplete = _slack_next_cursor(conversations_payload.get("response_metadata")) is not None
+        search_payload = _request_slack_json(
+            getter,
+            f"{_SLACK_BASE}/search.messages?{search_query}",
+            access_token=access_token,
+            timeout_seconds=budget.remaining(),
+        )
+        # Re-read the policy after the call so revocation cannot release a stale result.
+        current_policy = policy_for_verified_slack_workspace(connection_id, team_id)
+        if policy is not None:
+            if current_policy is None or current_policy.fingerprint != policy.fingerprint:
+                raise ValidationError("Slack channel policy changed during the source read")
+            current_policy.validate_search_result(search_payload)
+        search_messages = _required_object(search_payload.get("messages"), "Slack search response")
+        messages.extend(_object_items(search_messages, "matches", per_channel, optional=True))
     entries: list[tuple[dict[str, object], str]] = []
-    readable_conversations = 0
-    omitted_error: str | None = None
-    for conversation in conversations:
-        channel_id = _provider_id(conversation.get("id"), "Slack conversation ID")
-        try:
-            history = _request_slack_json(
-                getter,
-                (
-                    f"{_SLACK_BASE}/conversations.history?"
-                    f"{_query((('channel', channel_id), ('limit', '1')))}"
-                ),
-                access_token=access_token,
-                timeout_seconds=timeout_seconds,
+    for message in messages:
+        message_type = message.get("type")
+        # Search marks direct-message matches as "im", unlike conversation history.
+        if message_type not in (None, "message", "im"):
+            raise ValidationError("Slack message type is invalid")
+        channel = _required_object(message.get("channel"), "Slack message channel")
+        channel_id = _provider_id(channel.get("id"), "Slack conversation ID")
+        timestamp_value = _provider_id(message.get("ts"), "Slack message timestamp")
+        author = message.get("user") or message.get("bot_id")
+        author_ref = (
+            ""
+            if author is None
+            else _digest(
+                _EVIDENCE_NAMESPACE,
+                f"slack:author:{_provider_id(author, 'Slack message author')}",
             )
-        except _SlackAPIError as exc:
-            if exc.error not in _SLACK_LOCALIZED_OMISSION_CODES:
-                raise
-            if omitted_error is None:
-                omitted_error = exc.error
-            incomplete = True
-            continue
-        readable_conversations += 1
-        messages = _object_items(history, "messages", 1, optional=True)
-        has_more = history.get("has_more", False)
-        if not isinstance(has_more, bool):
-            raise ValidationError("Slack pagination flag is invalid")
-        incomplete = (
-            incomplete
-            or has_more
-            or _slack_next_cursor(history.get("response_metadata")) is not None
         )
-        channel_ref = _digest(_EVIDENCE_NAMESPACE, f"slack:channel:{channel_id}")
-        for message in messages:
-            if message.get("type") != "message":
-                raise ValidationError("Slack message type is invalid")
-            timestamp_value = _provider_id(message.get("ts"), "Slack message timestamp")
-            author = message.get("user") or message.get("bot_id")
-            author_ref = (
-                ""
-                if author is None
-                else _digest(
-                    _EVIDENCE_NAMESPACE,
-                    f"slack:author:{_provider_id(author, 'Slack message author')}",
-                )
+        text = _optional_text(
+            message.get("text"),
+            "Slack message text",
+            _MAX_SNIPPET_BYTES,
+        )
+        entries.append(
+            (
+                {
+                    "channelRef": _digest(_EVIDENCE_NAMESPACE, f"slack:channel:{channel_id}"),
+                    "authorRef": author_ref,
+                    "timestamp": _slack_timestamp(timestamp_value),
+                    "text": text[:_SLACK_PREVIEW_CHARS],
+                },
+                _digest(_EVIDENCE_NAMESPACE, f"slack:message:{channel_id}:{timestamp_value}"),
             )
-            text = _optional_text(
-                message.get("text"),
-                "Slack message text",
-                _MAX_SNIPPET_BYTES,
-            )
-            entries.append(
-                (
-                    {
-                        "channelRef": channel_ref,
-                        "authorRef": author_ref,
-                        "timestamp": _slack_timestamp(timestamp_value),
-                        "text": text[:_SLACK_PREVIEW_CHARS],
-                    },
-                    _digest(_EVIDENCE_NAMESPACE, f"slack:message:{channel_id}:{timestamp_value}"),
-                )
-            )
-    if conversations and readable_conversations == 0 and omitted_error is not None:
-        raise _SlackAPIError(omitted_error)
+        )
     entries.sort(key=lambda entry: cast(str, entry[0]["timestamp"]), reverse=True)
     entries = entries[:limit]
     evidence_refs = [reference for _, reference in entries]
     return _ReadResult(
         items=[item for item, _ in entries],
         account_binding=account_binding,
-        completeness=_page_completeness(None, incomplete=incomplete),
+        completeness=SourceCompleteness.PARTIAL,
         covered_through=format_time(observed_at),
         evidence_refs=evidence_refs,
     )
@@ -1092,16 +1081,6 @@ def _page_marker(value: object, label: str) -> str | None:
     if value is None:
         return None
     return _required_text(value, label, _MAX_TRANSIENT_BYTES)
-
-
-def _slack_next_cursor(value: object) -> str | None:
-    if value is None:
-        return None
-    metadata = _required_object(value, "Slack response metadata")
-    cursor = metadata.get("next_cursor")
-    if cursor in {None, ""}:
-        return None
-    return _required_text(cursor, "Slack page marker", _MAX_TRANSIENT_BYTES)
 
 
 def _slack_timestamp(value: str) -> str:

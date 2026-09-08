@@ -9,7 +9,7 @@ disposition files by hand.
 Read accepted Mind context, the current Pulse binding, and the Bridge request
 queue. Continue in the same onboarding task when its exact task UUID is known.
 If ownership is ambiguous, ask before taking over and never create a duplicate
-Pulse or silently replace another active hand.
+Pulse or silently replace another active execution unit.
 
 ## Stale or failed source
 

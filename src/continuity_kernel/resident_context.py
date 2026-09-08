@@ -49,6 +49,7 @@ MAX_SKILL_ENTRIES: Final = 8_192
 MAX_SKILL_DEPTH: Final = 16
 MAX_SKILL_PATH_CHARACTERS: Final = 512
 MAX_EXECUTION_BINDINGS: Final = 4_096
+MAX_WORK_SUMMARY_BYTES: Final = 32_768
 _SKILL_NAME: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _FRONTMATTER_NAME: Final = re.compile(r"^name\s*:\s*(?P<value>.+?)\s*$")
 _WINDOWS_RESERVED_NAMES: Final = frozenset(
@@ -110,16 +111,26 @@ class _ExecutionBindingSource(Protocol):
 def execution_bindings(source: _ExecutionBindingSource) -> dict[str, Any]:
     """Project complete explicit runtime bindings without semantic selection."""
 
-    active_hands = [
+    active_hands: list[dict[str, Any]] = [
         {
             "active_thread_id": task.active_thread_id,
             "revision": task.revision,
             "status": task.status,
             "task_id": task.identifier,
+            "work": _work_summary(task),
         }
         for task in sorted(source.list_tasks(), key=lambda item: item.identifier)
         if task.status not in TERMINAL_TASK_STATUSES and task.active_thread_id is not None
     ]
+    summary_bytes = 0
+    omitted_summaries = 0
+    for hand in active_hands:
+        work_bytes = len(json.dumps(hand["work"], ensure_ascii=False).encode("utf-8"))
+        if summary_bytes + work_bytes > MAX_WORK_SUMMARY_BYTES:
+            hand["work"] = None
+            omitted_summaries += 1
+        else:
+            summary_bytes += work_bytes
     focused_threads = [
         {
             "focus_task_id": thread.focus_task_id,
@@ -135,10 +146,37 @@ def execution_bindings(source: _ExecutionBindingSource) -> dict[str, Any]:
     return {
         "active_hand_count": len(active_hands),
         "active_hands": active_hands,
+        "work_summary_omitted_count": omitted_summaries,
         "focused_thread_count": len(focused_threads),
         "focused_threads": focused_threads,
         "format_version": 1,
     }
+
+
+def _work_summary(task: Task) -> dict[str, Any]:
+    """Give a routing index enough meaning without loading histories or raw refs."""
+    bounds = {
+        "title": 180,
+        "outcome": 360,
+        "next_action": 240,
+        "waiting_on": 240,
+        "project": 180,
+    }
+    summary: dict[str, Any] = {
+        "next_actor": task.next_actor,
+        "updated_at": task.updated_at,
+        "attention_at": task.attention_at,
+        "progress_check_by": task.progress_check_by,
+        "entity_ids": [link.entity_id for link in task.entity_links],
+    }
+    truncated = []
+    for field, limit in bounds.items():
+        value = getattr(task, field)
+        summary[field] = value[:limit] if value is not None else None
+        if value is not None and len(value) > limit:
+            truncated.append(field)
+    summary["truncated_fields"] = truncated
+    return summary
 
 
 def recover_interrupted_guidance_projection(vault_root: Path) -> None:

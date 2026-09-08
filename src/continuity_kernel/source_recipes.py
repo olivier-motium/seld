@@ -235,6 +235,7 @@ RECIPES: Final = {
             version="2",
             identity="wacli.account.identity",
             read="wacli.messages.recent_read",
+            limit=100,
             ttl_hours=6,
         ),
         _recipe(

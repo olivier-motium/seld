@@ -12,7 +12,10 @@ from typing import Any, cast
 
 import pytest
 
-from continuity_kernel import bridge, bridge_worker, resident_context, sqlite_snapshot
+import continuity_kernel.bridge as bridge
+import continuity_kernel.bridge_worker as bridge_worker
+import continuity_kernel.resident_context as resident_context
+import continuity_kernel.sqlite_snapshot as sqlite_snapshot
 from continuity_kernel.errors import ValidationError
 
 _POSIX_OS = cast(Any, os)

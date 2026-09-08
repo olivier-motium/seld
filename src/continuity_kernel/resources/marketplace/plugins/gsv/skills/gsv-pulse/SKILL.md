@@ -6,13 +6,26 @@ description: Run or repair Seld's resident Pulse in its dedicated Codex task. Ke
 # Seld resident Pulse
 
 Pulse is ambient executive function, not a task generator. In one short,
-serialized cognition episode it reads current Seld truth and useful new source
-evidence, updates only the canon that genuinely changed, and either helps
-through the foreground Chief of Staff task or stays silent.
+serialized cognition episode it reads the smallest current Seld truth and new
+source evidence needed for a decision, updates only the canon that genuinely
+changed, and either helps through the foreground Chief of Staff task or stays
+silent.
 
-Use [registration](references/registration.md) only for an explicit setup or
-repair. Use [source acquisition](references/source-acquisition.md) when a
-selected source is due or materially relevant.
+In this exact bound Pulse task, an empty scheduled continuation is a request
+to run the next Pulse wake. It is not a request for a readiness reply. Keep
+this standing behavior in the task's conversation: an in-chat heartbeat
+resumes existing context and may arrive without a new user message. This rule
+does not authorize work in another task or bypass the identity guard below.
+
+A mechanical sweep is not a cognition episode. It queues current due evidence
+and publishes a content-free sensor heartbeat. `gsv pulse status` proves only
+that sweep. It does not prove that an AI wake ran, read sources, integrated
+meaning, or delivered a foreground message.
+
+Use [canonical terminology](../gsv/references/terminology.md) for system roles
+and unit lifecycles. Use [registration](references/registration.md) only for an
+explicit setup or repair. Use [source acquisition](references/source-acquisition.md)
+when a selected source is due or materially relevant.
 
 ## Prove both resident identities
 
@@ -37,17 +50,29 @@ single foreground conversation for orientations, alerts, task notices, and
 reminders; it is not a second memory, task, reminder, inbox, score, or
 dashboard system. Pulse never uses Bridge operations for delivery,
 acknowledgement, or semantic work; the exact Chief of Staff task is its only
-foreground route.
+foreground route. Internal work coordination uses the exact existing execution
+task under [current work and follow-through](references/current-work.md).
+An internal handoff is not a foreground alert or authority to contact people.
 
 ## Freeze one useful wake
 
-At the start, read once:
+At the start, freeze the smallest set of canon that can change this wake:
 
-- `gsv_context`, current Direction, and the complete authored Portfolio;
-- ordinary open Tasks plus only relevant WorkThreads and Entities;
-- `MIND.md` and `NOW.md` with exact revisions;
+- `MIND.md`, `NOW.md`, and one bounded page of pending resident signals;
 - selected source state and its exact revision; and
-- one bounded page of pending resident signals with its exact queue revision.
+- the Task, WorkThread, Entity, Direction, or Portfolio item named by a signal
+  or needed for the one decision at hand.
+
+Include a compact view of current execution ownership on each wake. Follow
+[current work and follow-through](references/current-work.md): reconcile native
+execution bindings with a bounded live Codex task listing, inspect only work
+whose changed evidence or due follow-up can change this wake, and route useful
+changes to its existing owner. Source polling alone does not complete a wake
+when an actionable work handoff is due. A binding is ownership, not live status
+or completion evidence.
+
+Read the full Direction, Portfolio, or open-task set only when the current
+decision requires it. Do not load them as a routine context dump.
 
 Freeze the exact input IDs and source windows to inspect. New arrivals wait for
 the next wake. Re-read only an exact record immediately before its CAS mutation
@@ -60,12 +85,15 @@ then source ID. Unchanged auth/tool-absent incidents retry only after their
 fingerprint changes.
 
 Keep the episode inside its cadence. At seven elapsed minutes begin no new
-source, recall, or hand inspection; at eight minutes stop acquiring and finish
-the smallest honest judgment and readback already in hand. Bounds protect
-reliability, but do not impose an arbitrary item count: inspect the incremental
-evidence needed to make the current judgment.
+source, recall, or execution unit inspection; at eight minutes stop acquiring
+and finish the smallest honest judgment and readback already acquired. Bounds
+protect reliability, but do not impose an arbitrary item count: inspect the
+incremental evidence needed to make the current judgment.
 
-## Apply the task-birth gate
+Use QMD only for a concrete retrieval gap. QMD maintenance may defer or fail
+without changing the mechanical sweep result. Do not retry it inside the wake.
+
+## Apply the task-creation gate
 
 Create an ordinary Task only when the evidence shows one of these:
 
@@ -104,7 +132,7 @@ task only for:
 - an emergency;
 - a person genuinely blocked on Olivier;
 - a critical source, authentication, resident, or system failure;
-- a newly created Task that passed the task-birth gate;
+- a newly created Task that passed the task-creation gate;
 - a due reminder whose timing and context now make it useful; or
 - the scheduled morning or evening orientation.
 
@@ -167,8 +195,16 @@ returned bodies transient. A crash or stale CAS replays the same delivery; it
 never skips evidence or silently advances a checkpoint.
 
 Selected WhatsApp is due on every Pulse wake, regardless of its proof TTL or
-current freshness label. Its small poll limit is one replay unit, not a
-per-wake throughput limit. Poll, judge, persist any justified meaning, read it
+current freshness label. When its unread backlog predates the current day,
+first use the native local-source recent view to inspect at most 25 newest
+messages. If this existing Codex task lacks that tool, use the installed
+`gsv local-source recent --source whatsapp --limit 25` command. This is partial
+current context, not delivery acknowledgement or proof that the backlog was
+read. Keep its bodies transient, preserve the backlog, and deduplicate any
+derived changes against existing records when those messages later replay.
+
+Then continue the ordered poll/acknowledge handshake. Its small poll limit is
+one replay unit, not a per-wake throughput limit. Poll, judge, persist any justified meaning, read it
 back, and acknowledge that exact batch. If the batch is partial, immediately
 poll the next batch and repeat. Continue until the adapter reports complete
 coverage or the seven-minute no-new-acquisition boundary arrives. Each next
@@ -207,17 +243,21 @@ Do not copy the task ledger, Portfolio, provider messages, or a source digest
 into NOW. Preserve an earlier successful coverage horizon when a later attempt
 fails and name both facts.
 
-## Use one visible hand for sustained work
+## Use one visible droid for sustained work
 
 Pulse may update reversible local canon, prepare a small local draft, surface
 an intervention, or remain silent. It does not run a long implementation,
 browser session, or investigation inline.
 
 Continue an existing approved durable outcome in its one visible Codex task.
-Create a new sustained-work hand only when the task-birth gate already produced
+Before creating or resuming work, check the current owner and any unresolved
+handoff. Continue relevant new context there; do not create a parallel executor
+or turn a receipt into a completed outcome. A human or external dependency is
+not runnable agent work merely because the last Codex turn ended.
+Create a new sustained-work droid only when the task-creation gate already produced
 or identified a real durable outcome. Bind the real returned task UUID through
 fresh CAS. Never invent an ID, dispatch a duplicate, or treat a stopped Codex
-turn as completion. A wake creates at most one new hand.
+turn as completion. A wake launches at most one new droid.
 
 ## Unattended authority and privacy
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ from urllib.request import Request
 import pytest
 
 from continuity_kernel import connector_runtime as connector_runtime_module
+from continuity_kernel import slack_channel_access
 from continuity_kernel.connector_adapter import (
     ConnectorAdapterRegistry,
     ConnectorAdapterResult,
@@ -287,6 +289,7 @@ def _prepared(
     artifact_store: ArtifactStore | None = None,
     prepared_uploads: PreparedUploadCache | None = None,
     profile_name: str = "google",
+    require_confirmation_for_safe_mutations: bool = False,
 ) -> tuple[Vault, ConnectorAuthManager, _Adapter, ConnectorRuntime]:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Connector runtime")
@@ -348,8 +351,33 @@ def _prepared(
         session=ConnectorSession(secret=b"s" * 32),
         artifact_store=artifact_store,
         prepared_uploads=prepared_uploads,
+        require_confirmation_for_safe_mutations=require_confirmation_for_safe_mutations,
     )
     return vault, manager, adapter, runtime
+
+
+def _restrict_slack_channels(
+    monkeypatch: pytest.MonkeyPatch,
+    path: Path,
+    *,
+    connection_id: str,
+    channels: dict[str, str],
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workspaces": {
+                    "T1": {
+                        "channels": channels,
+                        "connection_ids": [connection_id],
+                        "pending_channel_names": [],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(slack_channel_access, "_config_path", lambda: path)
 
 
 def _install_local_upload_catalog(
@@ -638,6 +666,29 @@ def test_safe_mutation_executes_once_but_outward_effect_requires_bound_confirmat
             {**values, "confirmation_token": preview["confirmation_token"]},
         )
     assert [call[0] for call in adapter.calls] == ["drafts.create", "drafts.send"]
+
+
+def test_safe_mutation_can_require_one_process_confirmation(tmp_path: Path) -> None:
+    _vault, _manager, adapter, runtime = _prepared(
+        tmp_path,
+        require_confirmation_for_safe_mutations=True,
+    )
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"subject": "Draft only", "text_body": "Not sent"},
+        "operation": "drafts.create",
+    }
+
+    preview = runtime.call_tool("gsv_gmail_write", values)
+
+    assert preview["status"] == "confirmation_required"
+    assert adapter.calls == []
+    confirmed = runtime.call_tool(
+        "gsv_gmail_write",
+        {**values, "confirmation_token": preview["confirmation_token"]},
+    )
+    assert confirmed["status"] == "ok"
+    assert [call[0] for call in adapter.calls] == ["drafts.create"]
 
 
 def test_provider_confirmation_target_enriches_preview_and_mutation_digest(
@@ -2210,3 +2261,29 @@ def test_runtime_rejects_foreign_receipt_and_cleans_artifact_on_adapter_failure(
     assert not list(artifacts.root.glob("*.part"))
     runtime.close()
     foreign_store.close()
+
+
+def test_restricted_slack_reads_fail_before_the_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _Adapter()
+    adapter.providers = frozenset({"slack"})
+    _restrict_slack_channels(
+        monkeypatch,
+        tmp_path / "slack-channel-access.json",
+        connection_id=str(CONNECTION_ID),
+        channels={"CABC123": "allowed"},
+    )
+    _vault, _manager, _adapter, runtime = _prepared(tmp_path, adapter=adapter, profile_name="slack")
+    values = {
+        "connection_id": str(CONNECTION_ID),
+        "input": {"channel": "Cdenied"},
+        "operation": "messages.list",
+    }
+
+    with pytest.raises(ValidationError, match="approved channel scope"):
+        runtime.call_tool("gsv_slack_read", values)
+    with pytest.raises(ValidationError, match="approved channel scope"):
+        runtime.call_app_corpus_read("gsv_slack_read", values)
+
+    assert adapter.calls == []
