@@ -6,6 +6,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from continuity_kernel.connector_auth import (
     AccountMetadata,
     ClientKind,
@@ -15,6 +17,7 @@ from continuity_kernel.connector_auth import (
     CredentialKind,
     parse_connection_id,
 )
+from continuity_kernel.errors import ContinuityError, ValidationError
 from continuity_kernel.pulse_codex import LunaTurnResult
 from continuity_kernel.pulse_delivery import PulseDelivery
 from continuity_kernel.pulse_reports import PulseReportStore
@@ -244,6 +247,7 @@ def test_known_fingerprint_replays_the_latest_report_without_another_model_or_wa
         {
             "coverage_status": "failure",
             "error_code": "auth_required",
+            "failure_code": "checkpoint_validation_error",
             "incident_signature": "stale-incident-signature",
         },
     )
@@ -256,10 +260,59 @@ def test_known_fingerprint_replays_the_latest_report_without_another_model_or_wa
     assert source_state["report_id"] == delivered.identifier
     assert source_state["coverage_status"] == "success"
     assert source_state["error_code"] is None
+    assert source_state["failure_code"] is None
     assert source_state["incident_signature"] == _source_access_signature(vault, "slack")
     assert report_store.show(delivered.identifier) == delivered
     assert turns == ["source", "relevance"]
     assert len(queue_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "failure_code"),
+    [
+        (ValidationError("Pulse report receipt is invalid"), "report_receipt_invalid"),
+        (ContinuityError("local source content changed after polling"), "local_content_changed"),
+    ],
+)
+def test_checkpoint_failure_keeps_a_fixed_content_free_code(
+    vault: Vault,
+    failure: Exception,
+    failure_code: str,
+) -> None:
+    vault.select_sources(expected_revision=vault.get_source_snapshot().revision, sources=("slack",))
+    _bind_pulse(vault)
+
+    class CheckpointFailureAdapter(FakeSourceAdapter):
+        def commit(
+            self,
+            window: AcquiredSourceWindow,
+            *,
+            report_ref: str,
+            report_revision: str,
+            replay: bool = False,
+        ) -> Mapping[str, object]:
+            del window, report_ref, report_revision
+            self.commits.append(replay)
+            raise failure
+
+    turns: list[str] = []
+    runtime = PulseRuntime(
+        vault,
+        adapter=CheckpointFailureAdapter(vault),  # type: ignore[arg-type]
+        session_factory=lambda *, instructions, **_values: FakeLunaSession(
+            "relevance" if instructions.startswith("You are the separate relevance") else "source",
+            turns,
+        ),
+        wake_handler=lambda _ids: None,
+    )
+
+    asyncio.run(runtime.run(once=True))
+
+    source_state = runtime.state.read()["sources"]["slack"]
+    assert source_state["state"] == "unavailable"
+    assert source_state["failed_stage"] == "source_checkpoint"
+    assert source_state["failure_type"] == type(failure).__name__
+    assert source_state["failure_code"] == failure_code
 
 
 def test_unavailable_source_creates_a_gap_report_without_starting_a_source_model(

@@ -17,7 +17,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 from continuity_kernel.atomic import (
     PINNED_PATH_ROOT_SUPPORTED,
@@ -86,6 +86,26 @@ SOURCE_SCHEMA = {
         "uncertainty": {"type": "string", "maxLength": 2000},
     },
     "required": ["claim", "uncertainty"],
+}
+
+_CHECKPOINT_VALIDATION_CODES: Final[Mapping[str, str]] = {
+    "Pulse report receipt is invalid": "report_receipt_invalid",
+    "Pulse source commit requires a durable Pulse report store": "report_store_unavailable",
+    "canonical result reference must name one typed record revision": "result_reference_invalid",
+    "canonical result reference must end in a SHA-256 revision": "result_reference_invalid",
+    "source report reference is not in its canonical form": "report_reference_noncanonical",
+}
+_CHECKPOINT_CONTINUITY_CODES: Final[Mapping[str, str]] = {
+    "local source content changed after polling": "local_content_changed",
+    (
+        "standalone WhatsApp delivery checkpoint changed before acknowledgement"
+    ): "local_checkpoint_changed",
+    "standalone WhatsApp delivery checkpoint is stale": "local_checkpoint_stale",
+    "standalone WhatsApp delivery prefix changed before acknowledgement": "local_prefix_changed",
+    "standalone WhatsApp delivered content changed before acknowledgement": "local_content_changed",
+    "standalone WhatsApp store changed; cursor preserved": "local_store_changed",
+    "source receipt revision differs from its prepared commit marker": "receipt_marker_mismatch",
+    "host-local source adapter binding durability is unknown": "adapter_binding_durability_unknown",
 }
 DECISION_SCHEMA = {
     "type": "object",
@@ -491,6 +511,7 @@ class PulseRuntime:
                         "coverage_completeness": window.completeness,
                         "error_code": window.error_code,
                         "failed_stage": None,
+                        "failure_code": None,
                         "failure_type": None,
                         "incident_signature": _source_access_signature(self.vault, source),
                         "configuration": self._sessions[source].configuration
@@ -507,6 +528,7 @@ class PulseRuntime:
                         "state": "unavailable",
                         "last_poll_at": _now(),
                         "failed_stage": stage,
+                        "failure_code": _checkpoint_failure_code(stage, exc),
                         "failure_type": type(exc).__name__,
                     },
                 )
@@ -728,6 +750,7 @@ class PulseRuntime:
             "coverage_completeness": window.completeness,
             "error_code": window.error_code,
             "failed_stage": None,
+            "failure_code": None,
             "failure_type": None,
             "incident_signature": _source_access_signature(self.vault, source),
         }
@@ -748,6 +771,22 @@ def _record_facts(target: dict[str, Any], fields: Mapping[str, Any]) -> None:
         target["turns_total"] = target.get("turns_total", 0) + 1
         target["usage_coverage"] = "successful_native_turns_with_usage"
     target.update(fields)
+
+
+def _checkpoint_failure_code(stage: str, exc: Exception) -> str | None:
+    """Return a fixed operational code without retaining provider-derived detail."""
+
+    if stage != "source_checkpoint":
+        return None
+    if isinstance(exc, ValidationError):
+        return _CHECKPOINT_VALIDATION_CODES.get(str(exc), "checkpoint_validation_error")
+    if isinstance(exc, ContinuityError):
+        return _CHECKPOINT_CONTINUITY_CODES.get(str(exc), "checkpoint_continuity_error")
+    if isinstance(exc, TimeoutError):
+        return "checkpoint_timeout"
+    if isinstance(exc, OSError):
+        return "checkpoint_os_error"
+    return None
 
 
 def _bounded_text(value: Any, limit: int, *, empty: bool = False) -> str:
