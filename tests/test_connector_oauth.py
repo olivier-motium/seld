@@ -169,6 +169,26 @@ def test_configuration_requires_an_exact_loopback_redirect(redirect_uri: str) ->
         )
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_loopback_bind_never_does_a_reverse_dns_lookup(
+    host: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # HTTPServer.server_bind calls socket.getfqdn(), which on macOS asks the network
+    # resolver and has stalled past the 30 s OAuth deadline on CI runners.
+    if host == "::1" and not socket.has_ipv6:
+        pytest.skip("IPv6 is unavailable on this host")
+
+    def forbidden_lookup(name: str = "") -> str:
+        raise AssertionError(f"reverse DNS lookup of {name!r} during loopback bind")
+
+    monkeypatch.setattr(socket, "getfqdn", forbidden_lookup)
+    listener = BoundLoopbackCallback.bind(host=host, port=0, path="/oauth/callback")
+    try:
+        assert urlsplit(listener.redirect_uri).port
+    finally:
+        listener.close()
+
+
 def test_ipv6_loopback_callback_binds_and_completes_when_supported() -> None:
     if not socket.has_ipv6:
         pytest.skip("IPv6 is unavailable on this host")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import selectors
 import socket
+import socketserver
 import ssl
 import time
 from dataclasses import dataclass
@@ -42,6 +43,16 @@ class _OneShotServer(HTTPServer):
     attempt: OAuthAuthorizationAttempt
     authorization_code: str | None = None
     callback_error: OAuthCallbackError | None = None
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind sets server_name with socket.getfqdn(), a reverse
+        # DNS lookup of the loopback address. Nothing here reads server_name, and on
+        # macOS that lookup goes to the network resolver and can block for tens of
+        # seconds inside the caller's OAuth deadline. Bind without the lookup.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
 
 class _IPv6OneShotServer(_OneShotServer):
