@@ -277,6 +277,11 @@ def test_unpublished_linux_prebuilt_fails_before_network(tmp_path: Path) -> None
     assert not marker.exists()
 
 
+# A hang guard, not a speed assertion. A cold pwsh start took 28-31 s on a
+# loaded developer machine, so the old 30 s limit failed healthy runs.
+POWERSHELL_TIMEOUT_SECONDS = 120
+
+
 def _powershell_download_command(tmp_path: Path) -> list[str]:
     powershell = shutil.which("pwsh") or shutil.which("powershell")
     if powershell is None:
@@ -335,7 +340,7 @@ def test_powershell_installer_download_rejects_checksum_before_install(tmp_path:
         capture_output=True,
         text=True,
         env=environment,
-        timeout=30,
+        timeout=POWERSHELL_TIMEOUT_SECONDS,
     )
 
     assert result.returncode != 0
@@ -1060,7 +1065,7 @@ def test_powershell_uninstaller_removes_binary_only_after_verified_cleanup(
         capture_output=True,
         text=True,
         env=environment,
-        timeout=30,
+        timeout=POWERSHELL_TIMEOUT_SECONDS,
     )
 
     if bridge_status == 0 and cleanup_status == 0 and output_mode == "compact":

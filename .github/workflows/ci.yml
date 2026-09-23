@@ -8,7 +8,44 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that pull request's older run.
+# Runs on main are never cancelled, so every merge keeps a complete result.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.7.0
+        with:
+          enable-cache: true
+      - id: sync
+        run: uv sync --frozen --extra dev
+      # Each check runs even when an earlier one fails, so one run reports all of them.
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff check .
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff format --check .
+      # pyproject.toml pins mypy's python_version to 3.11, so the interpreter version
+      # does not change the result. --platform gives the same result as running mypy
+      # on that operating system.
+      - name: mypy for Linux
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run mypy --platform linux src tests scripts
+      - name: mypy for macOS
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run mypy --platform darwin src tests scripts
+      - name: mypy for Windows
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run mypy --platform win32 src tests scripts
+
   test:
     name: Python ${{ matrix.python }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -27,16 +64,18 @@ jobs:
       - uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.7.0
         with:
           enable-cache: true
-      - run: uv sync --frozen --extra dev --python "${{ matrix.python }}"
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run mypy src tests scripts
+      - id: sync
+        run: uv sync --frozen --extra dev --python "${{ matrix.python }}"
+      # -n auto starts one pytest-xdist worker per runner CPU.
       - if: runner.os != 'Windows'
-        run: uv run pytest --cov=continuity_kernel --cov-report=term-missing
+        run: uv run pytest -n auto --cov=continuity_kernel --cov-report=term-missing
       - if: runner.os == 'Windows'
-        run: uv run pytest --no-cov --tb=line
-      - run: uv run python scripts/privacy_check.py --self-test
-      - run: uv run python scripts/privacy_check.py .
+        run: uv run pytest -n auto --no-cov --tb=line
+      # The privacy checks also run after a test failure. They scan the tree the tests left.
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run python scripts/privacy_check.py --self-test
+      - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run python scripts/privacy_check.py .
 
   package:
     name: Python distributions
@@ -47,6 +86,8 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.7.0
+        with:
+          enable-cache: true
       - run: uv sync --frozen --extra dev
       - run: uv build
       - run: uv run python scripts/privacy_check.py . --artifact dist

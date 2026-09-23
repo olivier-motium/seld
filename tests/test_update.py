@@ -2178,6 +2178,9 @@ def test_apply_accepts_the_check_revision_published_by_status(
         (datetime.now(UTC) - timedelta(hours=6, seconds=1)).isoformat().replace("+00:00", "Z"),
         (datetime.now(UTC) + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
     ),
+    # Stable ids: the values come from the clock, and pytest-xdist workers must
+    # collect identical test ids.
+    ids=("expired", "future"),
 )
 def test_apply_rejects_expired_or_future_check_receipts(
     vault: Vault,

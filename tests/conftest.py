@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
 import os
 import socket
@@ -166,6 +167,23 @@ def no_real_browser(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequ
 def no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket.socket, "connect", _guarded_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", _guarded_connect_ex)
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    # Under pytest-xdist each worker records its own browser calls. Hand them to
+    # the controller so the guard report below still lists every caught test.
+    workeroutput = getattr(session.config, "workeroutput", None)
+    if workeroutput is not None:
+        workeroutput["recorded_browser_calls"] = [
+            dataclasses.asdict(call) for call in RECORDED_BROWSER_CALLS
+        ]
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: Any, error: object) -> None:
+    del error
+    for call in getattr(node, "workeroutput", {}).get("recorded_browser_calls", []):
+        RECORDED_BROWSER_CALLS.append(RecordedBrowserCall(**call))
 
 
 def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:
