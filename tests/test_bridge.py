@@ -1839,6 +1839,7 @@ def test_snapshot_endpoint_never_calls_full_status_or_logical_digest(
     assert "digest" not in snapshot["status"]
 
 
+@pytest.mark.serial
 def test_snapshot_does_not_wait_for_slow_codex_status_and_refreshes_once(
     vault: Vault,
 ) -> None:
@@ -2817,6 +2818,7 @@ def test_frozen_bridge_child_requests_an_independent_pyinstaller_runtime(
     assert environment["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
 
 
+@pytest.mark.serial
 def test_frozen_start_accepts_worker_pid_after_exact_launch_identity(
     vault: Vault, monkeypatch: pytest.MonkeyPatch
 ) -> None:

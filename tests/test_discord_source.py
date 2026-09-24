@@ -754,6 +754,11 @@ def test_child_environment_is_minimized(
     _provider(monkeypatch)
     monkeypatch.setenv("NODE_OPTIONS", "--require=unexpected")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-cross")
+    # Without any locale variable, CPython's PEP 538 C-locale coercion makes the
+    # fake Python provider set LC_CTYPE in its own environment. LC_ALL is on the
+    # allowlist and disables that coercion, so the recorded keys show only what
+    # the bridge passed.
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
     bridge.poll()
     keys = json.loads(bridge.state_path.with_suffix(".envkeys").read_text())
     state = json.loads(bridge.state_path.read_text())

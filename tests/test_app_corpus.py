@@ -813,6 +813,7 @@ def test_legacy_flat_document_paths_stay_readable_and_are_not_rewritten(
     assert legacy_path.is_file()
 
 
+@pytest.mark.serial
 def test_search_uses_committed_content_while_a_provider_read_is_in_flight(tmp_path: Path) -> None:
     vault = Vault(tmp_path / "vault")
     vault.initialize(name="Corpus")
@@ -883,6 +884,7 @@ def test_search_uses_committed_content_while_a_provider_read_is_in_flight(tmp_pa
     assert document.text == "newly fetched content"
 
 
+@pytest.mark.serial
 def test_search_degrades_to_committed_exact_text_during_qmd_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

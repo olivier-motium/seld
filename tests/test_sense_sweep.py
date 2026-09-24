@@ -133,6 +133,7 @@ def test_recall_failure_does_not_replace_a_complete_sweep_heartbeat(vault: Vault
     }
 
 
+@pytest.mark.serial
 def test_slow_recall_does_not_hold_the_sweep_lock(vault: Vault) -> None:
     refresh_started = threading.Event()
     allow_refresh_finish = threading.Event()
@@ -436,6 +437,7 @@ def test_heartbeat_rejects_extra_fields_and_wrong_host_binding(vault: Vault) -> 
         heartbeat_status(vault.root)
 
 
+@pytest.mark.serial
 def test_mechanical_sweep_does_not_scan_a_wide_recall_tree(vault: Vault) -> None:
     journal = vault.root / "journal/wide"
     journal.mkdir(parents=True)

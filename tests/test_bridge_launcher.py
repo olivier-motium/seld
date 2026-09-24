@@ -533,25 +533,31 @@ def test_descriptor_cleanup_never_deletes_a_swapped_foreign_tree(
     assert preserved.is_dir()
 
 
+@pytest.mark.serial
 def test_native_command_timeout_kills_its_descendant_process_group(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     child_pid_path = tmp_path / "child.pid"
-    monkeypatch.setattr(launcher, "SUBPROCESS_TIMEOUT_SECONDS", 0.2)
+    # The timeout must fire after the shell records its child. With 0.2 s, a loaded
+    # runner killed the shell after "> file" had created the file but before echo wrote
+    # the pid, so the file was empty. The child sleeps 60 s, so the timeout always
+    # fires; its length only sets how long the shell has to record the pid.
+    monkeypatch.setattr(launcher, "SUBPROCESS_TIMEOUT_SECONDS", 1.0)
 
     with pytest.raises(SetupError, match="timed out"):
         launcher._run(
             (
                 "/bin/sh",
                 "-c",
-                'sleep 60 & child=$!; echo "$child" > "$1"; wait "$child"',
+                'sleep 60 & child=$!; echo "$child" > "$1.tmp"; mv "$1.tmp" "$1"; wait "$child"',
                 "seld-timeout",
                 str(child_pid_path),
             ),
             runner=None,
         )
 
+    assert child_pid_path.exists(), "the timeout fired before the shell recorded its child"
     child_pid = int(child_pid_path.read_text(encoding="ascii").strip())
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
