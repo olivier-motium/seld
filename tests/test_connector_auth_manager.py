@@ -831,6 +831,7 @@ def test_refresh_sink_rejects_a_connection_swap_and_unpinned_endpoint(
         )
 
 
+@pytest.mark.serial
 def test_native_loopback_flow_ignores_host_header_and_persists_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

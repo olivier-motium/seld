@@ -65,6 +65,7 @@ def test_pulse_status_separates_mechanical_and_ai_wake_health(tmp_path: Path) ->
     }
 
 
+@pytest.mark.serial
 def test_pulse_status_returns_partial_when_resident_signals_are_busy(tmp_path: Path) -> None:
     vault = Vault(tmp_path / "pulse-status-lock-vault")
     vault.initialize(name="Pulse status lock scope")

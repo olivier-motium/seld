@@ -66,6 +66,9 @@ exclude = ["/.codex"]
 addopts = "-q --strict-markers"
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "serial: passes only if real work finishes inside a wall-clock bound of 1 s or less; CI runs these without pytest-xdist",
+]
 
 [tool.ruff]
 line-length = 100

@@ -604,6 +604,7 @@ def test_index_root_must_be_disjoint_and_subprocess_output_is_bounded(
     assert len(result.stdout) <= 128
 
 
+@pytest.mark.serial
 @_POSIX_INDEX
 def test_cross_process_refresh_is_single_flight_and_search_waits_for_readback(
     vault: Vault, tmp_path: Path
@@ -793,6 +794,7 @@ def test_ancestor_symlink_swap_cannot_redirect_recall_content(
     assert "outside secret" not in str(discovery)
 
 
+@pytest.mark.serial
 def test_recall_deadline_bounds_wide_tree_discovery(
     vault: Vault,
     tmp_path: Path,
